@@ -26,6 +26,13 @@ perf.data.old
 *.bak
 *.orig
 
+# Pre-built variant binaries (regenerate with tests/bench/build_variants.sh)
+tests/bench/bins/
+
+# Benchmark result JSON (generated output, not source)
+tests/bench/bench-results.json
+tests/bench/bench-features-results.json
+
 # Binaries produced by tests
 /tmp/
 
