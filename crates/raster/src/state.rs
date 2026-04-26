@@ -418,6 +418,91 @@ impl GraphicsState {
             },
         }
     }
+
+    /// Borrow the transfer tables as a [`TransferSet`] for use in the pipe.
+    ///
+    /// The returned `TransferSet` borrows from `self` and is valid for the lifetime
+    /// of this `GraphicsState`.
+    #[must_use]
+    pub fn transfer_set(&self) -> TransferSet<'_> {
+        TransferSet {
+            rgb: [
+                self.rgb_transfer[0].as_array(),
+                self.rgb_transfer[1].as_array(),
+                self.rgb_transfer[2].as_array(),
+            ],
+            gray: self.gray_transfer.as_array(),
+            cmyk: [
+                self.cmyk_transfer[0].as_array(),
+                self.cmyk_transfer[1].as_array(),
+                self.cmyk_transfer[2].as_array(),
+                self.cmyk_transfer[3].as_array(),
+            ],
+            device_n: &self.device_n_transfer,
+        }
+    }
+}
+
+// ── TransferSet ───────────────────────────────────────────────────────────────
+
+/// Borrowed references to all transfer LUTs from a [`GraphicsState`].
+///
+/// Constructed via [`GraphicsState::transfer_set`] and stored in [`PipeState`].
+/// Avoids cloning the tables for each paint operation.
+pub struct TransferSet<'a> {
+    /// RGB transfer tables: `[R, G, B]`, each 256 bytes.
+    pub rgb: [&'a [u8; 256]; 3],
+    /// Gray transfer table, 256 bytes.
+    pub gray: &'a [u8; 256],
+    /// CMYK transfer tables: `[C, M, Y, K]`, each 256 bytes.
+    pub cmyk: [&'a [u8; 256]; 4],
+    /// `DeviceN` transfer tables: `SPOT_NCOMPS + 4` tables of 256 bytes each, as a slice.
+    pub device_n: &'a [[u8; 256]],
+}
+
+impl TransferSet<'_> {
+    /// Return a `TransferSet` backed by identity (pass-through) arrays.
+    ///
+    /// Useful in tests and for the initial no-transfer state.
+    /// The returned value borrows from static memory.
+    #[must_use]
+    pub fn identity_rgb() -> TransferSet<'static> {
+        use color::TransferLut;
+        // SAFETY: TransferLut::IDENTITY is a static constant; its inner [u8; 256]
+        // reference is valid for 'static.
+        TransferSet {
+            rgb: [
+                TransferLut::IDENTITY.as_array(),
+                TransferLut::IDENTITY.as_array(),
+                TransferLut::IDENTITY.as_array(),
+            ],
+            gray: TransferLut::IDENTITY.as_array(),
+            cmyk: [
+                TransferLut::IDENTITY.as_array(),
+                TransferLut::IDENTITY.as_array(),
+                TransferLut::IDENTITY.as_array(),
+                TransferLut::IDENTITY.as_array(),
+            ],
+            device_n: {
+                // A static identity table for all 8 DeviceN channels.
+                static DN: [[u8; 256]; 8] = {
+                    let mut t = [[0u8; 256]; 8];
+                    let mut ch = 0;
+                    while ch < 8 {
+                        let mut i = 0u8;
+                        loop {
+                            t[ch][i as usize] = i;
+                            if i == 255 { break; }
+                            i += 1;
+                        }
+                        ch += 1;
+                    }
+                    t
+                };
+                &DN
+            },
+        }
+    }
 }
 
 // ── StateStack ────────────────────────────────────────────────────────────────

@@ -18,10 +18,12 @@
 //! - [`clip`] — [`Clip`] (rect + arbitrary path clip stack)
 //! - [`screen`] — [`HalftoneScreen`] (Bayer / stochastic threshold matrix)
 //! - [`state`] — [`GraphicsState`] and [`StateStack`]
+//! - [`pipe`] — compositing pipeline (simple, AA, general; blend modes; Pattern trait)
 
 pub mod bitmap;
 pub mod clip;
 pub mod path;
+pub mod pipe;
 pub mod scanner;
 pub mod screen;
 pub mod state;
@@ -31,9 +33,10 @@ pub mod xpath;
 pub use bitmap::{AaBuf, Bitmap};
 pub use clip::{Clip, ClipResult};
 pub use path::{Path, PathBuilder, PathFlags, PathPoint, StrokeAdjustHint};
+pub use pipe::{Pattern, PipeState, PipeSrc};
 pub use scanner::iter::ScanIterator;
 pub use scanner::{Intersect, XPathScanner};
 pub use screen::HalftoneScreen;
-pub use state::{GraphicsState, StateStack};
+pub use state::{GraphicsState, StateStack, TransferSet};
 pub use types::*;
 pub use xpath::{XPath, XPathFlags, XPathSeg};

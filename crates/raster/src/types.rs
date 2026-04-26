@@ -259,6 +259,61 @@ impl ScreenParams {
     }
 }
 
+// ── BlendMode ─────────────────────────────────────────────────────────────────
+
+/// PDF compositing blend mode (PDF 32000-1:2008, §11.3.5).
+///
+/// C++ origin: the `GfxBlendMode` enum in `poppler/GfxState.h`, mapped to
+/// `SplashBlendFunc` function pointers in `SplashOutputDev.cc`.
+///
+/// In this implementation blend mode is a typed enum rather than a raw function
+/// pointer; dispatch happens in `pipe::blend`.
+///
+/// # Separable vs. non-separable
+///
+/// The first twelve variants (`Normal` through `Exclusion`) are *separable*:
+/// the blend function operates independently on each colour channel.
+/// The last four (`Hue` through `Luminosity`) are *non-separable*: they operate
+/// on the full RGB triple (with CMYK converted to additive space first).
+///
+/// `Normal` is by far the most common; the pipeline fast-paths for it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum BlendMode {
+    /// Standard Porter-Duff over (gfxBlendNormal).
+    #[default]
+    Normal,
+    /// `Cs × Cd` (gfxBlendMultiply).
+    Multiply,
+    /// `Cs + Cd - Cs × Cd` (gfxBlendScreen).
+    Screen,
+    /// Hard-light of Cd over Cs (gfxBlendOverlay).
+    Overlay,
+    /// `min(Cs, Cd)` (gfxBlendDarken).
+    Darken,
+    /// `max(Cs, Cd)` (gfxBlendLighten).
+    Lighten,
+    /// Brighten Cd to reflect Cs (gfxBlendColorDodge).
+    ColorDodge,
+    /// Darken Cd to reflect Cs (gfxBlendColorBurn).
+    ColorBurn,
+    /// Multiply or screen depending on Cs < 0.5 (gfxBlendHardLight).
+    HardLight,
+    /// Soft version of `HardLight` (gfxBlendSoftLight).
+    SoftLight,
+    /// `|Cd - Cs|` (gfxBlendDifference).
+    Difference,
+    /// `Cs + Cd - 2 × Cs × Cd` (gfxBlendExclusion).
+    Exclusion,
+    /// Hue of Cs, saturation and luminosity of Cd (non-separable, gfxBlendHue).
+    Hue,
+    /// Saturation of Cs, hue and luminosity of Cd (non-separable, gfxBlendSaturation).
+    Saturation,
+    /// Hue and saturation of Cs, luminosity of Cd (non-separable, gfxBlendColor).
+    Color,
+    /// Luminosity of Cs, hue and saturation of Cd (non-separable, gfxBlendLuminosity).
+    Luminosity,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
