@@ -517,7 +517,7 @@ fn fill_impl_parallel<P: Pixel + Send>(
     let bands = bitmap.bands_mut(n_bands);
 
     bands.into_par_iter().for_each(|mut band| {
-        fill_band::<P>(&mut band, clip, pipe, src, &scanner, clip_res, false);
+        fill_band::<P>(&mut band, clip, pipe, src, &scanner, clip_res);
     });
 }
 
@@ -525,6 +525,7 @@ fn fill_impl_parallel<P: Pixel + Send>(
 ///
 /// `band.y_start` and `band.height` determine the y-range processed.
 /// `y` coordinates passed to span routines are absolute (matching the parent bitmap).
+/// Only called when `vector_antialias = false`; the AA path falls back to sequential.
 #[cfg(feature = "rayon")]
 fn fill_band<P: Pixel>(
     band: &mut BitmapBand<'_, P>,
@@ -533,7 +534,6 @@ fn fill_band<P: Pixel>(
     src: &PipeSrc<'_>,
     scanner: &XPathScanner,
     clip_res: ClipResult,
-    _vector_antialias: bool,
 ) {
     #[expect(
         clippy::cast_possible_wrap,
@@ -560,12 +560,8 @@ fn fill_band<P: Pixel>(
     )]
     let width_i = band.width as i32;
 
+    // y_start >= y_band_min >= 0 (band.y_start is u32), so y is always non-negative.
     for y in y_start..=y_end {
-        #[expect(clippy::cast_sign_loss, reason = "cast after y < 0 guard")]
-        if y < 0 || (y as u32) >= band.y_start + band.height {
-            continue;
-        }
-
         for (x0, x1) in ScanIterator::new(scanner, y) {
             let (mut sx0, mut sx1) = (x0, x1);
             let inner_clip = if clip_res == ClipResult::AllInside {
