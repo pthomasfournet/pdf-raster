@@ -237,8 +237,7 @@ impl XPath {
                     }
                 }
                 // Closing segment if requested and the subpath is not already closed.
-                if close_subpaths
-                    && ((cur_x - sp_x).abs() > 1e-10 || (cur_y - sp_y).abs() > 1e-10)
+                if close_subpaths && ((cur_x - sp_x).abs() > 1e-10 || (cur_y - sp_y).abs() > 1e-10)
                 {
                     xpath.add_segment(cur_x, cur_y, sp_x, sp_y);
                 }
@@ -275,11 +274,16 @@ impl XPath {
         let s = f64::from(AA_SIZE);
         for seg in &mut self.segs {
             debug_assert!(
-                seg.x0.is_finite() && seg.y0.is_finite()
-                    && seg.x1.is_finite() && seg.y1.is_finite(),
+                seg.x0.is_finite()
+                    && seg.y0.is_finite()
+                    && seg.x1.is_finite()
+                    && seg.y1.is_finite(),
                 "aa_scale: segment coordinates must be finite before scaling \
                  (x0={}, y0={}, x1={}, y1={})",
-                seg.x0, seg.y0, seg.x1, seg.y1,
+                seg.x0,
+                seg.y0,
+                seg.x1,
+                seg.y1,
             );
             seg.x0 *= s;
             seg.y0 *= s;
@@ -584,7 +588,12 @@ mod tests {
         xpath.add_segment(6.0, 5.0, 2.0, 1.0);
         let s = &xpath.segs[0];
         assert!(s.flags.contains(XPathFlags::FLIPPED));
-        assert!(s.y0 <= s.y1, "y0 ≤ y1 invariant violated: y0={} y1={}", s.y0, s.y1);
+        assert!(
+            s.y0 <= s.y1,
+            "y0 ≤ y1 invariant violated: y0={} y1={}",
+            s.y0,
+            s.y1
+        );
         // dxdy = (x1_orig - x0_orig)/(y1_orig - y0_orig) = (2-6)/(1-5) = 1.0
         assert!((s.dxdy - 1.0).abs() < f64::EPSILON, "dxdy={}", s.dxdy);
     }

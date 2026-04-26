@@ -26,8 +26,14 @@ const MAX_COMPS: usize = 8; // DeviceN8: 4 CMYK + 4 spot = 8 bytes
 ///
 /// Handles soft mask, blend modes, non-isolated groups, knockout, and overprint.
 /// Slower than `simple` or `aa` but covers every case.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ SplashPipe API; all parameters are necessary")]
-#[expect(clippy::too_many_lines, reason = "compositing formula has many branches that cannot be meaningfully split")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ SplashPipe API; all parameters are necessary"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "compositing formula has many branches that cannot be meaningfully split"
+)]
 pub(crate) fn render_span_general<P: Pixel>(
     pipe: &PipeState<'_>,
     src: &PipeSrc<'_>,
@@ -38,7 +44,10 @@ pub(crate) fn render_span_general<P: Pixel>(
     x1: i32,
     y: i32,
 ) {
-    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0"
+    )]
     let count = (x1 - x0 + 1) as usize;
     let ncomps = P::BYTES;
 
@@ -100,12 +109,21 @@ pub(crate) fn render_span_general<P: Pixel>(
                 let mut c_src_corr: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 let c_src: &[u8] = if pipe.non_isolated_group && shape_v != 0 {
                     let t = (a_dst * 255) / shape_v - a_dst;
-                    #[expect(clippy::cast_possible_wrap, reason = "t is a u32 alpha-domain value; wrapping is not expected in practice")]
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "t is a u32 alpha-domain value; wrapping is not expected in practice"
+                    )]
                     let t_i = t as i32;
                     for j in 0..ncomps {
-                        let v = i32::from(src_px[j]) + (i32::from(src_px[j]) - i32::from(dst_px[j])) * t_i / 255;
-                        #[expect(clippy::cast_sign_loss, reason = "value is clamped to [0, 255] above")]
-                        { c_src_corr[j] = v.clamp(0, 255) as u8; }
+                        let v = i32::from(src_px[j])
+                            + (i32::from(src_px[j]) - i32::from(dst_px[j])) * t_i / 255;
+                        #[expect(
+                            clippy::cast_sign_loss,
+                            reason = "value is clamped to [0, 255] above"
+                        )]
+                        {
+                            c_src_corr[j] = v.clamp(0, 255) as u8;
+                        }
                     }
                     // Knockout: if shape >= knockout_opacity, clear the destination alpha.
                     if pipe.knockout && shape_v >= u32::from(pipe.knockout_opacity) {
@@ -120,14 +138,20 @@ pub(crate) fn render_span_general<P: Pixel>(
                 // Blend function.
                 let mut c_blend: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 if pipe.blend_mode != BlendMode::Normal {
-                    apply_blend_fn(pipe.blend_mode, c_src, dst_px, &mut c_blend[..ncomps], is_cmyk_like, is_nonseparable);
+                    apply_blend_fn(
+                        pipe.blend_mode,
+                        c_src,
+                        dst_px,
+                        &mut c_blend[..ncomps],
+                        is_cmyk_like,
+                        is_nonseparable,
+                    );
                 }
 
                 // Result alpha.
                 let a_dst_eff = u32::from(dst_alpha[i]); // may have been cleared by knockout.
-                let (a_result, alpha_i, alpha_im1) = compute_alphas(
-                    a_src, a_dst_eff, shape_v, alpha0_at(i), pipe.knockout,
-                );
+                let (a_result, alpha_i, alpha_im1) =
+                    compute_alphas(a_src, a_dst_eff, shape_v, alpha0_at(i), pipe.knockout);
 
                 // Result colour.
                 if a_result == 0 {
@@ -147,8 +171,13 @@ pub(crate) fn render_span_general<P: Pixel>(
                                 + a_src * ((255 - alpha_im1) * c_src_j + alpha_im1 * c_b_j) / 255)
                                 / alpha_i
                         };
-                        #[expect(clippy::cast_possible_truncation, reason = "c is a weighted average of values ≤ 255, so c ≤ 255")]
-                        { dst_px[j] = apply_transfer_channel(pipe, j, c as u8); }
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "c is a weighted average of values ≤ 255, so c ≤ 255"
+                        )]
+                        {
+                            dst_px[j] = apply_transfer_channel(pipe, j, c as u8);
+                        }
                     }
                 }
 
@@ -157,8 +186,13 @@ pub(crate) fn render_span_general<P: Pixel>(
                     apply_overprint(pipe, dst_px, src_px, ncomps);
                 }
 
-                #[expect(clippy::cast_possible_truncation, reason = "a_result is clamped to ≤ 255 in compute_alphas")]
-                { dst_alpha[i] = a_result as u8; }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a_result is clamped to ≤ 255 in compute_alphas"
+                )]
+                {
+                    dst_alpha[i] = a_result as u8;
+                }
             }
         }
         None => {
@@ -184,7 +218,14 @@ pub(crate) fn render_span_general<P: Pixel>(
 
                 let mut c_blend: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 if pipe.blend_mode != BlendMode::Normal {
-                    apply_blend_fn(pipe.blend_mode, src_px, dst_px, &mut c_blend[..ncomps], is_cmyk_like, is_nonseparable);
+                    apply_blend_fn(
+                        pipe.blend_mode,
+                        src_px,
+                        dst_px,
+                        &mut c_blend[..ncomps],
+                        is_cmyk_like,
+                        is_nonseparable,
+                    );
                 }
 
                 for j in 0..ncomps {
@@ -199,8 +240,13 @@ pub(crate) fn render_span_general<P: Pixel>(
                     } else {
                         u32::from(div255((255 - a_src) * c_dst_j + a_src * c_b_j))
                     };
-                    #[expect(clippy::cast_possible_truncation, reason = "c is a weighted average of values ≤ 255, so c ≤ 255")]
-                    { dst_px[j] = apply_transfer_channel(pipe, j, c as u8); }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "c is a weighted average of values ≤ 255, so c ≤ 255"
+                    )]
+                    {
+                        dst_px[j] = apply_transfer_channel(pipe, j, c as u8);
+                    }
                 }
 
                 if pipe.overprint_mask != 0xFFFF_FFFF {
@@ -216,10 +262,16 @@ pub(crate) fn render_span_general<P: Pixel>(
 /// Returns `(a_result, alpha_i, alpha_im1)`.
 ///
 /// Matches the C++ `pipeRun` alpha logic for isolated/non-isolated, knockout/non-knockout.
-#[expect(clippy::option_if_let_else, reason = "if-let form is clearer than map_or_else for this multi-branch alpha computation")]
+#[expect(
+    clippy::option_if_let_else,
+    reason = "if-let form is clearer than map_or_else for this multi-branch alpha computation"
+)]
 fn compute_alphas(
-    a_src: u32, a_dst: u32, shape: u32,
-    alpha0: Option<u8>, knockout: bool,
+    a_src: u32,
+    a_dst: u32,
+    shape: u32,
+    alpha0: Option<u8>,
+    knockout: bool,
 ) -> (u32, u32, u32) {
     if let Some(a0) = alpha0 {
         let a0 = u32::from(a0);
@@ -249,8 +301,11 @@ fn compute_alphas(
 /// Apply the blend function and write into `c_blend`.
 fn apply_blend_fn(
     mode: BlendMode,
-    src: &[u8], dst: &[u8], c_blend: &mut [u8],
-    is_cmyk_like: bool, is_nonseparable: bool,
+    src: &[u8],
+    dst: &[u8],
+    c_blend: &mut [u8],
+    is_cmyk_like: bool,
+    is_nonseparable: bool,
 ) {
     debug_assert_eq!(src.len(), dst.len());
     debug_assert_eq!(src.len(), c_blend.len());
@@ -274,13 +329,23 @@ fn apply_blend_fn(
             c_blend[2] = 255 - r3[2];
             // K/spot channel: for Luminosity, use src K; for others use dst K (see C++).
             if ncomps >= 4 {
-                c_blend[3] = 255 - (if mode == BlendMode::Luminosity { src2[3] } else { dst2[3] });
+                c_blend[3] = 255
+                    - (if mode == BlendMode::Luminosity {
+                        src2[3]
+                    } else {
+                        dst2[3]
+                    });
             }
             for j in 4..ncomps {
                 c_blend[j] = 255 - dst2[j]; // spot channels pass through dst
             }
         } else {
-            blend::apply_separable(mode, &src2[..ncomps.min(4)], &dst2[..ncomps.min(4)], &mut c_blend[..ncomps.min(4)]);
+            blend::apply_separable(
+                mode,
+                &src2[..ncomps.min(4)],
+                &dst2[..ncomps.min(4)],
+                &mut c_blend[..ncomps.min(4)],
+            );
             for v in &mut c_blend[..ncomps.min(4)] {
                 *v = 255 - *v;
             }
@@ -295,8 +360,10 @@ fn apply_blend_fn(
         d3[..n].copy_from_slice(&dst[..n]);
         // Mono: replicate the single channel to all three.
         if ncomps == 1 {
-            s3[1] = s3[0]; s3[2] = s3[0];
-            d3[1] = d3[0]; d3[2] = d3[0];
+            s3[1] = s3[0];
+            s3[2] = s3[0];
+            d3[1] = d3[0];
+            d3[2] = d3[0];
         }
         let r3 = blend::apply_nonseparable_rgb(mode, s3, d3);
         c_blend[..n].copy_from_slice(&r3[..n]);

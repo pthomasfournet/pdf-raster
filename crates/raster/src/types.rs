@@ -370,19 +370,28 @@ mod tests {
     fn screen_params_validate_errors_are_borrowed() {
         use std::borrow::Cow;
 
-        let size_small = ScreenParams { size: 1, ..ScreenParams::default() };
+        let size_small = ScreenParams {
+            size: 1,
+            ..ScreenParams::default()
+        };
         assert!(
             matches!(size_small.validate(), Err(Cow::Borrowed(_))),
             "size < 2 error should be Cow::Borrowed"
         );
 
-        let size_non_pow2 = ScreenParams { size: 3, ..ScreenParams::default() };
+        let size_non_pow2 = ScreenParams {
+            size: 3,
+            ..ScreenParams::default()
+        };
         assert!(
             matches!(size_non_pow2.validate(), Err(Cow::Borrowed(_))),
             "non-power-of-two error should be Cow::Borrowed"
         );
 
-        let bad_radius = ScreenParams { dot_radius: 0, ..ScreenParams::default() };
+        let bad_radius = ScreenParams {
+            dot_radius: 0,
+            ..ScreenParams::default()
+        };
         assert!(
             matches!(bad_radius.validate(), Err(Cow::Borrowed(_))),
             "dot_radius < 1 error should be Cow::Borrowed"
@@ -392,21 +401,30 @@ mod tests {
     /// `validate` error messages contain the field name so they are human-readable.
     #[test]
     fn screen_params_validate_error_messages_mention_field() {
-        let size_small = ScreenParams { size: 0, ..ScreenParams::default() };
+        let size_small = ScreenParams {
+            size: 0,
+            ..ScreenParams::default()
+        };
         let msg = size_small.validate().unwrap_err();
         assert!(
             msg.contains("size"),
             "error for small size should mention 'size', got: {msg}"
         );
 
-        let size_non_pow2 = ScreenParams { size: 3, ..ScreenParams::default() };
+        let size_non_pow2 = ScreenParams {
+            size: 3,
+            ..ScreenParams::default()
+        };
         let msg = size_non_pow2.validate().unwrap_err();
         assert!(
             msg.contains("size"),
             "error for non-power-of-two should mention 'size', got: {msg}"
         );
 
-        let bad_radius = ScreenParams { dot_radius: 0, ..ScreenParams::default() };
+        let bad_radius = ScreenParams {
+            dot_radius: 0,
+            ..ScreenParams::default()
+        };
         let msg = bad_radius.validate().unwrap_err();
         assert!(
             msg.contains("dot_radius"),

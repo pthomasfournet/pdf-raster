@@ -18,18 +18,18 @@ use crate::pipe::Pattern;
 /// `t = dot(p - p0, axis) / |axis|²`, clamped to `[t0, t1]`
 /// (or extended to the nearest endpoint when `extend_start` / `extend_end` is set).
 pub struct AxialPattern {
-    color0:       [u8; 3],
-    color1:       [u8; 3],
-    ax:           f64,
-    ay:           f64,
-    p0x:          f64,
-    p0y:          f64,
+    color0: [u8; 3],
+    color1: [u8; 3],
+    ax: f64,
+    ay: f64,
+    p0x: f64,
+    p0y: f64,
     /// `1 / (ax² + ay²)`; zero when the axis is degenerate (zero-length).
-    inv_len_sq:   f64,
-    t0:           f64,
-    t1:           f64,
+    inv_len_sq: f64,
+    t0: f64,
+    t1: f64,
     extend_start: bool,
-    extend_end:   bool,
+    extend_end: bool,
 }
 
 impl AxialPattern {
@@ -46,21 +46,39 @@ impl AxialPattern {
     /// When `p0 == p1` (zero-length axis) every pixel returns `None` from
     /// `t_for`, so `fill_span` writes zeros.  This matches poppler's behaviour.
     #[must_use]
-    #[expect(clippy::too_many_arguments, reason = "mirrors PDF shading dict: 2 colors + 2 points + t range + 2 extend flags")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors PDF shading dict: 2 colors + 2 points + t range + 2 extend flags"
+    )]
     pub fn new(
-        color0:       [u8; 3],
-        color1:       [u8; 3],
-        p0x: f64, p0y: f64,
-        p1x: f64, p1y: f64,
-        t0: f64,  t1: f64,
+        color0: [u8; 3],
+        color1: [u8; 3],
+        p0x: f64,
+        p0y: f64,
+        p1x: f64,
+        p1y: f64,
+        t0: f64,
+        t1: f64,
         extend_start: bool,
-        extend_end:   bool,
+        extend_end: bool,
     ) -> Self {
         let ax = p1x - p0x;
         let ay = p1y - p0y;
         let len_sq = ax.mul_add(ax, ay * ay);
         let inv_len_sq = if len_sq > 0.0 { 1.0 / len_sq } else { 0.0 };
-        Self { color0, color1, ax, ay, p0x, p0y, inv_len_sq, t0, t1, extend_start, extend_end }
+        Self {
+            color0,
+            color1,
+            ax,
+            ay,
+            p0x,
+            p0y,
+            inv_len_sq,
+            t0,
+            t1,
+            extend_start,
+            extend_end,
+        }
     }
 
     /// Compute the gradient parameter `t ∈ [t0, t1]` for pixel `(x, y)`.
@@ -78,9 +96,17 @@ impl AxialPattern {
         let t = t_raw.mul_add(self.t1 - self.t0, self.t0);
 
         // Handle both t0 < t1 and t0 > t1 (inverted gradient).
-        let (lo, hi) = if self.t0 <= self.t1 { (self.t0, self.t1) } else { (self.t1, self.t0) };
+        let (lo, hi) = if self.t0 <= self.t1 {
+            (self.t0, self.t1)
+        } else {
+            (self.t1, self.t0)
+        };
         if t < lo {
-            if self.extend_start { Some(self.t0) } else { None }
+            if self.extend_start {
+                Some(self.t0)
+            } else {
+                None
+            }
         } else if t > hi {
             if self.extend_end { Some(self.t1) } else { None }
         } else {
@@ -102,11 +128,13 @@ impl Pattern for AxialPattern {
                 } else {
                     #[expect(clippy::cast_sign_loss, reason = "value clamped to 0.0..=256.0")]
                     #[expect(clippy::cast_possible_truncation, reason = "value ≤ 256")]
-                    { (((t - self.t0) / t_span).clamp(0.0, 1.0) * 256.0) as u32 }
+                    {
+                        (((t - self.t0) / t_span).clamp(0.0, 1.0) * 256.0) as u32
+                    }
                 };
                 lerp_color(self.color0, self.color1, frac, &mut out[off..off + 3]);
             } else {
-                out[off]     = 0;
+                out[off] = 0;
                 out[off + 1] = 0;
                 out[off + 2] = 0;
             }
@@ -125,11 +153,16 @@ mod tests {
 
     fn make_axial(extend: bool) -> AxialPattern {
         AxialPattern::new(
-            [0, 0, 0], [255, 255, 255],
-            0.0, 0.0,
-            8.0, 0.0,
-            0.0, 1.0,
-            extend, extend,
+            [0, 0, 0],
+            [255, 255, 255],
+            0.0,
+            0.0,
+            8.0,
+            0.0,
+            0.0,
+            1.0,
+            extend,
+            extend,
         )
     }
 
@@ -162,7 +195,11 @@ mod tests {
         let p = make_axial(false);
         let mut out = [0u8; 3];
         p.fill_span(0, -1, -1, &mut out);
-        assert_eq!(out, [0, 0, 0], "before start with no-extend should write zero");
+        assert_eq!(
+            out,
+            [0, 0, 0],
+            "before start with no-extend should write zero"
+        );
         p.fill_span(0, 9, 9, &mut out);
         assert_eq!(out, [0, 0, 0], "after end with no-extend should write zero");
     }
@@ -180,9 +217,16 @@ mod tests {
     #[test]
     fn degenerate_axis_writes_zeros() {
         let p = AxialPattern::new(
-            [255, 0, 0], [0, 255, 0],
-            5.0, 5.0, 5.0, 5.0,
-            0.0, 1.0, false, false,
+            [255, 0, 0],
+            [0, 255, 0],
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            0.0,
+            1.0,
+            false,
+            false,
         );
         let mut out = [42u8; 3];
         p.fill_span(5, 5, 5, &mut out);
@@ -202,17 +246,23 @@ mod tests {
     fn inverted_t_range_reverses_gradient() {
         // t0=1 t1=0: color0 at right end, color1 at left end.
         let p = AxialPattern::new(
-            [255, 0, 0], [0, 0, 255],
-            0.0, 0.0, 4.0, 0.0,
-            1.0, 0.0,   // inverted
-            true, true,
+            [255, 0, 0],
+            [0, 0, 255],
+            0.0,
+            0.0,
+            4.0,
+            0.0,
+            1.0,
+            0.0, // inverted
+            true,
+            true,
         );
         let mut start = [0u8; 3];
-        let mut end   = [0u8; 3];
+        let mut end = [0u8; 3];
         p.fill_span(0, 0, 0, &mut start);
         p.fill_span(0, 4, 4, &mut end);
         // t=1.0 at x=0 → color0=red; t=0.0 at x=4 → color1=blue.
         assert!(start[0] > 200, "x=0 should be near red (color0)");
-        assert!(end[2]   > 200, "x=4 should be near blue (color1)");
+        assert!(end[2] > 200, "x=4 should be near blue (color1)");
     }
 }

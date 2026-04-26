@@ -172,9 +172,8 @@ fn build_dispersed(mat: &mut [u8], size: usize, log2_size: u32) {
             // Compute the Bayer index for (x, y) at this size.
             let v = bayer_index(x, y, log2_size);
             // Scale to [1, 255]. The clamp guarantees the value fits in u8.
-            mat[y * size + x] =
-                u8::try_from(((v * 255 + total / 2) / total).clamp(1, 255))
-                    .expect("clamped to [1, 255]; always fits u8");
+            mat[y * size + x] = u8::try_from(((v * 255 + total / 2) / total).clamp(1, 255))
+                .expect("clamped to [1, 255]; always fits u8");
         }
     }
 }
@@ -262,8 +261,10 @@ fn build_clustered(mat: &mut [u8], size: usize) {
                 u32::try_from(x).is_ok() && u32::try_from(y).is_ok(),
                 "x={x} or y={y} exceeds u32::MAX"
             );
-            let dx = f64::from(u32::try_from(x).expect("x < size <= u32::MAX (verified above)")) - cx;
-            let dy = f64::from(u32::try_from(y).expect("y < size <= u32::MAX (verified above)")) - cy;
+            let dx =
+                f64::from(u32::try_from(x).expect("x < size <= u32::MAX (verified above)")) - cx;
+            let dy =
+                f64::from(u32::try_from(y).expect("y < size <= u32::MAX (verified above)")) - cy;
             let dist = dx.mul_add(dx, dy * dy);
             // Known false-positive: value is clamped to [0.5, 254.5] so
             // truncation to u8 is safe. #[expect] errors if clippy ever fixes

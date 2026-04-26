@@ -202,7 +202,10 @@ impl XPathScanner {
         // usize >= u32, so `as usize` is a widening cast that cannot lose data.
         let s = self.row_start[i] as usize;
         let e = self.row_start[i + 1] as usize;
-        debug_assert!(s <= e && e <= self.intersects.len(), "row_start invariant violated");
+        debug_assert!(
+            s <= e && e <= self.intersects.len(),
+            "row_start invariant violated"
+        );
         &self.intersects[s..e]
     }
 
@@ -571,7 +574,11 @@ mod tests {
     #[test]
     fn count_crossings_inside_span() {
         // count_crossings with x inside an intersection span returns on_span=true.
-        let row = vec![Intersect { x0: 2, x1: 5, count: -1 }];
+        let row = vec![Intersect {
+            x0: 2,
+            x1: 5,
+            count: -1,
+        }];
         let (count, on_span) = XPathScanner::count_crossings(&row, 3);
         assert!(on_span);
         assert_eq!(count, 0); // not yet accumulated the entry's count
@@ -580,7 +587,11 @@ mod tests {
     #[test]
     fn count_crossings_after_span() {
         // After span [2,5] count=-1: pixel 6 is outside, count reflects crossing.
-        let row = vec![Intersect { x0: 2, x1: 5, count: -1 }];
+        let row = vec![Intersect {
+            x0: 2,
+            x1: 5,
+            count: -1,
+        }];
         let (count, on_span) = XPathScanner::count_crossings(&row, 6);
         assert!(!on_span);
         assert_eq!(count, -1);

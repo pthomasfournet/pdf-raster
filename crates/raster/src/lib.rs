@@ -36,21 +36,24 @@ pub mod types;
 pub mod xpath;
 
 pub use bitmap::{AaBuf, Bitmap};
-pub use fill::{eo_fill, fill};
-pub use shading::shaded_fill;
-pub use shading::axial::AxialPattern;
-pub use shading::radial::RadialPattern;
-pub use shading::function::FunctionPattern;
-pub use shading::gouraud::{GouraudVertex, gouraud_triangle_fill};
-pub use image::{ImageSource, MaskSource, ImageResult, fill_image_mask, draw_image};
-pub use glyph::{GlyphBitmap, blit_glyph, fill_glyph};
 pub use clip::{Clip, ClipResult};
+pub use fill::{eo_fill, fill};
+pub use glyph::{GlyphBitmap, blit_glyph, fill_glyph};
+pub use image::{ImageResult, ImageSource, MaskSource, draw_image, fill_image_mask};
 pub use path::{Path, PathBuilder, PathFlags, PathPoint, StrokeAdjustHint};
-pub use pipe::{Pattern, PipeState, PipeSrc};
+pub use pipe::{Pattern, PipeSrc, PipeState};
 pub use scanner::iter::ScanIterator;
 pub use scanner::{Intersect, XPathScanner};
 pub use screen::HalftoneScreen;
+pub use shading::axial::AxialPattern;
+pub use shading::function::FunctionPattern;
+pub use shading::gouraud::{GouraudVertex, gouraud_triangle_fill};
+pub use shading::radial::RadialPattern;
+pub use shading::shaded_fill;
 pub use state::{GraphicsState, StateStack, TransferSet};
-pub use stroke::{StrokeParams, flatten_path, make_dashed_path, make_stroke_path, stroke, stroke_narrow, stroke_wide};
+pub use stroke::{
+    StrokeParams, flatten_path, make_dashed_path, make_stroke_path, stroke, stroke_narrow,
+    stroke_wide,
+};
 pub use types::*;
 pub use xpath::{XPath, XPathFlags, XPathSeg};

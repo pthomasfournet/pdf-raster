@@ -12,10 +12,10 @@
 //! | `aa`     | shape byte present, no soft mask, `BlendMode::Normal`, no group correction | `pipeRunAA*` |
 //! | `general`| everything else — soft mask, blend mode, non-isolated/knockout groups | `pipeRun` |
 
-pub mod blend;
-pub mod simple;
 pub mod aa;
+pub mod blend;
 pub mod general;
+pub mod simple;
 
 use crate::state::TransferSet;
 use crate::types::BlendMode;
@@ -162,10 +162,16 @@ pub fn render_span<P: Pixel>(
     debug_assert!(x0 <= x1, "render_span: x0={x0} > x1={x1}");
     debug_assert!(P::BYTES > 0, "render_span: Mono1 must be handled by caller");
 
-    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0"
+    )]
     let count = (x1 - x0 + 1) as usize;
-    debug_assert_eq!(dst_pixels.len(), count * P::BYTES,
-        "render_span: dst_pixels length mismatch");
+    debug_assert_eq!(
+        dst_pixels.len(),
+        count * P::BYTES,
+        "render_span: dst_pixels length mismatch"
+    );
 
     let uses_shape = shape.is_some();
 
@@ -173,9 +179,14 @@ pub fn render_span<P: Pixel>(
         simple::render_span_simple::<P>(pipe, src, dst_pixels, dst_alpha, x0, x1, y);
     } else if uses_shape && pipe.use_aa_path() {
         aa::render_span_aa::<P>(
-            pipe, src, dst_pixels, dst_alpha,
+            pipe,
+            src,
+            dst_pixels,
+            dst_alpha,
             shape.expect("use_aa_path requires shape"),
-            x0, x1, y,
+            x0,
+            x1,
+            y,
         );
     } else {
         general::render_span_general::<P>(pipe, src, dst_pixels, dst_alpha, shape, x0, x1, y);
@@ -212,7 +223,7 @@ mod tests {
     fn no_transparency_opaque_normal() {
         let pipe = make_pipe(255, BlendMode::Normal);
         assert!(pipe.no_transparency(false));
-        assert!(!pipe.no_transparency(true));  // shape disables it
+        assert!(!pipe.no_transparency(true)); // shape disables it
     }
 
     #[test]
@@ -240,7 +251,7 @@ mod tests {
         let src_color = [200u8, 100, 50];
         let src = PipeSrc::Solid(&src_color);
 
-        let mut dst = vec![0u8; 3 * 4];  // 4 pixels
+        let mut dst = vec![0u8; 3 * 4]; // 4 pixels
         let mut alpha = vec![0u8; 4];
         render_span::<Rgb8>(&pipe, &src, &mut dst, Some(&mut alpha), None, 0, 3, 0);
 
@@ -262,8 +273,17 @@ mod tests {
         let shape = vec![128u8; 4];
 
         let mut dst = vec![0u8; 3 * 4];
-        let mut alpha = vec![255u8; 4];  // fully opaque dst so blending is visible
-        render_span::<Rgb8>(&pipe, &src, &mut dst, Some(&mut alpha), Some(&shape), 0, 3, 0);
+        let mut alpha = vec![255u8; 4]; // fully opaque dst so blending is visible
+        render_span::<Rgb8>(
+            &pipe,
+            &src,
+            &mut dst,
+            Some(&mut alpha),
+            Some(&shape),
+            0,
+            3,
+            0,
+        );
 
         // a_src = div255(255*128) ≈ 128; a_dst=255; blends white over black at ~50%.
         for i in 0..4 {

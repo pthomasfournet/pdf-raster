@@ -40,8 +40,8 @@ use crate::bitmap::Bitmap;
 use crate::clip::{Clip, ClipResult};
 use crate::pipe::{self, PipeSrc, PipeState};
 use crate::types::PixelMode;
-use color::convert::splash_floor;
 use color::Pixel;
+use color::convert::splash_floor;
 
 // ── Compile-time sanity ───────────────────────────────────────────────────────
 
@@ -122,8 +122,13 @@ fn coord_upper(x: f64) -> i32 {
 /// Mirrors `splashCheckDet` from `splash/SplashMath.h`.
 #[inline]
 fn check_det(a: f64, b: f64, c: f64, d: f64, eps: f64) -> bool {
-    #[expect(clippy::suboptimal_flops, reason = "matches the C++ arithmetic exactly; no numerics benefit here")]
-    { (a * d - b * c).abs() >= eps }
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "matches the C++ arithmetic exactly; no numerics benefit here"
+    )]
+    {
+        (a * d - b * c).abs() >= eps
+    }
 }
 
 /// Unpack one packed-bits mask row into one-byte-per-pixel form (0 or 255).
@@ -138,9 +143,14 @@ fn unpack_mask_row(packed: &[u8], width: usize, out: &mut [u8]) {
     debug_assert!(
         packed.len() >= width.div_ceil(8),
         "unpack_mask_row: packed buffer too short ({} < {})",
-        packed.len(), width.div_ceil(8),
+        packed.len(),
+        width.div_ceil(8),
     );
-    debug_assert_eq!(out.len(), width, "unpack_mask_row: out length must equal width");
+    debug_assert_eq!(
+        out.len(),
+        width,
+        "unpack_mask_row: out length must equal width"
+    );
     for (i, slot) in out.iter_mut().enumerate() {
         // `packed.get` returns None for any over-short buffer; treat missing bits as 0.
         let byte = packed.get(i / 8).copied().unwrap_or(0);
@@ -177,9 +187,17 @@ fn compute_axis_aligned_bounds(matrix: &[f64; 6]) -> Result<ImageBounds, ImageRe
     }
 
     let (y0, y1, vflip) = if matrix[3] > 0.0 {
-        (coord_lower(matrix[5]), coord_upper(matrix[3] + matrix[5]), false)
+        (
+            coord_lower(matrix[5]),
+            coord_upper(matrix[3] + matrix[5]),
+            false,
+        )
     } else if matrix[3] < 0.0 {
-        (coord_lower(matrix[3] + matrix[5]), coord_upper(matrix[5]), true)
+        (
+            coord_lower(matrix[3] + matrix[5]),
+            coord_upper(matrix[5]),
+            true,
+        )
     } else {
         // Zero Y scale — degenerate (determinant guard catches this, but be explicit).
         return Err(ImageResult::SingularMatrix);
@@ -192,7 +210,13 @@ fn compute_axis_aligned_bounds(matrix: &[f64; 6]) -> Result<ImageBounds, ImageRe
     let x1 = if x0 == x1 { x1 + 1 } else { x1 };
     let y1 = if y0 == y1 { y1 + 1 } else { y1 };
 
-    Ok(ImageBounds { x0, y0, x1, y1, vflip })
+    Ok(ImageBounds {
+        x0,
+        y0,
+        x1,
+        y1,
+        vflip,
+    })
 }
 
 /// Flip a flat row-major buffer vertically in-place.
@@ -256,24 +280,48 @@ fn scale_mask(
     if scaled_h < src_h {
         if scaled_w < src_w {
             scale_mask_ydown_xdown(
-                mask_src, src_w, src_h, scaled_w, scaled_h,
-                &mut dest, &mut packed_buf, &mut line_buf,
+                mask_src,
+                src_w,
+                src_h,
+                scaled_w,
+                scaled_h,
+                &mut dest,
+                &mut packed_buf,
+                &mut line_buf,
             );
         } else {
             scale_mask_ydown_xup(
-                mask_src, src_w, src_h, scaled_w, scaled_h,
-                &mut dest, &mut packed_buf, &mut line_buf,
+                mask_src,
+                src_w,
+                src_h,
+                scaled_w,
+                scaled_h,
+                &mut dest,
+                &mut packed_buf,
+                &mut line_buf,
             );
         }
     } else if scaled_w < src_w {
         scale_mask_yup_xdown(
-            mask_src, src_w, src_h, scaled_w, scaled_h,
-            &mut dest, &mut packed_buf, &mut line_buf,
+            mask_src,
+            src_w,
+            src_h,
+            scaled_w,
+            scaled_h,
+            &mut dest,
+            &mut packed_buf,
+            &mut line_buf,
         );
     } else {
         scale_mask_yup_xup(
-            mask_src, src_w, src_h, scaled_w, scaled_h,
-            &mut dest, &mut packed_buf, &mut line_buf,
+            mask_src,
+            src_w,
+            src_h,
+            scaled_w,
+            scaled_h,
+            &mut dest,
+            &mut packed_buf,
+            &mut line_buf,
         );
     }
 
@@ -283,7 +331,10 @@ fn scale_mask(
 /// Vertical and horizontal box-filter downsampling.
 ///
 /// C++: `Splash::scaleMaskYdownXdown`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleMaskYdownXdown; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleMaskYdownXdown; all buffers are necessary"
+)]
 fn scale_mask_ydown_xdown(
     mask_src: &mut dyn MaskSource,
     src_w: usize,
@@ -318,10 +369,20 @@ fn scale_mask_ydown_xdown(
         }
 
         let d0 = if xp > 0 {
-            #[expect(clippy::cast_possible_truncation, reason = "y_step*xp ≤ src_h*src_w; fits u32 for practical image sizes")]
-            { (255u32 << 23) / (y_step * xp) as u32 }
-        } else { 0 };
-        #[expect(clippy::cast_possible_truncation, reason = "y_step*(xp+1) ≤ src_h*(src_w+1); fits u32 for practical image sizes")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "y_step*xp ≤ src_h*src_w; fits u32 for practical image sizes"
+            )]
+            {
+                (255u32 << 23) / (y_step * xp) as u32
+            }
+        } else {
+            0
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "y_step*(xp+1) ≤ src_h*(src_w+1); fits u32 for practical image sizes"
+        )]
         let d1 = (255u32 << 23) / (y_step * (xp + 1)) as u32;
 
         let mut xt = 0usize;
@@ -329,7 +390,11 @@ fn scale_mask_ydown_xdown(
         for _dx in 0..scaled_w {
             let (x_step, d) = {
                 let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 { (step, d1) } else { (step, d0) }
+                if step == xp + 1 {
+                    (step, d1)
+                } else {
+                    (step, d0)
+                }
             };
 
             let pix = pix_buf[xx..xx + x_step].iter().sum::<u32>();
@@ -343,7 +408,10 @@ fn scale_mask_ydown_xdown(
 /// Box-filter Y downsampling, nearest-neighbor X upsampling.
 ///
 /// C++: `Splash::scaleMaskYdownXup`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleMaskYdownXup; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleMaskYdownXup; all buffers are necessary"
+)]
 fn scale_mask_ydown_xup(
     mask_src: &mut dyn MaskSource,
     src_w: usize,
@@ -377,7 +445,10 @@ fn scale_mask_ydown_xup(
             }
         }
 
-        #[expect(clippy::cast_possible_truncation, reason = "y_step ≤ src_h; fits u32 for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "y_step ≤ src_h; fits u32 for practical image sizes"
+        )]
         let d = (255u32 << 23) / y_step as u32;
         let mut xt = 0usize;
 
@@ -395,7 +466,10 @@ fn scale_mask_ydown_xup(
 /// Nearest-neighbor Y upsampling, box-filter X downsampling.
 ///
 /// C++: `Splash::scaleMaskYupXdown`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleMaskYupXdown; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleMaskYupXdown; all buffers are necessary"
+)]
 fn scale_mask_yup_xdown(
     mask_src: &mut dyn MaskSource,
     src_w: usize,
@@ -412,10 +486,20 @@ fn scale_mask_yup_xdown(
     let xq = src_w % scaled_w;
 
     let d0 = if xp > 0 {
-        #[expect(clippy::cast_possible_truncation, reason = "xp ≤ src_w; fits u32 for practical image sizes")]
-        { (255u32 << 23) / xp as u32 }
-    } else { 0 };
-    #[expect(clippy::cast_possible_truncation, reason = "xp+1 ≤ src_w+1; fits u32 for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "xp ≤ src_w; fits u32 for practical image sizes"
+        )]
+        {
+            (255u32 << 23) / xp as u32
+        }
+    } else {
+        0
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "xp+1 ≤ src_w+1; fits u32 for practical image sizes"
+    )]
     let d1 = (255u32 << 23) / (xp + 1) as u32;
 
     let mut yt = 0usize;
@@ -424,7 +508,10 @@ fn scale_mask_yup_xdown(
     for sy in 0..src_h {
         let y_step = bresenham_step(&mut yt, yq, src_h, yp);
 
-        #[expect(clippy::cast_possible_truncation, reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
+        )]
         mask_src.get_row(sy as u32, packed_buf);
         unpack_mask_row(packed_buf, src_w, line_buf);
 
@@ -435,10 +522,17 @@ fn scale_mask_yup_xdown(
         for dx in 0..scaled_w {
             let (x_step, d) = {
                 let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 { (step, d1) } else { (step, d0) }
+                if step == xp + 1 {
+                    (step, d1)
+                } else {
+                    (step, d0)
+                }
             };
 
-            let pix = line_buf[xx..xx + x_step].iter().map(|&b| u32::from(b)).sum::<u32>();
+            let pix = line_buf[xx..xx + x_step]
+                .iter()
+                .map(|&b| u32::from(b))
+                .sum::<u32>();
             xx += x_step;
             dest[row_start + dx] = ((pix * d) >> 23).min(255) as u8;
         }
@@ -454,7 +548,10 @@ fn scale_mask_yup_xdown(
 /// Nearest-neighbor upsampling in both axes.
 ///
 /// C++: `Splash::scaleMaskYupXup`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleMaskYupXup; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleMaskYupXup; all buffers are necessary"
+)]
 fn scale_mask_yup_xup(
     mask_src: &mut dyn MaskSource,
     src_w: usize,
@@ -476,7 +573,10 @@ fn scale_mask_yup_xup(
     for sy in 0..src_h {
         let y_step = bresenham_step(&mut yt, yq, src_h, yp);
 
-        #[expect(clippy::cast_possible_truncation, reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
+        )]
         mask_src.get_row(sy as u32, packed_buf);
         unpack_mask_row(packed_buf, src_w, line_buf);
 
@@ -519,24 +619,48 @@ fn scale_image(
     if scaled_h < src_h {
         if scaled_w < src_w {
             scale_image_ydown_xdown(
-                image_src, src_w, src_h, scaled_w, scaled_h, ncomps,
-                &mut dest, &mut line_buf,
+                image_src,
+                src_w,
+                src_h,
+                scaled_w,
+                scaled_h,
+                ncomps,
+                &mut dest,
+                &mut line_buf,
             );
         } else {
             scale_image_ydown_xup(
-                image_src, src_w, src_h, scaled_w, scaled_h, ncomps,
-                &mut dest, &mut line_buf,
+                image_src,
+                src_w,
+                src_h,
+                scaled_w,
+                scaled_h,
+                ncomps,
+                &mut dest,
+                &mut line_buf,
             );
         }
     } else if scaled_w < src_w {
         scale_image_yup_xdown(
-            image_src, src_w, src_h, scaled_w, scaled_h, ncomps,
-            &mut dest, &mut line_buf,
+            image_src,
+            src_w,
+            src_h,
+            scaled_w,
+            scaled_h,
+            ncomps,
+            &mut dest,
+            &mut line_buf,
         );
     } else {
         scale_image_yup_xup(
-            image_src, src_w, src_h, scaled_w, scaled_h, ncomps,
-            &mut dest, &mut line_buf,
+            image_src,
+            src_w,
+            src_h,
+            scaled_w,
+            scaled_h,
+            ncomps,
+            &mut dest,
+            &mut line_buf,
         );
     }
 
@@ -546,7 +670,10 @@ fn scale_image(
 /// Box-filter downsampling in both Y and X.
 ///
 /// C++: `Splash::scaleImageYdownXdown`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleImageYdownXdown; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleImageYdownXdown; all buffers are necessary"
+)]
 fn scale_image_ydown_xdown(
     image_src: &mut dyn ImageSource,
     src_w: usize,
@@ -580,10 +707,20 @@ fn scale_image_ydown_xdown(
         }
 
         let d0 = if xp > 0 {
-            #[expect(clippy::cast_possible_truncation, reason = "y_step*xp fits u32 for practical image sizes")]
-            { (1u32 << 23) / (y_step * xp) as u32 }
-        } else { 0 };
-        #[expect(clippy::cast_possible_truncation, reason = "y_step*(xp+1) fits u32 for practical image sizes")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "y_step*xp fits u32 for practical image sizes"
+            )]
+            {
+                (1u32 << 23) / (y_step * xp) as u32
+            }
+        } else {
+            0
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "y_step*(xp+1) fits u32 for practical image sizes"
+        )]
         let d1 = (1u32 << 23) / (y_step * (xp + 1)) as u32;
 
         let mut xt = 0usize;
@@ -591,7 +728,11 @@ fn scale_image_ydown_xdown(
         for _dx in 0..scaled_w {
             let (x_step, d) = {
                 let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 { (step, d1) } else { (step, d0) }
+                if step == xp + 1 {
+                    (step, d1)
+                } else {
+                    (step, d0)
+                }
             };
 
             for c in 0..ncomps {
@@ -607,7 +748,10 @@ fn scale_image_ydown_xdown(
 /// Box-filter Y downsampling, nearest-neighbor X upsampling.
 ///
 /// C++: `Splash::scaleImageYdownXup`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleImageYdownXup; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleImageYdownXup; all buffers are necessary"
+)]
 fn scale_image_ydown_xup(
     image_src: &mut dyn ImageSource,
     src_w: usize,
@@ -640,7 +784,10 @@ fn scale_image_ydown_xup(
             }
         }
 
-        #[expect(clippy::cast_possible_truncation, reason = "y_step ≤ src_h; fits u32 for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "y_step ≤ src_h; fits u32 for practical image sizes"
+        )]
         let d = (1u32 << 23) / y_step as u32;
         let mut xt = 0usize;
 
@@ -663,7 +810,10 @@ fn scale_image_ydown_xup(
 /// Nearest-neighbor Y upsampling, box-filter X downsampling.
 ///
 /// C++: `Splash::scaleImageYupXdown`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleImageYupXdown; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleImageYupXdown; all buffers are necessary"
+)]
 fn scale_image_yup_xdown(
     image_src: &mut dyn ImageSource,
     src_w: usize,
@@ -680,10 +830,20 @@ fn scale_image_yup_xdown(
     let xq = src_w % scaled_w;
 
     let d0 = if xp > 0 {
-        #[expect(clippy::cast_possible_truncation, reason = "xp ≤ src_w; fits u32 for practical image sizes")]
-        { (1u32 << 23) / xp as u32 }
-    } else { 0 };
-    #[expect(clippy::cast_possible_truncation, reason = "xp+1 ≤ src_w+1; fits u32 for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "xp ≤ src_w; fits u32 for practical image sizes"
+        )]
+        {
+            (1u32 << 23) / xp as u32
+        }
+    } else {
+        0
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "xp+1 ≤ src_w+1; fits u32 for practical image sizes"
+    )]
     let d1 = (1u32 << 23) / (xp + 1) as u32;
 
     let mut yt = 0usize;
@@ -692,7 +852,10 @@ fn scale_image_yup_xdown(
     for sy in 0..src_h {
         let y_step = bresenham_step(&mut yt, yq, src_h, yp);
 
-        #[expect(clippy::cast_possible_truncation, reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
+        )]
         image_src.get_row(sy as u32, line_buf);
 
         let row_start = dest_off;
@@ -702,11 +865,17 @@ fn scale_image_yup_xdown(
         for dx in 0..scaled_w {
             let (x_step, d) = {
                 let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 { (step, d1) } else { (step, d0) }
+                if step == xp + 1 {
+                    (step, d1)
+                } else {
+                    (step, d0)
+                }
             };
 
             for c in 0..ncomps {
-                let pix: u32 = (0..x_step).map(|i| u32::from(line_buf[(xx + i) * ncomps + c])).sum();
+                let pix: u32 = (0..x_step)
+                    .map(|i| u32::from(line_buf[(xx + i) * ncomps + c]))
+                    .sum();
                 dest[row_start + dx * ncomps + c] = ((pix * d) >> 23).min(255) as u8;
             }
             xx += x_step;
@@ -726,7 +895,10 @@ fn scale_image_yup_xdown(
 /// Nearest-neighbor upsampling in both axes.
 ///
 /// C++: `Splash::scaleImageYupXup`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ scaleImageYupXup; all buffers are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ scaleImageYupXup; all buffers are necessary"
+)]
 fn scale_image_yup_xup(
     image_src: &mut dyn ImageSource,
     src_w: usize,
@@ -748,7 +920,10 @@ fn scale_image_yup_xup(
     for sy in 0..src_h {
         let y_step = bresenham_step(&mut yt, yq, src_h, yp);
 
-        #[expect(clippy::cast_possible_truncation, reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
+        )]
         image_src.get_row(sy as u32, line_buf);
 
         let row_start = dest_off;
@@ -793,10 +968,12 @@ struct ImageRowPattern<'a> {
 impl crate::pipe::Pattern for ImageRowPattern<'_> {
     fn fill_span(&self, _y: i32, _x0: i32, _x1: i32, out: &mut [u8]) {
         assert_eq!(
-            out.len(), self.data.len(),
+            out.len(),
+            self.data.len(),
             "ImageRowPattern::fill_span: out.len()={} != data.len()={} \
              (ncomps/P::BYTES mismatch — check draw_image caller)",
-            out.len(), self.data.len(),
+            out.len(),
+            self.data.len(),
         );
         out.copy_from_slice(self.data);
     }
@@ -813,7 +990,10 @@ impl crate::pipe::Pattern for ImageRowPattern<'_> {
 /// For each set pixel (coverage > 0) the fill pattern is applied through the
 /// compositing pipe using `shape = coverage`.  This mirrors `Splash::blitMask`
 /// in the non-AA path.
-#[expect(clippy::too_many_arguments, reason = "mirrors Splash::blitMask API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors Splash::blitMask API; all params necessary"
+)]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -831,9 +1011,15 @@ fn blit_mask<P: Pixel>(
     y_dest: i32,
     clip_all_inside: bool,
 ) {
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims ≤ i32::MAX in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims ≤ i32::MAX in practice"
+    )]
     let bmp_w = bitmap.width as i32;
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims ≤ i32::MAX in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims ≤ i32::MAX in practice"
+    )]
     let bmp_h = bitmap.height as i32;
 
     for dy in 0..scaled_h {
@@ -864,7 +1050,16 @@ fn blit_mask<P: Pixel>(
                     let (row, alpha) = bitmap.row_and_alpha_mut(y_u);
                     let dst_pixels = &mut row[byte_off..byte_end];
                     let dst_alpha = alpha.map(|a| &mut a[alpha_lo..=alpha_hi]);
-                    pipe::render_span::<P>(pipe, src, dst_pixels, dst_alpha, Some(&run_shape), rs, rx1, y);
+                    pipe::render_span::<P>(
+                        pipe,
+                        src,
+                        dst_pixels,
+                        dst_alpha,
+                        Some(&run_shape),
+                        rs,
+                        rx1,
+                        y,
+                    );
                     run_shape.clear();
                 }
             };
@@ -900,7 +1095,10 @@ fn blit_mask<P: Pixel>(
 /// `img_row` is the full scaled row for scanline `y`; `x_src_off` is the
 /// pixel offset into that row for pixel `x0`.  `x0`/`x1` are inclusive
 /// destination coordinates and must be within bitmap bounds.
-#[expect(clippy::too_many_arguments, reason = "all context is necessary for a span emit")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all context is necessary for a span emit"
+)]
 fn emit_image_span<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     pipe: &PipeState<'_>,
@@ -936,7 +1134,10 @@ fn emit_image_span<P: Pixel>(
 ///
 /// Asserts `ncomps == P::BYTES`; a mismatch means the scaled image buffer was
 /// built with the wrong component count for the destination pixel format.
-#[expect(clippy::too_many_arguments, reason = "mirrors Splash::blitImage API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors Splash::blitImage API; all params necessary"
+)]
 fn blit_image<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -950,7 +1151,8 @@ fn blit_image<P: Pixel>(
     clip_res: ClipResult,
 ) {
     debug_assert_eq!(
-        ncomps, P::BYTES,
+        ncomps,
+        P::BYTES,
         "blit_image: ncomps={ncomps} != P::BYTES={} — \
          scaled image has wrong component count for this pixel format",
         P::BYTES,
@@ -960,9 +1162,15 @@ fn blit_image<P: Pixel>(
         "blit_image: ncomps={ncomps} exceeds MAX_NCOMPS={MAX_NCOMPS}",
     );
 
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims ≤ i32::MAX in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims ≤ i32::MAX in practice"
+    )]
     let bmp_w = bitmap.width as i32;
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims ≤ i32::MAX in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims ≤ i32::MAX in practice"
+    )]
     let bmp_h = bitmap.height as i32;
 
     let clip_all_inside = clip_res == ClipResult::AllInside;
@@ -974,7 +1182,10 @@ fn blit_image<P: Pixel>(
         }
         #[expect(clippy::cast_sign_loss, reason = "dy ≥ 0 and scaled_w ≥ 0")]
         let img_row_off = dy as usize * scaled_w as usize * ncomps;
-        #[expect(clippy::cast_sign_loss, reason = "scaled_w ≥ 0 (it is the dest rect width)")]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "scaled_w ≥ 0 (it is the dest rect width)"
+        )]
         let img_row = &scaled_img[img_row_off..img_row_off + scaled_w as usize * ncomps];
 
         let x_lo = x_dest.max(0);
@@ -1037,7 +1248,10 @@ fn blit_image<P: Pixel>(
 /// # C++ equivalent
 ///
 /// `Splash::fillImageMask` (~line 2765).
-#[expect(clippy::too_many_arguments, reason = "mirrors Splash::fillImageMask API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors Splash::fillImageMask API; all params necessary"
+)]
 pub fn fill_image_mask<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -1056,16 +1270,28 @@ pub fn fill_image_mask<P: Pixel>(
         Ok(b) => b,
         Err(e) => return e,
     };
-    let ImageBounds { x0, y0, x1, y1, vflip } = bounds;
+    let ImageBounds {
+        x0,
+        y0,
+        x1,
+        y1,
+        vflip,
+    } = bounds;
 
     let clip_res = clip.test_rect(x0, y0, x1 - 1, y1 - 1);
     if clip_res == ClipResult::AllOutside {
         return ImageResult::Ok;
     }
 
-    #[expect(clippy::cast_sign_loss, reason = "x1 > x0 is guaranteed by compute_axis_aligned_bounds")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x1 > x0 is guaranteed by compute_axis_aligned_bounds"
+    )]
     let scaled_w = (x1 - x0) as usize;
-    #[expect(clippy::cast_sign_loss, reason = "y1 > y0 is guaranteed by compute_axis_aligned_bounds")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "y1 > y0 is guaranteed by compute_axis_aligned_bounds"
+    )]
     let scaled_h = (y1 - y0) as usize;
 
     let mut scaled = scale_mask(mask_src, src_w as usize, src_h as usize, scaled_w, scaled_h);
@@ -1080,10 +1306,22 @@ pub fn fill_image_mask<P: Pixel>(
         pipe,
         src,
         &scaled,
-        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "scaled_w ≤ bitmap.width ≤ i32::MAX")]
-        { scaled_w as i32 },
-        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "scaled_h ≤ bitmap.height ≤ i32::MAX")]
-        { scaled_h as i32 },
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "scaled_w ≤ bitmap.width ≤ i32::MAX"
+        )]
+        {
+            scaled_w as i32
+        },
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "scaled_h ≤ bitmap.height ≤ i32::MAX"
+        )]
+        {
+            scaled_h as i32
+        },
         x0,
         y0,
         clip_res == ClipResult::AllInside,
@@ -1109,7 +1347,10 @@ pub fn fill_image_mask<P: Pixel>(
 /// # C++ equivalent
 ///
 /// `Splash::drawImage` (~line 3528).
-#[expect(clippy::too_many_arguments, reason = "mirrors Splash::drawImage API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors Splash::drawImage API; all params necessary"
+)]
 pub fn draw_image<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -1125,7 +1366,8 @@ pub fn draw_image<P: Pixel>(
     let _ = src_mode;
 
     debug_assert_eq!(
-        ncomps, P::BYTES,
+        ncomps,
+        P::BYTES,
         "draw_image: ncomps={ncomps} != P::BYTES={} — pixel format mismatch",
         P::BYTES,
     );
@@ -1142,19 +1384,38 @@ pub fn draw_image<P: Pixel>(
         Ok(b) => b,
         Err(e) => return e,
     };
-    let ImageBounds { x0, y0, x1, y1, vflip } = bounds;
+    let ImageBounds {
+        x0,
+        y0,
+        x1,
+        y1,
+        vflip,
+    } = bounds;
 
     let clip_res = clip.test_rect(x0, y0, x1 - 1, y1 - 1);
     if clip_res == ClipResult::AllOutside {
         return ImageResult::Ok;
     }
 
-    #[expect(clippy::cast_sign_loss, reason = "x1 > x0 is guaranteed by compute_axis_aligned_bounds")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x1 > x0 is guaranteed by compute_axis_aligned_bounds"
+    )]
     let scaled_w = (x1 - x0) as usize;
-    #[expect(clippy::cast_sign_loss, reason = "y1 > y0 is guaranteed by compute_axis_aligned_bounds")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "y1 > y0 is guaranteed by compute_axis_aligned_bounds"
+    )]
     let scaled_h = (y1 - y0) as usize;
 
-    let mut scaled = scale_image(image_src, src_w as usize, src_h as usize, scaled_w, scaled_h, ncomps);
+    let mut scaled = scale_image(
+        image_src,
+        src_w as usize,
+        src_h as usize,
+        scaled_w,
+        scaled_h,
+        ncomps,
+    );
 
     if vflip {
         vflip_rows(&mut scaled, scaled_w * ncomps);
@@ -1165,10 +1426,22 @@ pub fn draw_image<P: Pixel>(
         clip,
         pipe,
         &scaled,
-        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "scaled_w ≤ bitmap.width ≤ i32::MAX")]
-        { scaled_w as i32 },
-        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "scaled_h ≤ bitmap.height ≤ i32::MAX")]
-        { scaled_h as i32 },
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "scaled_w ≤ bitmap.width ≤ i32::MAX"
+        )]
+        {
+            scaled_w as i32
+        },
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "scaled_h ≤ bitmap.height ≤ i32::MAX"
+        )]
+        {
+            scaled_h as i32
+        },
         x0,
         y0,
         ncomps,
@@ -1316,8 +1589,15 @@ mod tests {
         let mut img_src = SolidColor { r: 0, g: 0, b: 200 };
         let mat = [4.0f64, 0.0, 0.0, 4.0, 0.0, 0.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut img_src,
-            crate::types::PixelMode::Rgb8, 4, 4, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut img_src,
+            crate::types::PixelMode::Rgb8,
+            4,
+            4,
+            &mat,
+            3,
         );
 
         assert_eq!(result, ImageResult::Ok);
@@ -1337,12 +1617,23 @@ mod tests {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
         let clip = full_clip(8, 8);
         let pipe = simple_pipe();
-        let mut img_src = SolidColor { r: 100, g: 100, b: 100 };
+        let mut img_src = SolidColor {
+            r: 100,
+            g: 100,
+            b: 100,
+        };
 
         let mat = [2.0f64, 1.0, 1.0, 2.0, 0.0, 0.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut img_src,
-            crate::types::PixelMode::Rgb8, 4, 4, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut img_src,
+            crate::types::PixelMode::Rgb8,
+            4,
+            4,
+            &mat,
+            3,
         );
         assert_eq!(result, ImageResult::ArbitraryTransformSkipped);
     }
@@ -1357,8 +1648,15 @@ mod tests {
 
         let mat = [4.0f64, 0.0, 0.0, 4.0, 0.0, 0.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut img_src,
-            crate::types::PixelMode::Rgb8, 0, 4, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut img_src,
+            crate::types::PixelMode::Rgb8,
+            0,
+            4,
+            &mat,
+            3,
         );
         assert_eq!(result, ImageResult::ZeroImage);
     }
@@ -1370,11 +1668,22 @@ mod tests {
         let clip = full_clip(8, 8);
         let pipe = simple_pipe();
 
-        let mut img_src = SolidColor { r: 128, g: 64, b: 32 };
+        let mut img_src = SolidColor {
+            r: 128,
+            g: 64,
+            b: 32,
+        };
         let mat = [4.0f64, 0.0, 0.0, 4.0, 0.0, 0.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut img_src,
-            crate::types::PixelMode::Rgb8, 2, 2, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut img_src,
+            crate::types::PixelMode::Rgb8,
+            2,
+            2,
+            &mat,
+            3,
         );
         assert_eq!(result, ImageResult::Ok);
         for y in 0..4u32 {
@@ -1393,11 +1702,22 @@ mod tests {
         let clip = full_clip(8, 8);
         let pipe = simple_pipe();
 
-        let mut img_src = SolidColor { r: 200, g: 100, b: 50 };
+        let mut img_src = SolidColor {
+            r: 200,
+            g: 100,
+            b: 50,
+        };
         let mat = [2.0f64, 0.0, 0.0, 2.0, 0.0, 0.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut img_src,
-            crate::types::PixelMode::Rgb8, 4, 4, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut img_src,
+            crate::types::PixelMode::Rgb8,
+            4,
+            4,
+            &mat,
+            3,
         );
         assert_eq!(result, ImageResult::Ok);
         for y in 0..2u32 {
@@ -1450,9 +1770,11 @@ mod tests {
     /// `vflip_rows` with stride 2: rows [A,B,C] become [C,B,A].
     #[test]
     fn vflip_rows_three_rows() {
-        let mut data = vec![1u8, 2,  // row 0
-                            3,   4,  // row 1
-                            5,   6]; // row 2
+        let mut data = vec![
+            1u8, 2, // row 0
+            3, 4, // row 1
+            5, 6,
+        ]; // row 2
         vflip_rows(&mut data, 2);
         assert_eq!(data, [5, 6, 3, 4, 1, 2]);
     }
@@ -1482,7 +1804,9 @@ mod tests {
             fn get_row(&mut self, y: u32, row_buf: &mut [u8]) {
                 let (r, g, b) = if y == 0 { (255, 0, 0) } else { (0, 0, 255) };
                 for chunk in row_buf.chunks_exact_mut(3) {
-                    chunk[0] = r; chunk[1] = g; chunk[2] = b;
+                    chunk[0] = r;
+                    chunk[1] = g;
+                    chunk[2] = b;
                 }
             }
         }
@@ -1495,16 +1819,23 @@ mod tests {
         // Y bounds: coord_lower(-2+2)=0, coord_upper(2)=3 → rows 0..3.
         let mat = [2.0f64, 0.0, 0.0, -2.0, 0.0, 2.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut TwoRowImage,
-            crate::types::PixelMode::Rgb8, 2, 2, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut TwoRowImage,
+            crate::types::PixelMode::Rgb8,
+            2,
+            2,
+            &mat,
+            3,
         );
         assert_eq!(result, ImageResult::Ok);
         // After vflip: source row 1 (blue) maps to dest top, row 0 (red) to dest bottom.
         // Dest rows 0..1 should be blue (0,0,255), rows 2..3 should be red (255,0,0).
         // (Exact row mapping depends on Bresenham split; just verify both colours appear.)
-        let has_red  = (0..3u32).any(|y| bmp.row(y)[0].r == 255 && bmp.row(y)[0].b == 0);
+        let has_red = (0..3u32).any(|y| bmp.row(y)[0].r == 255 && bmp.row(y)[0].b == 0);
         let has_blue = (0..3u32).any(|y| bmp.row(y)[0].b == 255 && bmp.row(y)[0].r == 0);
-        assert!(has_red,  "vflip: expected red pixels in output");
+        assert!(has_red, "vflip: expected red pixels in output");
         assert!(has_blue, "vflip: expected blue pixels in output");
     }
 
@@ -1516,12 +1847,23 @@ mod tests {
         let clip = Clip::new(2.0, 0.0, 4.999, 7.999, false);
         let pipe = simple_pipe();
 
-        let mut img_src = SolidColor { r: 255, g: 255, b: 255 };
+        let mut img_src = SolidColor {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
         // Fill the full 8×8 canvas.
         let mat = [8.0f64, 0.0, 0.0, 8.0, 0.0, 0.0];
         let result = draw_image::<Rgb8>(
-            &mut bmp, &clip, &pipe, &mut img_src,
-            crate::types::PixelMode::Rgb8, 8, 8, &mat, 3,
+            &mut bmp,
+            &clip,
+            &pipe,
+            &mut img_src,
+            crate::types::PixelMode::Rgb8,
+            8,
+            8,
+            &mat,
+            3,
         );
         assert_eq!(result, ImageResult::Ok);
 

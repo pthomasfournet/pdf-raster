@@ -26,7 +26,10 @@ use color::convert::div255;
 /// - `dst_pixels.len() == count * P::BYTES`.
 /// - `shape.len() == count`.
 /// - `P::BYTES > 0`.
-#[expect(clippy::too_many_arguments, reason = "mirrors C++ SplashPipe API; all parameters are necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors C++ SplashPipe API; all parameters are necessary"
+)]
 pub(crate) fn render_span_aa<P: Pixel>(
     pipe: &PipeState<'_>,
     src: &PipeSrc<'_>,
@@ -40,7 +43,10 @@ pub(crate) fn render_span_aa<P: Pixel>(
     debug_assert_eq!(pipe.blend_mode, BlendMode::Normal);
     debug_assert!(pipe.soft_mask.is_none());
 
-    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0"
+    )]
     let count = (x1 - x0 + 1) as usize;
     let ncomps = P::BYTES;
 
@@ -55,7 +61,12 @@ pub(crate) fn render_span_aa<P: Pixel>(
             // Repeat the solid colour into a scratch buffer so the inner loop
             // can be written uniformly.  For large spans this is a minor cost;
             // for the simple case (a_src==255 everywhere) the loop fast-paths anyway.
-            src_buf_storage = color.iter().cycle().take(count * ncomps).copied().collect::<Vec<_>>();
+            src_buf_storage = color
+                .iter()
+                .cycle()
+                .take(count * ncomps)
+                .copied()
+                .collect::<Vec<_>>();
             &src_buf_storage
         }
         PipeSrc::Pattern(pat) => {
@@ -103,13 +114,23 @@ pub(crate) fn render_span_aa<P: Pixel>(
                         let c_dst = u32::from(dst_px[j]);
                         // ((a_result - a_src) * c_dst + a_src * c_src) / a_result
                         let blended = ((a_result - a_src) * c_dst + a_src * c_src) / a_result;
-                        #[expect(clippy::cast_possible_truncation, reason = "blended = (weighted sum) / a_result ≤ 255")]
-                        { dst_px[j] = blended as u8; }
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "blended = (weighted sum) / a_result ≤ 255"
+                        )]
+                        {
+                            dst_px[j] = blended as u8;
+                        }
                     }
                     apply_transfer_in_place(pipe, dst_px);
                 }
-                #[expect(clippy::cast_possible_truncation, reason = "a_result is clamped via Porter-Duff; ≤ 255")]
-                { dst_alpha[i] = a_result as u8; }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a_result is clamped via Porter-Duff; ≤ 255"
+                )]
+                {
+                    dst_alpha[i] = a_result as u8;
+                }
             }
         }
         None => {
@@ -125,7 +146,8 @@ pub(crate) fn render_span_aa<P: Pixel>(
 
                 // c_result = div255((255 - a_src) * c_dst + a_src * c_src)
                 for j in 0..ncomps {
-                    let blended = div255((255 - a_src) * u32::from(dst_px[j]) + a_src * u32::from(src_px[j]));
+                    let blended =
+                        div255((255 - a_src) * u32::from(dst_px[j]) + a_src * u32::from(src_px[j]));
                     dst_px[j] = blended;
                 }
                 apply_transfer_in_place(pipe, dst_px);

@@ -79,7 +79,10 @@ pub fn blend_color_burn(src: u8, dst: u8) -> u8 {
         0
     } else {
         let x = u32::from(255 - dst) * 255 / u32::from(src);
-        #[expect(clippy::cast_possible_truncation, reason = "x < 255 is checked above, so 255 - x ≤ 254 which fits u8")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "x < 255 is checked above, so 255 - x ≤ 254 which fits u8"
+        )]
         if x >= 255 { 0 } else { (255 - x) as u8 }
     }
 }
@@ -103,13 +106,20 @@ pub fn blend_soft_light(src: u8, dst: u8) -> u8 {
             (((16 * d - 12 * 255) * d / 255 + 4 * 255) * d) / 255
         } else {
             // Integer sqrt: sqrt(255 * d), scaled to [0,255].
-            #[expect(clippy::cast_possible_truncation, reason = "sqrt of non-negative f64; result is in [0,255] before clamp")]
-            { (f64::from(d) * 255.0).sqrt() as i32 }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "sqrt of non-negative f64; result is in [0,255] before clamp"
+            )]
+            {
+                (f64::from(d) * 255.0).sqrt() as i32
+            }
         };
         d + (2 * s - 255) * (x - d) / 255
     };
     #[expect(clippy::cast_sign_loss, reason = "value is clamped to [0, 255] above")]
-    { result.clamp(0, 255) as u8 }
+    {
+        result.clamp(0, 255) as u8
+    }
 }
 
 /// Difference: `|src - dst|`.
@@ -123,7 +133,9 @@ pub const fn blend_difference(src: u8, dst: u8) -> u8 {
 pub fn blend_exclusion(src: u8, dst: u8) -> u8 {
     let s = u32::from(src);
     let d = u32::from(dst);
-    (s + d).saturating_sub(u32::from(div255(2 * s * d))).min(255) as u8
+    (s + d)
+        .saturating_sub(u32::from(div255(2 * s * d)))
+        .min(255) as u8
 }
 
 // ── Non-separable helpers (RGB additive space) ────────────────────────────────
@@ -185,8 +197,14 @@ fn set_sat(r_in: i32, g_in: i32, b_in: i32, sat: i32) -> (i32, i32, i32) {
         out[slot_hi] = sat.clamp(0, 255);
     }
     out[slot_lo] = 0;
-    #[expect(clippy::tuple_array_conversions, reason = "caller API returns a triple; no Into impl for non-Copy i32")]
-    { let [a, b, c] = out; (a, b, c) }
+    #[expect(
+        clippy::tuple_array_conversions,
+        reason = "caller API returns a triple; no Into impl for non-Copy i32"
+    )]
+    {
+        let [a, b, c] = out;
+        (a, b, c)
+    }
 }
 
 /// Non-separable Hue blend: hue of src, saturation and luminosity of dst.
@@ -196,7 +214,11 @@ pub fn blend_hue_rgb(src: [u8; 3], dst: [u8; 3]) -> [u8; 3] {
     let [dr, dg, db] = dst.map(i32::from);
     let (r0, g0, b0) = set_sat(sr, sg, sb, get_sat(dr, dg, db));
     let (r1, g1, b1) = set_lum(r0, g0, b0, get_lum(dr, dg, db));
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clip_color clamps all channels to [0, 255]")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clip_color clamps all channels to [0, 255]"
+    )]
     [r1 as u8, g1 as u8, b1 as u8]
 }
 
@@ -207,7 +229,11 @@ pub fn blend_saturation_rgb(src: [u8; 3], dst: [u8; 3]) -> [u8; 3] {
     let [dr, dg, db] = dst.map(i32::from);
     let (r0, g0, b0) = set_sat(dr, dg, db, get_sat(sr, sg, sb));
     let (r1, g1, b1) = set_lum(r0, g0, b0, get_lum(dr, dg, db));
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clip_color clamps all channels to [0, 255]")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clip_color clamps all channels to [0, 255]"
+    )]
     [r1 as u8, g1 as u8, b1 as u8]
 }
 
@@ -217,7 +243,11 @@ pub fn blend_color_rgb(src: [u8; 3], dst: [u8; 3]) -> [u8; 3] {
     let [sr, sg, sb] = src.map(i32::from);
     let [dr, dg, db] = dst.map(i32::from);
     let (r, g, b) = set_lum(sr, sg, sb, get_lum(dr, dg, db));
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clip_color clamps all channels to [0, 255]")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clip_color clamps all channels to [0, 255]"
+    )]
     [r as u8, g as u8, b as u8]
 }
 
@@ -227,7 +257,11 @@ pub fn blend_luminosity_rgb(src: [u8; 3], dst: [u8; 3]) -> [u8; 3] {
     let [sr, sg, sb] = src.map(i32::from);
     let [dr, dg, db] = dst.map(i32::from);
     let (r, g, b) = set_lum(dr, dg, db, get_lum(sr, sg, sb));
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clip_color clamps all channels to [0, 255]")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clip_color clamps all channels to [0, 255]"
+    )]
     [r as u8, g as u8, b as u8]
 }
 
@@ -329,8 +363,11 @@ mod tests {
     fn hard_light_matches_overlay_swapped() {
         for s in (0u8..=255).step_by(17) {
             for d in (0u8..=255).step_by(11) {
-                assert_eq!(blend_hard_light(s, d), blend_overlay(d, s),
-                    "hard_light({s},{d}) should equal overlay({d},{s})");
+                assert_eq!(
+                    blend_hard_light(s, d),
+                    blend_overlay(d, s),
+                    "hard_light({s},{d}) should equal overlay({d},{s})"
+                );
             }
         }
     }
@@ -382,7 +419,10 @@ mod tests {
     fn soft_light_midpoint() {
         // For src=128, dst=128: result should be close to 128.
         let r = blend_soft_light(128, 128);
-        assert!((r as i32 - 128).abs() <= 2, "soft_light(128,128)={r}, expected ~128");
+        assert!(
+            (r as i32 - 128).abs() <= 2,
+            "soft_light(128,128)={r}, expected ~128"
+        );
     }
 
     #[test]

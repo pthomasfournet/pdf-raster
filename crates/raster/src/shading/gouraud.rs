@@ -40,9 +40,9 @@ pub struct GouraudVertex {
 /// Both x and per-channel colour are expressed as `slope * y + offset`.
 struct EdgeMap {
     x_slope: f64,
-    x_off:   f64,
+    x_off: f64,
     c_slope: [f64; 3],
-    c_off:   [f64; 3],
+    c_off: [f64; 3],
 }
 
 impl EdgeMap {
@@ -54,30 +54,44 @@ impl EdgeMap {
             // Horizontal edge — slope undefined; hold start-vertex values.
             return Self {
                 x_slope: 0.0,
-                x_off:   va.x,
+                x_off: va.x,
                 c_slope: [0.0; 3],
-                c_off:   [f64::from(va.color[0]), f64::from(va.color[1]), f64::from(va.color[2])],
+                c_off: [
+                    f64::from(va.color[0]),
+                    f64::from(va.color[1]),
+                    f64::from(va.color[2]),
+                ],
             };
         }
         let x_slope = (vb.x - va.x) / dy;
-        let x_off   = ya.mul_add(-x_slope, va.x);
-        let c_slope: [f64; 3] = std::array::from_fn(|ch| {
-            (f64::from(vb.color[ch]) - f64::from(va.color[ch])) / dy
-        });
-        let c_off: [f64; 3] = std::array::from_fn(|ch| {
-            ya.mul_add(-c_slope[ch], f64::from(va.color[ch]))
-        });
-        Self { x_slope, x_off, c_slope, c_off }
+        let x_off = ya.mul_add(-x_slope, va.x);
+        let c_slope: [f64; 3] =
+            std::array::from_fn(|ch| (f64::from(vb.color[ch]) - f64::from(va.color[ch])) / dy);
+        let c_off: [f64; 3] =
+            std::array::from_fn(|ch| ya.mul_add(-c_slope[ch], f64::from(va.color[ch])));
+        Self {
+            x_slope,
+            x_off,
+            c_slope,
+            c_off,
+        }
     }
 
     /// Evaluate the edge at scanline `y` → (pixel x, interpolated RGB).
     fn eval(&self, y: f64) -> (i32, [u8; 3]) {
-        #[expect(clippy::cast_possible_truncation, reason = "pixel coordinate rounding (+ 0.5 before truncation)")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "pixel coordinate rounding (+ 0.5 before truncation)"
+        )]
         let x = (self.x_slope.mul_add(y, self.x_off) + 0.5) as i32;
         let c: [u8; 3] = std::array::from_fn(|ch| {
             #[expect(clippy::cast_possible_truncation, reason = "value clamped to 0..=255")]
             #[expect(clippy::cast_sign_loss, reason = "value clamped to 0.0..=255.0")]
-            { self.c_slope[ch].mul_add(y, self.c_off[ch]).clamp(0.0, 255.0) as u8 }
+            {
+                self.c_slope[ch]
+                    .mul_add(y, self.c_off[ch])
+                    .clamp(0.0, 255.0) as u8
+            }
         });
         (x, c)
     }
@@ -86,15 +100,25 @@ impl EdgeMap {
 /// Round a vertex Y coordinate to the nearest pixel (matches C++ `splashRound`).
 #[inline]
 fn round_y(v: &GouraudVertex) -> i32 {
-    #[expect(clippy::cast_possible_truncation, reason = "splashRound: floor(y + 0.5)")]
-    { (v.y + 0.5) as i32 }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splashRound: floor(y + 0.5)"
+    )]
+    {
+        (v.y + 0.5) as i32
+    }
 }
 
 /// Round a vertex X coordinate to the nearest pixel.
 #[inline]
 fn round_x(v: &GouraudVertex) -> i32 {
-    #[expect(clippy::cast_possible_truncation, reason = "splashRound: floor(x + 0.5)")]
-    { (v.x + 0.5) as i32 }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splashRound: floor(x + 0.5)"
+    )]
+    {
+        (v.x + 0.5) as i32
+    }
 }
 
 /// Pre-computed row of colour bytes used as a `Pattern` source.
@@ -109,10 +133,12 @@ struct RowSrc<'a> {
 impl Pattern for RowSrc<'_> {
     fn fill_span(&self, _y: i32, x0: i32, x1: i32, out: &mut [u8]) {
         debug_assert_eq!(
-            out.len(), self.data.len(),
+            out.len(),
+            self.data.len(),
             "RowSrc::fill_span: out.len()={} data.len()={} (x0={x0} x1={x1}) \
              — gouraud_triangle_fill called with P::BYTES != 3",
-            out.len(), self.data.len(),
+            out.len(),
+            self.data.len(),
         );
         out.copy_from_slice(self.data);
     }
@@ -131,15 +157,26 @@ fn emit_run<P: Pixel>(
     run_x1: i32,
     y: i32,
 ) {
-    debug_assert!(run_x0 >= buf_x0, "emit_run: run_x0={run_x0} < buf_x0={buf_x0}");
-    debug_assert!(run_x0 <= run_x1, "emit_run: empty run x0={run_x0} x1={run_x1}");
-    debug_assert!(y >= 0,           "emit_run: negative y={y}");
+    debug_assert!(
+        run_x0 >= buf_x0,
+        "emit_run: run_x0={run_x0} < buf_x0={buf_x0}"
+    );
+    debug_assert!(
+        run_x0 <= run_x1,
+        "emit_run: empty run x0={run_x0} x1={run_x1}"
+    );
+    debug_assert!(y >= 0, "emit_run: negative y={y}");
 
-    #[expect(clippy::cast_sign_loss, reason = "run_x0 >= buf_x0 >= 0 (both clamped to 0 upstream)")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "run_x0 >= buf_x0 >= 0 (both clamped to 0 upstream)"
+    )]
     let buf_off = (run_x0 - buf_x0) as usize * 3;
     #[expect(clippy::cast_sign_loss, reason = "run_x1 >= run_x0")]
     let buf_end = buf_off + (run_x1 - run_x0 + 1) as usize * 3;
-    let src = RowSrc { data: &span_color[buf_off..buf_end] };
+    let src = RowSrc {
+        data: &span_color[buf_off..buf_end],
+    };
 
     #[expect(clippy::cast_sign_loss, reason = "y >= 0")]
     let y_u = y as u32;
@@ -156,7 +193,10 @@ fn emit_run<P: Pixel>(
         &PipeSrc::Pattern(&src),
         &mut row[byte_off..byte_end],
         alpha.map(|a| &mut a[alpha_range]),
-        None, run_x0, run_x1, y,
+        None,
+        run_x0,
+        run_x1,
+        y,
     );
 }
 
@@ -170,6 +210,7 @@ fn emit_run<P: Pixel>(
 /// bitmaps **must** convert vertex colours to device RGB before calling this
 /// function.  Violating this constraint triggers `debug_assert!` in debug
 /// builds; release builds return silently without painting.
+#[expect(clippy::too_many_lines, reason = "single-function triangle rasterizer; extracted helpers would obscure the scan-conversion algorithm")]
 pub fn gouraud_triangle_fill<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -177,17 +218,24 @@ pub fn gouraud_triangle_fill<P: Pixel>(
     mut v: [GouraudVertex; 3],
 ) {
     debug_assert_eq!(
-        P::BYTES, 3,
+        P::BYTES,
+        3,
         "gouraud_triangle_fill: P::BYTES={} but only RGB (3) is supported",
         P::BYTES,
     );
-    if P::BYTES != 3 { return; }
+    if P::BYTES != 3 {
+        return;
+    }
 
     // --- Sort vertices by Y (insertion sort, 3 elements) ---
-    if v[0].y > v[1].y { v.swap(0, 1); }
+    if v[0].y > v[1].y {
+        v.swap(0, 1);
+    }
     if v[1].y > v[2].y {
         v.swap(1, 2);
-        if v[0].y > v[1].y { v.swap(0, 1); }
+        if v[0].y > v[1].y {
+            v.swap(0, 1);
+        }
     }
     // v[0].y ≤ v[1].y ≤ v[2].y.
 
@@ -195,15 +243,19 @@ pub fn gouraud_triangle_fill<P: Pixel>(
     let y1 = round_y(&v[1]);
     let y2 = round_y(&v[2]);
 
-    if y0 == y2 { return; } // all three vertices on the same scanline — degenerate
+    if y0 == y2 {
+        return;
+    } // all three vertices on the same scanline — degenerate
 
     let x_min = round_x(&v[0]).min(round_x(&v[1])).min(round_x(&v[2]));
     let x_max = round_x(&v[0]).max(round_x(&v[1])).max(round_x(&v[2]));
     // Single test_rect call; result used for both early-exit and per-scanline clip decisions.
     let clip_bbox = clip.test_rect(x_min, y0, x_max, y2);
-    if clip_bbox == ClipResult::AllOutside { return; }
+    if clip_bbox == ClipResult::AllOutside {
+        return;
+    }
 
-    let long_edge  = EdgeMap::from_vertices(&v[0], &v[2]);
+    let long_edge = EdgeMap::from_vertices(&v[0], &v[2]);
     let upper_edge = EdgeMap::from_vertices(&v[0], &v[1]);
     let lower_edge = EdgeMap::from_vertices(&v[1], &v[2]);
 
@@ -221,16 +273,25 @@ pub fn gouraud_triangle_fill<P: Pixel>(
         xl <= xs
     };
 
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims are bounded by platform address space")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims are bounded by platform address space"
+    )]
     let bmp_h = bitmap.height as i32;
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims are bounded by platform address space")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims are bounded by platform address space"
+    )]
     let bmp_w = bitmap.width as i32;
     let scan_y0 = y0.max(clip.y_min_i).max(0);
     let scan_y2 = y2.min(clip.y_max_i).min(bmp_h - 1);
 
     // Span colour buffer — allocated once to the widest possible scanline
     // (clip width + 1 px for rounding slack).  Never grows inside the loop.
-    #[expect(clippy::cast_sign_loss, reason = "max(0) ensures non-negative before cast")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "max(0) ensures non-negative before cast"
+    )]
     let max_span = (clip.x_max_i - clip.x_min_i + 2).max(0) as usize;
     let mut span_color = vec![0u8; max_span * 3];
 
@@ -249,13 +310,17 @@ pub fn gouraud_triangle_fill<P: Pixel>(
 
         let sx0 = x_left.max(clip.x_min_i).max(0);
         let sx1 = x_right.min(clip.x_max_i).min(bmp_w - 1);
-        if sx0 > sx1 { continue; }
+        if sx0 > sx1 {
+            continue;
+        }
 
         #[expect(clippy::cast_sign_loss, reason = "sx1 >= sx0 (guarded above)")]
         let span_len = (sx1 - sx0 + 1) as usize;
         // span_len ≤ max_span: sx1 - sx0 ≤ clip.x_max_i - clip.x_min_i < max_span.
-        debug_assert!(span_len <= max_span,
-            "span_len {span_len} exceeds pre-allocated max_span {max_span}");
+        debug_assert!(
+            span_len <= max_span,
+            "span_len {span_len} exceeds pre-allocated max_span {max_span}"
+        );
         let buf = &mut span_color[..span_len * 3];
 
         let span_width = f64::from((x_right - x_left).max(1));
@@ -264,7 +329,7 @@ pub fn gouraud_triangle_fill<P: Pixel>(
             #[expect(clippy::cast_sign_loss, reason = "t ∈ [0,1]")]
             #[expect(clippy::cast_possible_truncation, reason = "t * 256 ≤ 256")]
             let frac = (t * 256.0) as u32;
-            buf[i * 3]     = lerp_u8(c_left[0], c_right[0], frac);
+            buf[i * 3] = lerp_u8(c_left[0], c_right[0], frac);
             buf[i * 3 + 1] = lerp_u8(c_left[1], c_right[1], frac);
             buf[i * 3 + 2] = lerp_u8(c_left[2], c_right[2], frac);
         }
@@ -279,7 +344,9 @@ pub fn gouraud_triangle_fill<P: Pixel>(
             let mut run_start: Option<i32> = None;
             for px in sx0..=sx1 {
                 if clip.test(px, y) {
-                    if run_start.is_none() { run_start = Some(px); }
+                    if run_start.is_none() {
+                        run_start = Some(px);
+                    }
                 } else if let Some(rs) = run_start.take() {
                     emit_run::<P>(bitmap, pipe, &span_color, sx0, rs, px - 1, y);
                 }
@@ -330,9 +397,21 @@ mod tests {
         let pipe = simple_pipe();
 
         let tri = [
-            GouraudVertex { x: 2.0, y: 2.0, color: [255, 255, 255] },
-            GouraudVertex { x: 8.0, y: 2.0, color: [255, 255, 255] },
-            GouraudVertex { x: 5.0, y: 7.0, color: [255, 255, 255] },
+            GouraudVertex {
+                x: 2.0,
+                y: 2.0,
+                color: [255, 255, 255],
+            },
+            GouraudVertex {
+                x: 8.0,
+                y: 2.0,
+                color: [255, 255, 255],
+            },
+            GouraudVertex {
+                x: 5.0,
+                y: 7.0,
+                color: [255, 255, 255],
+            },
         ];
         gouraud_triangle_fill::<Rgb8>(&mut bmp, &clip, &pipe, tri);
 
@@ -350,9 +429,21 @@ mod tests {
         let pipe = simple_pipe();
 
         let tri = [
-            GouraudVertex { x: 1.0,  y: 1.0, color: [255, 0,   0  ] },
-            GouraudVertex { x: 10.0, y: 1.0, color: [0,   255, 0  ] },
-            GouraudVertex { x: 5.5,  y: 9.0, color: [0,   0,   255] },
+            GouraudVertex {
+                x: 1.0,
+                y: 1.0,
+                color: [255, 0, 0],
+            },
+            GouraudVertex {
+                x: 10.0,
+                y: 1.0,
+                color: [0, 255, 0],
+            },
+            GouraudVertex {
+                x: 5.5,
+                y: 9.0,
+                color: [0, 0, 255],
+            },
         ];
         gouraud_triangle_fill::<Rgb8>(&mut bmp, &clip, &pipe, tri);
 
@@ -370,9 +461,21 @@ mod tests {
         let pipe = simple_pipe();
 
         let tri = [
-            GouraudVertex { x: 1.0, y: 4.0, color: [255, 0, 0] },
-            GouraudVertex { x: 5.0, y: 4.0, color: [0, 255, 0] },
-            GouraudVertex { x: 3.0, y: 4.0, color: [0, 0, 255] },
+            GouraudVertex {
+                x: 1.0,
+                y: 4.0,
+                color: [255, 0, 0],
+            },
+            GouraudVertex {
+                x: 5.0,
+                y: 4.0,
+                color: [0, 255, 0],
+            },
+            GouraudVertex {
+                x: 3.0,
+                y: 4.0,
+                color: [0, 0, 255],
+            },
         ];
         gouraud_triangle_fill::<Rgb8>(&mut bmp, &clip, &pipe, tri);
 
@@ -391,9 +494,21 @@ mod tests {
         let pipe = simple_pipe();
 
         let tri = [
-            GouraudVertex { x: 5.0, y: 5.0, color: [255, 0, 0] },
-            GouraudVertex { x: 7.0, y: 5.0, color: [0, 255, 0] },
-            GouraudVertex { x: 6.0, y: 7.0, color: [0, 0, 255] },
+            GouraudVertex {
+                x: 5.0,
+                y: 5.0,
+                color: [255, 0, 0],
+            },
+            GouraudVertex {
+                x: 7.0,
+                y: 5.0,
+                color: [0, 255, 0],
+            },
+            GouraudVertex {
+                x: 6.0,
+                y: 7.0,
+                color: [0, 0, 255],
+            },
         ];
         gouraud_triangle_fill::<Rgb8>(&mut bmp, &clip, &pipe, tri);
 
@@ -408,9 +523,21 @@ mod tests {
     #[test]
     fn vertex_order_both_paint_interior() {
         let tri_abc = [
-            GouraudVertex { x: 2.0, y: 2.0, color: [255, 0, 0] },
-            GouraudVertex { x: 8.0, y: 2.0, color: [0, 255, 0] },
-            GouraudVertex { x: 5.0, y: 7.0, color: [0, 0, 255] },
+            GouraudVertex {
+                x: 2.0,
+                y: 2.0,
+                color: [255, 0, 0],
+            },
+            GouraudVertex {
+                x: 8.0,
+                y: 2.0,
+                color: [0, 255, 0],
+            },
+            GouraudVertex {
+                x: 5.0,
+                y: 7.0,
+                color: [0, 0, 255],
+            },
         ];
         let tri_cba = [tri_abc[2], tri_abc[1], tri_abc[0]];
 
@@ -423,10 +550,12 @@ mod tests {
         gouraud_triangle_fill::<Rgb8>(&mut bmp2, &clip, &pipe, tri_cba);
 
         let interior_painted = |bmp: &Bitmap<Rgb8>| {
-            (3..7u32).any(|y| (3..8usize).any(|x| {
-                let p = bmp.row(y)[x];
-                p.r > 0 || p.g > 0 || p.b > 0
-            }))
+            (3..7u32).any(|y| {
+                (3..8usize).any(|x| {
+                    let p = bmp.row(y)[x];
+                    p.r > 0 || p.g > 0 || p.b > 0
+                })
+            })
         };
         assert!(interior_painted(&bmp1), "ABC order: interior not painted");
         assert!(interior_painted(&bmp2), "CBA order: interior not painted");
@@ -441,15 +570,30 @@ mod tests {
 
         // Apex at top, flat base at bottom.
         let tri = [
-            GouraudVertex { x: 5.0, y: 1.0, color: [255, 0, 0] },
-            GouraudVertex { x: 2.0, y: 7.0, color: [0, 255, 0] },
-            GouraudVertex { x: 8.0, y: 7.0, color: [0, 0, 255] },
+            GouraudVertex {
+                x: 5.0,
+                y: 1.0,
+                color: [255, 0, 0],
+            },
+            GouraudVertex {
+                x: 2.0,
+                y: 7.0,
+                color: [0, 255, 0],
+            },
+            GouraudVertex {
+                x: 8.0,
+                y: 7.0,
+                color: [0, 0, 255],
+            },
         ];
         gouraud_triangle_fill::<Rgb8>(&mut bmp, &clip, &pipe, tri);
 
         // Midpoint row should be painted.
         let mid = bmp.row(4);
         let any_painted = (2..8usize).any(|x| mid[x].r > 0 || mid[x].g > 0 || mid[x].b > 0);
-        assert!(any_painted, "mid-row of flat-bottom triangle should be painted");
+        assert!(
+            any_painted,
+            "mid-row of flat-bottom triangle should be painted"
+        );
     }
 }

@@ -326,8 +326,14 @@ fn detect_rect(xpath: &XPath) -> Option<(f64, f64, f64, f64)> {
     }
     let segs = &xpath.segs;
     // Need exactly 2 vertical + 2 horizontal segments.
-    let verts = segs.iter().filter(|s| s.flags.contains(XPathFlags::VERT)).count();
-    let horizs = segs.iter().filter(|s| s.flags.contains(XPathFlags::HORIZ)).count();
+    let verts = segs
+        .iter()
+        .filter(|s| s.flags.contains(XPathFlags::VERT))
+        .count();
+    let horizs = segs
+        .iter()
+        .filter(|s| s.flags.contains(XPathFlags::HORIZ))
+        .count();
     if verts != 2 || horizs != 2 {
         return None;
     }

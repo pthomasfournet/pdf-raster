@@ -49,13 +49,13 @@ impl StateFlags {
     // Each constant occupies a unique bit position (0–7); all eight u8 bits
     // are consumed, so no two masks can ever overlap.
     const MULTIPLY_PATTERN_ALPHA: u8 = 1 << 0; // bit 0
-    const STROKE_ADJUST: u8 = 1 << 1;           // bit 1
-    const DELETE_SOFT_MASK: u8 = 1 << 2;        // bit 2
-    const IN_NON_ISOLATED_GROUP: u8 = 1 << 3;   // bit 3
-    const IN_KNOCKOUT_GROUP: u8 = 1 << 4;       // bit 4
-    const FILL_OVERPRINT: u8 = 1 << 5;          // bit 5
-    const STROKE_OVERPRINT: u8 = 1 << 6;        // bit 6
-    const OVERPRINT_ADDITIVE: u8 = 1 << 7;      // bit 7
+    const STROKE_ADJUST: u8 = 1 << 1; // bit 1
+    const DELETE_SOFT_MASK: u8 = 1 << 2; // bit 2
+    const IN_NON_ISOLATED_GROUP: u8 = 1 << 3; // bit 3
+    const IN_KNOCKOUT_GROUP: u8 = 1 << 4; // bit 4
+    const FILL_OVERPRINT: u8 = 1 << 5; // bit 5
+    const STROKE_OVERPRINT: u8 = 1 << 6; // bit 6
+    const OVERPRINT_ADDITIVE: u8 = 1 << 7; // bit 7
 
     const fn get(self, mask: u8) -> bool {
         self.bits & mask != 0
@@ -358,7 +358,7 @@ impl GraphicsState {
             cc[i] = 255 - self.rgb_transfer[0].0[255 - i]; // C ← invert_complement(R)
             cm[i] = 255 - self.rgb_transfer[1].0[255 - i]; // M ← invert_complement(G)
             cy[i] = 255 - self.rgb_transfer[2].0[255 - i]; // Y ← invert_complement(B)
-            ck[i] = 255 - self.gray_transfer.0[255 - i];   // K ← invert_complement(gray)
+            ck[i] = 255 - self.gray_transfer.0[255 - i]; // K ← invert_complement(gray)
         }
         self.cmyk_transfer = [
             TransferLut(cc),
@@ -492,7 +492,9 @@ impl TransferSet<'_> {
                         let mut i = 0u8;
                         loop {
                             t[ch][i as usize] = i;
-                            if i == 255 { break; }
+                            if i == 255 {
+                                break;
+                            }
                             i += 1;
                         }
                         ch += 1;
@@ -551,7 +553,9 @@ impl StateStack {
     #[must_use]
     pub fn current(&self) -> &GraphicsState {
         // SAFETY: stack invariant guarantees len >= 1; .last() cannot be None.
-        self.stack.last().expect("StateStack invariant violated: stack is empty")
+        self.stack
+            .last()
+            .expect("StateStack invariant violated: stack is empty")
     }
 
     /// Mutably borrow the current state.
@@ -562,7 +566,9 @@ impl StateStack {
     /// one entry at all times.  The `expect` is a development-time tripwire.
     pub fn current_mut(&mut self) -> &mut GraphicsState {
         // SAFETY: stack invariant guarantees len >= 1; .last_mut() cannot be None.
-        self.stack.last_mut().expect("StateStack invariant violated: stack is empty")
+        self.stack
+            .last_mut()
+            .expect("StateStack invariant violated: stack is empty")
     }
 
     /// Push a clone of the current state (PDF `q` operator).
@@ -573,7 +579,11 @@ impl StateStack {
     /// one entry at all times.  The `expect` is a development-time tripwire.
     pub fn save(&mut self) {
         // SAFETY: stack invariant guarantees len >= 1; .last() cannot be None.
-        let cloned = self.stack.last().expect("StateStack invariant violated: stack is empty").save_clone();
+        let cloned = self
+            .stack
+            .last()
+            .expect("StateStack invariant violated: stack is empty")
+            .save_clone();
         self.stack.push(cloned);
     }
 

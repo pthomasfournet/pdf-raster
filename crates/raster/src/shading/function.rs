@@ -33,7 +33,9 @@ impl FunctionPattern {
     where
         F: Fn(f64, f64) -> [u8; 3] + Send + Sync + 'static,
     {
-        Self { func: Box::new(func) }
+        Self {
+            func: Box::new(func),
+        }
     }
 }
 
@@ -43,7 +45,7 @@ impl Pattern for FunctionPattern {
         let mut off = 0usize;
         for x in x0..=x1 {
             let rgb = (self.func)(f64::from(x), f64::from(y));
-            out[off]     = rgb[0];
+            out[off] = rgb[0];
             out[off + 1] = rgb[1];
             out[off + 2] = rgb[2];
             off += 3;
@@ -70,7 +72,7 @@ mod tests {
         p.fill_span(0, 10, 13, &mut out);
         for i in 0..4usize {
             let expected = (10 + i) as u8;
-            assert_eq!(out[i * 3],     expected, "pixel {i} R");
+            assert_eq!(out[i * 3], expected, "pixel {i} R");
             assert_eq!(out[i * 3 + 1], expected, "pixel {i} G");
             assert_eq!(out[i * 3 + 2], expected, "pixel {i} B");
         }
@@ -82,9 +84,9 @@ mod tests {
         let mut out = vec![0u8; 3 * 3];
         p.fill_span(5, 0, 2, &mut out);
         for i in 0..3usize {
-            assert_eq!(out[i * 3],     128, "pixel {i} R");
-            assert_eq!(out[i * 3 + 1], 64,  "pixel {i} G");
-            assert_eq!(out[i * 3 + 2], 32,  "pixel {i} B");
+            assert_eq!(out[i * 3], 128, "pixel {i} R");
+            assert_eq!(out[i * 3 + 1], 64, "pixel {i} G");
+            assert_eq!(out[i * 3 + 2], 32, "pixel {i} B");
         }
     }
 

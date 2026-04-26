@@ -29,7 +29,10 @@ pub(crate) fn render_span_simple<P: Pixel>(
     debug_assert_eq!(pipe.blend_mode, BlendMode::Normal);
     debug_assert_eq!(pipe.a_input, 255);
 
-    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0"
+    )]
     let count = (x1 - x0 + 1) as usize;
     let ncomps = P::BYTES;
 
@@ -38,7 +41,10 @@ pub(crate) fn render_span_simple<P: Pixel>(
             debug_assert_eq!(color.len(), ncomps, "solid color length must match ncomps");
             // Apply transfer to the source colour once, then fill.
             let mut applied = [0u8; 8]; // DeviceN8 is the largest: 8 bytes.
-            debug_assert!(ncomps <= 8, "ncomps {ncomps} > 8; only modes up to DeviceN8 supported");
+            debug_assert!(
+                ncomps <= 8,
+                "ncomps {ncomps} > 8; only modes up to DeviceN8 supported"
+            );
             apply_transfer_to_color(pipe, color, &mut applied[..ncomps]);
             let applied = &applied[..ncomps];
 
@@ -126,7 +132,12 @@ fn apply_transfer_in_place(pipe: &PipeState<'_>, pixel: &mut [u8]) {
 /// For overprinting: restore destination bytes for channels whose bit in
 /// `overprint_mask` is 0.  For additive overprint, the caller must handle
 /// the accumulation before calling this function.
-fn apply_overprint_simple(pipe: &PipeState<'_>, dst_pixels: &mut [u8], ncomps: usize, count: usize) {
+fn apply_overprint_simple(
+    pipe: &PipeState<'_>,
+    dst_pixels: &mut [u8],
+    ncomps: usize,
+    count: usize,
+) {
     // This function is only called when overprint_mask != 0xFFFF_FFFF, meaning some
     // channels should NOT be painted.  But since we already wrote to dst_pixels, we
     // need to restore the channels that should be left untouched.
@@ -199,7 +210,13 @@ mod tests {
         static ID: [u8; 256] = {
             let mut a = [0u8; 256];
             let mut i = 0u8;
-            loop { a[i as usize] = i; if i == 255 { break; } i += 1; }
+            loop {
+                a[i as usize] = i;
+                if i == 255 {
+                    break;
+                }
+                i += 1;
+            }
             a
         };
         static DN: [[u8; 256]; 8] = {
@@ -207,7 +224,13 @@ mod tests {
             let mut ch = 0;
             while ch < 8 {
                 let mut i = 0u8;
-                loop { t[ch][i as usize] = i; if i == 255 { break; } i += 1; }
+                loop {
+                    t[ch][i as usize] = i;
+                    if i == 255 {
+                        break;
+                    }
+                    i += 1;
+                }
                 ch += 1;
             }
             t

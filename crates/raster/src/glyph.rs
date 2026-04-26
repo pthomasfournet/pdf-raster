@@ -41,11 +41,15 @@ impl GlyphBitmap<'_> {
         let w = self.w.max(0);
         if self.aa {
             #[expect(clippy::cast_sign_loss, reason = "w = self.w.max(0) is non-negative")]
-            { w as usize }
+            {
+                w as usize
+            }
         } else {
             // w = self.w.max(0) ≥ 0, so (w+7)/8 ≥ 0 — cast to usize is safe.
             #[expect(clippy::cast_sign_loss, reason = "w = self.w.max(0) is non-negative")]
-            { ((w + 7) / 8) as usize }
+            {
+                ((w + 7) / 8) as usize
+            }
         }
     }
 }
@@ -61,7 +65,10 @@ impl GlyphBitmap<'_> {
 /// # C++ equivalent
 ///
 /// Matches `Splash::fillGlyph2` with `noClip = clip_all_inside`.
-#[expect(clippy::too_many_arguments, reason = "mirrors Splash::fillGlyph2 API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors Splash::fillGlyph2 API; all params necessary"
+)]
 pub fn blit_glyph<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -77,9 +84,15 @@ pub fn blit_glyph<P: Pixel>(
     let y_start_raw = pen_y - glyph.y;
 
     // Clamp to bitmap bounds.
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims ≤ i32::MAX in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims ≤ i32::MAX in practice"
+    )]
     let bmp_w = bitmap.width as i32;
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap dims ≤ i32::MAX in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap dims ≤ i32::MAX in practice"
+    )]
     let bmp_h = bitmap.height as i32;
 
     let x_clip = x_start_raw.max(0);
@@ -92,9 +105,15 @@ pub fn blit_glyph<P: Pixel>(
     }
 
     // All four differences are non-negative because of the checks above.
-    #[expect(clippy::cast_sign_loss, reason = "x_clip ≥ x_start_raw.max(0) so difference ≥ 0")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x_clip ≥ x_start_raw.max(0) so difference ≥ 0"
+    )]
     let x_data_skip = (x_clip - x_start_raw) as usize;
-    #[expect(clippy::cast_sign_loss, reason = "y_clip ≥ y_start_raw.max(0) so difference ≥ 0")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "y_clip ≥ y_start_raw.max(0) so difference ≥ 0"
+    )]
     let y_data_skip = (y_clip - y_start_raw) as usize;
     #[expect(clippy::cast_sign_loss, reason = "x_end > x_clip by guard above")]
     let xx_limit = (x_end - x_clip) as usize;
@@ -104,21 +123,44 @@ pub fn blit_glyph<P: Pixel>(
 
     if glyph.aa {
         blit_aa::<P>(
-            bitmap, clip, clip_all_inside, pipe, src,
-            glyph, x_clip, y_clip, x_data_skip, y_data_skip,
-            xx_limit, yy_limit, row_bytes,
+            bitmap,
+            clip,
+            clip_all_inside,
+            pipe,
+            src,
+            glyph,
+            x_clip,
+            y_clip,
+            x_data_skip,
+            y_data_skip,
+            xx_limit,
+            yy_limit,
+            row_bytes,
         );
     } else {
         blit_mono::<P>(
-            bitmap, clip, clip_all_inside, pipe, src,
-            glyph, x_clip, y_clip, x_data_skip, y_data_skip,
-            xx_limit, yy_limit, row_bytes,
+            bitmap,
+            clip,
+            clip_all_inside,
+            pipe,
+            src,
+            glyph,
+            x_clip,
+            y_clip,
+            x_data_skip,
+            y_data_skip,
+            xx_limit,
+            yy_limit,
+            row_bytes,
         );
     }
 }
 
 /// Blit an AA (per-byte coverage) glyph.
-#[expect(clippy::too_many_arguments, reason = "internal helper; all params necessary for this blit path")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper; all params necessary for this blit path"
+)]
 fn blit_aa<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -137,7 +179,10 @@ fn blit_aa<P: Pixel>(
     let data = glyph.data;
 
     for yy in 0..yy_limit {
-        #[expect(clippy::cast_possible_truncation, reason = "yy < yy_limit ≤ bitmap.height ≤ i32::MAX")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "yy < yy_limit ≤ bitmap.height ≤ i32::MAX"
+        )]
         #[expect(clippy::cast_possible_wrap, reason = "yy < bitmap.height ≤ i32::MAX")]
         let y = y_start + yy as i32;
         let row_off = (y_data_skip + yy) * row_bytes + x_data_skip;
@@ -146,7 +191,10 @@ fn blit_aa<P: Pixel>(
         let mut run_shape: Vec<u8> = Vec::new();
 
         for xx in 0..xx_limit {
-            #[expect(clippy::cast_possible_truncation, reason = "xx < xx_limit ≤ bitmap.width ≤ i32::MAX")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "xx < xx_limit ≤ bitmap.width ≤ i32::MAX"
+            )]
             #[expect(clippy::cast_possible_wrap, reason = "xx < bitmap.width ≤ i32::MAX")]
             let x = x_start + xx as i32;
             let data_idx = row_off + xx;
@@ -170,7 +218,10 @@ fn blit_aa<P: Pixel>(
 }
 
 /// Blit a mono (1-bit packed) glyph.
-#[expect(clippy::too_many_arguments, reason = "internal helper; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper; all params necessary"
+)]
 fn blit_mono<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -190,7 +241,10 @@ fn blit_mono<P: Pixel>(
     let data = glyph.data;
 
     for yy in 0..yy_limit {
-        #[expect(clippy::cast_possible_truncation, reason = "yy < yy_limit ≤ bitmap.height ≤ i32::MAX")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "yy < yy_limit ≤ bitmap.height ≤ i32::MAX"
+        )]
         #[expect(clippy::cast_possible_wrap, reason = "yy < bitmap.height ≤ i32::MAX")]
         let y = y_start + yy as i32;
         let row_off = (y_data_skip + yy) * row_bytes + x_data_skip / 8;
@@ -206,15 +260,23 @@ fn blit_mono<P: Pixel>(
                 let lo = data.get(byte_idx).copied().unwrap_or(0);
                 let hi = data.get(byte_idx + 1).copied().unwrap_or(0);
                 #[expect(clippy::cast_possible_truncation, reason = "shift result fits in u8")]
-                { (u16::from(lo) << x_shift | u16::from(hi) >> (8 - x_shift)) as u8 }
+                {
+                    (u16::from(lo) << x_shift | u16::from(hi) >> (8 - x_shift)) as u8
+                }
             } else {
                 data.get(byte_idx).copied().unwrap_or(0)
             };
 
             let bits_this_byte = (xx_limit - xx).min(8);
             for bit in 0..bits_this_byte {
-                #[expect(clippy::cast_possible_truncation, reason = "xx + bit < xx_limit ≤ bitmap.width ≤ i32::MAX")]
-                #[expect(clippy::cast_possible_wrap, reason = "xx + bit < bitmap.width ≤ i32::MAX")]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "xx + bit < xx_limit ≤ bitmap.width ≤ i32::MAX"
+                )]
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "xx + bit < bitmap.width ≤ i32::MAX"
+                )]
                 let x = x_start + (xx + bit) as i32;
                 let set = (alpha0 >> (7 - bit)) & 1 != 0;
                 let inside_clip = clip_all_inside || clip.test(x, y);
@@ -231,8 +293,14 @@ fn blit_mono<P: Pixel>(
             xx += bits_this_byte;
         }
         if let Some(rs) = run_start.take() {
-            #[expect(clippy::cast_possible_truncation, reason = "xx_limit ≤ bitmap.width ≤ i32::MAX")]
-            #[expect(clippy::cast_possible_wrap, reason = "xx_limit < bitmap.width ≤ i32::MAX")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "xx_limit ≤ bitmap.width ≤ i32::MAX"
+            )]
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "xx_limit < bitmap.width ≤ i32::MAX"
+            )]
             let rx1 = x_start + xx_limit as i32 - 1;
             emit_solid_run::<P>(bitmap, pipe, src, rs, rx1, y);
         }
@@ -250,8 +318,14 @@ fn emit_aa_run<P: Pixel>(
 ) {
     debug_assert!(!shape.is_empty());
     // shape.len() ≤ bitmap.width ≤ i32::MAX in practice.
-    #[expect(clippy::cast_possible_truncation, reason = "shape.len() ≤ bitmap.width ≤ i32::MAX")]
-    #[expect(clippy::cast_possible_wrap, reason = "shape.len() ≤ bitmap.width ≤ i32::MAX")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "shape.len() ≤ bitmap.width ≤ i32::MAX"
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "shape.len() ≤ bitmap.width ≤ i32::MAX"
+    )]
     let x1 = x0 + shape.len() as i32 - 1;
     #[expect(clippy::cast_sign_loss, reason = "y ≥ 0 by construction")]
     let y_u = y as u32;
@@ -316,8 +390,14 @@ pub fn fill_glyph<P: Pixel>(
     let clip_res = clip.test_rect(x0, y0, x1, y1);
     if clip_res != ClipResult::AllOutside {
         blit_glyph::<P>(
-            bitmap, clip, clip_res == ClipResult::AllInside,
-            pipe, src, pen_x, pen_y, glyph,
+            bitmap,
+            clip,
+            clip_res == ClipResult::AllInside,
+            pipe,
+            src,
+            pen_x,
+            pen_y,
+            glyph,
         );
     }
     clip_res
@@ -362,7 +442,14 @@ mod tests {
 
         // 4×4 AA glyph with full coverage (255) everywhere.
         let data = vec![255u8; 16];
-        let glyph = GlyphBitmap { data: &data, x: 0, y: 0, w: 4, h: 4, aa: true };
+        let glyph = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            aa: true,
+        };
 
         blit_glyph::<Rgb8>(&mut bmp, &clip, true, &pipe, &src, 2, 2, &glyph);
 
@@ -385,7 +472,14 @@ mod tests {
         let src = PipeSrc::Solid(&color);
 
         let data = vec![0u8; 4];
-        let glyph = GlyphBitmap { data: &data, x: 0, y: 0, w: 2, h: 2, aa: true };
+        let glyph = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+            aa: true,
+        };
 
         blit_glyph::<Rgb8>(&mut bmp, &clip, true, &pipe, &src, 0, 0, &glyph);
 
@@ -407,7 +501,14 @@ mod tests {
 
         // 8×2 mono glyph: row 0 all-set (0xFF), row 1 all-clear (0x00).
         let data = [0xFFu8, 0x00u8];
-        let glyph = GlyphBitmap { data: &data, x: 0, y: 0, w: 8, h: 2, aa: false };
+        let glyph = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 2,
+            aa: false,
+        };
 
         blit_glyph::<Rgb8>(&mut bmp, &clip, true, &pipe, &src, 0, 0, &glyph);
 
@@ -430,7 +531,14 @@ mod tests {
         let src = PipeSrc::Solid(&color);
 
         let data = vec![255u8; 16];
-        let glyph = GlyphBitmap { data: &data, x: 0, y: 0, w: 4, h: 4, aa: true };
+        let glyph = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            aa: true,
+        };
 
         blit_glyph::<Rgb8>(&mut bmp, &clip, false, &pipe, &src, 0, 0, &glyph);
 
@@ -448,7 +556,14 @@ mod tests {
         let src = PipeSrc::Solid(&color);
 
         let data = vec![128u8; 4];
-        let glyph = GlyphBitmap { data: &data, x: 0, y: 0, w: 2, h: 2, aa: true };
+        let glyph = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+            aa: true,
+        };
 
         let res = fill_glyph::<Rgb8>(&mut bmp, &clip, &pipe, &src, 1, 1, &glyph);
         assert_eq!(res, ClipResult::AllInside);
@@ -457,16 +572,37 @@ mod tests {
     #[test]
     fn glyph_row_bytes_aa() {
         let data = [];
-        let g = GlyphBitmap { data: &data, x: 0, y: 0, w: 7, h: 1, aa: true };
+        let g = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 7,
+            h: 1,
+            aa: true,
+        };
         assert_eq!(g.row_bytes(), 7);
     }
 
     #[test]
     fn glyph_row_bytes_mono() {
         let data = [];
-        let g = GlyphBitmap { data: &data, x: 0, y: 0, w: 7, h: 1, aa: false };
+        let g = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 7,
+            h: 1,
+            aa: false,
+        };
         assert_eq!(g.row_bytes(), 1); // ceil(7/8) = 1
-        let g9 = GlyphBitmap { data: &data, x: 0, y: 0, w: 9, h: 1, aa: false };
+        let g9 = GlyphBitmap {
+            data: &data,
+            x: 0,
+            y: 0,
+            w: 9,
+            h: 1,
+            aa: false,
+        };
         assert_eq!(g9.row_bytes(), 2); // ceil(9/8) = 2
     }
 }

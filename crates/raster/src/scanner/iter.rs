@@ -199,8 +199,16 @@ mod tests {
         // Emit (0, 7). One span total.
         use crate::scanner::Intersect;
         let row = vec![
-            Intersect { x0: 0, x1: 3, count: -1 },
-            Intersect { x0: 4, x1: 7, count: 1 },
+            Intersect {
+                x0: 0,
+                x1: 3,
+                count: -1,
+            },
+            Intersect {
+                x0: 4,
+                x1: 7,
+                count: 1,
+            },
         ];
         let scanner_stub = XPathScanner {
             eo: false,
@@ -228,10 +236,26 @@ mod tests {
         //   Consume [11,13,+1]: x1=max(10,13)=13, count=0. Outside. Emit (8,13).
         use crate::scanner::Intersect;
         let row = vec![
-            Intersect { x0: 0,  x1: 2,  count: -1 },
-            Intersect { x0: 3,  x1: 5,  count:  1 },
-            Intersect { x0: 8,  x1: 10, count: -1 },
-            Intersect { x0: 11, x1: 13, count:  1 },
+            Intersect {
+                x0: 0,
+                x1: 2,
+                count: -1,
+            },
+            Intersect {
+                x0: 3,
+                x1: 5,
+                count: 1,
+            },
+            Intersect {
+                x0: 8,
+                x1: 10,
+                count: -1,
+            },
+            Intersect {
+                x0: 11,
+                x1: 13,
+                count: 1,
+            },
         ];
         let scanner_stub = XPathScanner {
             eo: false,
@@ -258,10 +282,26 @@ mod tests {
         // [11,13,1]: count 3→4 (even=outside), x1=max(10,13)=13. Emit (8,13).
         use crate::scanner::Intersect;
         let row = vec![
-            Intersect { x0: 0,  x1: 2,  count: 1 },
-            Intersect { x0: 3,  x1: 5,  count: 1 },
-            Intersect { x0: 8,  x1: 10, count: 1 },
-            Intersect { x0: 11, x1: 13, count: 1 },
+            Intersect {
+                x0: 0,
+                x1: 2,
+                count: 1,
+            },
+            Intersect {
+                x0: 3,
+                x1: 5,
+                count: 1,
+            },
+            Intersect {
+                x0: 8,
+                x1: 10,
+                count: 1,
+            },
+            Intersect {
+                x0: 11,
+                x1: 13,
+                count: 1,
+            },
         ];
         let scanner_stub = XPathScanner {
             eo: true,
@@ -282,7 +322,11 @@ mod tests {
         // row has one entry [{5,7,+1}]. count should go to 0 after consuming it.
         // We test this by directly manipulating iterator state.
         use crate::scanner::Intersect;
-        let row = vec![Intersect { x0: 5, x1: 7, count: 1 }];
+        let row = vec![Intersect {
+            x0: 5,
+            x1: 7,
+            count: 1,
+        }];
         let scanner_stub = XPathScanner {
             eo: false,
             x_min: 5,

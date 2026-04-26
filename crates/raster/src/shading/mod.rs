@@ -45,7 +45,10 @@ pub(super) fn lerp_color(a: [u8; 3], b: [u8; 3], frac: u32, out: &mut [u8]) {
 /// shape; `pattern` supplies per-pixel colour via the [`Pattern`] trait.
 /// `eo` selects even-odd vs. non-zero winding rule.
 /// The caller sets `pipe.a_input` to control fill/stroke opacity.
-#[expect(clippy::too_many_arguments, reason = "mirrors shadedFill signature: bitmap+clip+path+pipe+pattern+matrix+flatness+aa+eo")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors shadedFill signature: bitmap+clip+path+pipe+pattern+matrix+flatness+aa+eo"
+)]
 pub fn shaded_fill<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -59,9 +62,27 @@ pub fn shaded_fill<P: Pixel>(
 ) {
     let src = PipeSrc::Pattern(pattern);
     if eo {
-        fill::eo_fill::<P>(bitmap, clip, path, pipe, &src, matrix, flatness, vector_antialias);
+        fill::eo_fill::<P>(
+            bitmap,
+            clip,
+            path,
+            pipe,
+            &src,
+            matrix,
+            flatness,
+            vector_antialias,
+        );
     } else {
-        fill::fill::<P>(bitmap, clip, path, pipe, &src, matrix, flatness, vector_antialias);
+        fill::fill::<P>(
+            bitmap,
+            clip,
+            path,
+            pipe,
+            &src,
+            matrix,
+            flatness,
+            vector_antialias,
+        );
     }
 }
 
@@ -117,19 +138,30 @@ mod tests {
         let pattern = AxialPattern::new(
             [0u8, 0, 0],
             [255u8, 255, 255],
-            1.0, 3.5,
-            6.0, 3.5,
-            0.0, 1.0,
-            false, false,
+            1.0,
+            3.5,
+            6.0,
+            3.5,
+            0.0,
+            1.0,
+            false,
+            false,
         );
 
         shaded_fill::<Rgb8>(
-            &mut bmp, &clip, &path, &pipe, &pattern,
-            &identity_matrix(), 1.0, false, false,
+            &mut bmp,
+            &clip,
+            &path,
+            &pipe,
+            &pattern,
+            &identity_matrix(),
+            1.0,
+            false,
+            false,
         );
 
         let r3 = bmp.row(3);
-        assert!(r3[1].r < 60,  "x=1 should be near-black (got {})", r3[1].r);
+        assert!(r3[1].r < 60, "x=1 should be near-black (got {})", r3[1].r);
         assert!(r3[5].r > 180, "x=5 should be near-white (got {})", r3[5].r);
     }
 
@@ -142,16 +174,44 @@ mod tests {
         let pipe = simple_pipe();
         let path = rect_path(1.0, 1.0, 6.0, 6.0);
         let pattern = AxialPattern::new(
-            [200u8, 0, 0], [200u8, 0, 0],
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 1.0, true, true,
+            [200u8, 0, 0],
+            [200u8, 0, 0],
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            true,
+            true,
         );
-        shaded_fill::<Rgb8>(&mut bmp_nz, &clip, &path, &pipe, &pattern,
-            &identity_matrix(), 1.0, false, false);
-        shaded_fill::<Rgb8>(&mut bmp_eo, &clip, &path, &pipe, &pattern,
-            &identity_matrix(), 1.0, false, true);
-        assert_eq!(bmp_nz.row(3)[3].r, bmp_eo.row(3)[3].r,
-            "non-zero and eo must agree for a simple convex path");
+        shaded_fill::<Rgb8>(
+            &mut bmp_nz,
+            &clip,
+            &path,
+            &pipe,
+            &pattern,
+            &identity_matrix(),
+            1.0,
+            false,
+            false,
+        );
+        shaded_fill::<Rgb8>(
+            &mut bmp_eo,
+            &clip,
+            &path,
+            &pipe,
+            &pattern,
+            &identity_matrix(),
+            1.0,
+            false,
+            true,
+        );
+        assert_eq!(
+            bmp_nz.row(3)[3].r,
+            bmp_eo.row(3)[3].r,
+            "non-zero and eo must agree for a simple convex path"
+        );
     }
 
     #[test]
@@ -161,12 +221,28 @@ mod tests {
         let pipe = simple_pipe();
         let path = PathBuilder::new().build();
         let pattern = AxialPattern::new(
-            [255u8, 0, 0], [0u8, 255, 0],
-            0.0, 0.0, 8.0, 0.0,
-            0.0, 1.0, false, false,
+            [255u8, 0, 0],
+            [0u8, 255, 0],
+            0.0,
+            0.0,
+            8.0,
+            0.0,
+            0.0,
+            1.0,
+            false,
+            false,
         );
-        shaded_fill::<Rgb8>(&mut bmp, &clip, &path, &pipe, &pattern,
-            &identity_matrix(), 1.0, false, false);
+        shaded_fill::<Rgb8>(
+            &mut bmp,
+            &clip,
+            &path,
+            &pipe,
+            &pattern,
+            &identity_matrix(),
+            1.0,
+            false,
+            false,
+        );
         assert_eq!(bmp.row(4)[4].r, 0, "empty path must not paint");
     }
 }

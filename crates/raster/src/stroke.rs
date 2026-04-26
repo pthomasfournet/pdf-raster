@@ -112,9 +112,7 @@ pub fn stroke<P: Pixel>(
     if params.line_width == 0.0 {
         stroke_narrow::<P>(bitmap, clip, &path2, pipe, src, matrix, params.flatness);
     } else {
-        stroke_wide::<P>(
-            bitmap, clip, &path2, pipe, src, matrix, params,
-        );
+        stroke_wide::<P>(bitmap, clip, &path2, pipe, src, matrix, params);
     }
 }
 
@@ -204,7 +202,10 @@ pub fn stroke_narrow<P: Pixel>(
 /// Draw a span (possibly a single pixel), clamped to the bitmap and clipped.
 ///
 /// Used by [`stroke_narrow`] to draw each hairline pixel-run.
-#[expect(clippy::too_many_arguments, reason = "all parameters are required; splitting would add indirection")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are required; splitting would add indirection"
+)]
 fn draw_narrow_span<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -223,7 +224,10 @@ fn draw_narrow_span<P: Pixel>(
         return;
     }
     // Clamp x to bitmap.
-    #[expect(clippy::cast_possible_wrap, reason = "bitmap width fits in i32 in practice")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bitmap width fits in i32 in practice"
+    )]
     let width_i = bitmap.width as i32;
 
     let (sx0, sx1) = if clip_res == ClipResult::AllInside {
@@ -383,8 +387,14 @@ pub fn flatten_path(path: &Path, _matrix: &[f64; 6], flatness: f64) -> Path {
 /// coincident, a degenerate (zero-length) subpath is emitted to allow end-caps
 /// to be drawn, matching Acrobat behaviour.
 #[must_use]
-#[expect(clippy::suboptimal_flops, reason = "a + b*c expressions match the C++ source; mul_add would obscure the 1:1 correspondence")]
-#[expect(clippy::while_float, reason = "direct port of Splash::makeDashedPath; seg_len is decremented toward 0 each iteration")]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "a + b*c expressions match the C++ source; mul_add would obscure the 1:1 correspondence"
+)]
+#[expect(
+    clippy::while_float,
+    reason = "direct port of Splash::makeDashedPath; seg_len is decremented toward 0 each iteration"
+)]
 pub fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) -> Path {
     // Sum the dash array.
     let line_dash_total: f64 = line_dash.iter().sum();
@@ -514,9 +524,18 @@ pub fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) ->
 ///
 /// Stroke-adjust hints are emitted when `params.stroke_adjust` is `true`.
 #[must_use]
-#[expect(clippy::too_many_lines, reason = "direct port of Splash::makeStrokePath; splitting would obscure the 1:1 correspondence")]
-#[expect(clippy::similar_names, reason = "geometry variables dx/dy/wdx/wdy share a common prefix by convention; renaming harms readability")]
-#[expect(clippy::suboptimal_flops, reason = "a + b*c expressions match the C++ source exactly; mul_add would obscure the 1:1 correspondence")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "direct port of Splash::makeStrokePath; splitting would obscure the 1:1 correspondence"
+)]
+#[expect(
+    clippy::similar_names,
+    reason = "geometry variables dx/dy/wdx/wdy share a common prefix by convention; renaming harms readability"
+)]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "a + b*c expressions match the C++ source exactly; mul_add would obscure the 1:1 correspondence"
+)]
 pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path {
     if path.pts.is_empty() {
         return Path::new();
@@ -585,18 +604,17 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
         let last = path.flags[j1].is_last();
 
         // k0: the start of the segment *after* (j1, next), used for join computation.
-        let k0 = if last {
-            subpath_start1 + 1
-        } else {
-            j1 + 1
-        };
+        let k0 = if last { subpath_start1 + 1 } else { j1 + 1 };
         let _k1 = advance_past_coincident(path, k0);
 
         // ── Compute the unit tangent for segment (i1 → j0) ───────────────────
-        let d = 1.0 / splash_dist(
-            path.pts[i1].x, path.pts[i1].y,
-            path.pts[j0].x, path.pts[j0].y,
-        );
+        let d = 1.0
+            / splash_dist(
+                path.pts[i1].x,
+                path.pts[i1].y,
+                path.pts[j0].x,
+                path.pts[j0].y,
+            );
         let dx = d * (path.pts[j0].x - path.pts[i1].x);
         let dy = d * (path.pts[j0].y - path.pts[i1].y);
         let wdx = 0.5 * w * dx;
@@ -604,7 +622,10 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
 
         // ── Draw the start cap ────────────────────────────────────────────────
         // moveTo left side of segment start.
-        if out.move_to(path.pts[i0].x - wdy, path.pts[i0].y + wdx).is_err() {
+        if out
+            .move_to(path.pts[i0].x - wdy, path.pts[i0].y + wdx)
+            .is_err()
+        {
             break;
         }
         if i0 == subpath_start0 {
@@ -636,14 +657,8 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                     );
                 }
                 LineCap::Projecting => {
-                    let _ = out.line_to(
-                        path.pts[i0].x - wdx - wdy,
-                        path.pts[i0].y + wdx - wdy,
-                    );
-                    let _ = out.line_to(
-                        path.pts[i0].x - wdx + wdy,
-                        path.pts[i0].y - wdx - wdy,
-                    );
+                    let _ = out.line_to(path.pts[i0].x - wdx - wdy, path.pts[i0].y + wdx - wdy);
+                    let _ = out.line_to(path.pts[i0].x - wdx + wdy, path.pts[i0].y - wdx - wdy);
                     let _ = out.line_to(path.pts[i0].x + wdy, path.pts[i0].y - wdx);
                 }
             }
@@ -681,14 +696,8 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                     );
                 }
                 LineCap::Projecting => {
-                    let _ = out.line_to(
-                        path.pts[j0].x + wdy + wdx,
-                        path.pts[j0].y - wdx + wdy,
-                    );
-                    let _ = out.line_to(
-                        path.pts[j0].x - wdy + wdx,
-                        path.pts[j0].y + wdx + wdy,
-                    );
+                    let _ = out.line_to(path.pts[j0].x + wdy + wdx, path.pts[j0].y - wdx + wdy);
+                    let _ = out.line_to(path.pts[j0].x - wdy + wdx, path.pts[j0].y + wdx + wdy);
                     let _ = out.line_to(path.pts[j0].x - wdy, path.pts[j0].y + wdx);
                 }
             }
@@ -704,10 +713,13 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
         let join2 = out.pts_len();
         if !last || closed {
             // Compute tangent for the *next* segment (j1 → k0).
-            let dn = 1.0 / splash_dist(
-                path.pts[j1].x, path.pts[j1].y,
-                path.pts[k0].x, path.pts[k0].y,
-            );
+            let dn = 1.0
+                / splash_dist(
+                    path.pts[j1].x,
+                    path.pts[j1].y,
+                    path.pts[k0].x,
+                    path.pts[k0].y,
+                );
             let dx_next = dn * (path.pts[k0].x - path.pts[j1].x);
             let dy_next = dn * (path.pts[k0].y - path.pts[j1].y);
             let wdx_next = 0.5 * w * dx_next;
@@ -733,7 +745,11 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                     // Join angle < 180° (inside corner on the left).
                     let angle = f64::atan2(dx, -dy);
                     let angle_next = f64::atan2(dx_next, -dy_next);
-                    let angle = if angle < angle_next { angle + 2.0 * PI } else { angle };
+                    let angle = if angle < angle_next {
+                        angle + 2.0 * PI
+                    } else {
+                        angle
+                    };
                     let d_angle = (angle - angle_next) / PI;
 
                     if d_angle < 0.501 {
@@ -745,15 +761,24 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                         let cy2 = path.pts[j0].y + wdx_next - kappa * dy_next;
                         let _ = out.move_to(path.pts[j0].x, path.pts[j0].y);
                         let _ = out.line_to(path.pts[j0].x - wdy_next, path.pts[j0].y + wdx_next);
-                        let _ = out.curve_to(cx2, cy2, cx1, cy1, path.pts[j0].x - wdy, path.pts[j0].y + wdx);
+                        let _ = out.curve_to(
+                            cx2,
+                            cy2,
+                            cx1,
+                            cy1,
+                            path.pts[j0].x - wdy,
+                            path.pts[j0].y + wdx,
+                        );
                     } else {
                         // Two arcs (> 90°).
                         let d_join = splash_dist(-wdy, wdx, -wdy_next, wdx_next);
                         if d_join > 0.0 {
                             let dx_join = (-wdy_next + wdy) / d_join;
                             let dy_join = (wdx_next - wdx) / d_join;
-                            let xc = path.pts[j0].x + 0.5 * w * f64::cos(0.5 * (angle + angle_next));
-                            let yc = path.pts[j0].y + 0.5 * w * f64::sin(0.5 * (angle + angle_next));
+                            let xc =
+                                path.pts[j0].x + 0.5 * w * f64::cos(0.5 * (angle + angle_next));
+                            let yc =
+                                path.pts[j0].y + 0.5 * w * f64::sin(0.5 * (angle + angle_next));
                             let kappa = d_angle * BEZIER_CIRCLE2 * w;
                             let cx1 = path.pts[j0].x - wdy + kappa * dx;
                             let cy1 = path.pts[j0].y + wdx + kappa * dy;
@@ -764,16 +789,28 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                             let cx4 = path.pts[j0].x - wdy_next - kappa * dx_next;
                             let cy4 = path.pts[j0].y + wdx_next - kappa * dy_next;
                             let _ = out.move_to(path.pts[j0].x, path.pts[j0].y);
-                            let _ = out.line_to(path.pts[j0].x - wdy_next, path.pts[j0].y + wdx_next);
+                            let _ =
+                                out.line_to(path.pts[j0].x - wdy_next, path.pts[j0].y + wdx_next);
                             let _ = out.curve_to(cx4, cy4, cx3, cy3, xc, yc);
-                            let _ = out.curve_to(cx2, cy2, cx1, cy1, path.pts[j0].x - wdy, path.pts[j0].y + wdx);
+                            let _ = out.curve_to(
+                                cx2,
+                                cy2,
+                                cx1,
+                                cy1,
+                                path.pts[j0].x - wdy,
+                                path.pts[j0].y + wdx,
+                            );
                         }
                     }
                 } else {
                     // Join angle ≥ 180° (inside corner on the right).
                     let angle = f64::atan2(-dx, dy);
                     let angle_next = f64::atan2(-dx_next, dy_next);
-                    let angle_next = if angle_next < angle { angle_next + 2.0 * PI } else { angle_next };
+                    let angle_next = if angle_next < angle {
+                        angle_next + 2.0 * PI
+                    } else {
+                        angle_next
+                    };
                     let d_angle = (angle_next - angle) / PI;
 
                     if d_angle < 0.501 {
@@ -785,15 +822,24 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                         let cy2 = path.pts[j0].y - wdx_next - kappa * dy_next;
                         let _ = out.move_to(path.pts[j0].x, path.pts[j0].y);
                         let _ = out.line_to(path.pts[j0].x + wdy, path.pts[j0].y - wdx);
-                        let _ = out.curve_to(cx1, cy1, cx2, cy2, path.pts[j0].x + wdy_next, path.pts[j0].y - wdx_next);
+                        let _ = out.curve_to(
+                            cx1,
+                            cy1,
+                            cx2,
+                            cy2,
+                            path.pts[j0].x + wdy_next,
+                            path.pts[j0].y - wdx_next,
+                        );
                     } else {
                         // Two arcs.
                         let d_join = splash_dist(wdy, -wdx, wdy_next, -wdx_next);
                         if d_join > 0.0 {
                             let dx_join = (wdy_next - wdy) / d_join;
                             let dy_join = (-wdx_next + wdx) / d_join;
-                            let xc = path.pts[j0].x + 0.5 * w * f64::cos(0.5 * (angle + angle_next));
-                            let yc = path.pts[j0].y + 0.5 * w * f64::sin(0.5 * (angle + angle_next));
+                            let xc =
+                                path.pts[j0].x + 0.5 * w * f64::cos(0.5 * (angle + angle_next));
+                            let yc =
+                                path.pts[j0].y + 0.5 * w * f64::sin(0.5 * (angle + angle_next));
                             let kappa = d_angle * BEZIER_CIRCLE2 * w;
                             let cx1 = path.pts[j0].x + wdy + kappa * dx;
                             let cy1 = path.pts[j0].y - wdx + kappa * dy;
@@ -806,7 +852,14 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                             let _ = out.move_to(path.pts[j0].x, path.pts[j0].y);
                             let _ = out.line_to(path.pts[j0].x + wdy, path.pts[j0].y - wdx);
                             let _ = out.curve_to(cx1, cy1, cx2, cy2, xc, yc);
-                            let _ = out.curve_to(cx3, cy3, cx4, cy4, path.pts[j0].x + wdy_next, path.pts[j0].y - wdx_next);
+                            let _ = out.curve_to(
+                                cx3,
+                                cy3,
+                                cx4,
+                                cy4,
+                                path.pts[j0].x + wdy_next,
+                                path.pts[j0].y - wdx_next,
+                            );
                         }
                     }
                 }
@@ -855,10 +908,25 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
                     }
                     LineCap::Projecting => {
                         if last {
-                            out.add_stroke_adjust_hint(first_pt + 1, left2 + 2, first_pt + 1, first_pt + 2);
-                            out.add_stroke_adjust_hint(first_pt + 1, left2 + 2, left2 + 2, left2 + 3);
+                            out.add_stroke_adjust_hint(
+                                first_pt + 1,
+                                left2 + 2,
+                                first_pt + 1,
+                                first_pt + 2,
+                            );
+                            out.add_stroke_adjust_hint(
+                                first_pt + 1,
+                                left2 + 2,
+                                left2 + 2,
+                                left2 + 3,
+                            );
                         } else {
-                            out.add_stroke_adjust_hint(first_pt + 1, left2 + 1, first_pt + 1, first_pt + 2);
+                            out.add_stroke_adjust_hint(
+                                first_pt + 1,
+                                left2 + 1,
+                                first_pt + 1,
+                                first_pt + 2,
+                            );
                         }
                     }
                     LineCap::Round => {}
@@ -1012,9 +1080,7 @@ mod tests {
 
         // Flatten (it's already flat) and draw hairline.
         let flat = flatten_path(&path, &identity_matrix(), 1.0);
-        stroke_narrow::<Rgb8>(
-            &mut bmp, &clip, &flat, &pipe, &src, &identity_matrix(), 1.0,
-        );
+        stroke_narrow::<Rgb8>(&mut bmp, &clip, &flat, &pipe, &src, &identity_matrix(), 1.0);
 
         // At least one pixel on the diagonal should be painted.
         let mut any_painted = false;
@@ -1024,7 +1090,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_painted, "stroke_narrow should paint at least one diagonal pixel");
+        assert!(
+            any_painted,
+            "stroke_narrow should paint at least one diagonal pixel"
+        );
     }
 
     /// `make_stroke_path` must return a non-empty outline for a non-degenerate
@@ -1123,6 +1192,9 @@ mod tests {
             "flatten_path must remove all CURVE flags"
         );
         // The flattened path should have more than 2 points (the curve was subdivided).
-        assert!(flat.pts.len() >= 2, "flattened curve should have at least 2 points");
+        assert!(
+            flat.pts.len() >= 2,
+            "flattened curve should have at least 2 points"
+        );
     }
 }

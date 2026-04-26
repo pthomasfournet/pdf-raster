@@ -19,27 +19,31 @@
 //! # C++ equivalent
 //! `Splash::fillWithPattern` (Splash.cc ~line 2382).
 
-use crate::bitmap::Bitmap;
 use crate::bitmap::AaBuf;
+use crate::bitmap::Bitmap;
 use crate::clip::{Clip, ClipResult};
 use crate::path::Path;
 use crate::pipe::{self, PipeSrc, PipeState};
-use crate::scanner::iter::ScanIterator;
 use crate::scanner::XPathScanner;
+use crate::scanner::iter::ScanIterator;
 use crate::types::AA_SIZE;
 use crate::xpath::XPath;
 use color::Pixel;
 
 /// AA gamma table for `splashAASize=4`, `splashAAGamma=1.5`.
 /// Entry `i`: `round((i/16)^1.5 * 255)` for i in 0..=16.
-const AA_GAMMA: [u8; (AA_SIZE * AA_SIZE + 1) as usize] =
-    [0, 4, 11, 20, 32, 45, 59, 75, 91, 108, 128, 148, 169, 191, 214, 238, 255];
+const AA_GAMMA: [u8; (AA_SIZE * AA_SIZE + 1) as usize] = [
+    0, 4, 11, 20, 32, 45, 59, 75, 91, 108, 128, 148, 169, 191, 214, 238, 255,
+];
 
 /// Bit-count table for nibbles 0x0..=0xf — number of set bits.
 const NIBBLE_POP: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
 
 /// Non-zero winding fill.
-#[expect(clippy::too_many_arguments, reason = "mirrors SplashFillWithPattern API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors SplashFillWithPattern API; all params necessary"
+)]
 pub fn fill<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -50,11 +54,24 @@ pub fn fill<P: Pixel>(
     flatness: f64,
     vector_antialias: bool,
 ) {
-    fill_impl::<P>(bitmap, clip, path, pipe, src, matrix, flatness, vector_antialias, false);
+    fill_impl::<P>(
+        bitmap,
+        clip,
+        path,
+        pipe,
+        src,
+        matrix,
+        flatness,
+        vector_antialias,
+        false,
+    );
 }
 
 /// Even-odd fill.
-#[expect(clippy::too_many_arguments, reason = "mirrors SplashFillWithPattern API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors SplashFillWithPattern API; all params necessary"
+)]
 pub fn eo_fill<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -65,10 +82,23 @@ pub fn eo_fill<P: Pixel>(
     flatness: f64,
     vector_antialias: bool,
 ) {
-    fill_impl::<P>(bitmap, clip, path, pipe, src, matrix, flatness, vector_antialias, true);
+    fill_impl::<P>(
+        bitmap,
+        clip,
+        path,
+        pipe,
+        src,
+        matrix,
+        flatness,
+        vector_antialias,
+        true,
+    );
 }
 
-#[expect(clippy::too_many_arguments, reason = "mirrors SplashFillWithPattern API; all params necessary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors SplashFillWithPattern API; all params necessary"
+)]
 fn fill_impl<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -140,7 +170,10 @@ fn fill_impl<P: Pixel>(
 
             // At the boundary of each output row, emit one composited line.
             if aa_row == AA_SIZE as usize - 1 {
-                #[expect(clippy::cast_sign_loss, reason = "y = aa_y / AA_SIZE ≥ 0 since scanner.y_min ≥ 0")]
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "y = aa_y / AA_SIZE ≥ 0 since scanner.y_min ≥ 0"
+                )]
                 if x0 <= x1 && y >= 0 && (y as u32) < bitmap.height {
                     draw_aa_line::<P>(bitmap, pipe, src, &aa_buf, x0, x1, y);
                 }
@@ -153,7 +186,10 @@ fn fill_impl<P: Pixel>(
             if y < 0 || (y as u32) >= bitmap.height {
                 continue;
             }
-            #[expect(clippy::cast_possible_wrap, reason = "bitmap.width ≤ i32::MAX in practice")]
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "bitmap.width ≤ i32::MAX in practice"
+            )]
             let width_i = bitmap.width as i32;
             for (x0, x1) in ScanIterator::new(&scanner, y) {
                 let (mut sx0, mut sx1) = (x0, x1);
@@ -264,8 +300,14 @@ fn draw_aa_line<P: Pixel>(
     for (i, shape_byte) in shape.iter_mut().enumerate() {
         // x0 >= 0 and i < bitmap.width ≤ i32::MAX, so the sum fits in i32.
         #[expect(clippy::cast_sign_loss, reason = "x0 >= 0")]
-        #[expect(clippy::cast_possible_truncation, reason = "x0 + i ≤ bitmap width ≤ i32::MAX")]
-        #[expect(clippy::cast_possible_wrap, reason = "x0 + i ≤ bitmap width ≤ i32::MAX")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "x0 + i ≤ bitmap width ≤ i32::MAX"
+        )]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "x0 + i ≤ bitmap width ≤ i32::MAX"
+        )]
         let x = (x0 as usize + i) as i32;
         let t = aa_coverage(aa_buf, x);
         if t > 0 {
@@ -373,7 +415,16 @@ mod tests {
         // Columns span x=1..5 (the two vertical edges at x=1 and x=5).
         let path = rect_path(1.0, 1.0, 5.0, 5.0);
 
-        fill::<Rgb8>(&mut bmp, &clip, &path, &pipe, &src, &identity_matrix(), 1.0, false);
+        fill::<Rgb8>(
+            &mut bmp,
+            &clip,
+            &path,
+            &pipe,
+            &src,
+            &identity_matrix(),
+            1.0,
+            false,
+        );
 
         // Interior pixels (rows 2..4, cols 1..5) should be painted.
         for y in 2..5u32 {
@@ -381,7 +432,7 @@ mod tests {
             for x in 1..=5usize {
                 assert_eq!(row[x].r, 200, "y={y} x={x} R");
                 assert_eq!(row[x].g, 100, "y={y} x={x} G");
-                assert_eq!(row[x].b, 50,  "y={y} x={x} B");
+                assert_eq!(row[x].b, 50, "y={y} x={x} B");
             }
         }
 
@@ -400,7 +451,16 @@ mod tests {
         let src = PipeSrc::Solid(&color);
         let path = PathBuilder::new().build(); // empty
 
-        fill::<Rgb8>(&mut bmp, &clip, &path, &pipe, &src, &identity_matrix(), 1.0, false);
+        fill::<Rgb8>(
+            &mut bmp,
+            &clip,
+            &path,
+            &pipe,
+            &src,
+            &identity_matrix(),
+            1.0,
+            false,
+        );
 
         // Nothing should be painted.
         assert_eq!(bmp.row(0)[0].r, 0);
@@ -429,7 +489,16 @@ mod tests {
         b.close(true).unwrap();
         let path = b.build();
 
-        eo_fill::<Rgb8>(&mut bmp, &clip, &path, &pipe, &src, &identity_matrix(), 1.0, false);
+        eo_fill::<Rgb8>(
+            &mut bmp,
+            &clip,
+            &path,
+            &pipe,
+            &src,
+            &identity_matrix(),
+            1.0,
+            false,
+        );
 
         // Interior (4,4) should be unpainted.
         assert_eq!(bmp.row(4)[4].r, 0, "interior should be clear with EO rule");
@@ -443,13 +512,17 @@ mod tests {
         assert_eq!(AA_GAMMA[0], 0);
         assert_eq!(AA_GAMMA[16], 255);
         // t=8 (50%): round((8/16)^1.5 * 255) = round(0.5^1.5 * 255) = round(0.3536*255) ≈ 90
-        assert!(AA_GAMMA[8] >= 88 && AA_GAMMA[8] <= 93, "AA_GAMMA[8]={}", AA_GAMMA[8]);
+        assert!(
+            AA_GAMMA[8] >= 88 && AA_GAMMA[8] <= 93,
+            "AA_GAMMA[8]={}",
+            AA_GAMMA[8]
+        );
     }
 
     #[test]
     fn scanner_produces_spans_for_rect() {
-        use crate::scanner::iter::ScanIterator;
         use crate::scanner::XPathScanner;
+        use crate::scanner::iter::ScanIterator;
         use crate::xpath::XPath;
 
         let path = rect_path(1.0, 1.0, 5.0, 5.0);
@@ -457,8 +530,23 @@ mod tests {
         let scanner = XPathScanner::new(&xpath, false, 0, 7);
         // Interior rows 2,3,4 should have spans; boundary rows 1,5 have horizontal
         // edges (count=0) and produce no interior spans.
-        assert!(!ScanIterator::new(&scanner, 2).collect::<Vec<_>>().is_empty(), "no spans at y=2");
-        assert!(!ScanIterator::new(&scanner, 3).collect::<Vec<_>>().is_empty(), "no spans at y=3");
-        assert!(!ScanIterator::new(&scanner, 4).collect::<Vec<_>>().is_empty(), "no spans at y=4");
+        assert!(
+            !ScanIterator::new(&scanner, 2)
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "no spans at y=2"
+        );
+        assert!(
+            !ScanIterator::new(&scanner, 3)
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "no spans at y=3"
+        );
+        assert!(
+            !ScanIterator::new(&scanner, 4)
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "no spans at y=4"
+        );
     }
 }
