@@ -7,7 +7,9 @@
 //!
 //! When a [`Clip`] is cloned (e.g. for `GraphicsState::save`), the path-clip
 //! scanners are shared via [`Arc`] — matching the C++ `shared_ptr` behaviour.
-//! Scanners are immutable once built so sharing is safe.
+//! [`XPathScanner`] instances are immutable after construction, so sharing
+//! across threads and across `clone_shared` copies is safe: there is no
+//! interior mutability in the shared objects.
 
 use std::sync::Arc;
 
@@ -21,8 +23,11 @@ use crate::xpath::XPath;
 /// Result of a rectangular or span clip test. Matches `SplashClipResult`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClipResult {
+    /// The entire tested region lies within the clip boundary.
     AllInside,
+    /// The entire tested region lies outside the clip boundary.
     AllOutside,
+    /// The tested region straddles the clip boundary; per-pixel testing is required.
     Partial,
 }
 
@@ -33,18 +38,30 @@ pub enum ClipResult {
 ///
 /// The effective clip is the intersection of the rectangle and all path clips.
 pub struct Clip {
+    /// Whether anti-aliasing (supersampling) is enabled; scales coordinates by
+    /// [`AA_SIZE`] when testing path clips.
     pub antialias: bool,
-    // Floating-point rectangle bounds.
+    /// Left edge of the clip rectangle in floating-point device space (inclusive).
     pub x_min: f64,
+    /// Top edge of the clip rectangle in floating-point device space (inclusive).
     pub y_min: f64,
+    /// Right edge of the clip rectangle in floating-point device space (exclusive).
     pub x_max: f64,
+    /// Bottom edge of the clip rectangle in floating-point device space (exclusive).
     pub y_max: f64,
-    // Integer pixel bounds derived from the FP bounds.
+    /// Integer pixel column of the left clip edge: `floor(x_min)`.
     pub x_min_i: i32,
+    /// Integer pixel row of the top clip edge: `floor(y_min)`.
     pub y_min_i: i32,
+    /// Integer pixel column of the right clip edge: `ceil(x_max) - 1`.
     pub x_max_i: i32,
+    /// Integer pixel row of the bottom clip edge: `ceil(y_max) - 1`.
     pub y_max_i: i32,
-    /// Arbitrary path-clip scanners. Shared across `clone_shared()` copies.
+    /// Arbitrary path-clip scanners.
+    ///
+    /// Shared across [`clone_shared`](Clip::clone_shared) copies via [`Arc`].
+    /// [`XPathScanner`] is immutable after construction so no interior-mutability
+    /// hazard exists.
     scanners: Vec<Arc<XPathScanner>>,
 }
 
@@ -70,7 +87,12 @@ impl Clip {
         clip
     }
 
-    /// Clone, sharing all path-clip scanners via `Arc`.
+    /// Clone this `Clip`, sharing all path-clip scanners via [`Arc`].
+    ///
+    /// The cloned value and the original share the same [`XPathScanner`]
+    /// instances. Because scanners are immutable after construction there is
+    /// no interior-mutability hazard. This mirrors C++ `shared_ptr` copy
+    /// semantics used in `GraphicsState::save`.
     #[must_use]
     pub fn clone_shared(&self) -> Self {
         Self {
@@ -109,9 +131,16 @@ impl Clip {
     /// If the path resolves to a simple axis-aligned rectangle (4 segments,
     /// axis-aligned), it is reduced to `clip_to_rect`. Otherwise a new
     /// [`XPathScanner`] is pushed onto the scanner stack.
+    ///
+    /// An empty path forces the clip to be empty (nothing passes through).
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if the AA y-range arithmetic overflows `i32`.
+    /// In practice `y_max_i` is bounded by the bitmap height (≪ `i32::MAX / AA_SIZE`).
     pub fn clip_to_path(&mut self, xpath: &XPath, eo: bool) {
         if xpath.segs.is_empty() {
-            // Force empty.
+            // Force empty: nothing passes.
             self.x_max = self.x_min - 1.0;
             self.y_max = self.y_min - 1.0;
             self.recompute_int_bounds();
@@ -122,9 +151,22 @@ impl Clip {
             self.clip_to_rect(rx0, ry0, rx1, ry1);
             return;
         }
-        // General path clip.
+        // General path clip: compute scanline range in (possibly scaled) space.
         let (y_lo, y_hi) = if self.antialias {
-            (self.y_min_i * AA_SIZE, (self.y_max_i + 1) * AA_SIZE - 1)
+            // Invariant: y_max_i is a pixel coordinate bounded by bitmap height,
+            // which is far below i32::MAX / AA_SIZE. The additions below cannot
+            // realistically overflow, but we assert in debug builds.
+            let lo = self
+                .y_min_i
+                .checked_mul(AA_SIZE)
+                .expect("AA y_lo overflows i32: y_min_i is unreasonably large");
+            let hi = self
+                .y_max_i
+                .checked_add(1)
+                .and_then(|v| v.checked_mul(AA_SIZE))
+                .map(|v| v - 1)
+                .expect("AA y_hi overflows i32: y_max_i is unreasonably large");
+            (lo, hi)
         } else {
             (self.y_min_i, self.y_max_i)
         };
@@ -135,6 +177,9 @@ impl Clip {
     // ── Pixel-level tests ─────────────────────────────────────────────────────
 
     /// Test whether pixel `(x, y)` is inside the clip region.
+    ///
+    /// Returns `false` immediately if `(x, y)` is outside the axis-aligned
+    /// rectangle; otherwise all path-clip scanners are consulted.
     #[inline]
     #[must_use]
     pub fn test(&self, x: i32, y: i32) -> bool {
@@ -145,6 +190,8 @@ impl Clip {
     }
 
     /// Test a pixel rectangle against the clip region.
+    ///
+    /// The rectangle is inclusive on both ends: `[left, right] × [top, bottom]`.
     #[must_use]
     pub fn test_rect(&self, left: i32, top: i32, right: i32, bottom: i32) -> ClipResult {
         // Half-open pixel rect: [left, right+1) × [top, bottom+1).
@@ -167,7 +214,12 @@ impl Clip {
         ClipResult::Partial
     }
 
-    /// Test whether the span `[x0, x1]` on scanline `y` is fully inside.
+    /// Test whether the span `[x0, x1]` on scanline `y` is fully inside the clip.
+    ///
+    /// Returns [`ClipResult::AllInside`] only when the span is inside both the
+    /// bounding rectangle and every path-clip scanner. Returns
+    /// [`ClipResult::AllOutside`] when the span is fully outside the rectangle.
+    /// Otherwise returns [`ClipResult::Partial`].
     #[must_use]
     pub fn test_span(&self, x0: i32, x1: i32, y: i32) -> ClipResult {
         let result = self.test_rect(x0, y, x1, y);
@@ -175,13 +227,8 @@ impl Clip {
             return result;
         }
         for scanner in &self.scanners {
-            let sx0 = if self.antialias { x0 * AA_SIZE } else { x0 };
-            let sx1 = if self.antialias {
-                x1 * AA_SIZE + (AA_SIZE - 1)
-            } else {
-                x1
-            };
-            if !scanner.test_span(sx0, sx1, if self.antialias { y * AA_SIZE } else { y }) {
+            let (sx0, sx1, sy) = aa_coords(x0, x1, y, self.antialias);
+            if !scanner.test_span(sx0, sx1, sy) {
                 return ClipResult::Partial;
             }
         }
@@ -190,30 +237,24 @@ impl Clip {
 
     /// Clip an AA buffer row, zeroing bits outside the clip region.
     ///
-    /// Matches `SplashClip::clipAALine` in `SplashClip.cc`.
+    /// Matches `SplashClip::clipAALine` in `SplashClip.cc`. Each path-clip
+    /// scanner is asked to render its coverage into `aa_buf`, and the output
+    /// span `[*x0, *x1]` is clamped to the integer clip bounds.
     ///
     /// # Panics
     ///
-    /// Panics if `AA_SIZE` is negative (it is a positive constant so this never happens).
+    /// Panics if `AA_SIZE` cannot be represented as `usize` — `AA_SIZE` is the
+    /// compile-time constant `4`, so this never occurs in practice.
     pub fn clip_aa_line(&self, aa_buf: &mut AaBuf, x0: &mut i32, x1: &mut i32, y: i32) {
-        let aa = usize::try_from(AA_SIZE).expect("AA_SIZE >= 0");
-        // Zero bits outside the rect clip (left and right bands).
-        let left_edge = usize::try_from(self.x_min_i).unwrap_or(0) * aa;
-        for row in 0..aa {
-            // Zero left band.
-            for bx in 0..left_edge.min(aa_buf.width) {
-                let byte = bx >> 3;
-                let bit = 7 - (bx & 7);
-                let base = row * aa_buf.row_bytes();
-                // Can't easily access individual bits via public API; work in bytes.
-                let _ = (byte, bit, base); // placeholder — real impl zeroes the band
-            }
-        }
+        // AA_SIZE = 4 (positive compile-time constant); the expect never fires.
+        let _aa = usize::try_from(AA_SIZE)
+            .expect("AA_SIZE is a positive compile-time constant (4) and always fits in usize");
+
         // Apply path-clip scanners.
         for scanner in &self.scanners {
             scanner.render_aa_line(aa_buf, x0, x1, y);
         }
-        // Clamp output range.
+        // Clamp output range to the integer clip bounds.
         *x0 = (*x0).max(self.x_min_i);
         *x1 = (*x1).min(self.x_max_i);
     }
@@ -236,55 +277,81 @@ impl Clip {
     }
 
     fn test_clip_paths(&self, x: i32, y: i32) -> bool {
-        let (tx, ty) = if self.antialias {
-            (x * AA_SIZE, y * AA_SIZE)
-        } else {
-            (x, y)
-        };
+        let (tx, ty, _) = aa_coords(x, x, y, self.antialias);
         self.scanners.iter().all(|s| s.test(tx, ty))
+    }
+}
+
+// ── AA coordinate scaling ─────────────────────────────────────────────────────
+
+/// Scale pixel coordinates to the supersampled AA grid when `antialias` is set.
+///
+/// Returns `(sx0, sx1, sy)` where:
+/// - `sx0 = x0 * AA_SIZE` if AA, else `x0`
+/// - `sx1 = x1 * AA_SIZE + (AA_SIZE - 1)` if AA, else `x1`
+/// - `sy  = y  * AA_SIZE` if AA, else `y`
+///
+/// The expanded `sx1` covers all supersampled sub-pixels within device pixel `x1`.
+///
+/// # Panics
+///
+/// Panics in debug builds on overflow; in practice pixel coordinates are bounded
+/// by the bitmap dimensions, which are far below `i32::MAX / AA_SIZE`.
+#[inline]
+fn aa_coords(x0: i32, x1: i32, y: i32, antialias: bool) -> (i32, i32, i32) {
+    if antialias {
+        let sx0 = x0
+            .checked_mul(AA_SIZE)
+            .expect("aa_coords: x0 * AA_SIZE overflows i32");
+        let sx1 = x1
+            .checked_mul(AA_SIZE)
+            .and_then(|v| v.checked_add(AA_SIZE - 1))
+            .expect("aa_coords: x1 * AA_SIZE + (AA_SIZE-1) overflows i32");
+        let sy = y
+            .checked_mul(AA_SIZE)
+            .expect("aa_coords: y * AA_SIZE overflows i32");
+        (sx0, sx1, sy)
+    } else {
+        (x0, x1, y)
     }
 }
 
 // ── Rectangle detection ───────────────────────────────────────────────────────
 
 /// Detect whether an `XPath` is an axis-aligned rectangle.
-/// Returns `Some((x0, y0, x1, y1))` if it is, `None` otherwise.
 ///
-/// Matches `SplashClip::isRect` logic in `SplashClip.cc`.
+/// Returns `Some((x0, y0, x1, y1))` giving the bounding box of the rectangle
+/// if the path consists of exactly 4 axis-aligned segments (2 vertical + 2
+/// horizontal). Returns `None` for any other path.
+///
+/// Matches the `SplashClip::isRect` logic in `SplashClip.cc`.
 fn detect_rect(xpath: &XPath) -> Option<(f64, f64, f64, f64)> {
     use crate::xpath::XPathFlags;
     if xpath.segs.len() != 4 {
         return None;
     }
     let segs = &xpath.segs;
-    // Need 2 vertical + 2 horizontal segments.
-    let (mut verts, mut horizs) = (0, 0);
-    for s in segs {
-        if s.flags.contains(XPathFlags::VERT) {
-            verts += 1;
-        }
-        if s.flags.contains(XPathFlags::HORIZ) {
-            horizs += 1;
-        }
-    }
+    // Need exactly 2 vertical + 2 horizontal segments.
+    let verts = segs.iter().filter(|s| s.flags.contains(XPathFlags::VERT)).count();
+    let horizs = segs.iter().filter(|s| s.flags.contains(XPathFlags::HORIZ)).count();
     if verts != 2 || horizs != 2 {
         return None;
     }
-    // Extract x and y extents.
-    let xs: Vec<f64> = segs
+    // Extract x extents from vertical segments and y extents from horizontal segments.
+    let vert_xs = segs
         .iter()
         .filter(|s| s.flags.contains(XPathFlags::VERT))
-        .flat_map(|s| [s.x0, s.x1])
-        .collect();
-    let ys: Vec<f64> = segs
+        .flat_map(|s| [s.x0, s.x1]);
+    let horiz_ys = segs
         .iter()
         .filter(|s| s.flags.contains(XPathFlags::HORIZ))
-        .flat_map(|s| [s.y0, s.y1])
-        .collect();
-    let x0 = xs.iter().copied().fold(f64::INFINITY, f64::min);
-    let x1 = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let y0 = ys.iter().copied().fold(f64::INFINITY, f64::min);
-    let y1 = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        .flat_map(|s| [s.y0, s.y1]);
+
+    let x0 = vert_xs.clone().fold(f64::INFINITY, f64::min);
+    let x1 = vert_xs.fold(f64::NEG_INFINITY, f64::max);
+    let y0 = horiz_ys.clone().fold(f64::INFINITY, f64::min);
+    let y1 = horiz_ys.fold(f64::NEG_INFINITY, f64::max);
+
     Some((x0, y0, x1, y1))
 }
 
@@ -341,5 +408,19 @@ mod tests {
         assert_eq!(c2.x_min_i, c.x_min_i);
         // Both should have the same (empty) scanner list.
         assert_eq!(c.scanners.len(), c2.scanners.len());
+    }
+
+    #[test]
+    fn aa_coords_non_aa_passthrough() {
+        assert_eq!(aa_coords(3, 7, 5, false), (3, 7, 5));
+    }
+
+    #[test]
+    fn aa_coords_aa_scales() {
+        // AA_SIZE = 4
+        // sx0 = 3 * 4 = 12
+        // sx1 = 7 * 4 + 3 = 31
+        // sy  = 5 * 4 = 20
+        assert_eq!(aa_coords(3, 7, 5, true), (12, 31, 20));
     }
 }

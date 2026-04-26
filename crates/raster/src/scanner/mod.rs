@@ -19,6 +19,7 @@
 //! This eliminates per-row heap allocations and is friendlier to the CPU cache
 //! and future SIMD work.
 
+/// The coalescing span iterator for a scanner row.
 pub mod iter;
 
 use crate::bitmap::AaBuf;
@@ -32,8 +33,10 @@ use crate::xpath::{XPath, XPathFlags};
 /// Matches `SplashIntersect` in `splash/SplashXPathScanner.h`.
 #[derive(Copy, Clone, Debug)]
 pub struct Intersect {
-    pub x0: i32, // left pixel (inclusive)
-    pub x1: i32, // right pixel (inclusive)
+    /// Left pixel of the intersection span, inclusive.
+    pub x0: i32,
+    /// Right pixel of the intersection span, inclusive. Always `x0 ≤ x1`.
+    pub x1: i32,
     /// Winding contribution: +1 or -1 for sloped/vertical segments, 0 for horizontal.
     /// Used by non-zero winding number fill rule; ignored by even-odd.
     pub count: i32,
@@ -45,11 +48,27 @@ pub struct Intersect {
 ///
 /// After construction the scanner is read-only; it is cheaply shareable via
 /// [`Arc`] (matching the C++ `shared_ptr<SplashXPathScanner>` used in `SplashClip`).
+///
+/// ## `SoA` layout invariant
+///
+/// `row_start` has length `(y_max - y_min + 2)` when non-empty: one entry per
+/// scanline plus a sentinel at index `n_rows`. For any valid row index `i`:
+///
+/// ```text
+/// row_start[i] <= row_start[i + 1] <= intersects.len()
+/// ```
+///
+/// Intersections within each row are sorted in ascending `x0` order.
 pub struct XPathScanner {
-    pub eo: bool, // even-odd fill rule (false = non-zero winding)
+    /// Fill rule: `true` = even-odd, `false` = non-zero winding number.
+    pub eo: bool,
+    /// Minimum device-pixel x-coordinate of any intersection in the table.
     pub x_min: i32,
+    /// Maximum device-pixel x-coordinate of any intersection in the table.
     pub x_max: i32,
+    /// First scanline (device-pixel y) covered by this scanner.
     pub y_min: i32,
+    /// Last scanline (device-pixel y) covered by this scanner, inclusive.
     pub y_max: i32,
     /// `row_start[i]` = start of row `y_min + i` in `intersects`.
     /// Length = `(y_max - y_min + 2)` (includes sentinel at the end).
@@ -66,7 +85,9 @@ impl XPathScanner {
     ///
     /// # Panics
     ///
-    /// Panics if `y_max < y_min` after clamping (cannot happen when clip range is valid).
+    /// Panics if the number of rows after clamping overflows `usize` (cannot
+    /// happen for valid PDF coordinate ranges, as `y_max - y_min + 1` is at
+    /// most `i32::MAX`).
     #[must_use]
     pub fn new(xpath: &XPath, eo: bool, clip_y_min: i32, clip_y_max: i32) -> Self {
         if xpath.segs.is_empty() || clip_y_min > clip_y_max {
@@ -155,43 +176,71 @@ impl XPathScanner {
 
     /// The intersections for scanline `y`, sorted by `x0`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `y < y_min` (cannot happen when `y` is within range).
+    /// Returns an empty slice if `y` is outside `[y_min, y_max]`. Never panics.
     #[must_use]
     pub fn row(&self, y: i32) -> &[Intersect] {
         if y < self.y_min || y > self.y_max {
             return &[];
         }
-        let i = usize::try_from(y - self.y_min).expect("y >= y_min");
+        // y_min <= y <= y_max is guaranteed by the check above, so the
+        // subtraction is non-negative and within [0, y_max - y_min].
+        // That range fits in usize on any platform; cast is safe.
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "y >= y_min is asserted by the bounds check above; \
+                      the difference is non-negative"
+        )]
+        let i = (y - self.y_min) as usize;
+        debug_assert!(i + 1 < self.row_start.len(), "row_start sentinel missing");
+        // row_start entries are u32; on all supported (32/64-bit) platforms
+        // usize >= u32, so `as usize` is a widening cast that cannot lose data.
         let s = self.row_start[i] as usize;
         let e = self.row_start[i + 1] as usize;
+        debug_assert!(s <= e && e <= self.intersects.len(), "row_start invariant violated");
         &self.intersects[s..e]
     }
 
-    /// Test whether pixel `(x, y)` is inside the path.
-    #[must_use]
-    pub fn test(&self, x: i32, y: i32) -> bool {
-        let row = self.row(y);
-        let eo_mask: i32 = if self.eo { 1 } else { !0 };
+    /// Accumulate winding crossings for all intersections in `row` up to (but
+    /// not including) pixel `x`.
+    ///
+    /// Returns `(count, on_span)` where:
+    /// - `count` is the sum of `Intersect::count` for every entry whose span
+    ///   ends before `x` (i.e. `x1 < x`).
+    /// - `on_span` is `true` if `x` falls within one of the intersection spans.
+    ///
+    /// The caller applies the fill-rule mask to `count` to decide whether the
+    /// pixel is inside the path when `on_span` is `false`.
+    fn count_crossings(row: &[Intersect], x: i32) -> (i32, bool) {
         let mut count = 0i32;
         for int in row {
             if int.x0 > x {
                 break;
             }
             if x <= int.x1 {
-                return true;
+                // `x` falls inside this intersection span.
+                return (count, true);
             }
             count = count.wrapping_add(int.count);
         }
-        (count & eo_mask) != 0
+        (count, false)
     }
 
-    /// Test whether the entire span `[x0, x1]` on scanline `y` is inside.
+    /// Test whether pixel `(x, y)` is inside the path.
+    #[must_use]
+    pub fn test(&self, x: i32, y: i32) -> bool {
+        let row = self.row(y);
+        let eo_mask = if self.eo { 1i32 } else { !0i32 };
+        let (count, on_span) = Self::count_crossings(row, x);
+        on_span || (count & eo_mask) != 0
+    }
+
+    /// Test whether the entire span `[x0, x1]` on scanline `y` is inside the path.
+    ///
+    /// Returns `true` only if every pixel in `[x0, x1]` is covered by the fill.
     #[must_use]
     pub fn test_span(&self, x0: i32, x1: i32, y: i32) -> bool {
         let row = self.row(y);
-        let eo_mask: i32 = if self.eo { 1 } else { !0 };
+        let eo_mask = if self.eo { 1i32 } else { !0i32 };
         let mut count = 0i32;
         let mut i = 0;
         let mut xx1 = x0 - 1;
@@ -216,34 +265,40 @@ impl XPathScanner {
     /// Matches `SplashXPathScanner::renderAALine`. `y` is in device-pixel space;
     /// the scanner must have been built from an `aa_scale()`'d `XPath`.
     ///
+    /// `x0` and `x1` are updated to the tightest bounding range of pixels
+    /// written into `aa_buf`. If no pixels are written, `*x0` is set equal to
+    /// `*x1` (empty range).
+    ///
     /// # Panics
     ///
-    /// Panics if any AA sub-row index `yy` is negative (impossible since `AA_SIZE` > 0).
+    /// Does not panic in practice. `AA_SIZE` is a positive compile-time constant
+    /// so all `try_from` conversions on loop indices succeed.
     pub fn render_aa_line(&self, aa_buf: &mut AaBuf, x0: &mut i32, x1: &mut i32, y: i32) {
         aa_buf.clear();
         let aa_width_i32 = i32::try_from(aa_buf.width).unwrap_or(i32::MAX);
         let mut xx_min = aa_width_i32;
         let mut xx_max = -1i32;
 
-        let eo_mask: i32 = if self.eo { 1 } else { !0 };
+        let eo_mask = if self.eo { 1i32 } else { !0i32 };
         let aa = AA_SIZE;
 
         for yy in 0..aa {
             let scan_y = y * aa + yy;
             let row = self.row(scan_y);
             let mut count = 0i32;
-            let mut i = 0;
+            let mut i = 0usize;
             let mut xx = 0i32;
+
+            // Walk through intersections, emitting covered spans into aa_buf.
+            //
+            // Winding rule: we are "inside" the path when
+            //   (count & eo_mask) != 0
+            // where count is the running sum of `Intersect::count` values seen so
+            // far. For EO fill eo_mask=1 so the low bit tracks parity; for NZ
+            // winding eo_mask=!0 so any non-zero count means inside.
             while i < row.len() || (count & eo_mask) != 0 {
-                // Find next covered span start.
-                let _span_x0 = if i < row.len() {
-                    row[i].x0
-                } else {
-                    aa_width_i32
-                };
-                // Advance past entries that are before the current position.
                 if (count & eo_mask) == 0 {
-                    // Not inside → skip to next intersection.
+                    // Currently outside — skip to the next intersection entry.
                     if i >= row.len() {
                         break;
                     }
@@ -252,24 +307,25 @@ impl XPathScanner {
                     i += 1;
                     continue;
                 }
-                // Currently inside a covered region — find end of this span.
-                let mut span_x1;
-                loop {
+
+                // Currently inside a covered region — find the end of this span.
+                let span_x1 = loop {
                     if i >= row.len() {
-                        span_x1 = aa_width_i32;
-                        break;
+                        break aa_width_i32;
                     }
                     count = count.wrapping_add(row[i].count);
-                    span_x1 = row[i].x1 + 1;
+                    let end = row[i].x1 + 1;
                     i += 1;
                     if (count & eo_mask) == 0 {
-                        break;
+                        break end;
                     }
-                }
+                };
+
                 let bx0 = usize::try_from(xx.max(0)).unwrap_or(0);
                 let bx1 = usize::try_from(span_x1.min(aa_width_i32)).unwrap_or(0);
                 if bx0 < bx1 {
-                    aa_buf.set_span(usize::try_from(yy).expect("yy >= 0"), bx0, bx1);
+                    let row_idx = usize::try_from(yy).expect("yy in 0..AA_SIZE, always >= 0");
+                    aa_buf.set_span(row_idx, bx0, bx1);
                     let bx0_i32 = i32::try_from(bx0).unwrap_or(i32::MAX);
                     let bx1_i32 = i32::try_from(bx1).unwrap_or(i32::MAX);
                     if bx0_i32 < xx_min {
@@ -284,6 +340,7 @@ impl XPathScanner {
         }
 
         if xx_min > xx_max {
+            // No pixels were written; collapse to an empty range.
             xx_min = xx_max;
         }
         *x0 = xx_min / aa;
@@ -367,8 +424,21 @@ fn fill_buckets(xpath: &XPath, y_min: i32, y_max: i32, buckets: &mut [Vec<Inters
 
 /// Add or merge one intersection entry into a row bucket.
 ///
-/// Adjacent or overlapping entries are merged (count accumulated, x0/x1 expanded),
-/// matching `SplashXPathScanner::addIntersection` in `SplashXPathScanner.cc`.
+/// Entries are assumed to arrive in approximately ascending `x0` order (they
+/// are sorted again later in `XPathScanner::new`). Adjacent or overlapping
+/// entries whose ranges touch (i.e. `last.x1 + 1 >= entry.x0`) are merged:
+/// the `count` is accumulated and the span is expanded to cover both ranges.
+///
+/// ## Adjacency criterion
+///
+/// Two spans are merged when `last.x1 + 1 >= entry.x0`, which means pixels
+/// at positions `last.x1` and `entry.x0` are either the same pixel or
+/// neighbours. This matches `SplashXPathScanner::addIntersection` in
+/// `SplashXPathScanner.cc`.
+///
+/// Note: since entries may arrive out of order across different segment types,
+/// the merge only compares against the *last* pushed entry. Full deduplication
+/// happens after the per-row sort in `XPathScanner::new`.
 fn add_intersection(row: &mut Vec<Intersect>, x0: i32, x1: i32, count: i32, _is_horiz: bool) {
     let (lo, hi) = (x0.min(x1), x0.max(x1));
     let entry = Intersect {
@@ -382,6 +452,11 @@ fn add_intersection(row: &mut Vec<Intersect>, x0: i32, x1: i32, count: i32, _is_
         return;
     }
     let last = row.last_mut().unwrap();
+    // Merge when spans touch or overlap. The second half of the disjoint
+    // condition (`last.x0 > entry.x1 + 1`) handles the case where a new entry
+    // arrives to the *left* of the last one (can happen with sloped segments
+    // on the same row). If entries are disjoint in both directions, push a new
+    // entry; the final sort in new() will place it correctly.
     if last.x1 + 1 < entry.x0 || last.x0 > entry.x1 + 1 {
         // Disjoint — push new entry.
         row.push(entry);
@@ -415,7 +490,6 @@ mod tests {
     #[test]
     fn empty_on_no_segs() {
         let xpath = XPath::empty();
-        // Need to access private field; use new() on an empty XPath
         let scanner = XPathScanner::new(&xpath, false, 0, 10);
         assert!(scanner.is_empty());
     }
@@ -431,8 +505,6 @@ mod tests {
     #[test]
     fn horizontal_segment_count_zero() {
         // A purely horizontal segment should produce count=0.
-        let _xpath = XPath::empty();
-        // Directly test add_intersection
         let mut row = Vec::new();
         add_intersection(&mut row, 0, 5, 0, true);
         assert_eq!(row[0].count, 0);
@@ -452,5 +524,57 @@ mod tests {
         let scanner = XPathScanner::new(&xpath, false, 0, 4);
         assert!(!scanner.test(10, 2));
         assert!(!scanner.test(2, 5));
+    }
+
+    #[test]
+    fn row_out_of_range_returns_empty() {
+        let xpath = triangle_xpath();
+        let scanner = XPathScanner::new(&xpath, false, 0, 4);
+        // y below y_min
+        assert!(scanner.row(scanner.y_min - 1).is_empty());
+        // y above y_max
+        assert!(scanner.row(scanner.y_max + 1).is_empty());
+        // large out-of-range values
+        assert!(scanner.row(i32::MIN).is_empty());
+        assert!(scanner.row(i32::MAX).is_empty());
+    }
+
+    #[test]
+    fn add_intersection_merge_adjacent() {
+        // [0,3] then [4,7]: last.x1+1 == entry.x0, so they should merge.
+        let mut row = Vec::new();
+        add_intersection(&mut row, 0, 3, -1, false);
+        add_intersection(&mut row, 4, 7, 1, false);
+        assert_eq!(row.len(), 1, "adjacent spans must merge");
+        assert_eq!(row[0].x0, 0);
+        assert_eq!(row[0].x1, 7);
+        assert_eq!(row[0].count, 0); // -1 + 1 = 0
+    }
+
+    #[test]
+    fn add_intersection_disjoint() {
+        // [0,2] then [5,7]: gap of 2 pixels, must NOT merge.
+        let mut row = Vec::new();
+        add_intersection(&mut row, 0, 2, -1, false);
+        add_intersection(&mut row, 5, 7, -1, false);
+        assert_eq!(row.len(), 2, "disjoint spans must not merge");
+    }
+
+    #[test]
+    fn count_crossings_inside_span() {
+        // count_crossings with x inside an intersection span returns on_span=true.
+        let row = vec![Intersect { x0: 2, x1: 5, count: -1 }];
+        let (count, on_span) = XPathScanner::count_crossings(&row, 3);
+        assert!(on_span);
+        assert_eq!(count, 0); // not yet accumulated the entry's count
+    }
+
+    #[test]
+    fn count_crossings_after_span() {
+        // After span [2,5] count=-1: pixel 6 is outside, count reflects crossing.
+        let row = vec![Intersect { x0: 2, x1: 5, count: -1 }];
+        let (count, on_span) = XPathScanner::count_crossings(&row, 6);
+        assert!(!on_span);
+        assert_eq!(count, -1);
     }
 }

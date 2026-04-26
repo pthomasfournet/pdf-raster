@@ -11,9 +11,29 @@
 //! endpoint `cx[p2*3]`. The loop advances `p1` rightward, either emitting a
 //! line segment when the chord deviation is within `flatness_sq`, or splitting
 //! via De Casteljau and inserting a midpoint `p3`.
+//!
+//! ## Output convention
+//!
+//! `p0` (the curve start) is **implicit** — it is the caller's current point and
+//! is **not** included in `out`. The first point appended to `out` is the
+//! endpoint of the first emitted sub-segment, and the last point appended is
+//! always `p3` (the curve endpoint).
 
 use super::PathPoint;
 use crate::types::MAX_CURVE_SPLITS;
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Convert a non-negative `i32` slot index to `usize`.
+///
+/// # Panics
+///
+/// Panics in debug builds if `v < 0`. By construction every value passed here
+/// starts at 0 and is only ever increased, so this invariant always holds.
+#[inline]
+fn to_idx(v: i32) -> usize {
+    usize::try_from(v).expect("curve stack index must be non-negative")
+}
 
 // ── CurveData ─────────────────────────────────────────────────────────────────
 
@@ -21,6 +41,16 @@ use crate::types::MAX_CURVE_SPLITS;
 ///
 /// Lazy-allocated (via `Option<Box<CurveData>>`) because it is ~25 KB —
 /// only needed for paths containing Bezier curves.
+///
+/// ## Array sizing
+///
+/// `MAX_CURVE_SPLITS = 1024`, so the slot count is `n = 1025`.
+///
+/// * `cx` / `cy`: length `n * 3 = 3075`.  The maximum slot index used is
+///   `max_u = 1024`, giving a maximum array index of `1024 * 3 + 2 = 3074`,
+///   which is within bounds (no off-by-one).
+/// * `c_next`: length `n = 1025`.  The maximum index used is `max_u = 1024`,
+///   which is also within bounds.
 pub struct CurveData {
     /// X coordinates: 3 control points per slot, indexed by `slot * 3 + {0,1,2}`.
     pub cx: Box<[f64]>,
@@ -35,10 +65,14 @@ impl CurveData {
     ///
     /// # Panics
     ///
-    /// Panics if `MAX_CURVE_SPLITS` is negative (it is a positive constant so this never happens).
+    /// Panics if `MAX_CURVE_SPLITS` is negative. It is defined as the positive
+    /// constant `1024` (matching `splashMaxCurveSplits` in `SplashTypes.h`), so
+    /// this branch is unreachable in practice.
     #[must_use]
     pub fn new() -> Box<Self> {
-        let n = usize::try_from(MAX_CURVE_SPLITS).expect("MAX_CURVE_SPLITS >= 0") + 1;
+        let n = usize::try_from(MAX_CURVE_SPLITS)
+            .expect("MAX_CURVE_SPLITS must be non-negative (it is the constant 1024)")
+            + 1;
         Box::new(Self {
             cx: vec![0.0f64; n * 3].into_boxed_slice(),
             cy: vec![0.0f64; n * 3].into_boxed_slice(),
@@ -51,8 +85,10 @@ impl CurveData {
 
 /// Flatten a cubic Bezier curve into a sequence of line endpoints.
 ///
-/// Appends one `PathPoint` per emitted line segment endpoint to `out` (not
-/// including the implicit start point `p0` — that is the previous endpoint).
+/// Appends one `PathPoint` per emitted line segment endpoint to `out`. The
+/// implicit start point `p0` (the caller's current point) is **not** appended.
+/// The first appended point is the endpoint of the first sub-segment; the last
+/// appended point is always `p3`.
 ///
 /// `flatness_sq` is the **squared** maximum allowed deviation from the true
 /// curve to a chord. Use `flatness * flatness` when calling from `XPath::new`.
@@ -61,9 +97,15 @@ impl CurveData {
 /// same `XPath`. Pass `None` on the first call; the `Box<CurveData>` is
 /// returned and should be stored for the next call.
 ///
+/// ## Midpoint arithmetic
+///
+/// All midpoints are computed with `f64::midpoint` / `i32::midpoint` (stable
+/// since Rust 1.85). These methods guarantee a correctly-rounded result and
+/// never overflow, unlike the naive `(a + b) / 2`.
+///
 /// # Panics
 ///
-/// Panics if `MAX_CURVE_SPLITS` is negative (it is a positive constant so this never happens).
+/// Panics if `MAX_CURVE_SPLITS` is negative (it is the positive constant 1024).
 pub fn flatten_curve(
     p0: PathPoint,
     p1: PathPoint,
@@ -76,7 +118,8 @@ pub fn flatten_curve(
     let data = curve_data.get_or_insert_with(CurveData::new);
 
     let max = MAX_CURVE_SPLITS;
-    let max_u = usize::try_from(max).expect("MAX_CURVE_SPLITS >= 0");
+    let max_u = usize::try_from(max)
+        .expect("MAX_CURVE_SPLITS must be non-negative (it is the constant 1024)");
 
     // Initialise the stack: one segment covering [0, max].
     let i0 = 0usize;
@@ -93,12 +136,16 @@ pub fn flatten_curve(
     data.cy[i2 * 3] = p3.y;
     data.c_next[i0] = max;
 
+    // Loop invariant: `pp1 >= 0` always, because it starts at 0 and is only
+    // ever set to `pp2` (which comes from `c_next`, initialised to non-negative
+    // values) or to `pp3 = i32::midpoint(pp1, pp2)` (always in [pp1, pp2]).
+    // Therefore `pp2 >= pp1 >= 0` throughout, so `pp2 - pp1` never underflows.
     let mut pp1 = 0i32; // current left slot
 
     while pp1 < max {
-        let pp2 = data.c_next[usize::try_from(pp1).expect("pp1 >= 0")];
-        let pp2u = usize::try_from(pp2).expect("pp2 >= 0");
-        let pp1u = usize::try_from(pp1).expect("pp1 >= 0");
+        let pp1u = to_idx(pp1);
+        let pp2 = data.c_next[pp1u];
+        let pp2u = to_idx(pp2);
 
         // Read this segment's endpoints and control points.
         let xl0 = data.cx[pp1u * 3];
@@ -110,7 +157,7 @@ pub fn flatten_curve(
         let xr3 = data.cx[pp2u * 3];
         let yr3 = data.cy[pp2u * 3];
 
-        // Midpoint of the chord.
+        // Midpoint of the chord (f64::midpoint: stable Rust 1.85, never overflows).
         let mx = xl0.midpoint(xr3);
         let my = yl0.midpoint(yr3);
 
@@ -128,6 +175,7 @@ pub fn flatten_curve(
             pp1 = pp2;
         } else {
             // De Casteljau midpoint subdivision.
+            // All midpoint calls use f64::midpoint (stable Rust 1.85).
             let xl1 = xl0.midpoint(xx1);
             let yl1 = yl0.midpoint(yy1);
             let xh = xx1.midpoint(xx2);
@@ -141,8 +189,10 @@ pub fn flatten_curve(
             let xr0 = xl2.midpoint(xr1);
             let yr0 = yl2.midpoint(yr1);
 
+            // i32::midpoint (stable Rust 1.85) gives the floor of the average,
+            // always in [pp1, pp2], so pp3u is a valid slot index.
             let pp3 = i32::midpoint(pp1, pp2);
-            let pp3u = usize::try_from(pp3).expect("pp3 >= 0");
+            let pp3u = to_idx(pp3);
 
             // Update left segment: [pp1, pp3] with left sub-curve controls.
             data.cx[pp1u * 3 + 1] = xl1;
@@ -227,5 +277,28 @@ mod tests {
         flatten_curve(p0, p1, p2, p3, 0.5 * 0.5, &mut out, &mut data);
         // Must terminate and emit ≤ MAX_CURVE_SPLITS segments.
         assert!(out.len() <= usize::try_from(MAX_CURVE_SPLITS).expect("non-negative"));
+    }
+
+    #[test]
+    fn curve_to_line_is_two_points() {
+        // Degenerate curve: all four control points are identical.
+        // The chord has zero length, both control points sit exactly on the
+        // chord midpoint (deviation = 0), so the flatness test passes
+        // immediately. The output must contain exactly one point (the endpoint
+        // p3 = p0 = the single shared coordinate).
+        let origin = pt(5.0, 7.0);
+        let mut out = Vec::new();
+        let mut data = None;
+        flatten_curve(
+            origin,
+            origin,
+            origin,
+            origin,
+            f64::EPSILON,
+            &mut out,
+            &mut data,
+        );
+        assert_eq!(out.len(), 1, "degenerate curve must emit exactly one point");
+        assert_eq!(out[0], origin, "emitted point must equal p3");
     }
 }

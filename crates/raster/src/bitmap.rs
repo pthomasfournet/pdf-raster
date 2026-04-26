@@ -13,6 +13,20 @@ use std::marker::PhantomData;
 
 use crate::types::{AA_SIZE, Pixel};
 
+// ── internal helper ───────────────────────────────────────────────────────────
+
+/// Convert a `u32` to `usize`.
+///
+/// On every platform where Rust runs, `usize` is at least 32 bits wide, so
+/// this conversion is always exact. The compile-time `const` assertion below
+/// enforces that invariant; any platform that violates it will fail to
+/// compile rather than producing silently truncated values.
+#[inline]
+const fn u32_to_usize(v: u32) -> usize {
+    const { assert!(u32::BITS <= usize::BITS, "platform has a narrower usize than u32") }
+    v as usize
+}
+
 // ── Bitmap ────────────────────────────────────────────────────────────────────
 
 /// A typed, top-down pixel buffer.
@@ -24,9 +38,13 @@ use crate::types::{AA_SIZE, Pixel};
 /// The optional alpha plane is always `width * height` bytes, one byte per pixel,
 /// top-down. It is stored separately from the colour data (matching `SplashBitmap`).
 pub struct Bitmap<P: Pixel> {
+    /// Width of the bitmap in pixels.
     pub width: u32,
+    /// Height of the bitmap in pixels.
     pub height: u32,
-    pub stride: usize, // bytes per row, ≥ width * P::BYTES, multiple of row_pad
+    /// Byte distance between the start of consecutive rows; always `≥ width * P::BYTES`
+    /// and a multiple of `row_pad`.
+    pub stride: usize,
     data: Vec<u8>,
     alpha: Option<Vec<u8>>,
     _marker: PhantomData<P>,
@@ -44,19 +62,15 @@ impl<P: Pixel> Bitmap<P> {
     #[must_use]
     pub fn new(width: u32, height: u32, row_pad: usize, with_alpha: bool) -> Self {
         assert!(row_pad >= 1, "row_pad must be ≥ 1");
-        let raw_stride = usize::try_from(width).unwrap_or(0) * P::BYTES;
+        let raw_stride = u32_to_usize(width) * P::BYTES;
         let stride = if row_pad <= 1 {
             raw_stride
         } else {
             raw_stride.div_ceil(row_pad) * row_pad
         };
-        let data = vec![0u8; stride * usize::try_from(height).unwrap_or(0)];
+        let data = vec![0u8; stride * u32_to_usize(height)];
         let alpha = if with_alpha {
-            Some(vec![
-                0u8;
-                usize::try_from(width).unwrap_or(0)
-                    * usize::try_from(height).unwrap_or(0)
-            ])
+            Some(vec![0u8; u32_to_usize(width) * u32_to_usize(height)])
         } else {
             None
         };
@@ -74,16 +88,24 @@ impl<P: Pixel> Bitmap<P> {
 
     /// Typed read-only access to row `y`.
     ///
-    /// Returns a slice of exactly `width` pixels. Panics if `y ≥ height`.
+    /// Returns a slice of exactly `width` pixels.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y >= height`.
     #[must_use]
     pub fn row(&self, y: u32) -> &[P] {
         let bytes = self.row_bytes(y);
-        bytemuck::cast_slice(&bytes[..usize::try_from(self.width).unwrap_or(0) * P::BYTES])
+        bytemuck::cast_slice(&bytes[..u32_to_usize(self.width) * P::BYTES])
     }
 
     /// Typed mutable access to row `y`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y >= height`.
     pub fn row_mut(&mut self, y: u32) -> &mut [P] {
-        let w = usize::try_from(self.width).unwrap_or(0) * P::BYTES;
+        let w = u32_to_usize(self.width) * P::BYTES;
         let bytes = self.row_bytes_mut(y);
         bytemuck::cast_slice_mut(&mut bytes[..w])
     }
@@ -95,8 +117,12 @@ impl<P: Pixel> Bitmap<P> {
     /// Panics if `y >= height`.
     #[must_use]
     pub fn row_bytes(&self, y: u32) -> &[u8] {
-        assert!(y < self.height);
-        let off = usize::try_from(y).unwrap_or(0) * self.stride;
+        assert!(
+            y < self.height,
+            "row index {y} is out of bounds for bitmap height {}",
+            self.height
+        );
+        let off = u32_to_usize(y) * self.stride;
         &self.data[off..off + self.stride]
     }
 
@@ -106,8 +132,12 @@ impl<P: Pixel> Bitmap<P> {
     ///
     /// Panics if `y >= height`.
     pub fn row_bytes_mut(&mut self, y: u32) -> &mut [u8] {
-        assert!(y < self.height);
-        let off = usize::try_from(y).unwrap_or(0) * self.stride;
+        assert!(
+            y < self.height,
+            "row index {y} is out of bounds for bitmap height {}",
+            self.height
+        );
+        let off = u32_to_usize(y) * self.stride;
         &mut self.data[off..off + self.stride]
     }
 
@@ -121,6 +151,11 @@ impl<P: Pixel> Bitmap<P> {
         self.row_bytes(y).as_ptr()
     }
 
+    /// Mutable raw pointer to the start of row `y`. For SIMD inner loops.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y >= height`.
     pub fn row_ptr_mut(&mut self, y: u32) -> *mut u8 {
         self.row_bytes_mut(y).as_mut_ptr()
     }
@@ -129,33 +164,46 @@ impl<P: Pixel> Bitmap<P> {
 
     /// Alpha plane row `y`, if the alpha plane was allocated.
     ///
+    /// Returns `None` if this bitmap was created without an alpha plane.
+    ///
     /// # Panics
     ///
     /// Panics if `y >= height`.
     #[must_use]
     pub fn alpha_row(&self, y: u32) -> Option<&[u8]> {
-        assert!(y < self.height);
+        assert!(
+            y < self.height,
+            "row index {y} is out of bounds for bitmap height {}",
+            self.height
+        );
         self.alpha.as_ref().map(|a| {
-            let w = usize::try_from(self.width).unwrap_or(0);
-            let off = usize::try_from(y).unwrap_or(0) * w;
+            let w = u32_to_usize(self.width);
+            let off = u32_to_usize(y) * w;
             &a[off..off + w]
         })
     }
 
     /// Mutable alpha plane row `y`.
     ///
+    /// Returns `None` if this bitmap was created without an alpha plane.
+    ///
     /// # Panics
     ///
     /// Panics if `y >= height`.
     pub fn alpha_row_mut(&mut self, y: u32) -> Option<&mut [u8]> {
-        assert!(y < self.height);
-        let w = usize::try_from(self.width).unwrap_or(0);
+        assert!(
+            y < self.height,
+            "row index {y} is out of bounds for bitmap height {}",
+            self.height
+        );
+        let w = u32_to_usize(self.width);
         self.alpha.as_mut().map(|a| {
-            let off = usize::try_from(y).unwrap_or(0) * w;
+            let off = u32_to_usize(y) * w;
             &mut a[off..off + w]
         })
     }
 
+    /// Returns `true` if this bitmap has a separate alpha plane.
     #[must_use]
     pub const fn has_alpha(&self) -> bool {
         self.alpha.is_some()
@@ -167,20 +215,19 @@ impl<P: Pixel> Bitmap<P> {
     ///
     /// `alpha` is ignored if the bitmap has no alpha plane.
     pub fn clear(&mut self, color: P, alpha: u8) {
-        // Write one pixel then memcpy-extend across the row, then extend across rows.
         let pixel_bytes: &[u8] = bytemuck::bytes_of(&color);
         if P::BYTES == 1 {
             // Optimise single-byte pixels: memset the entire data buffer.
             self.data.fill(pixel_bytes[0]);
         } else {
-            let w = usize::try_from(self.width).unwrap_or(0);
+            // Write one pixel-sized chunk per pixel in each row, then zero the
+            // stride padding. Using `chunks_exact_mut` avoids manual index arithmetic.
+            let w = u32_to_usize(self.width);
+            let n = w * P::BYTES;
             let stride = self.stride;
-            for y in 0..self.height {
-                let off = usize::try_from(y).unwrap_or(0) * stride;
-                let row = &mut self.data[off..off + stride];
-                let n = w * P::BYTES;
-                for px in 0..w {
-                    row[px * P::BYTES..px * P::BYTES + P::BYTES].copy_from_slice(pixel_bytes);
+            for row in self.data.chunks_exact_mut(stride) {
+                for dst in row[..n].chunks_exact_mut(P::BYTES) {
+                    dst.copy_from_slice(pixel_bytes);
                 }
                 row[n..].fill(0);
             }
@@ -202,6 +249,7 @@ impl<P: Pixel> Bitmap<P> {
         &self.data
     }
 
+    /// Mutable access to the full colour data buffer as a flat byte slice.
     pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.data
     }
@@ -214,14 +262,20 @@ impl<P: Pixel> Bitmap<P> {
 ///
 /// Phase 2 will add rendering methods; Phase 1 only needs storage + dimensions.
 pub enum AnyBitmap {
+    /// 24-bit RGB, 8 bits per channel.
     Rgb8(Bitmap<crate::types::Rgb8>),
+    /// 32-bit RGBA, 8 bits per channel (alpha stored in a separate plane).
     Rgba8(Bitmap<crate::types::Rgba8>),
+    /// 8-bit grayscale.
     Gray8(Bitmap<crate::types::Gray8>),
+    /// 32-bit CMYK, 8 bits per channel.
     Cmyk8(Bitmap<crate::types::Cmyk8>),
+    /// Up to 8 spot/device-N channels, 8 bits each.
     DeviceN8(Bitmap<crate::types::DeviceN8>),
 }
 
 impl AnyBitmap {
+    /// Width of the contained bitmap in pixels.
     #[must_use]
     pub const fn width(&self) -> u32 {
         match self {
@@ -233,6 +287,7 @@ impl AnyBitmap {
         }
     }
 
+    /// Height of the contained bitmap in pixels.
     #[must_use]
     pub const fn height(&self) -> u32 {
         match self {
@@ -244,6 +299,7 @@ impl AnyBitmap {
         }
     }
 
+    /// The pixel mode (colour space + bit depth) of the contained bitmap.
     #[must_use]
     pub const fn mode(&self) -> crate::types::PixelMode {
         match self {
@@ -275,12 +331,23 @@ pub struct AaBuf {
     data: Vec<u8>, // row-major; rows are (width+7)/8 bytes each
 }
 
+/// `AA_SIZE` converted to `usize`. Computed once as a compile-time constant.
+///
+/// `AA_SIZE` is `i32 = 4`, which is always non-negative, so the conversion
+/// can never fail; the `expect` ensures any future change to a negative value
+/// is caught immediately.
+const AA_SIZE_USIZE: usize = {
+    // i32 → usize: can only fail if AA_SIZE is negative.
+    assert!(AA_SIZE >= 0, "AA_SIZE must be non-negative");
+    AA_SIZE as usize
+};
+
 impl AaBuf {
     /// Create a new zeroed AA buffer for a bitmap of the given pixel width.
     #[must_use]
     pub fn new(bitmap_width: usize) -> Self {
-        let width = bitmap_width * usize::try_from(AA_SIZE).unwrap_or(4);
-        let height = usize::try_from(AA_SIZE).unwrap_or(4);
+        let width = bitmap_width * AA_SIZE_USIZE;
+        let height = AA_SIZE_USIZE;
         let row_bytes = width.div_ceil(8);
         Self {
             width,
@@ -310,7 +377,11 @@ impl AaBuf {
     ///
     /// Panics if `row >= height`.
     pub fn set_span(&mut self, row: usize, x0: usize, x1: usize) {
-        assert!(row < self.height);
+        assert!(
+            row < self.height,
+            "row index {row} is out of bounds for AaBuf height {}",
+            self.height
+        );
         let x0 = x0.min(self.width);
         let x1 = x1.min(self.width);
         if x0 >= x1 {
@@ -350,16 +421,39 @@ impl AaBuf {
         }
     }
 
-    /// Read one raw byte from the given row and byte index.
+    /// Read one raw byte from the given `row` at byte index `byte_idx`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= height` or `byte_idx >= row_bytes()`.
     #[inline]
     #[must_use]
     pub fn get_byte(&self, row: usize, byte_idx: usize) -> u8 {
-        self.data[row * self.row_bytes() + byte_idx]
+        let rb = self.row_bytes();
+        assert!(
+            row < self.height,
+            "row index {row} is out of bounds for AaBuf height {}",
+            self.height
+        );
+        assert!(
+            byte_idx < rb,
+            "byte_idx {byte_idx} is out of bounds for row_bytes {rb}"
+        );
+        self.data[row * rb + byte_idx]
     }
 
     /// Read-only access to a full row as a byte slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= height`.
     #[must_use]
     pub fn row_slice(&self, row: usize) -> &[u8] {
+        assert!(
+            row < self.height,
+            "row index {row} is out of bounds for AaBuf height {}",
+            self.height
+        );
         let rb = self.row_bytes();
         &self.data[row * rb..(row + 1) * rb]
     }

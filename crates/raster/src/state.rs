@@ -28,20 +28,34 @@ use color::TransferLut;
 // ── StateFlags ────────────────────────────────────────────────────────────────
 
 /// Boolean flags packed into a single byte to avoid `struct_excessive_bools`.
+///
+/// Bit layout (all positions are distinct):
+/// ```text
+/// bit 0 – MULTIPLY_PATTERN_ALPHA
+/// bit 1 – STROKE_ADJUST
+/// bit 2 – DELETE_SOFT_MASK
+/// bit 3 – IN_NON_ISOLATED_GROUP
+/// bit 4 – IN_KNOCKOUT_GROUP
+/// bit 5 – FILL_OVERPRINT
+/// bit 6 – STROKE_OVERPRINT
+/// bit 7 – OVERPRINT_ADDITIVE
+/// ```
 #[derive(Copy, Clone, Debug, Default)]
 pub struct StateFlags {
     bits: u8,
 }
 
 impl StateFlags {
-    const MULTIPLY_PATTERN_ALPHA: u8 = 1 << 0;
-    const STROKE_ADJUST: u8 = 1 << 1;
-    const DELETE_SOFT_MASK: u8 = 1 << 2;
-    const IN_NON_ISOLATED_GROUP: u8 = 1 << 3;
-    const IN_KNOCKOUT_GROUP: u8 = 1 << 4;
-    const FILL_OVERPRINT: u8 = 1 << 5;
-    const STROKE_OVERPRINT: u8 = 1 << 6;
-    const OVERPRINT_ADDITIVE: u8 = 1 << 7;
+    // Each constant occupies a unique bit position (0–7); all eight u8 bits
+    // are consumed, so no two masks can ever overlap.
+    const MULTIPLY_PATTERN_ALPHA: u8 = 1 << 0; // bit 0
+    const STROKE_ADJUST: u8 = 1 << 1;           // bit 1
+    const DELETE_SOFT_MASK: u8 = 1 << 2;        // bit 2
+    const IN_NON_ISOLATED_GROUP: u8 = 1 << 3;   // bit 3
+    const IN_KNOCKOUT_GROUP: u8 = 1 << 4;       // bit 4
+    const FILL_OVERPRINT: u8 = 1 << 5;          // bit 5
+    const STROKE_OVERPRINT: u8 = 1 << 6;        // bit 6
+    const OVERPRINT_ADDITIVE: u8 = 1 << 7;      // bit 7
 
     const fn get(self, mask: u8) -> bool {
         self.bits & mask != 0
@@ -54,60 +68,76 @@ impl StateFlags {
         }
     }
 
+    /// Returns `true` if pattern alpha should be multiplied into the stroke/fill alpha.
     #[must_use]
     pub const fn multiply_pattern_alpha(self) -> bool {
         self.get(Self::MULTIPLY_PATTERN_ALPHA)
     }
+    /// Returns `true` if stroke adjustment (pixel-grid hinting for thin lines) is enabled.
     #[must_use]
     pub const fn stroke_adjust(self) -> bool {
         self.get(Self::STROKE_ADJUST)
     }
+    /// Returns `true` if the soft mask should be deleted on the next state restore.
     #[must_use]
     pub const fn delete_soft_mask(self) -> bool {
         self.get(Self::DELETE_SOFT_MASK)
     }
+    /// Returns `true` if rendering is currently inside a non-isolated transparency group.
     #[must_use]
     pub const fn in_non_isolated_group(self) -> bool {
         self.get(Self::IN_NON_ISOLATED_GROUP)
     }
+    /// Returns `true` if rendering is currently inside a knockout transparency group.
     #[must_use]
     pub const fn in_knockout_group(self) -> bool {
         self.get(Self::IN_KNOCKOUT_GROUP)
     }
+    /// Returns `true` if fill overprinting is enabled for the current state.
     #[must_use]
     pub const fn fill_overprint(self) -> bool {
         self.get(Self::FILL_OVERPRINT)
     }
+    /// Returns `true` if stroke overprinting is enabled for the current state.
     #[must_use]
     pub const fn stroke_overprint(self) -> bool {
         self.get(Self::STROKE_OVERPRINT)
     }
+    /// Returns `true` if overprinting uses additive (rather than subtractive) compositing.
     #[must_use]
     pub const fn overprint_additive(self) -> bool {
         self.get(Self::OVERPRINT_ADDITIVE)
     }
 
+    /// Sets whether pattern alpha should be multiplied into the stroke/fill alpha.
     pub const fn set_multiply_pattern_alpha(&mut self, v: bool) {
         self.set(Self::MULTIPLY_PATTERN_ALPHA, v);
     }
+    /// Sets whether stroke adjustment (pixel-grid hinting for thin lines) is active.
     pub const fn set_stroke_adjust(&mut self, v: bool) {
         self.set(Self::STROKE_ADJUST, v);
     }
+    /// Sets whether the soft mask should be deleted on the next state restore.
     pub const fn set_delete_soft_mask(&mut self, v: bool) {
         self.set(Self::DELETE_SOFT_MASK, v);
     }
+    /// Sets whether rendering is inside a non-isolated transparency group.
     pub const fn set_in_non_isolated_group(&mut self, v: bool) {
         self.set(Self::IN_NON_ISOLATED_GROUP, v);
     }
+    /// Sets whether rendering is inside a knockout transparency group.
     pub const fn set_in_knockout_group(&mut self, v: bool) {
         self.set(Self::IN_KNOCKOUT_GROUP, v);
     }
+    /// Sets whether fill overprinting is enabled.
     pub const fn set_fill_overprint(&mut self, v: bool) {
         self.set(Self::FILL_OVERPRINT, v);
     }
+    /// Sets whether stroke overprinting is enabled.
     pub const fn set_stroke_overprint(&mut self, v: bool) {
         self.set(Self::STROKE_OVERPRINT, v);
     }
+    /// Sets whether overprinting uses additive compositing.
     pub const fn set_overprint_additive(&mut self, v: bool) {
         self.set(Self::OVERPRINT_ADDITIVE, v);
     }
@@ -120,43 +150,59 @@ impl StateFlags {
 /// Patterns are stubbed as `()` for Phase 1; Phase 2 replaces them with
 /// `Box<dyn Pattern>`.
 pub struct GraphicsState {
-    // Current transformation matrix (column-vector 2-D affine).
+    /// Current transformation matrix in column-vector 2-D affine form: `[a, b, c, d, e, f]`.
     pub matrix: [f64; 6],
 
     // Patterns (Phase 2 placeholder).
     // pub stroke_pattern: Box<dyn Pattern>,
     // pub fill_pattern:   Box<dyn Pattern>,
+    /// Halftone screen parameters controlling frequency, angle, and spot function.
     pub screen: ScreenParams,
 
+    /// Opacity for stroking operations. `0.0` = fully transparent, `1.0` = fully opaque.
     pub stroke_alpha: f64,
+    /// Opacity for fill operations. `0.0` = fully transparent, `1.0` = fully opaque.
     pub fill_alpha: f64,
+    /// Effective stroke alpha after multiplying in pattern alpha (used when `multiply_pattern_alpha` is set).
     pub pattern_stroke_alpha: f64,
+    /// Effective fill alpha after multiplying in pattern alpha (used when `multiply_pattern_alpha` is set).
     pub pattern_fill_alpha: f64,
 
+    /// Stroke line width in user-space units; must be ≥ 0.
     pub line_width: f64,
+    /// Style of line end caps (butt, round, or square).
     pub line_cap: LineCap,
+    /// Style of line joins (miter, round, or bevel).
     pub line_join: LineJoin,
+    /// Maximum ratio of miter length to line width before a miter join is beveled; default 10.0.
     pub miter_limit: f64,
+    /// Maximum permitted distance between the path and the approximating line segments; default 1.0.
     pub flatness: f64,
 
+    /// Dash pattern array: alternating on/off lengths in user-space units.
     pub line_dash: Vec<f64>,
+    /// Offset into the dash pattern at which stroking begins.
     pub line_dash_phase: f64,
 
+    /// Active clipping region; updated by clip operators.
     pub clip: Clip,
 
     /// Soft mask bitmap (None if no soft mask is active).
     pub soft_mask: Option<Box<AnyBitmap>>,
 
+    /// PDF overprint mode: `0` = `CompatibleOverprint`, `1` = `IsolatePaint`.
     pub overprint_mode: i32,
 
     /// Transfer LUTs — RGB channels (R=0, G=1, B=2).
     pub rgb_transfer: [TransferLut; 3],
+    /// Transfer LUT for the gray channel.
     pub gray_transfer: TransferLut,
     /// Transfer LUTs — CMYK channels (C=0, M=1, Y=2, K=3).
     pub cmyk_transfer: [TransferLut; 4],
     /// Transfer LUTs — `DeviceN` channels (indices `0..SPOT_NCOMPS+4` = 8).
     pub device_n_transfer: Vec<[u8; 256]>,
 
+    /// Bitmask of color components that participate in overprinting; default `0xFFFF_FFFF` (all).
     pub overprint_mask: u32,
 
     /// Boolean flags (replaces individual bool fields to satisfy `struct_excessive_bools`).
@@ -165,34 +211,42 @@ pub struct GraphicsState {
 
 // Convenience accessors mirroring the old public bool fields.
 impl GraphicsState {
+    /// Returns `true` if pattern alpha should be multiplied into the stroke/fill alpha.
     #[must_use]
     pub const fn multiply_pattern_alpha(&self) -> bool {
         self.flags.multiply_pattern_alpha()
     }
+    /// Returns `true` if stroke adjustment (pixel-grid hinting for thin lines) is enabled.
     #[must_use]
     pub const fn stroke_adjust(&self) -> bool {
         self.flags.stroke_adjust()
     }
+    /// Returns `true` if the soft mask should be deleted on the next state restore.
     #[must_use]
     pub const fn delete_soft_mask(&self) -> bool {
         self.flags.delete_soft_mask()
     }
+    /// Returns `true` if rendering is currently inside a non-isolated transparency group.
     #[must_use]
     pub const fn in_non_isolated_group(&self) -> bool {
         self.flags.in_non_isolated_group()
     }
+    /// Returns `true` if rendering is currently inside a knockout transparency group.
     #[must_use]
     pub const fn in_knockout_group(&self) -> bool {
         self.flags.in_knockout_group()
     }
+    /// Returns `true` if fill overprinting is enabled for the current state.
     #[must_use]
     pub const fn fill_overprint(&self) -> bool {
         self.flags.fill_overprint()
     }
+    /// Returns `true` if stroke overprinting is enabled for the current state.
     #[must_use]
     pub const fn stroke_overprint(&self) -> bool {
         self.flags.stroke_overprint()
     }
+    /// Returns `true` if overprinting uses additive (rather than subtractive) compositing.
     #[must_use]
     pub const fn overprint_additive(&self) -> bool {
         self.flags.overprint_additive()
@@ -204,8 +258,16 @@ impl GraphicsState {
     ///
     /// `clip` is set to `[0, 0, width-0.001, height-0.001]` — the intentional
     /// 0.001 inset matches `SplashState` constructor and avoids edge-pixel issues.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in debug builds only) if `width` or `height` is zero.  A zero
+    /// dimension would produce a negative clip bound (`0.0 - 0.001 = -0.001`),
+    /// which is meaningless and almost certainly a caller bug.
     #[must_use]
     pub fn new(width: u32, height: u32, vector_antialias: bool) -> Self {
+        debug_assert!(width > 0, "GraphicsState::new: width must be > 0");
+        debug_assert!(height > 0, "GraphicsState::new: height must be > 0");
         let clip = Clip::new(
             0.0,
             0.0,
@@ -259,23 +321,44 @@ impl GraphicsState {
     /// Apply new RGB and gray transfer functions, deriving CMYK and `DeviceN`[0..4]
     /// from the **inverted** current RGB/gray values before overwriting them.
     ///
-    /// Matches `SplashState::setTransfer` in `SplashState.cc`:
+    /// Matches `SplashState::setTransfer` in `SplashState.cc` exactly.
+    ///
+    /// ## Derivation
+    ///
+    /// CMYK uses a subtractive colour model: a CMYK value of 0 means "no ink"
+    /// (full brightness) and 255 means "full ink" (zero brightness).  The
+    /// relationship to the existing RGB transfer LUT is therefore:
+    ///
     /// ```text
-    /// cmykTransferC[i] = 255 - rgbTransferR[255 - i]   (before overwrite)
-    /// deviceNTransfer[0][i] = 255 - rgbTransferR[255 - i]
-    /// …
+    /// Step 1 – invert the index:   look up rgb_transfer_R at position (255 - i)
+    ///                               to obtain the complemented input value.
+    /// Step 2 – invert the result:  subtract from 255 to flip from additive to
+    ///                               subtractive space.
+    ///
+    /// cmykTransferC[i] = 255 - rgb_transfer_R[255 - i]   ← C mapped from R
+    /// cmykTransferM[i] = 255 - rgb_transfer_G[255 - i]   ← M mapped from G
+    /// cmykTransferY[i] = 255 - rgb_transfer_B[255 - i]   ← Y mapped from B
+    /// cmykTransferK[i] = 255 - gray_transfer[255 - i]    ← K mapped from gray
+    /// deviceNTransfer[0..=3][i]  = same as CMYK (C/M/Y/K), respectively
     /// ```
+    ///
+    /// Only after the CMYK/DeviceN tables have been built are `rgb_transfer` and
+    /// `gray_transfer` overwritten with the new `r`, `g`, `b`, `gray` LUTs.
     pub fn set_transfer(&mut self, r: &[u8; 256], g: &[u8; 256], b: &[u8; 256], gray: &[u8; 256]) {
-        // Derive CMYK and DeviceN[0..4] from the CURRENT (pre-overwrite) LUTs.
+        // ── Step 1: Snapshot CMYK derivations from the CURRENT (pre-overwrite) LUTs ──
+        //
+        // Each entry uses invert_complement: cmyk[i] = 255 - rgb[255 - i].
+        // This converts the additive RGB transfer into the subtractive CMYK
+        // transfer in one pass, before the RGB/gray LUTs are replaced below.
         let mut cc = [0u8; 256];
         let mut cm = [0u8; 256];
         let mut cy = [0u8; 256];
         let mut ck = [0u8; 256];
         for i in 0usize..256 {
-            cc[i] = 255 - self.rgb_transfer[0].0[255 - i];
-            cm[i] = 255 - self.rgb_transfer[1].0[255 - i];
-            cy[i] = 255 - self.rgb_transfer[2].0[255 - i];
-            ck[i] = 255 - self.gray_transfer.0[255 - i];
+            cc[i] = 255 - self.rgb_transfer[0].0[255 - i]; // C ← invert_complement(R)
+            cm[i] = 255 - self.rgb_transfer[1].0[255 - i]; // M ← invert_complement(G)
+            cy[i] = 255 - self.rgb_transfer[2].0[255 - i]; // Y ← invert_complement(B)
+            ck[i] = 255 - self.gray_transfer.0[255 - i];   // K ← invert_complement(gray)
         }
         self.cmyk_transfer = [
             TransferLut(cc),
@@ -283,13 +366,16 @@ impl GraphicsState {
             TransferLut(cy),
             TransferLut(ck),
         ];
+
+        // DeviceN channels 0–3 mirror CMYK C/M/Y/K exactly.
         for i in 0usize..256 {
             self.device_n_transfer[0][i] = 255 - self.rgb_transfer[0].0[255 - i];
             self.device_n_transfer[1][i] = 255 - self.rgb_transfer[1].0[255 - i];
             self.device_n_transfer[2][i] = 255 - self.rgb_transfer[2].0[255 - i];
             self.device_n_transfer[3][i] = 255 - self.gray_transfer.0[255 - i];
         }
-        // Now overwrite RGB and gray.
+
+        // ── Step 2: Overwrite RGB and gray with the caller-supplied LUTs ──
         self.rgb_transfer[0] = TransferLut(*r);
         self.rgb_transfer[1] = TransferLut(*g);
         self.rgb_transfer[2] = TransferLut(*b);
@@ -339,13 +425,31 @@ impl GraphicsState {
 /// A Vec-based save/restore stack of [`GraphicsState`] values.
 ///
 /// Replaces the raw-pointer linked list (`SplashState *next`) in the C++
-/// original. The stack always has at least one entry (the initial state).
+/// original.
+///
+/// ## Stack invariant
+///
+/// The stack **always** contains at least one entry — the initial state passed
+/// to [`StateStack::new`].  This invariant is established by the constructor
+/// and maintained by every method:
+///
+/// - [`save`](StateStack::save) only pushes (depth grows).
+/// - [`restore`](StateStack::restore) refuses to pop the last entry and signals
+///   this via its `bool` return value.
+///
+/// Because the invariant holds unconditionally, the `.last()` / `.last_mut()`
+/// calls in [`current`](StateStack::current), [`current_mut`](StateStack::current_mut),
+/// and [`save`](StateStack::save) can never return `None`.  The `.expect()`
+/// calls there exist solely to surface a bug if the invariant is ever broken
+/// during development.
 pub struct StateStack {
     stack: Vec<GraphicsState>,
 }
 
 impl StateStack {
-    /// Create a new stack with `initial` as the bottom state.
+    /// Create a new stack with `initial` as the sole (bottom) state.
+    ///
+    /// After construction, [`depth`](StateStack::depth) returns `1`.
     #[must_use]
     pub fn new(initial: GraphicsState) -> Self {
         Self {
@@ -357,41 +461,57 @@ impl StateStack {
     ///
     /// # Panics
     ///
-    /// Panics if the stack is empty (cannot happen; the stack always has at least one entry).
+    /// Never panics in correct code — the stack invariant guarantees at least
+    /// one entry at all times.  The `expect` is a development-time tripwire.
     #[must_use]
     pub fn current(&self) -> &GraphicsState {
-        self.stack.last().expect("StateStack is empty")
+        // SAFETY: stack invariant guarantees len >= 1; .last() cannot be None.
+        self.stack.last().expect("StateStack invariant violated: stack is empty")
     }
 
     /// Mutably borrow the current state.
     ///
     /// # Panics
     ///
-    /// Panics if the stack is empty (cannot happen; the stack always has at least one entry).
+    /// Never panics in correct code — the stack invariant guarantees at least
+    /// one entry at all times.  The `expect` is a development-time tripwire.
     pub fn current_mut(&mut self) -> &mut GraphicsState {
-        self.stack.last_mut().expect("StateStack is empty")
+        // SAFETY: stack invariant guarantees len >= 1; .last_mut() cannot be None.
+        self.stack.last_mut().expect("StateStack invariant violated: stack is empty")
     }
 
-    /// Save: push a clone of the current state.
+    /// Push a clone of the current state (PDF `q` operator).
     ///
     /// # Panics
     ///
-    /// Panics if the stack is empty (cannot happen; the stack always has at least one entry).
+    /// Never panics in correct code — the stack invariant guarantees at least
+    /// one entry at all times.  The `expect` is a development-time tripwire.
     pub fn save(&mut self) {
-        let cloned = self.stack.last().expect("StateStack is empty").save_clone();
+        // SAFETY: stack invariant guarantees len >= 1; .last() cannot be None.
+        let cloned = self.stack.last().expect("StateStack invariant violated: stack is empty").save_clone();
         self.stack.push(cloned);
     }
 
-    /// Restore: pop the top state. Returns `false` if the stack is at the bottom.
+    /// Pop the top state (PDF `Q` operator).
+    ///
+    /// Returns `true` on success.
+    ///
+    /// Returns `false` — **without modifying the stack** — when the stack is at
+    /// depth 1 (only the initial state remains).  The initial state is never
+    /// popped; this preserves the stack invariant (`depth ≥ 1`).
+    ///
+    /// Callers that receive `false` should treat it as an unmatched `Q` operator
+    /// and continue rendering with the current state unchanged.
     pub fn restore(&mut self) -> bool {
         if self.stack.len() <= 1 {
+            // Invariant: never pop the last (initial) state.
             return false;
         }
-        self.stack.pop();
+        drop(self.stack.pop());
         true
     }
 
-    /// Current nesting depth (1 = only the initial state, no saves).
+    /// Current nesting depth (`1` = only the initial state, no saves in progress).
     #[must_use]
     pub const fn depth(&self) -> usize {
         self.stack.len()
@@ -478,5 +598,63 @@ mod tests {
         for i in 0u8..=255 {
             assert_eq!(s.cmyk_transfer[0].apply(i), i, "cmyk C[{i}]");
         }
+    }
+
+    /// All eight `StateFlags` bit-mask constants must be distinct powers of two
+    /// that together cover all 8 bits of a `u8`.
+    #[test]
+    fn state_flags_bit_positions_are_distinct() {
+        let masks = [
+            StateFlags::MULTIPLY_PATTERN_ALPHA,
+            StateFlags::STROKE_ADJUST,
+            StateFlags::DELETE_SOFT_MASK,
+            StateFlags::IN_NON_ISOLATED_GROUP,
+            StateFlags::IN_KNOCKOUT_GROUP,
+            StateFlags::FILL_OVERPRINT,
+            StateFlags::STROKE_OVERPRINT,
+            StateFlags::OVERPRINT_ADDITIVE,
+        ];
+        // All distinct
+        for (i, a) in masks.iter().enumerate() {
+            for (j, b) in masks.iter().enumerate() {
+                if i != j {
+                    assert_eq!(a & b, 0, "masks[{i}] and masks[{j}] share a bit");
+                }
+            }
+        }
+        // Together they cover all 8 bits
+        let union: u8 = masks.iter().fold(0, |acc, m| acc | m);
+        assert_eq!(union, 0xFF, "not all 8 bits are covered");
+    }
+
+    /// In debug builds, constructing a GraphicsState with zero width must panic.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "width must be > 0")]
+    fn new_panics_on_zero_width() {
+        let _ = GraphicsState::new(0, 100, false);
+    }
+
+    /// In debug builds, constructing a GraphicsState with zero height must panic.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "height must be > 0")]
+    fn new_panics_on_zero_height() {
+        let _ = GraphicsState::new(100, 0, false);
+    }
+
+    /// Verify that multiple unmatched restores never pop below depth 1.
+    #[test]
+    fn restore_never_pops_below_one() {
+        let initial = GraphicsState::new(100, 100, false);
+        let mut stack = StateStack::new(initial);
+        stack.save();
+        stack.save();
+        assert!(stack.restore());
+        assert!(stack.restore());
+        // At bottom now — further restores must return false without changing depth.
+        assert!(!stack.restore());
+        assert!(!stack.restore());
+        assert_eq!(stack.depth(), 1);
     }
 }

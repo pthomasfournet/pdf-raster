@@ -101,7 +101,9 @@ fn rgb_to_cmyk_channel(channel: u8, black: u8, dk: u8) -> u8 {
 /// `bytemuck::cast_slice`. `BYTES` must match `std::mem::size_of::<Self>()`;
 /// compile-time assertions in this module enforce the invariant.
 pub trait Pixel: Copy + Pod + Zeroable + Send + Sync + 'static {
+    /// The [`PixelMode`] variant that identifies this pixel format at runtime.
     const MODE: PixelMode;
+    /// Byte width of one pixel. Must equal `std::mem::size_of::<Self>()`.
     const BYTES: usize;
 
     /// Convert to linear RGBA f32, with alpha = 1.0 unless the type carries alpha.
@@ -122,8 +124,11 @@ pub trait Pixel: Copy + Pod + Zeroable + Send + Sync + 'static {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Pod, Zeroable)]
 pub struct Rgb8 {
+    /// Red channel, `0` = minimum, `255` = full intensity.
     pub r: u8,
+    /// Green channel, `0` = minimum, `255` = full intensity.
     pub g: u8,
+    /// Blue channel, `0` = minimum, `255` = full intensity.
     pub b: u8,
 }
 
@@ -161,9 +166,13 @@ impl Pixel for Rgb8 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Pod, Zeroable)]
 pub struct Rgba8 {
+    /// Red channel, `0` = minimum, `255` = full intensity.
     pub r: u8,
+    /// Green channel, `0` = minimum, `255` = full intensity.
     pub g: u8,
+    /// Blue channel, `0` = minimum, `255` = full intensity.
     pub b: u8,
+    /// Alpha channel, `0` = fully transparent, `255` = fully opaque.
     pub a: u8,
 }
 
@@ -197,6 +206,7 @@ impl Pixel for Rgba8 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Pod, Zeroable)]
 pub struct Gray8 {
+    /// Luminance, `0` = black, `255` = white.
     pub v: u8,
 }
 
@@ -238,9 +248,13 @@ impl Pixel for Gray8 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Pod, Zeroable)]
 pub struct Cmyk8 {
+    /// Cyan ink, `0` = no ink, `255` = full coverage.
     pub c: u8,
+    /// Magenta ink, `0` = no ink, `255` = full coverage.
     pub m: u8,
+    /// Yellow ink, `0` = no ink, `255` = full coverage.
     pub y: u8,
+    /// Black (key) ink, `0` = no ink, `255` = full coverage.
     pub k: u8,
 }
 
@@ -291,7 +305,9 @@ impl Pixel for Cmyk8 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Pod, Zeroable)]
 pub struct DeviceN8 {
+    /// Process CMYK channels.
     pub cmyk: Cmyk8,
+    /// Spot channels `S0`–`S3`, `0` = no ink, `255` = full coverage.
     pub spots: [u8; 4],
 }
 
@@ -327,7 +343,9 @@ impl Pixel for DeviceN8 {
 /// colour, graphics-state default colour, and similar configuration values.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AnyColor {
+    /// Raw pixel bytes; only the first `mode.bytes_per_pixel()` entries are meaningful.
     pub bytes: [u8; 8],
+    /// The pixel format that determines how `bytes` should be interpreted.
     pub mode: PixelMode,
 }
 

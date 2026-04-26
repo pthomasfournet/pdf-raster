@@ -1,5 +1,5 @@
 [package]
-name = "raster"
+name    = "raster"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,3 +11,6 @@ bitflags = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[lints]
+workspace = true
