@@ -18,6 +18,21 @@
 //!
 //! This eliminates per-row heap allocations and is friendlier to the CPU cache
 //! and future SIMD work.
+//!
+//! ## Two-pass construction (Tier 3)
+//!
+//! `XPathScanner::new` uses a two-pass counting-sort to avoid `n_rows`
+//! individual `Vec` allocations:
+//!
+//! 1. **Count pass**: walk segments, increment a `counts[row]` entry for each
+//!    intersection generated (identical edge-walking logic as the fill pass).
+//! 2. **Prefix-sum**: convert counts into `row_start` offsets; allocate the
+//!    flat `intersects` buffer in one shot.
+//! 3. **Fill pass**: walk segments again, writing into the pre-allocated slots.
+//! 4. **Sort**: sort each row's slice in-place by `x0`.
+//!
+//! This reduces construction from `O(n_rows)` heap allocs + flatten to a single
+//! pair of allocations regardless of path height.
 
 /// The coalescing span iterator for a scanner row.
 pub mod iter;
@@ -131,25 +146,59 @@ impl XPathScanner {
 
         let n_rows = usize::try_from(y_max - y_min + 1).expect("y_max >= y_min");
 
-        // Accumulate intersections into per-row buckets, then flatten.
-        let mut buckets: Vec<Vec<Intersect>> = vec![Vec::new(); n_rows];
-        fill_buckets(xpath, y_min, y_max, &mut buckets);
+        // ── Two-pass construction: count → prefix-sum → fill → finalise ──────
+        //
+        // Pass 1: count the maximum number of Intersect slots needed per row.
+        // Adjacent-span merging may reduce the final count, so this is an upper bound.
+        let mut counts = vec![0u32; n_rows];
+        count_intersections(xpath, y_min, y_max, &mut counts);
 
-        // Sort each row's intersections by x0, then flatten into the SoA layout.
+        // Pass 2: prefix-sum to produce base offsets; allocate the flat buffer.
+        let mut alloc_start = Vec::with_capacity(n_rows + 1);
+        let mut total = 0u32;
+        for &c in &counts {
+            alloc_start.push(total);
+            total = total
+                .checked_add(c)
+                .expect("intersection count exceeds u32::MAX; path has too many segments");
+        }
+        alloc_start.push(total);
+        let total_n = total as usize;
+        let mut intersects = vec![Intersect { x0: 0, x1: 0, count: 0 }; total_n];
+
+        // Pass 3: fill the flat buffer.  `cursors[i]` counts the actual number of
+        // entries written into row i (≤ counts[i] after merging).  Reset counts
+        // to zero and use them as the write cursors.
+        counts.fill(0);
+        fill_intersections(xpath, y_min, y_max, &alloc_start, &mut counts, &mut intersects);
+        // `counts` now holds the actual written count per row.
+
+        // Pass 4: build the final row_start from actual counts, compact intersects,
+        // and sort each row slice by x0.
+        //
+        // Compaction is needed because merging may have left unfilled slots between
+        // rows (each row was pre-allocated for its upper-bound count, but the actual
+        // fill may be smaller).  We re-pack in place using a single forward pass.
         let mut row_start = Vec::with_capacity(n_rows + 1);
-        let mut intersects = Vec::new();
-        for bucket in &mut buckets {
+        let mut write_pos = 0usize;
+        for i in 0..n_rows {
             row_start.push(
-                u32::try_from(intersects.len())
-                    .expect("intersection count exceeds u32::MAX; path has too many segments"),
+                u32::try_from(write_pos)
+                    .expect("compacted intersection count exceeds u32::MAX"),
             );
-            bucket.sort_unstable_by_key(|i| i.x0);
-            intersects.extend_from_slice(bucket);
+            let read_base = alloc_start[i] as usize;
+            let n_written = counts[i] as usize;
+            // Sort the actual written slice before copying.
+            intersects[read_base..read_base + n_written].sort_unstable_by_key(|ix| ix.x0);
+            // Copy into the compacted position (may overlap if no merging occurred).
+            intersects.copy_within(read_base..read_base + n_written, write_pos);
+            write_pos += n_written;
         }
         row_start.push(
-            u32::try_from(intersects.len())
-                .expect("intersection count exceeds u32::MAX; path has too many segments"),
+            u32::try_from(write_pos)
+                .expect("compacted intersection count exceeds u32::MAX"),
         );
+        intersects.truncate(write_pos);
 
         Self {
             eo,
@@ -359,120 +408,176 @@ impl XPathScanner {
     }
 }
 
-// ── Bucket filling ────────────────────────────────────────────────────────────
+// ── Two-pass intersection construction ───────────────────────────────────────
 
-/// Distribute all path segments from `xpath` into `buckets` (one bucket per
-/// scanline `y_min..=y_max`). Called only from `XPathScanner::new`.
-fn fill_buckets(xpath: &XPath, y_min: i32, y_max: i32, buckets: &mut [Vec<Intersect>]) {
+/// Pass 1: count how many `Intersect` entries each row will receive.
+///
+/// Walks the same segment logic as [`fill_intersections`] without writing
+/// anything, so the two passes must stay in sync.
+fn count_intersections(xpath: &XPath, y_min: i32, y_max: i32, counts: &mut [u32]) {
     for seg in &xpath.segs {
         if seg.x0.is_nan() || seg.y0.is_nan() {
             continue;
         }
-
         let seg_y_min = seg.y0.min(seg.y1);
         let seg_y_max = seg.y0.max(seg.y1);
-
         let row_y0 = splash_floor(seg_y_min).max(y_min);
         let row_y1 = splash_floor(seg_y_max).min(y_max);
 
         if seg.flags.contains(XPathFlags::HORIZ) {
-            // Horizontal segments: count = 0 (no winding contribution).
             let row = splash_floor(seg_y_min);
             if row >= y_min && row <= y_max {
-                let x0 = splash_floor(seg.x0.min(seg.x1));
-                let x1 = splash_floor(seg.x0.max(seg.x1));
-                let bucket_idx = usize::try_from(row - y_min).expect("row >= y_min");
-                add_intersection(&mut buckets[bucket_idx], x0, x1, 0, true);
-            }
-        } else if seg.flags.contains(XPathFlags::VERT) {
-            // Vertical segments.
-            let count = if seg.flags.contains(XPathFlags::FLIPPED) {
-                1
-            } else {
-                -1
-            };
-            let x = splash_floor(seg.x0);
-            for row in row_y0..=row_y1 {
-                // Count is 0 on the topmost row (seg_y_min < row), matching C++.
-                let c = if seg_y_min < f64::from(row) { count } else { 0 };
-                let bucket_idx = usize::try_from(row - y_min).expect("row >= y_min");
-                add_intersection(&mut buckets[bucket_idx], x, x, c, false);
+                let idx = usize::try_from(row - y_min).expect("row >= y_min");
+                counts[idx] = counts[idx].saturating_add(1);
             }
         } else {
-            // Sloped segment: interpolate x across the scanline range.
-            let count = if seg.flags.contains(XPathFlags::FLIPPED) {
-                1
-            } else {
-                -1
-            };
-            let x_base = seg.y0.mul_add(-seg.dxdy, seg.x0);
-            let sloped_x_min = seg.x0.min(seg.x1);
-            let sloped_x_max = seg.x0.max(seg.x1);
-
-            let xx0 = if f64::from(row_y0) > seg.y0 {
-                f64::from(row_y0).mul_add(seg.dxdy, x_base)
-            } else {
-                seg.x0
-            };
-            let xx0 = xx0.clamp(sloped_x_min, sloped_x_max);
-            let mut px0 = splash_floor(xx0);
-
             for row in row_y0..=row_y1 {
-                let xx1 = f64::from(row + 1)
-                    .mul_add(seg.dxdy, x_base)
-                    .clamp(sloped_x_min, sloped_x_max);
-                let px1 = splash_floor(xx1);
-                let c = if seg_y_min < f64::from(row) { count } else { 0 };
-                let bucket_idx = usize::try_from(row - y_min).expect("row >= y_min");
-                add_intersection(&mut buckets[bucket_idx], px0, px1, c, false);
-                px0 = px1;
+                let idx = usize::try_from(row - y_min).expect("row >= y_min");
+                counts[idx] = counts[idx].saturating_add(1);
             }
         }
     }
 }
 
+/// Pass 3: write `Intersect` entries into the pre-allocated flat buffer.
+///
+/// `row_start` holds the base offset for each row (prefix-summed from counts).
+/// `cursors` starts at all-zero and is incremented per row as entries are written —
+/// so `row_start[i] + cursors[i]` is the next free slot for row `i`.
+///
+/// Sloped segments use an incremental f64 accumulator (`xx1 += dxdy`) rather
+/// than recomputing `(row+1) * dxdy + x_base` each iteration, saving one FP
+/// multiply per scanline per segment.
+fn fill_intersections(
+    xpath: &XPath,
+    y_min: i32,
+    y_max: i32,
+    row_start: &[u32],
+    cursors: &mut [u32],
+    intersects: &mut [Intersect],
+) {
+    for seg in &xpath.segs {
+        if seg.x0.is_nan() || seg.y0.is_nan() {
+            continue;
+        }
+        let seg_y_min = seg.y0.min(seg.y1);
+        let seg_y_max = seg.y0.max(seg.y1);
+        let row_y0 = splash_floor(seg_y_min).max(y_min);
+        let row_y1 = splash_floor(seg_y_max).min(y_max);
+
+        if seg.flags.contains(XPathFlags::HORIZ) {
+            let row = splash_floor(seg_y_min);
+            if row >= y_min && row <= y_max {
+                let x0 = splash_floor(seg.x0.min(seg.x1));
+                let x1 = splash_floor(seg.x0.max(seg.x1));
+                write_intersect(row, y_min, row_start, cursors, intersects, x0, x1, 0);
+            }
+        } else if seg.flags.contains(XPathFlags::VERT) {
+            let count = if seg.flags.contains(XPathFlags::FLIPPED) { 1 } else { -1 };
+            let x = splash_floor(seg.x0);
+            for row in row_y0..=row_y1 {
+                let c = if seg_y_min < f64::from(row) { count } else { 0 };
+                write_intersect(row, y_min, row_start, cursors, intersects, x, x, c);
+            }
+        } else {
+            let count = if seg.flags.contains(XPathFlags::FLIPPED) { 1 } else { -1 };
+            let x_base = seg.y0.mul_add(-seg.dxdy, seg.x0);
+            let sloped_x_min = seg.x0.min(seg.x1);
+            let sloped_x_max = seg.x0.max(seg.x1);
+
+            // Initial x at the top of the first row (or seg.x0 if row_y0 == seg.y0).
+            let xx_init = if f64::from(row_y0) > seg.y0 {
+                f64::from(row_y0).mul_add(seg.dxdy, x_base)
+            } else {
+                seg.x0
+            };
+            let mut px0 = splash_floor(xx_init.clamp(sloped_x_min, sloped_x_max));
+
+            // Incremental accumulator: step by dxdy each row instead of a
+            // full multiply — saves one FP mul per scanline per sloped segment.
+            let mut xx1 = f64::from(row_y0 + 1).mul_add(seg.dxdy, x_base);
+            for row in row_y0..=row_y1 {
+                let px1 = splash_floor(xx1.clamp(sloped_x_min, sloped_x_max));
+                let c = if seg_y_min < f64::from(row) { count } else { 0 };
+                write_intersect(row, y_min, row_start, cursors, intersects, px0, px1, c);
+                px0 = px1;
+                xx1 += seg.dxdy;
+            }
+        }
+    }
+}
+
+/// Write one `Intersect` entry into its row slot, applying the same
+/// adjacent-span merge logic as `add_intersection`.
+///
+/// `cursors[idx]` tracks how many entries have been written into row `idx` so far.
+/// The slot is `row_start[idx] + cursors[idx] - 1` for merge, or `+ cursors[idx]`
+/// for a new entry.
+#[inline]
+#[expect(clippy::too_many_arguments, reason = "private helper: all params are load-bearing")]
+fn write_intersect(
+    row: i32,
+    y_min: i32,
+    row_start: &[u32],
+    cursors: &mut [u32],
+    intersects: &mut [Intersect],
+    x0: i32,
+    x1: i32,
+    count: i32,
+) {
+    let (lo, hi) = (x0.min(x1), x0.max(x1));
+    let entry = Intersect { x0: lo, x1: hi, count };
+    let idx = usize::try_from(row - y_min).expect("row >= y_min");
+    let base = row_start[idx] as usize;
+    let cur = cursors[idx] as usize;
+
+    if cur > 0 {
+        // Check the last written entry in this row for adjacency/overlap.
+        let last = &mut intersects[base + cur - 1];
+        if last.x1 + 1 >= entry.x0 && last.x0 <= entry.x1 + 1 {
+            // Merge: expand span and accumulate count.
+            last.count = last.count.wrapping_add(entry.count);
+            last.x0 = last.x0.min(entry.x0);
+            last.x1 = last.x1.max(entry.x1);
+            return;
+        }
+    }
+
+    // New entry: write into the next free slot.
+    // The count pass guarantees capacity; the debug_assert guards against
+    // logic divergence between the two passes.
+    debug_assert!(
+        base + cur < intersects.len(),
+        "write_intersect: slot out of range (row={row}, base={base}, cur={cur}, len={})",
+        intersects.len()
+    );
+    intersects[base + cur] = entry;
+    cursors[idx] += 1;
+}
+
 // ── Intersection helper ───────────────────────────────────────────────────────
 
-/// Add or merge one intersection entry into a row bucket.
+/// Add or merge one intersection entry into a `Vec<Intersect>` row buffer.
 ///
-/// Entries are assumed to arrive in approximately ascending `x0` order (they
-/// are sorted again later in `XPathScanner::new`). Adjacent or overlapping
-/// entries whose ranges touch (i.e. `last.x1 + 1 >= entry.x0`) are merged:
-/// the `count` is accumulated and the span is expanded to cover both ranges.
+/// Used only in unit tests to exercise the merge/disjoint logic independently.
+/// Production code uses [`write_intersect`] with the pre-allocated flat buffer.
 ///
-/// ## Adjacency criterion
-///
-/// Two spans are merged when `last.x1 + 1 >= entry.x0`, which means pixels
-/// at positions `last.x1` and `entry.x0` are either the same pixel or
-/// neighbours. This matches `SplashXPathScanner::addIntersection` in
-/// `SplashXPathScanner.cc`.
-///
-/// Note: since entries may arrive out of order across different segment types,
-/// the merge only compares against the *last* pushed entry. Full deduplication
-/// happens after the per-row sort in `XPathScanner::new`.
+/// Two spans are merged when `last.x1 + 1 >= entry.x0` *and*
+/// `last.x0 <= entry.x1 + 1` (i.e. they touch or overlap in either direction).
+/// This matches `SplashXPathScanner::addIntersection` in `SplashXPathScanner.cc`.
+#[cfg(test)]
 fn add_intersection(row: &mut Vec<Intersect>, x0: i32, x1: i32, count: i32, _is_horiz: bool) {
     let (lo, hi) = (x0.min(x1), x0.max(x1));
-    let entry = Intersect {
-        x0: lo,
-        x1: hi,
-        count,
-    };
+    let entry = Intersect { x0: lo, x1: hi, count };
 
     if row.is_empty() {
         row.push(entry);
         return;
     }
     let last = row.last_mut().unwrap();
-    // Merge when spans touch or overlap. The second half of the disjoint
-    // condition (`last.x0 > entry.x1 + 1`) handles the case where a new entry
-    // arrives to the *left* of the last one (can happen with sloped segments
-    // on the same row). If entries are disjoint in both directions, push a new
-    // entry; the final sort in new() will place it correctly.
     if last.x1 + 1 < entry.x0 || last.x0 > entry.x1 + 1 {
-        // Disjoint — push new entry.
         row.push(entry);
     } else {
-        // Touch or overlap — merge.
         last.count = last.count.wrapping_add(entry.count);
         last.x0 = last.x0.min(entry.x0);
         last.x1 = last.x1.max(entry.x1);
