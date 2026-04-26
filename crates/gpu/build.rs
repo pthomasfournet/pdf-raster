@@ -43,6 +43,9 @@ fn main() {
             .status()
             .unwrap_or_else(|e| panic!("failed to run nvcc ({nvcc}): {e}"));
 
-        assert!(status.success(), "nvcc failed for {kernel}.cu (arch={arch})");
+        assert!(
+            status.success(),
+            "nvcc failed for {kernel}.cu (arch={arch})"
+        );
     }
 }

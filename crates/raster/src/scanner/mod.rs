@@ -164,13 +164,27 @@ impl XPathScanner {
         }
         alloc_start.push(total);
         let total_n = total as usize;
-        let mut intersects = vec![Intersect { x0: 0, x1: 0, count: 0 }; total_n];
+        let mut intersects = vec![
+            Intersect {
+                x0: 0,
+                x1: 0,
+                count: 0
+            };
+            total_n
+        ];
 
         // Pass 3: fill the flat buffer.  `cursors[i]` counts the actual number of
         // entries written into row i (≤ counts[i] after merging).  Reset counts
         // to zero and use them as the write cursors.
         counts.fill(0);
-        fill_intersections(xpath, y_min, y_max, &alloc_start, &mut counts, &mut intersects);
+        fill_intersections(
+            xpath,
+            y_min,
+            y_max,
+            &alloc_start,
+            &mut counts,
+            &mut intersects,
+        );
         // `counts` now holds the actual written count per row.
 
         // Pass 4: build the final row_start from actual counts, compact intersects,
@@ -183,8 +197,7 @@ impl XPathScanner {
         let mut write_pos = 0usize;
         for i in 0..n_rows {
             row_start.push(
-                u32::try_from(write_pos)
-                    .expect("compacted intersection count exceeds u32::MAX"),
+                u32::try_from(write_pos).expect("compacted intersection count exceeds u32::MAX"),
             );
             let read_base = alloc_start[i] as usize;
             let n_written = counts[i] as usize;
@@ -194,10 +207,8 @@ impl XPathScanner {
             intersects.copy_within(read_base..read_base + n_written, write_pos);
             write_pos += n_written;
         }
-        row_start.push(
-            u32::try_from(write_pos)
-                .expect("compacted intersection count exceeds u32::MAX"),
-        );
+        row_start
+            .push(u32::try_from(write_pos).expect("compacted intersection count exceeds u32::MAX"));
         intersects.truncate(write_pos);
 
         Self {
@@ -473,14 +484,22 @@ fn fill_intersections(
                 write_intersect(row, y_min, row_start, cursors, intersects, x0, x1, 0);
             }
         } else if seg.flags.contains(XPathFlags::VERT) {
-            let count = if seg.flags.contains(XPathFlags::FLIPPED) { 1 } else { -1 };
+            let count = if seg.flags.contains(XPathFlags::FLIPPED) {
+                1
+            } else {
+                -1
+            };
             let x = splash_floor(seg.x0);
             for row in row_y0..=row_y1 {
                 let c = if seg_y_min < f64::from(row) { count } else { 0 };
                 write_intersect(row, y_min, row_start, cursors, intersects, x, x, c);
             }
         } else {
-            let count = if seg.flags.contains(XPathFlags::FLIPPED) { 1 } else { -1 };
+            let count = if seg.flags.contains(XPathFlags::FLIPPED) {
+                1
+            } else {
+                -1
+            };
             let x_base = seg.y0.mul_add(-seg.dxdy, seg.x0);
             let sloped_x_min = seg.x0.min(seg.x1);
             let sloped_x_max = seg.x0.max(seg.x1);
@@ -514,7 +533,10 @@ fn fill_intersections(
 /// The slot is `row_start[idx] + cursors[idx] - 1` for merge, or `+ cursors[idx]`
 /// for a new entry.
 #[inline]
-#[expect(clippy::too_many_arguments, reason = "private helper: all params are load-bearing")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private helper: all params are load-bearing"
+)]
 fn write_intersect(
     row: i32,
     y_min: i32,
@@ -526,7 +548,11 @@ fn write_intersect(
     count: i32,
 ) {
     let (lo, hi) = (x0.min(x1), x0.max(x1));
-    let entry = Intersect { x0: lo, x1: hi, count };
+    let entry = Intersect {
+        x0: lo,
+        x1: hi,
+        count,
+    };
     let idx = usize::try_from(row - y_min).expect("row >= y_min");
     let base = row_start[idx] as usize;
     let cur = cursors[idx] as usize;
@@ -568,7 +594,11 @@ fn write_intersect(
 #[cfg(test)]
 fn add_intersection(row: &mut Vec<Intersect>, x0: i32, x1: i32, count: i32, _is_horiz: bool) {
     let (lo, hi) = (x0.min(x1), x0.max(x1));
-    let entry = Intersect { x0: lo, x1: hi, count };
+    let entry = Intersect {
+        x0: lo,
+        x1: hi,
+        count,
+    };
 
     if row.is_empty() {
         row.push(entry);

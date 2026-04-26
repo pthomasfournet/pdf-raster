@@ -1055,6 +1055,8 @@ name = "pdf_interp"
 version = "0.1.0"
 dependencies = [
  "color 0.1.0",
+ "encode",
+ "env_logger",
  "font",
  "log",
  "lopdf",

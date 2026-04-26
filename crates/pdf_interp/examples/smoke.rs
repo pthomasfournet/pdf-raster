@@ -1,5 +1,7 @@
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "tests/fixtures/cryptic-rite.pdf".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "tests/fixtures/cryptic-rite.pdf".to_string());
     let doc = pdf_interp::open(&path).expect("open");
     let total = pdf_interp::page_count(&doc);
     println!("Pages: {total}");
@@ -8,12 +10,18 @@ fn main() {
     for op in ops.iter().take(20) {
         println!("  {op:?}");
     }
-    let mut unknown: Vec<_> = ops.iter().filter_map(|o| {
-        if let pdf_interp::content::Operator::Unknown(kw) = o {
-            Some(String::from_utf8_lossy(kw).to_string())
-        } else { None }
-    }).collect();
-    unknown.sort(); unknown.dedup();
+    let mut unknown: Vec<_> = ops
+        .iter()
+        .filter_map(|o| {
+            if let pdf_interp::content::Operator::Unknown(kw) = o {
+                Some(String::from_utf8_lossy(kw).to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    unknown.sort();
+    unknown.dedup();
     if unknown.is_empty() {
         println!("No unknown operators.");
     } else {

@@ -110,20 +110,48 @@ impl<'a> Tokenizer<'a> {
                     out.push(b')');
                 }
                 b'\\' => match self.peek() {
-                    Some(b'n')  => { self.advance(); out.push(b'\n'); }
-                    Some(b'r')  => { self.advance(); out.push(b'\r'); }
-                    Some(b't')  => { self.advance(); out.push(b'\t'); }
-                    Some(b'b')  => { self.advance(); out.push(b'\x08'); }
-                    Some(b'f')  => { self.advance(); out.push(b'\x0C'); }
-                    Some(b'(')  => { self.advance(); out.push(b'('); }
-                    Some(b')')  => { self.advance(); out.push(b')'); }
-                    Some(b'\\') => { self.advance(); out.push(b'\\'); }
+                    Some(b'n') => {
+                        self.advance();
+                        out.push(b'\n');
+                    }
+                    Some(b'r') => {
+                        self.advance();
+                        out.push(b'\r');
+                    }
+                    Some(b't') => {
+                        self.advance();
+                        out.push(b'\t');
+                    }
+                    Some(b'b') => {
+                        self.advance();
+                        out.push(b'\x08');
+                    }
+                    Some(b'f') => {
+                        self.advance();
+                        out.push(b'\x0C');
+                    }
+                    Some(b'(') => {
+                        self.advance();
+                        out.push(b'(');
+                    }
+                    Some(b')') => {
+                        self.advance();
+                        out.push(b')');
+                    }
+                    Some(b'\\') => {
+                        self.advance();
+                        out.push(b'\\');
+                    }
                     Some(b'\r') => {
                         self.advance();
                         // CRLF line continuation — skip both bytes.
-                        if self.peek() == Some(b'\n') { self.advance(); }
+                        if self.peek() == Some(b'\n') {
+                            self.advance();
+                        }
                     }
-                    Some(b'\n') => { self.advance(); }
+                    Some(b'\n') => {
+                        self.advance();
+                    }
                     Some(d) if d.is_ascii_digit() && d < b'8' => {
                         // Up to 3 octal digits (PDF §7.3.4.2).
                         // Max octal value is \377 (255); mask to u8 is safe.
@@ -219,7 +247,10 @@ impl<'a> Tokenizer<'a> {
                 break self.pos;
             }
             if self.remaining().starts_with(b"ID")
-                && self.remaining().get(2).map_or(true, |&b| is_whitespace(b) || is_delimiter(b))
+                && self
+                    .remaining()
+                    .get(2)
+                    .map_or(true, |&b| is_whitespace(b) || is_delimiter(b))
             {
                 let end = self.pos;
                 self.pos += 2; // consume `ID`
@@ -242,11 +273,13 @@ impl<'a> Tokenizer<'a> {
             // Check that the byte before `EI` is whitespace; at pos==data_start
             // there is no preceding byte, so we treat that as whitespace (pos 0
             // relative to data).
-            let prev_is_ws = self.pos == data_start
-                || is_whitespace(self.src[self.pos - 1]);
+            let prev_is_ws = self.pos == data_start || is_whitespace(self.src[self.pos - 1]);
             if prev_is_ws
                 && self.remaining().starts_with(b"EI")
-                && self.remaining().get(2).map_or(true, |&b| is_whitespace(b) || is_delimiter(b))
+                && self
+                    .remaining()
+                    .get(2)
+                    .map_or(true, |&b| is_whitespace(b) || is_delimiter(b))
             {
                 // data_end is the position of the preceding whitespace byte,
                 // which is not part of the image data.
@@ -355,7 +388,10 @@ fn is_whitespace(b: u8) -> bool {
 
 /// Returns `true` for the ten PDF delimiter characters (PDF §7.2.2).
 fn is_delimiter(b: u8) -> bool {
-    matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
 }
 
 /// Convert a single ASCII hex character to its nibble value.
@@ -443,7 +479,11 @@ mod tests {
         let t = tokens(b"[1 2 3]");
         assert_eq!(
             t[0],
-            Token::Array(vec![Token::Number(1.0), Token::Number(2.0), Token::Number(3.0)])
+            Token::Array(vec![
+                Token::Number(1.0),
+                Token::Number(2.0),
+                Token::Number(3.0)
+            ])
         );
     }
 

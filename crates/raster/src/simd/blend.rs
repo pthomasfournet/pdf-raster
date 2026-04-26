@@ -9,7 +9,12 @@
 /// Fill `count` RGB pixels in `dst` with `color` using a scalar loop.
 #[inline]
 pub(super) fn blend_solid_rgb8_scalar(dst: &mut [u8], color: [u8; 3], count: usize) {
-    debug_assert!(dst.len() >= count * 3, "dst too short: {} < {}", dst.len(), count * 3);
+    debug_assert!(
+        dst.len() >= count * 3,
+        "dst too short: {} < {}",
+        dst.len(),
+        count * 3
+    );
     for chunk in dst[..count * 3].chunks_exact_mut(3) {
         chunk.copy_from_slice(&color);
     }
@@ -18,7 +23,12 @@ pub(super) fn blend_solid_rgb8_scalar(dst: &mut [u8], color: [u8; 3], count: usi
 /// Fill `count` grayscale pixels in `dst` with `color`.
 #[inline]
 pub(super) fn blend_solid_gray8_scalar(dst: &mut [u8], color: u8, count: usize) {
-    debug_assert!(dst.len() >= count, "dst too short: {} < {}", dst.len(), count);
+    debug_assert!(
+        dst.len() >= count,
+        "dst too short: {} < {}",
+        dst.len(),
+        count
+    );
     dst[..count].fill(color);
 }
 
@@ -34,7 +44,12 @@ pub(super) fn blend_solid_gray8_scalar(dst: &mut [u8], color: u8, count: usize) 
 #[target_feature(enable = "avx2")]
 unsafe fn blend_solid_rgb8_avx2(dst: &mut [u8], color: [u8; 3], count: usize) {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
-    debug_assert!(dst.len() >= count * 3, "dst too short for AVX2 RGB fill: {} < {}", dst.len(), count * 3);
+    debug_assert!(
+        dst.len() >= count * 3,
+        "dst too short for AVX2 RGB fill: {} < {}",
+        dst.len(),
+        count * 3
+    );
 
     let [r, g, b] = color;
     // Build a 96-byte tile (32 pixels × 3 bytes = LCM(3,32)) so that three
@@ -94,7 +109,12 @@ unsafe fn blend_solid_rgb8_avx2(dst: &mut [u8], color: [u8; 3], count: usize) {
 #[target_feature(enable = "avx2")]
 unsafe fn blend_solid_gray8_avx2(dst: &mut [u8], color: u8, count: usize) {
     use std::arch::x86_64::{_mm256_set1_epi8, _mm256_storeu_si256};
-    debug_assert!(dst.len() >= count, "dst too short for AVX2 gray fill: {} < {}", dst.len(), count);
+    debug_assert!(
+        dst.len() >= count,
+        "dst too short for AVX2 gray fill: {} < {}",
+        dst.len(),
+        count
+    );
 
     #[expect(
         clippy::cast_possible_wrap,

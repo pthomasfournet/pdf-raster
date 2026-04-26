@@ -76,14 +76,14 @@ const CASES: &[Case] = &[
         ref_prefix: "cryptic-rite-72",
         first: 1,
         last: 3,
-        total_pages: 7,   // 7 pages → 1-digit padding (e.g. page-1.ppm)
+        total_pages: 7, // 7 pages → 1-digit padding (e.g. page-1.ppm)
     },
     Case {
         pdf: "ritual-14th.pdf",
         ref_prefix: "ritual-14th-72",
         first: 1,
         last: 3,
-        total_pages: 41,  // 41 pages → 2-digit padding (e.g. page-01.ppm)
+        total_pages: 41, // 41 pages → 2-digit padding (e.g. page-01.ppm)
     },
 ];
 
@@ -114,9 +114,7 @@ fn ref_dir() -> PathBuf {
 /// Skip ASCII whitespace and `#`-comment lines, advancing `pos` in `buf`.
 fn skip_whitespace_and_comments(buf: &[u8], pos: &mut usize) {
     loop {
-        while *pos < buf.len()
-            && matches!(buf[*pos], b' ' | b'\t' | b'\n' | b'\r')
-        {
+        while *pos < buf.len() && matches!(buf[*pos], b' ' | b'\t' | b'\n' | b'\r') {
             *pos += 1;
         }
         if *pos < buf.len() && buf[*pos] == b'#' {
@@ -143,8 +141,8 @@ fn read_token(buf: &[u8], pos: &mut usize) -> String {
 ///
 /// Panics with a clear message on any parse failure so test output is readable.
 fn parse_ppm(path: &Path) -> (u32, u32, Vec<u8>) {
-    let data = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let data =
+        std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
     let mut pos = 0usize;
 
@@ -153,7 +151,8 @@ fn parse_ppm(path: &Path) -> (u32, u32, Vec<u8>) {
         data.get(pos..pos + 2) == Some(b"P6"),
         "not a P6 PPM file: {} (got {:?})",
         path.display(),
-        data.get(..4).map(|b| String::from_utf8_lossy(b).into_owned())
+        data.get(..4)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
     );
     pos += 2;
 
@@ -233,11 +232,16 @@ fn run_case(case: &Case) {
 
     let output = Command::new(binary)
         .args([
-            "-r", &dpi_str,
-            "-f", &first_str,
-            "-l", &last_str,
+            "-r",
+            &dpi_str,
+            "-f",
+            &first_str,
+            "-l",
+            &last_str,
             pdf_path.to_str().expect("pdf path must be valid UTF-8"),
-            out_prefix.to_str().expect("tempdir path must be valid UTF-8"),
+            out_prefix
+                .to_str()
+                .expect("tempdir path must be valid UTF-8"),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

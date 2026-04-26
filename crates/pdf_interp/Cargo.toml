@@ -7,8 +7,13 @@ edition = "2024"
 raster = { path = "../raster" }
 color  = { path = "../color" }
 font   = { path = "../font" }
+encode = { path = "../encode" }
 lopdf  = "0.40"
 log    = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+
 
 [lints.rust]
 unsafe_code  = "deny"

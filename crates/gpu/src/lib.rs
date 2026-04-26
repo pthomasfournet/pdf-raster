@@ -221,7 +221,10 @@ pub fn apply_soft_mask_cpu(pixels: &mut [u8], mask: &[u8]) {
         let a = u32::from(p[3]);
         let m = u32::from(m);
         // a*m is at most 255*255 = 65025; +127 = 65152 < u32::MAX; /255 ≤ 255: safe cast.
-        #[expect(clippy::cast_possible_truncation, reason = "result ≤ 255, always fits u8")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "result ≤ 255, always fits u8"
+        )]
         let scaled = ((a * m + 127) / 255) as u8;
         p[3] = scaled;
     }

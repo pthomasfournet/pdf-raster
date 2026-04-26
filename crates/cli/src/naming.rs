@@ -67,6 +67,7 @@ mod tests {
             num_threads: 0,
             separator: sep,
             force_num_digits: force,
+            progress: false,
         }
     }
 

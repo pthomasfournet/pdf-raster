@@ -104,7 +104,10 @@ fn main() {
                     if rate > 0.0 && completed > 0 {
                         // remaining ≤ n_pages which is bounded by i32::MAX in practice;
                         // precision loss is irrelevant for an ETA display.
-                        #[expect(clippy::cast_precision_loss, reason = "ETA display; ±1s accuracy is sufficient")]
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "ETA display; ±1s accuracy is sufficient"
+                        )]
                         let eta_s = remaining as f64 / rate;
                         eprintln!(
                             "pdf-raster: page {page_num} done  \
@@ -113,9 +116,7 @@ fn main() {
                              ~{eta_s:.1}s remaining"
                         );
                     } else {
-                        eprintln!(
-                            "pdf-raster: page {page_num} done  [{completed}/{n_pages}]"
-                        );
+                        eprintln!("pdf-raster: page {page_num} done  [{completed}/{n_pages}]");
                     }
                 }
 

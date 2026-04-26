@@ -56,8 +56,16 @@ pub fn composite_aa_rgb8(
     shape: &[u8],
 ) {
     let count = shape.len();
-    debug_assert_eq!(dst.len(), count * 3, "composite_aa_rgb8: dst length mismatch");
-    debug_assert_eq!(dst_alpha.len(), count, "composite_aa_rgb8: dst_alpha length mismatch");
+    debug_assert_eq!(
+        dst.len(),
+        count * 3,
+        "composite_aa_rgb8: dst length mismatch"
+    );
+    debug_assert_eq!(
+        dst_alpha.len(),
+        count,
+        "composite_aa_rgb8: dst_alpha length mismatch"
+    );
 
     let a_in = u32::from(a_input);
     let [sr, sg, sb] = src;
@@ -83,8 +91,7 @@ pub fn composite_aa_rgb8(
             dst_alpha[i] = 0;
         } else {
             let prod_aa = a_src * a_dst;
-            let a_result =
-                (a_src + a_dst - ((prod_aa + (prod_aa >> 8) + 0x80) >> 8)).min(255);
+            let a_result = (a_src + a_dst - ((prod_aa + (prod_aa >> 8) + 0x80) >> 8)).min(255);
 
             let weight_src = a_src;
             let weight_dst = a_result - a_src;
@@ -308,10 +315,8 @@ mod tests {
             #[expect(clippy::cast_possible_truncation, reason = "div255_u16 result ≤ 255")]
             {
                 ref_dst[b] = div255_u16(inv * u16::from(ref_dst[b]) + a_src * sr) as u8;
-                ref_dst[b + 1] =
-                    div255_u16(inv * u16::from(ref_dst[b + 1]) + a_src * sg) as u8;
-                ref_dst[b + 2] =
-                    div255_u16(inv * u16::from(ref_dst[b + 2]) + a_src * sb) as u8;
+                ref_dst[b + 1] = div255_u16(inv * u16::from(ref_dst[b + 1]) + a_src * sg) as u8;
+                ref_dst[b + 2] = div255_u16(inv * u16::from(ref_dst[b + 2]) + a_src * sb) as u8;
             }
         }
 

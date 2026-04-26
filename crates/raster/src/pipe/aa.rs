@@ -70,10 +70,7 @@ pub(crate) fn render_span_aa<P: Pixel>(
             // Fast path: solid RGB source, no alpha plane, identity transfer.
             // composite_aa_rgb8_opaque processes 16 pixels/iter via [u16;16] lanes
             // that LLVM auto-vectorizes into AVX2/AVX-512.
-            if dst_alpha.is_none()
-                && ncomps == 3
-                && pipe.transfer.is_identity_rgb()
-            {
+            if dst_alpha.is_none() && ncomps == 3 && pipe.transfer.is_identity_rgb() {
                 composite_aa_rgb8_opaque(
                     dst_pixels,
                     [color[0], color[1], color[2]],
@@ -124,7 +121,10 @@ pub(crate) fn render_span_aa<P: Pixel>(
 /// indexes into the pre-filled scratch buffer.  Using a closure rather than a
 /// `bool` flag keeps a single code path and lets the compiler inline both variants.
 #[inline]
-#[expect(clippy::too_many_arguments, reason = "all params necessary; closure eliminates the solid/pattern duplication")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all params necessary; closure eliminates the solid/pattern duplication"
+)]
 fn render_span_aa_inner<'src>(
     pipe: &PipeState<'_>,
     src_px_at: impl Fn(usize) -> &'src [u8],

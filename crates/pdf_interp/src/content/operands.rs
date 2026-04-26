@@ -52,11 +52,14 @@ pub fn drain_numbers(stack: &mut Vec<Token<'_>>) -> Vec<f64> {
         .iter()
         .position(|t| !matches!(t, Token::Number(_) | Token::Bool(_)))
         .unwrap_or(stack.len());
-    stack.drain(..first_non_num).map(|t| match t {
-        Token::Number(n) => n,
-        Token::Bool(b) => f64::from(u8::from(b)),
-        _ => unreachable!(),
-    }).collect()
+    stack
+        .drain(..first_non_num)
+        .map(|t| match t {
+            Token::Number(n) => n,
+            Token::Bool(b) => f64::from(u8::from(b)),
+            _ => unreachable!(),
+        })
+        .collect()
 }
 
 /// Pop the topmost token as a flat array of numbers.

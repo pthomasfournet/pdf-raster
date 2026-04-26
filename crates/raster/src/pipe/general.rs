@@ -77,9 +77,17 @@ pub(crate) fn render_span_general<P: Pixel>(
             render_span_general_inner(
                 pipe,
                 |_i| color,
-                dst_pixels, dst_alpha, shape,
-                count, ncomps, a_input, is_nonseparable, is_cmyk_like,
-                &shape_at, &soft_mask_at, &alpha0_at,
+                dst_pixels,
+                dst_alpha,
+                shape,
+                count,
+                ncomps,
+                a_input,
+                is_nonseparable,
+                is_cmyk_like,
+                &shape_at,
+                &soft_mask_at,
+                &alpha0_at,
             );
         }
         PipeSrc::Pattern(pat) => {
@@ -90,17 +98,31 @@ pub(crate) fn render_span_general<P: Pixel>(
                 render_span_general_inner(
                     pipe,
                     |i| &buf[i * ncomps..(i + 1) * ncomps],
-                    dst_pixels, dst_alpha, shape,
-                    count, ncomps, a_input, is_nonseparable, is_cmyk_like,
-                    &shape_at, &soft_mask_at, &alpha0_at,
+                    dst_pixels,
+                    dst_alpha,
+                    shape,
+                    count,
+                    ncomps,
+                    a_input,
+                    is_nonseparable,
+                    is_cmyk_like,
+                    &shape_at,
+                    &soft_mask_at,
+                    &alpha0_at,
                 );
             });
         }
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "all params necessary; closure eliminates solid/pattern duplication")]
-#[expect(clippy::too_many_lines, reason = "compositing formula has many branches that cannot be meaningfully split")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all params necessary; closure eliminates solid/pattern duplication"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "compositing formula has many branches that cannot be meaningfully split"
+)]
 fn render_span_general_inner<'src>(
     pipe: &PipeState<'_>,
     src_px_at: impl Fn(usize) -> &'src [u8],
@@ -116,7 +138,6 @@ fn render_span_general_inner<'src>(
     soft_mask_at: &dyn Fn(usize) -> u8,
     alpha0_at: &dyn Fn(usize) -> Option<u8>,
 ) {
-
     match dst_alpha {
         Some(dst_alpha) => {
             debug_assert_eq!(dst_alpha.len(), count);

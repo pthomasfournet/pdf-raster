@@ -4,8 +4,8 @@
 //! [`Operator`] value ready for dispatch to the renderer.
 
 use super::operands::{
-    drain_numbers, pop2, pop3, pop4, pop_f64, pop_i32, pop_matrix, pop_name,
-    pop_number_array, pop_string,
+    drain_numbers, pop_f64, pop_i32, pop_matrix, pop_name, pop_number_array, pop_string, pop2,
+    pop3, pop4,
 };
 use super::tokenizer::Token;
 
@@ -205,32 +205,41 @@ pub enum TextArrayElement {
 ///
 /// `operands` is always cleared on return, regardless of success or failure,
 /// so the stack is always empty and ready for the next operator.
-#[expect(clippy::too_many_lines, reason = "operator dispatch table — splitting adds no clarity")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "operator dispatch table — splitting adds no clarity"
+)]
 pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
     let result = match op {
         // ── Graphics state ────────────────────────────────────────────────────
-        b"q"  => Operator::Save,
-        b"Q"  => Operator::Restore,
+        b"q" => Operator::Save,
+        b"Q" => Operator::Restore,
         b"cm" => Operator::ConcatMatrix(pop_matrix(operands)),
-        b"w"  => Operator::SetLineWidth(pop_f64(operands)),
-        b"J"  => Operator::SetLineCap(pop_i32(operands)),
-        b"j"  => Operator::SetLineJoin(pop_i32(operands)),
-        b"M"  => Operator::SetMiterLimit(pop_f64(operands)),
-        b"d"  => {
+        b"w" => Operator::SetLineWidth(pop_f64(operands)),
+        b"J" => Operator::SetLineCap(pop_i32(operands)),
+        b"j" => Operator::SetLineJoin(pop_i32(operands)),
+        b"M" => Operator::SetMiterLimit(pop_f64(operands)),
+        b"d" => {
             // Stream order: `[dash array] phase d`
             // Stack order (LIFO): phase is on top, array below.
-            let phase  = pop_f64(operands);
+            let phase = pop_f64(operands);
             let dashes = pop_number_array(operands);
             Operator::SetDash { dashes, phase }
         }
         b"ri" => Operator::SetRenderingIntent(pop_name(operands)),
-        b"i"  => Operator::SetFlatness(pop_f64(operands)),
+        b"i" => Operator::SetFlatness(pop_f64(operands)),
         b"gs" => Operator::SetExtGState(pop_name(operands)),
 
         // ── Path construction ─────────────────────────────────────────────────
-        b"m"  => { let (x, y) = pop2(operands); Operator::MoveTo(x, y) }
-        b"l"  => { let (x, y) = pop2(operands); Operator::LineTo(x, y) }
-        b"c"  => {
+        b"m" => {
+            let (x, y) = pop2(operands);
+            Operator::MoveTo(x, y)
+        }
+        b"l" => {
+            let (x, y) = pop2(operands);
+            Operator::LineTo(x, y)
+        }
+        b"c" => {
             let (x1, y1, x2, y2, x3, y3) = {
                 let f = pop_f64(operands);
                 let e = pop_f64(operands);
@@ -242,24 +251,33 @@ pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
             };
             Operator::CurveTo(x1, y1, x2, y2, x3, y3)
         }
-        b"v"  => { let (x2, y2, x3, y3) = pop4(operands); Operator::CurveToV(x2, y2, x3, y3) }
-        b"y"  => { let (x1, y1, x3, y3) = pop4(operands); Operator::CurveToY(x1, y1, x3, y3) }
-        b"h"  => Operator::ClosePath,
-        b"re" => { let (x, y, w, h) = pop4(operands); Operator::Rectangle(x, y, w, h) }
+        b"v" => {
+            let (x2, y2, x3, y3) = pop4(operands);
+            Operator::CurveToV(x2, y2, x3, y3)
+        }
+        b"y" => {
+            let (x1, y1, x3, y3) = pop4(operands);
+            Operator::CurveToY(x1, y1, x3, y3)
+        }
+        b"h" => Operator::ClosePath,
+        b"re" => {
+            let (x, y, w, h) = pop4(operands);
+            Operator::Rectangle(x, y, w, h)
+        }
 
         // ── Path painting ─────────────────────────────────────────────────────
-        b"S"  => Operator::Stroke,
-        b"s"  => Operator::CloseStroke,
+        b"S" => Operator::Stroke,
+        b"s" => Operator::CloseStroke,
         b"f" | b"F" => Operator::Fill,
         b"f*" => Operator::FillEvenOdd,
-        b"B"  => Operator::FillStroke,
+        b"B" => Operator::FillStroke,
         b"B*" => Operator::FillStrokeEvenOdd,
-        b"b"  => Operator::CloseFillStroke,
+        b"b" => Operator::CloseFillStroke,
         b"b*" => Operator::CloseFillStrokeEvenOdd,
-        b"n"  => Operator::EndPath,
+        b"n" => Operator::EndPath,
 
         // ── Clipping ─────────────────────────────────────────────────────────
-        b"W"  => Operator::Clip,
+        b"W" => Operator::Clip,
         b"W*" => Operator::ClipEvenOdd,
 
         // ── Text objects ──────────────────────────────────────────────────────
@@ -281,34 +299,52 @@ pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
         b"Tr" => Operator::SetTextRenderMode(pop_i32(operands)),
 
         // ── Text positioning ──────────────────────────────────────────────────
-        b"Td" => { let (tx, ty) = pop2(operands); Operator::TextMove(tx, ty) }
-        b"TD" => { let (tx, ty) = pop2(operands); Operator::TextMoveSetLeading(tx, ty) }
+        b"Td" => {
+            let (tx, ty) = pop2(operands);
+            Operator::TextMove(tx, ty)
+        }
+        b"TD" => {
+            let (tx, ty) = pop2(operands);
+            Operator::TextMoveSetLeading(tx, ty)
+        }
         b"Tm" => Operator::SetTextMatrix(pop_matrix(operands)),
         b"T*" => Operator::NextLine,
 
         // ── Text showing ──────────────────────────────────────────────────────
         b"Tj" => Operator::ShowText(pop_string(operands)),
         b"TJ" => Operator::ShowTextArray(pop_text_array(operands)),
-        b"'"  => Operator::MoveNextLineShow(pop_string(operands)),
+        b"'" => Operator::MoveNextLineShow(pop_string(operands)),
         b"\"" => {
             // Stream order: `aw ac string "`
             let text = pop_string(operands);
-            let ac   = pop_f64(operands);
-            let aw   = pop_f64(operands);
+            let ac = pop_f64(operands);
+            let aw = pop_f64(operands);
             Operator::MoveNextLineShowSpaced { aw, ac, text }
         }
 
         // ── Colour ────────────────────────────────────────────────────────────
-        b"cs"  => Operator::SetFillColorSpace(pop_name(operands)),
-        b"CS"  => Operator::SetStrokeColorSpace(pop_name(operands)),
+        b"cs" => Operator::SetFillColorSpace(pop_name(operands)),
+        b"CS" => Operator::SetStrokeColorSpace(pop_name(operands)),
         b"sc" | b"scn" => Operator::SetFillColor(drain_numbers(operands)),
         b"SC" | b"SCN" => Operator::SetStrokeColor(drain_numbers(operands)),
-        b"g"   => Operator::SetFillGray(pop_f64(operands)),
-        b"G"   => Operator::SetStrokeGray(pop_f64(operands)),
-        b"rg"  => { let (r, g, b) = pop3(operands); Operator::SetFillRgb(r, g, b) }
-        b"RG"  => { let (r, g, b) = pop3(operands); Operator::SetStrokeRgb(r, g, b) }
-        b"k"   => { let (c, m, y, k) = pop4(operands); Operator::SetFillCmyk(c, m, y, k) }
-        b"K"   => { let (c, m, y, k) = pop4(operands); Operator::SetStrokeCmyk(c, m, y, k) }
+        b"g" => Operator::SetFillGray(pop_f64(operands)),
+        b"G" => Operator::SetStrokeGray(pop_f64(operands)),
+        b"rg" => {
+            let (r, g, b) = pop3(operands);
+            Operator::SetFillRgb(r, g, b)
+        }
+        b"RG" => {
+            let (r, g, b) = pop3(operands);
+            Operator::SetStrokeRgb(r, g, b)
+        }
+        b"k" => {
+            let (c, m, y, k) = pop4(operands);
+            Operator::SetFillCmyk(c, m, y, k)
+        }
+        b"K" => {
+            let (c, m, y, k) = pop4(operands);
+            Operator::SetStrokeCmyk(c, m, y, k)
+        }
 
         // ── XObjects & images ─────────────────────────────────────────────────
         b"Do" => Operator::PaintXObject(pop_name(operands)),
