@@ -1,0 +1,20 @@
+[package]
+name    = "pdf_interp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+raster = { path = "../raster" }
+color  = { path = "../color" }
+font   = { path = "../font" }
+lopdf  = "0.40"
+log    = { workspace = true }
+
+[lints.rust]
+unsafe_code  = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
