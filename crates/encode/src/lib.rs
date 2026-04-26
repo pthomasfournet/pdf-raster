@@ -2,19 +2,21 @@
 //!
 //! # Supported formats
 //!
-//! | Function | Format | Pixel modes |
-//! |----------|--------|-------------|
-//! | [`write_ppm`] | Netpbm P6 binary | `Rgb8`, `Bgr8`, `Xbgr8`, `Cmyk8`, `DeviceN8` |
-//! | [`write_pgm`] | Netpbm P5 binary | `Gray8`, `Mono8` |
-//! | [`write_png`] | PNG (via `png` crate) | `Rgb8`, `Gray8`, `Rgba8` |
+//! | Function | Format | Accepted pixel types |
+//! |----------|--------|--------------------|
+//! | [`write_ppm`] | Netpbm P6 binary | `Rgb8`, `Bgr8`, `Rgba8` (`Xbgr8`), `Cmyk8`, `DeviceN8` |
+//! | [`write_pgm`] | Netpbm P5 binary | `Gray8` |
+//! | [`write_png`] | PNG | `Rgb8`, `Gray8`, `Rgba8` |
 //!
-//! All functions write to any [`std::io::Write`] sink (file, `Vec<u8>`, …).
+//! All functions consume the output sink (`W: Write`) rather than borrowing
+//! `&mut W`, matching the convention of format-specific writer types.
 //!
 //! # CMYK handling
 //!
 //! Neither PPM nor PNG natively supports CMYK.  [`write_ppm`] converts
-//! CMYK/`DeviceN` to RGB via simple ink-density subtraction before writing.
-//! Use [`write_png`] with a pre-converted `Bitmap<Rgb8>` for best quality.
+//! CMYK/`DeviceN` to RGB via the naïve ink-density formula
+//! `R = 255 − C − K` (matching poppler's `pdftoppm` output).
+//! For ICC-accurate colour, convert to `Rgb8` before encoding.
 
 pub mod pgm;
 pub mod png;
@@ -31,10 +33,12 @@ use std::io;
 pub enum EncodeError {
     /// An I/O error writing to the output sink.
     Io(io::Error),
-    /// The pixel mode is not supported by the chosen format.
+    /// The pixel mode is not supported by the chosen encoder.
+    ///
+    /// The message describes what the caller should do instead.
     UnsupportedMode(&'static str),
-    /// The `png` encoder returned an internal error.
-    Png(::png::EncodingError),
+    /// An internal error from the `png` encoder (non-I/O).
+    PngEncoder(::png::EncodingError),
 }
 
 impl std::fmt::Display for EncodeError {
@@ -42,7 +46,7 @@ impl std::fmt::Display for EncodeError {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::UnsupportedMode(m) => write!(f, "pixel mode not supported: {m}"),
-            Self::Png(e) => write!(f, "PNG encoding error: {e}"),
+            Self::PngEncoder(e) => write!(f, "PNG encoder error: {e}"),
         }
     }
 }
@@ -51,7 +55,7 @@ impl std::error::Error for EncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Png(e) => Some(e),
+            Self::PngEncoder(e) => Some(e),
             Self::UnsupportedMode(_) => None,
         }
     }
@@ -65,9 +69,10 @@ impl From<io::Error> for EncodeError {
 
 impl From<::png::EncodingError> for EncodeError {
     fn from(e: ::png::EncodingError) -> Self {
+        // Unwrap the I/O layer so EncodeError::Io is the canonical I/O path.
         match e {
             ::png::EncodingError::IoError(io_err) => Self::Io(io_err),
-            other => Self::Png(other),
+            other => Self::PngEncoder(other),
         }
     }
 }
