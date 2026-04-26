@@ -166,7 +166,10 @@ impl<'a> Tokenizer<'a> {
                             }
                         }
                         // Truncate to low byte; values >255 are malformed PDF.
-                        #[expect(clippy::cast_possible_truncation, reason = "intentional: malformed PDF octal values >255 are truncated per spec leniency")]
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "intentional: malformed PDF octal values >255 are truncated per spec leniency"
+                        )]
                         out.push(val as u8);
                     }
                     _ => {} // Unrecognised escape — PDF spec says ignore the backslash.

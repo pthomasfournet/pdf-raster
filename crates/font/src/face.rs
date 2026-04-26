@@ -104,6 +104,14 @@ impl FontFace {
         let ft_matrix = to_ft_matrix_norm(&mat, f64::from(size_px));
         let ft_text_matrix = to_ft_matrix_norm(&text_mat, text_scale * f64::from(size_px));
 
+        // Tell FreeType the nominal pixel size for this face.  Without this,
+        // FreeType renders at an arbitrary internal default and transforms only
+        // the outline shape, not its scale.  set_pixel_sizes(width=0, height)
+        // lets FreeType derive the width from the height automatically.
+        if face.set_pixel_sizes(0, u32::from(size_px)).is_err() {
+            return None;
+        }
+
         Some(Self {
             id,
             face,
@@ -253,10 +261,18 @@ impl FontFace {
     }
 
     /// Resolve a character code to a `FreeType` glyph index.
+    ///
+    /// When `code_to_gid` is populated (e.g. from a PDF `Differences` array),
+    /// it is used directly.  When empty, we fall through to `FreeType`'s active
+    /// charmap (`FT_Get_Char_Index`), treating the char code as a Unicode
+    /// codepoint.  This is correct for standard encodings (`WinAnsi`, `MacRoman`,
+    /// `Standard`) where byte values in the printable ASCII range are Unicode.
     fn resolve_gid(&self, char_code: u32) -> u32 {
-        self.code_to_gid
-            .get(char_code as usize)
-            .copied()
+        if let Some(&gid) = self.code_to_gid.get(char_code as usize) {
+            return gid;
+        }
+        self.face
+            .get_char_index(char_code as usize)
             .unwrap_or(char_code)
     }
 }

@@ -43,7 +43,7 @@ use raster::{
 
 use super::color::RasterColor;
 use super::font_cache::FontCache;
-use super::gstate::{GStateStack, InterpGState, ctm_multiply, ctm_transform};
+use super::gstate::{GStateStack, InterpGState, ctm_multiply, ctm_transform, mat2x2_mul};
 use crate::content::{Operator, TextArrayElement};
 use crate::resources::{ImageColorSpace, PageResources};
 
@@ -356,7 +356,10 @@ impl<'doc> PageRenderer<'doc> {
             }
 
             // Compile-time exhaustiveness guard.
-            #[expect(unreachable_patterns, reason = "future Operator variants are caught here")]
+            #[expect(
+                unreachable_patterns,
+                reason = "future Operator variants are caught here"
+            )]
             _ => {}
         }
     }
@@ -386,7 +389,11 @@ impl<'doc> PageRenderer<'doc> {
         let word_spacing = self.gstate.current().text.word_spacing;
         // PDF Tz is a percentage; 0 % means zero-advance (degenerate — treat as 100 %).
         let raw_hz = self.gstate.current().text.horiz_scaling;
-        let horiz_scaling = if raw_hz.abs() < f64::EPSILON { 1.0 } else { raw_hz / 100.0 };
+        let horiz_scaling = if raw_hz.abs() < f64::EPSILON {
+            1.0
+        } else {
+            raw_hz / 100.0
+        };
         let ctm = self.gstate.current().ctm;
         let rise = self.gstate.current().text.rise;
         let mut tm = self.gstate.current().text.text_matrix;
@@ -406,11 +413,13 @@ impl<'doc> PageRenderer<'doc> {
         let mut records: Vec<GlyphRecord> = Vec::with_capacity(bytes.len());
 
         {
+            // Trm[2×2] = font_size × Tm[2×2] × CTM[2×2] — the text rendering
+            // matrix in device pixels, encoding actual size and skew/rotation.
+            let tm2x2 = mat2x2_mul(&tm, &ctm);
+            let trm = tm2x2.map(|v| v * font_size);
+
             // Load (or retrieve cached) FreeType face — mutable borrow of font_cache.
-            let Some(face) = self
-                .font_cache
-                .get_or_load(&font_name, &descriptor, font_size)
-            else {
+            let Some(face) = self.font_cache.get_or_load(&font_name, &descriptor, trm) else {
                 return;
             };
 

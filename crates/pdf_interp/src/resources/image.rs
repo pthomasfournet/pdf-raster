@@ -67,7 +67,11 @@ pub struct ImageDescriptor {
 /// - the filter is unsupported (a warning is logged), or
 /// - any decoding error occurs.
 #[must_use]
-pub fn resolve_image(doc: &Document, page_dict: &Dictionary, name: &[u8]) -> Option<ImageDescriptor> {
+pub fn resolve_image(
+    doc: &Document,
+    page_dict: &Dictionary,
+    name: &[u8],
+) -> Option<ImageDescriptor> {
     let stream_id = xobject_id(doc, page_dict, name)?;
     let obj = doc.get_object(stream_id).ok()?;
     let stream = obj.as_stream().ok()?;
@@ -192,7 +196,12 @@ fn decode_raw(
         1 => {
             // Packed 1-bit: expand to one byte per pixel.
             let pixels = expand_1bpp(data, width, height)?;
-            Some(ImageDescriptor { width, height, color_space: cs, data: pixels })
+            Some(ImageDescriptor {
+                width,
+                height,
+                color_space: cs,
+                data: pixels,
+            })
         }
         8 => {
             let components: usize = match cs {
@@ -246,9 +255,7 @@ fn expand_1bpp(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
         for col in 0..width as usize {
             let byte_idx = col / 8;
             let bit_idx = 7 - (col % 8);
-            let bit = row_data
-                .get(byte_idx)
-                .map_or(0u8, |b| (b >> bit_idx) & 1);
+            let bit = row_data.get(byte_idx).map_or(0u8, |b| (b >> bit_idx) & 1);
             // PDF convention: bit 0 = black (0x00), bit 1 = white (0xFF)
             out.push(if bit == 0 { 0x00 } else { 0xFF });
         }
@@ -298,11 +305,8 @@ fn decode_ccitt(
     let mut data_out: Vec<u8> = Vec::with_capacity(capacity);
     let mut rows_decoded: u32 = 0;
 
-    let completed = fax::decoder::decode_g4(
-        data.iter().copied(),
-        w_u16,
-        Some(h_u16),
-        |transitions| {
+    let completed =
+        fax::decoder::decode_g4(data.iter().copied(), w_u16, Some(h_u16), |transitions| {
             let row_start = data_out.len();
             data_out.extend(fax::decoder::pels(transitions, w_u16).map(|color| {
                 // Map fax Color to PDF image convention: 0x00 = black, 0xFF = white.
@@ -316,8 +320,7 @@ fn decode_ccitt(
             let row_end = row_start + width as usize;
             data_out.resize(row_end, 0xFF);
             rows_decoded += 1;
-        },
-    );
+        });
 
     if completed.is_none() {
         log::warn!(
@@ -330,8 +333,17 @@ fn decode_ccitt(
         data_out.resize(capacity, 0xFF);
     }
 
-    let cs = if is_mask { ImageColorSpace::Mask } else { ImageColorSpace::Gray };
-    Some(ImageDescriptor { width, height, color_space: cs, data: data_out })
+    let cs = if is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width,
+        height,
+        color_space: cs,
+        data: data_out,
+    })
 }
 
 // ── Color space helpers ───────────────────────────────────────────────────────

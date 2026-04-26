@@ -35,6 +35,20 @@ pub fn ctm_multiply(a: &Ctm, b: &Ctm) -> Ctm {
     ]
 }
 
+/// Multiply the 2×2 linear parts of two CTMs, returning a 2×2 matrix `[a,b,c,d]`.
+///
+/// Drops the translation column.  Used to compute the text rendering matrix
+/// `Trm[2×2] = Tm[2×2] × CTM[2×2]` without the translation terms.
+#[must_use]
+pub fn mat2x2_mul(a: &Ctm, b: &Ctm) -> [f64; 4] {
+    [
+        a[0].mul_add(b[0], a[1] * b[2]),
+        a[0].mul_add(b[1], a[1] * b[3]),
+        a[2].mul_add(b[0], a[3] * b[2]),
+        a[2].mul_add(b[1], a[3] * b[3]),
+    ]
+}
+
 /// Transform a point `(x, y)` by `ctm`, returning `(x', y')`.
 #[must_use]
 pub fn ctm_transform(ctm: &Ctm, x: f64, y: f64) -> (f64, f64) {
