@@ -46,10 +46,11 @@ impl GlyphBitmap<'_> {
                 w as usize
             }
         } else {
-            // w = self.w.max(0) ≥ 0, so (w+7)/8 ≥ 0 — cast to usize is safe.
+            // Use saturating_add so a pathological w near i32::MAX doesn't wrap.
+            // In practice FreeType glyphs are always < 2^16 px wide.
             #[expect(clippy::cast_sign_loss, reason = "w = self.w.max(0) is non-negative")]
             {
-                ((w + 7) / 8) as usize
+                (w.saturating_add(7) / 8) as usize
             }
         }
     }
@@ -178,6 +179,14 @@ fn blit_aa<P: Pixel>(
     row_bytes: usize,
 ) {
     let data = glyph.data;
+    // Verify the glyph data buffer covers the visible region.  A mismatch
+    // indicates a malformed GlyphBitmap (wrong w/h/row_bytes); we clamp via
+    // get() in the inner loop, but the assert catches it in debug builds.
+    debug_assert!(
+        data.len() >= (y_data_skip + yy_limit) * row_bytes,
+        "blit_aa: glyph data too short: len={} < (y_data_skip={y_data_skip} + yy_limit={yy_limit}) * row_bytes={row_bytes}",
+        data.len(),
+    );
     // Hoisted above the row loop to avoid per-row heap allocation.
     let mut run_shape: Vec<u8> = Vec::new();
 
@@ -246,6 +255,13 @@ fn blit_mono<P: Pixel>(
 ) {
     let x_shift = x_data_skip % 8;
     let data = glyph.data;
+
+    // Verify the glyph data buffer covers the visible region (debug builds only).
+    debug_assert!(
+        data.len() >= (y_data_skip + yy_limit) * row_bytes,
+        "blit_mono: glyph data too short: len={} < (y_data_skip={y_data_skip} + yy_limit={yy_limit}) * row_bytes={row_bytes}",
+        data.len(),
+    );
 
     // Scratch buffer for SIMD-expanded bits: one byte per pixel, 0x00 or 0xFF.
     // Sized to the maximum row width; reused across rows.

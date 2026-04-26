@@ -37,6 +37,12 @@ use color::Pixel;
 /// C++ origin: `#define bezierCircle2 (0.5 * 0.55228475)` in `Splash.cc`.
 const BEZIER_CIRCLE2: f64 = 0.5 * BEZIER_CIRCLE;
 
+/// `dotprod` threshold above which two segments are considered nearly anti-parallel
+/// for miter computation.  When `dotprod > MITER_NEARLY_STRAIGHT` the miter
+/// formula's `1 - dotprod` denominator is too small to use; we force miter > limit²
+/// so the miter join always degrades to bevel.  Value matches the C++ source.
+const MITER_NEARLY_STRAIGHT: f64 = 0.999_9;
+
 // ── Inline geometry helper ────────────────────────────────────────────────────
 
 /// Euclidean distance between two points.
@@ -605,16 +611,24 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
 
         // k0: the start of the segment *after* (j1, next), used for join computation.
         let k0 = if last { subpath_start1 + 1 } else { j1 + 1 };
-        let _k1 = advance_past_coincident(path, k0);
 
         // ── Compute the unit tangent for segment (i1 → j0) ───────────────────
-        let d = 1.0
-            / splash_dist(
-                path.pts[i1].x,
-                path.pts[i1].y,
-                path.pts[j0].x,
-                path.pts[j0].y,
-            );
+        let seg_dist = splash_dist(
+            path.pts[i1].x,
+            path.pts[i1].y,
+            path.pts[j0].x,
+            path.pts[j0].y,
+        );
+        // advance_past_coincident skips identical consecutive points, so the
+        // segment (i1, j0) should never be zero-length; guard anyway to avoid
+        // producing NaN tangent components that corrupt downstream geometry.
+        if seg_dist == 0.0 {
+            i0 = j0;
+            i1 = j1;
+            seg += 1;
+            continue;
+        }
+        let d = 1.0 / seg_dist;
         let dx = d * (path.pts[j0].x - path.pts[i1].x);
         let dy = d * (path.pts[j0].y - path.pts[i1].y);
         let wdx = 0.5 * w * dx;
@@ -729,7 +743,7 @@ pub fn make_stroke_path(path: &Path, w: f64, params: &StrokeParams<'_>) -> Path 
             let dotprod = -(dx * dx_next + dy * dy_next);
             let has_angle = crossprod != 0.0 || dx * dx_next < 0.0 || dy * dy_next < 0.0;
 
-            let (miter, m) = if dotprod > 0.999_9 {
+            let (miter, m) = if dotprod > MITER_NEARLY_STRAIGHT {
                 // Avoid divide-by-zero: set miter > miter_limit² so the miter
                 // test always fails, and m is never used in that case.
                 ((params.miter_limit + 1.0) * (params.miter_limit + 1.0), 0.0)
