@@ -75,7 +75,9 @@ pub(crate) fn render_span_general<P: Pixel>(
         PipeSrc::Solid(color) => {
             debug_assert_eq!(color.len(), ncomps);
             render_span_general_inner(
-                pipe, color, true, dst_pixels, dst_alpha, shape,
+                pipe,
+                |_i| color,
+                dst_pixels, dst_alpha, shape,
                 count, ncomps, a_input, is_nonseparable, is_cmyk_like,
                 &shape_at, &soft_mask_at, &alpha0_at,
             );
@@ -84,9 +86,11 @@ pub(crate) fn render_span_general<P: Pixel>(
             PAT_BUF.with(|cell| {
                 let mut buf = cell.borrow_mut();
                 buf.resize(count * ncomps, 0);
-                pat.fill_span(y, x0, x1, &mut buf);
+                pat.fill_span(y, x0, x1, &mut buf[..count * ncomps]);
                 render_span_general_inner(
-                    pipe, &buf, false, dst_pixels, dst_alpha, shape,
+                    pipe,
+                    |i| &buf[i * ncomps..(i + 1) * ncomps],
+                    dst_pixels, dst_alpha, shape,
                     count, ncomps, a_input, is_nonseparable, is_cmyk_like,
                     &shape_at, &soft_mask_at, &alpha0_at,
                 );
@@ -95,12 +99,11 @@ pub(crate) fn render_span_general<P: Pixel>(
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "all params necessary; extracted to avoid code duplication")]
+#[expect(clippy::too_many_arguments, reason = "all params necessary; closure eliminates solid/pattern duplication")]
 #[expect(clippy::too_many_lines, reason = "compositing formula has many branches that cannot be meaningfully split")]
-fn render_span_general_inner(
+fn render_span_general_inner<'src>(
     pipe: &PipeState<'_>,
-    src_buf: &[u8],
-    src_is_solid: bool,
+    src_px_at: impl Fn(usize) -> &'src [u8],
     dst_pixels: &mut [u8],
     dst_alpha: Option<&mut [u8]>,
     shape: Option<&[u8]>,
@@ -113,11 +116,6 @@ fn render_span_general_inner(
     soft_mask_at: &dyn Fn(usize) -> u8,
     alpha0_at: &dyn Fn(usize) -> Option<u8>,
 ) {
-    // For solid sources, every pixel uses the same src_buf[0..ncomps].
-    // For patterns, pixel i uses src_buf[i*ncomps..(i+1)*ncomps].
-    let src_px_at = |i: usize| -> &[u8] {
-        if src_is_solid { &src_buf[..ncomps] } else { &src_buf[i * ncomps..(i + 1) * ncomps] }
-    };
 
     match dst_alpha {
         Some(dst_alpha) => {
@@ -146,6 +144,8 @@ fn render_span_general_inner(
                 // c_src_corrected = c_src + (c_src - c_dst) * (a_dst * 255 / shape - a_dst) / 255.
                 let mut c_src_corr: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 let c_src: &[u8] = if pipe.non_isolated_group && shape_v != 0 {
+                    // shape_v != 0 is confirmed by the enclosing condition.
+                    debug_assert!(shape_v > 0, "divide by shape_v requires shape_v > 0");
                     let t = (a_dst * 255) / shape_v - a_dst;
                     #[expect(
                         clippy::cast_possible_wrap,
@@ -445,13 +445,13 @@ fn apply_transfer_channel(pipe: &PipeState<'_>, channel: usize, v: u8) -> u8 {
 fn apply_overprint(pipe: &PipeState<'_>, dst_px: &mut [u8], src_px: &[u8], ncomps: usize) {
     if pipe.overprint_additive {
         for j in 0..ncomps {
+            // Channels whose bit is 0 in the mask are not painted; dst already holds
+            // the correct value, so skip them.
             if pipe.overprint_mask & (1 << j) == 0 {
-                // Additive: do not write this channel.
-                // (The destination already has the value; we just didn't paint it.)
-            } else {
-                // Additive overprint: accumulate (clamped to 255, so the as u8 is safe).
-                dst_px[j] = (u16::from(dst_px[j]) + u16::from(src_px[j])).min(255) as u8;
+                continue;
             }
+            // Additive overprint: accumulate into the destination, clamped to 255.
+            dst_px[j] = (u16::from(dst_px[j]) + u16::from(src_px[j])).min(255) as u8;
         }
     } else {
         // Replace overprint: channels not in mask keep their original dst value.

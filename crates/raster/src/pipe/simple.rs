@@ -85,10 +85,10 @@ pub(crate) fn render_span_simple<P: Pixel>(
                 let mut buf = cell.borrow_mut();
                 buf.resize(count * ncomps, 0);
                 pat.fill_span(y, x0, x1, &mut buf);
-                for chunk in buf[..count * ncomps].chunks_exact_mut(ncomps) {
+                for chunk in buf.chunks_exact_mut(ncomps) {
                     pipe::apply_transfer_in_place(pipe, chunk);
                 }
-                dst_pixels.copy_from_slice(&buf[..count * ncomps]);
+                dst_pixels.copy_from_slice(&buf);
             });
         }
     }
