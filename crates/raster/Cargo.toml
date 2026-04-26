@@ -7,12 +7,14 @@ edition = "2024"
 default     = ["simd-avx2"]
 simd-avx2   = []                   # AVX2 blend / fill paths
 simd-avx512 = ["simd-avx2"]       # adds vpopcntq AA counter (requires avx512vpopcntdq)
+rayon       = ["dep:rayon"]        # tile-level rayon parallelism for fill
 
 [dependencies]
 color    = { path = "../color" }
 bytemuck = { workspace = true }
 smallvec = { workspace = true }
 bitflags = { workspace = true }
+rayon    = { version = "1", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

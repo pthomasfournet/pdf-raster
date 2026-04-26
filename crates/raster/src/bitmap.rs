@@ -305,6 +305,147 @@ impl<P: Pixel> Bitmap<P> {
     }
 }
 
+// ── BitmapBand ────────────────────────────────────────────────────────────────
+
+/// A mutable view into a horizontal band of a [`Bitmap`].
+///
+/// Created by [`Bitmap::bands_mut`].  Provides the same row-access interface
+/// as `Bitmap<P>` but covers only the rows `[y_start, y_start + height)`.
+///
+/// Row indices passed to [`BitmapBand::row_and_alpha_mut`] and
+/// [`BitmapBand::row_bytes_mut`] are **absolute** (i.e. in the same coordinate
+/// space as the parent bitmap), not band-local.
+pub struct BitmapBand<'bmp, P: Pixel> {
+    /// Pixel width of the band (same as the parent bitmap width).
+    pub width: u32,
+    /// Number of rows in this band.
+    pub height: u32,
+    /// Absolute y-coordinate of the first row in the full bitmap.
+    pub y_start: u32,
+    /// Byte distance between the start of consecutive rows.
+    pub stride: usize,
+    data: &'bmp mut [u8],
+    alpha: Option<&'bmp mut [u8]>,
+    _marker: PhantomData<P>,
+}
+
+impl<P: Pixel> BitmapBand<'_, P> {
+    /// Simultaneous mutable access to the pixel row and the alpha row.
+    ///
+    /// `y` is the **absolute** row index (must satisfy `y_start ≤ y < y_start + height`).
+    ///
+    /// Returns `(pixel_row_bytes, Some(alpha_row))` or `(pixel_row_bytes, None)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y` is outside `[y_start, y_start + height)`.
+    pub fn row_and_alpha_mut(&mut self, y: u32) -> (&mut [u8], Option<&mut [u8]>) {
+        let y_local = self.local_y(y);
+        let stride = self.stride;
+        let w = u32_to_usize(self.width);
+        let off = y_local * stride;
+        let pixels = &mut self.data[off..off + stride];
+        let alpha = self.alpha.as_mut().map(|a| {
+            let aoff = y_local * w;
+            &mut a[aoff..aoff + w]
+        });
+        (pixels, alpha)
+    }
+
+    /// Raw byte mutable access to the full stride of row `y`.
+    ///
+    /// `y` is the **absolute** row index (must satisfy `y_start ≤ y < y_start + height`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y` is outside `[y_start, y_start + height)`.
+    pub fn row_bytes_mut(&mut self, y: u32) -> &mut [u8] {
+        let y_local = self.local_y(y);
+        let stride = self.stride;
+        let off = y_local * stride;
+        &mut self.data[off..off + stride]
+    }
+
+    /// Convert an absolute row index to a band-local index, panicking if out of range.
+    #[inline]
+    fn local_y(&self, y: u32) -> usize {
+        assert!(
+            y >= self.y_start && y < self.y_start + self.height,
+            "row index {y} is out of range for band [y_start={}, height={}]",
+            self.y_start,
+            self.height,
+        );
+        u32_to_usize(y - self.y_start)
+    }
+}
+
+impl<P: Pixel> Bitmap<P> {
+    /// Split the bitmap into `n_bands` horizontal bands of approximately equal height,
+    /// returning a `Vec<BitmapBand<'_, P>>`.
+    ///
+    /// The bands cover the full height of the bitmap with no gaps and no overlaps.
+    /// Each band borrows a disjoint slice of the underlying pixel data and alpha plane,
+    /// making it safe to render bands in parallel.
+    ///
+    /// If `n_bands == 0` or `n_bands > height`, the number of bands is clamped so that
+    /// each band contains at least one row.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_bands` is 0.
+    pub fn bands_mut(&mut self, n_bands: usize) -> Vec<BitmapBand<'_, P>> {
+        assert!(n_bands >= 1, "n_bands must be ≥ 1");
+        let h = u32_to_usize(self.height);
+        // Clamp so each band has at least 1 row.
+        let n = n_bands.min(h.max(1));
+
+        let width = self.width;
+        let stride = self.stride;
+
+        // Split the pixel data into per-band slices using split_at_mut.
+        // We build a Vec of mutable slices without unsafe by iterating with split_at_mut.
+        let mut remaining_data: &mut [u8] = &mut self.data;
+        let mut remaining_alpha: Option<&mut [u8]> = self.alpha.as_deref_mut();
+
+        let mut bands = Vec::with_capacity(n);
+
+        for band_idx in 0..n {
+            // Distribute rows as evenly as possible: first `h % n` bands get one extra row.
+            let rows_before = (h / n) * band_idx + band_idx.min(h % n);
+            let rows_in_band = h / n + usize::from(band_idx < h % n);
+            let _ = rows_before; // used only for y_start calculation via cumulative split
+
+            let data_bytes = rows_in_band * stride;
+            let alpha_bytes = rows_in_band * u32_to_usize(width);
+
+            let (band_data, rest_data) = remaining_data.split_at_mut(data_bytes);
+            remaining_data = rest_data;
+
+            let (band_alpha_opt, rest_alpha_opt) = remaining_alpha.map_or((None, None), |a| {
+                let (ba, ra) = a.split_at_mut(alpha_bytes);
+                (Some(ba), Some(ra))
+            });
+            remaining_alpha = rest_alpha_opt;
+
+            // y_start is the cumulative row count of all previous bands.
+            // Recompute from the band index.
+            let y_start = (h / n) * band_idx + band_idx.min(h % n);
+
+            bands.push(BitmapBand {
+                width,
+                height: u32::try_from(rows_in_band).expect("rows_in_band fits in u32"),
+                y_start: u32::try_from(y_start).expect("y_start fits in u32"),
+                stride,
+                data: band_data,
+                alpha: band_alpha_opt,
+                _marker: PhantomData,
+            });
+        }
+
+        bands
+    }
+}
+
 // ── Type-erased bitmap ────────────────────────────────────────────────────────
 
 /// A mode-erased bitmap, used when the transparency group stack must store

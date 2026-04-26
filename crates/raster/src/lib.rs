@@ -37,8 +37,12 @@ pub mod transparency;
 pub mod types;
 pub mod xpath;
 
+#[cfg(feature = "rayon")]
+pub use bitmap::BitmapBand;
 pub use bitmap::{AaBuf, Bitmap};
 pub use clip::{Clip, ClipResult};
+#[cfg(feature = "rayon")]
+pub use fill::{PARALLEL_FILL_MIN_HEIGHT, eo_fill_parallel, fill_parallel};
 pub use fill::{eo_fill, fill};
 pub use glyph::{GlyphBitmap, blit_glyph, fill_glyph};
 pub use image::{ImageResult, ImageSource, MaskSource, draw_image, fill_image_mask};
