@@ -3,6 +3,11 @@ name    = "raster"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default     = ["simd-avx2"]
+simd-avx2   = []                   # AVX2 blend / fill paths
+simd-avx512 = ["simd-avx2"]       # adds vpopcntq AA counter (requires avx512vpopcntdq)
+
 [dependencies]
 color    = { path = "../color" }
 bytemuck = { workspace = true }

@@ -12,6 +12,7 @@
 use crate::bitmap::Bitmap;
 use crate::clip::{Clip, ClipResult};
 use crate::pipe::{self, PipeSrc, PipeState};
+use crate::simd;
 use color::Pixel;
 
 /// A rasterized glyph bitmap as produced by a font renderer.
@@ -222,6 +223,10 @@ fn blit_aa<P: Pixel>(
     clippy::too_many_arguments,
     reason = "internal helper; all params necessary"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "function handles both SIMD and scalar mono-unpack paths; splitting further would obscure the logic"
+)]
 fn blit_mono<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -240,6 +245,10 @@ fn blit_mono<P: Pixel>(
     let x_shift = x_data_skip % 8;
     let data = glyph.data;
 
+    // Scratch buffer for SIMD-expanded bits: one byte per pixel, 0x00 or 0xFF.
+    // Sized to the maximum row width; reused across rows.
+    let mut expanded: Vec<u8> = vec![0u8; xx_limit];
+
     for yy in 0..yy_limit {
         #[expect(
             clippy::cast_possible_truncation,
@@ -248,6 +257,53 @@ fn blit_mono<P: Pixel>(
         #[expect(clippy::cast_possible_wrap, reason = "yy < bitmap.height ≤ i32::MAX")]
         let y = y_start + yy as i32;
         let row_off = (y_data_skip + yy) * row_bytes + x_data_skip / 8;
+
+        // Use SIMD unpack when x_shift == 0 (bits are byte-aligned).
+        // When x_shift > 0 the pixels straddle byte boundaries, so we fall
+        // back to the scalar bit-extraction path which handles that case.
+        #[cfg(target_arch = "x86_64")]
+        let use_simd_unpack = x_shift == 0;
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_simd_unpack = false;
+
+        if use_simd_unpack {
+            let packed_row = &data[row_off..];
+            simd::unpack_mono_row(packed_row, xx_limit, &mut expanded);
+
+            let mut run_start: Option<i32> = None;
+            for (xx, &cov) in expanded[..xx_limit].iter().enumerate() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "xx < xx_limit ≤ bitmap.width ≤ i32::MAX"
+                )]
+                #[expect(clippy::cast_possible_wrap, reason = "xx < bitmap.width ≤ i32::MAX")]
+                let x = x_start + xx as i32;
+                let set = cov != 0;
+                let inside_clip = clip_all_inside || clip.test(x, y);
+
+                if set && inside_clip {
+                    if run_start.is_none() {
+                        run_start = Some(x);
+                    }
+                } else if let Some(rs) = run_start.take() {
+                    let rx1 = x - 1;
+                    emit_solid_run::<P>(bitmap, pipe, src, rs, rx1, y);
+                }
+            }
+            if let Some(rs) = run_start.take() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "xx_limit ≤ bitmap.width ≤ i32::MAX"
+                )]
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "xx_limit < bitmap.width ≤ i32::MAX"
+                )]
+                let rx1 = x_start + xx_limit as i32 - 1;
+                emit_solid_run::<P>(bitmap, pipe, src, rs, rx1, y);
+            }
+            continue;
+        }
 
         let mut run_start: Option<i32> = None;
         let mut xx = 0usize;

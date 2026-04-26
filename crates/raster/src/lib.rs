@@ -30,6 +30,7 @@ pub mod pipe;
 pub mod scanner;
 pub mod screen;
 pub mod shading;
+pub mod simd;
 pub mod state;
 pub mod stroke;
 pub mod transparency;
@@ -51,6 +52,9 @@ pub use shading::function::FunctionPattern;
 pub use shading::gouraud::{GouraudVertex, gouraud_triangle_fill};
 pub use shading::radial::RadialPattern;
 pub use shading::shaded_fill;
+pub use simd::{
+    blend_solid_gray8, blend_solid_rgb8, composite_aa_rgb8, popcnt_aa_row, unpack_mono_row,
+};
 pub use state::{GraphicsState, StateStack, TransferSet};
 pub use stroke::{
     StrokeParams, flatten_path, make_dashed_path, make_stroke_path, stroke, stroke_narrow,

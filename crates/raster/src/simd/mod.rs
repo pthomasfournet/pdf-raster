@@ -1,0 +1,24 @@
+//! SIMD-accelerated hot paths for the rasterizer.
+//!
+//! All SIMD code is gated behind `#[cfg(target_arch = "x86_64")]` and uses
+//! runtime feature detection (`is_x86_feature_detected!`) so the binary runs
+//! correctly on machines that lack the required extensions.
+//!
+//! # Sub-modules
+//!
+//! - [`blend`]         — solid-colour fill (`blend_solid_rgb8`, `blend_solid_gray8`)
+//! - [`composite`]     — AA per-pixel blend (`composite_aa_rgb8`)
+//! - [`popcnt`]        — set-bit count for `AaBuf` rows (`popcnt_aa_row`)
+//! - [`glyph_unpack`]  — 1-bit-per-pixel mono glyph expansion (`unpack_mono_row`)
+
+#![allow(unsafe_code)]
+
+pub mod blend;
+pub mod composite;
+pub mod glyph_unpack;
+pub mod popcnt;
+
+pub use blend::{blend_solid_gray8, blend_solid_rgb8};
+pub use composite::composite_aa_rgb8;
+pub use glyph_unpack::unpack_mono_row;
+pub use popcnt::popcnt_aa_row;

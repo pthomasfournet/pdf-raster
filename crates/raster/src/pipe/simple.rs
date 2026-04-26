@@ -5,6 +5,8 @@
 //! belongs in the fill/stroke caller, not a generic span function.
 
 use crate::pipe::{self, PipeSrc, PipeState};
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
+use crate::simd;
 use crate::types::BlendMode;
 use color::Pixel;
 
@@ -48,8 +50,27 @@ pub(crate) fn render_span_simple<P: Pixel>(
             pipe::apply_transfer_pixel(pipe, color, &mut applied[..ncomps]);
             let applied = &applied[..ncomps];
 
-            for chunk in dst_pixels.chunks_exact_mut(ncomps) {
-                chunk.copy_from_slice(applied);
+            #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
+            {
+                match ncomps {
+                    1 => simd::blend_solid_gray8(dst_pixels, applied[0], count),
+                    3 => simd::blend_solid_rgb8(
+                        dst_pixels,
+                        [applied[0], applied[1], applied[2]],
+                        count,
+                    ),
+                    _ => {
+                        for chunk in dst_pixels.chunks_exact_mut(ncomps) {
+                            chunk.copy_from_slice(applied);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "simd-avx2")))]
+            {
+                for chunk in dst_pixels.chunks_exact_mut(ncomps) {
+                    chunk.copy_from_slice(applied);
+                }
             }
         }
         PipeSrc::Pattern(pat) => {
