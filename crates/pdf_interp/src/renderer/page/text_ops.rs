@@ -8,14 +8,14 @@ use crate::renderer::gstate::ctm_transform;
 
 /// Holds rasterized glyph data for two-phase text rendering.
 pub(super) struct GlyphRecord {
-    pub(super) pen_x: i32,
-    pub(super) pen_y: i32,
-    pub(super) x_off: i32,
-    pub(super) y_off: i32,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) aa: bool,
-    pub(super) data: Vec<u8>,
+    pub pen_x: i32,
+    pub pen_y: i32,
+    pub x_off: i32,
+    pub y_off: i32,
+    pub width: u32,
+    pub height: u32,
+    pub aa: bool,
+    pub data: Vec<u8>,
 }
 
 // ── Coordinate helpers ────────────────────────────────────────────────────────

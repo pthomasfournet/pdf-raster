@@ -7,13 +7,13 @@
 //! Import with `use crate::resources::dict_ext::DictExt;` (or via the
 //! resources prelude once one is added).
 
-use lopdf::{Dictionary, Object};
+use lopdf::Dictionary;
 
 /// Convenience accessors for [`lopdf::Dictionary`] that return `Option<T>`
 /// instead of `lopdf::Error`.
 pub trait DictExt {
-    /// Return the value at `key` as a byte slice name (`/Name`), or `None`.
-    fn get_name<'a>(&'a self, key: &[u8]) -> Option<&'a [u8]>;
+    /// Return the value at `key` as a byte-slice name (`/Name`), or `None`.
+    fn get_name(&self, key: &[u8]) -> Option<&[u8]>;
 
     /// Return the value at `key` as an `i64` integer, or `None`.
     fn get_i64(&self, key: &[u8]) -> Option<i64>;
@@ -23,7 +23,7 @@ pub trait DictExt {
 }
 
 impl DictExt for Dictionary {
-    fn get_name<'a>(&'a self, key: &[u8]) -> Option<&'a [u8]> {
+    fn get_name(&self, key: &[u8]) -> Option<&[u8]> {
         self.get(key).ok()?.as_name().ok()
     }
 
@@ -32,9 +32,6 @@ impl DictExt for Dictionary {
     }
 
     fn get_bool(&self, key: &[u8]) -> Option<bool> {
-        match self.get(key).ok()? {
-            Object::Boolean(b) => Some(*b),
-            _ => None,
-        }
+        self.get(key).ok()?.as_bool().ok()
     }
 }

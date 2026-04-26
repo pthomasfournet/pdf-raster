@@ -19,14 +19,12 @@ use super::fill_impl;
 /// Minimum fill height (in output pixel rows) for which the parallel path is
 /// activated.  Below this threshold the thread-spawn overhead dominates and
 /// sequential rendering is faster.
-#[cfg(feature = "rayon")]
 pub const PARALLEL_FILL_MIN_HEIGHT: u32 = 256;
 
 /// Non-zero winding fill, parallelized across horizontal bands using rayon.
 ///
 /// Only activated when `n_bands > 1` and the fill Y range spans at least
 /// [`PARALLEL_FILL_MIN_HEIGHT`] rows.  Falls back to sequential [`fill`] otherwise.
-#[cfg(feature = "rayon")]
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors fill API; all params necessary"
@@ -60,7 +58,6 @@ pub fn fill_parallel<P: Pixel + Send>(
 ///
 /// Only activated when `n_bands > 1` and the fill Y range spans at least
 /// [`PARALLEL_FILL_MIN_HEIGHT`] rows.  Falls back to sequential [`eo_fill`] otherwise.
-#[cfg(feature = "rayon")]
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors eo_fill API; all params necessary"
@@ -93,7 +90,6 @@ pub fn eo_fill_parallel<P: Pixel + Send>(
 /// Inner implementation for parallel fill.
 ///
 /// Falls back to [`fill_impl`] when the Y range is too small or `n_bands == 1`.
-#[cfg(feature = "rayon")]
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors fill_impl API; all params necessary"
@@ -183,13 +179,9 @@ fn fill_impl_parallel<P: Pixel + Send>(
         return;
     }
 
-    // Split the bitmap into disjoint bands and render each in parallel.
-    // PipeState<'_> contains only &[u8; 256] references (Send because [u8;256]: Sync)
-    // and Option<&[u8]> (also Send). PipeSrc::Solid(&[u8]) is trivially Send.
-    // PipeSrc::Pattern(&dyn Pattern) is Send+Sync per the Pattern trait bound.
-    // Clip contains only plain data and Arc<XPathScanner> which is Send+Sync.
-    // XPathScanner contains only Vec<T> where T: Send. The scanner reference is
-    // shared read-only. Each band borrows a disjoint slice of the bitmap data.
+    // Split the bitmap into disjoint horizontal bands; render each in parallel.
+    // Each band borrows a disjoint slice of the bitmap data, so there are no
+    // aliasing hazards. The scanner and pipe are shared read-only across bands.
     let bands = bitmap.bands_mut(n_bands);
 
     bands.into_par_iter().for_each(|mut band| {
@@ -202,7 +194,6 @@ fn fill_impl_parallel<P: Pixel + Send>(
 /// `band.y_start` and `band.height` determine the y-range processed.
 /// `y` coordinates passed to span routines are absolute (matching the parent bitmap).
 /// Only called when `vector_antialias = false`; the AA path falls back to sequential.
-#[cfg(feature = "rayon")]
 fn fill_band<P: Pixel>(
     band: &mut BitmapBand<'_, P>,
     clip: &Clip,
@@ -264,7 +255,6 @@ fn fill_band<P: Pixel>(
 }
 
 /// Emit a solid span into a band row that is fully inside the clip.
-#[cfg(feature = "rayon")]
 fn draw_span_band<P: Pixel>(
     band: &mut BitmapBand<'_, P>,
     pipe: &PipeState<'_>,
@@ -292,7 +282,6 @@ fn draw_span_band<P: Pixel>(
 }
 
 /// Emit a span with per-pixel clip test into a band row.
-#[cfg(feature = "rayon")]
 fn draw_span_band_clipped<P: Pixel>(
     band: &mut BitmapBand<'_, P>,
     clip: &Clip,

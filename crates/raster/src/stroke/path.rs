@@ -105,9 +105,11 @@ pub fn flatten_path(path: &Path, _matrix: &[f64; 6], flatness: f64) -> Path {
     reason = "direct port of Splash::makeDashedPath; seg_len is decremented toward 0 each iteration"
 )]
 pub fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) -> Path {
-    // Sum the dash array.
+    // Sum the dash array.  Guard against zero or subnormal totals: a very small
+    // but non-zero total would cause phase / line_dash_total to overflow i32 in
+    // splash_floor, producing garbage phase values.
     let line_dash_total: f64 = line_dash.iter().sum();
-    if line_dash_total == 0.0 {
+    if line_dash_total < f64::EPSILON {
         return Path::new();
     }
 
