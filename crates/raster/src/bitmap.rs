@@ -220,6 +220,7 @@ impl<P: Pixel> Bitmap<P> {
             // Optimise single-byte pixels: memset the entire data buffer.
             self.data.fill(pixel_bytes[0]);
         } else {
+            debug_assert!(P::BYTES > 0, "clear: P::BYTES must be non-zero for chunked fill");
             // Write one pixel-sized chunk per pixel in each row, then zero the
             // stride padding. Using `chunks_exact_mut` avoids manual index arithmetic.
             let w = u32_to_usize(self.width);

@@ -241,15 +241,9 @@ impl Clip {
     /// scanner is asked to render its coverage into `aa_buf`, and the output
     /// span `[*x0, *x1]` is clamped to the integer clip bounds.
     ///
-    /// # Panics
-    ///
-    /// Panics if `AA_SIZE` cannot be represented as `usize` — `AA_SIZE` is the
-    /// compile-time constant `4`, so this never occurs in practice.
+    /// This method does not panic. `AA_SIZE` is the compile-time constant `4`,
+    /// which is always representable as `usize`.
     pub fn clip_aa_line(&self, aa_buf: &mut AaBuf, x0: &mut i32, x1: &mut i32, y: i32) {
-        // AA_SIZE = 4 (positive compile-time constant); the expect never fires.
-        let _aa = usize::try_from(AA_SIZE)
-            .expect("AA_SIZE is a positive compile-time constant (4) and always fits in usize");
-
         // Apply path-clip scanners.
         for scanner in &self.scanners {
             scanner.render_aa_line(aa_buf, x0, x1, y);
@@ -338,19 +332,22 @@ fn detect_rect(xpath: &XPath) -> Option<(f64, f64, f64, f64)> {
         return None;
     }
     // Extract x extents from vertical segments and y extents from horizontal segments.
-    let vert_xs = segs
+    // Collect into small Vecs (at most 4 elements each) to avoid a double-filter pass.
+    let vert_xs: Vec<f64> = segs
         .iter()
         .filter(|s| s.flags.contains(XPathFlags::VERT))
-        .flat_map(|s| [s.x0, s.x1]);
-    let horiz_ys = segs
+        .flat_map(|s| [s.x0, s.x1])
+        .collect();
+    let horiz_ys: Vec<f64> = segs
         .iter()
         .filter(|s| s.flags.contains(XPathFlags::HORIZ))
-        .flat_map(|s| [s.y0, s.y1]);
+        .flat_map(|s| [s.y0, s.y1])
+        .collect();
 
-    let x0 = vert_xs.clone().fold(f64::INFINITY, f64::min);
-    let x1 = vert_xs.fold(f64::NEG_INFINITY, f64::max);
-    let y0 = horiz_ys.clone().fold(f64::INFINITY, f64::min);
-    let y1 = horiz_ys.fold(f64::NEG_INFINITY, f64::max);
+    let x0 = vert_xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let x1 = vert_xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y0 = horiz_ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let y1 = horiz_ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
     Some((x0, y0, x1, y1))
 }

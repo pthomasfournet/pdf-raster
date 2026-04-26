@@ -256,6 +256,12 @@ impl Path {
     /// sentinel — which is correct: appending an empty path does not create a
     /// current point.
     pub fn append(&mut self, other: &Self) {
+        debug_assert!(
+            other.cur_subpath <= other.pts.len(),
+            "append: other.cur_subpath ({}) exceeds other.pts.len() ({}); invariant broken",
+            other.cur_subpath,
+            other.pts.len()
+        );
         let base = self.pts.len();
         self.cur_subpath = base + other.cur_subpath;
         self.pts.extend_from_slice(&other.pts);
@@ -419,6 +425,11 @@ impl PathBuilder {
         if force || (sp != last_idx && first != last) {
             self.line_to(first.x, first.y)?;
         }
+        debug_assert_eq!(
+            self.path.pts.len(),
+            self.path.flags.len(),
+            "close: pts/flags length invariant violated"
+        );
 
         // Stamp CLOSED on the first and last point of the subpath.
         let new_last = self.path.pts.len() - 1;

@@ -139,11 +139,17 @@ impl XPathScanner {
         let mut row_start = Vec::with_capacity(n_rows + 1);
         let mut intersects = Vec::new();
         for bucket in &mut buckets {
-            row_start.push(u32::try_from(intersects.len()).unwrap_or(u32::MAX));
+            row_start.push(
+                u32::try_from(intersects.len())
+                    .expect("intersection count exceeds u32::MAX; path has too many segments"),
+            );
             bucket.sort_unstable_by_key(|i| i.x0);
             intersects.extend_from_slice(bucket);
         }
-        row_start.push(u32::try_from(intersects.len()).unwrap_or(u32::MAX));
+        row_start.push(
+            u32::try_from(intersects.len())
+                .expect("intersection count exceeds u32::MAX; path has too many segments"),
+        );
 
         Self {
             eo,
@@ -266,8 +272,8 @@ impl XPathScanner {
     /// the scanner must have been built from an `aa_scale()`'d `XPath`.
     ///
     /// `x0` and `x1` are updated to the tightest bounding range of pixels
-    /// written into `aa_buf`. If no pixels are written, `*x0` is set equal to
-    /// `*x1` (empty range).
+    /// written into `aa_buf`. If no pixels are written, `*x0` is set to `0`
+    /// and `*x1` to `-1` (so `*x0 > *x1` reliably indicates an empty range).
     ///
     /// # Panics
     ///
@@ -340,8 +346,10 @@ impl XPathScanner {
         }
 
         if xx_min > xx_max {
-            // No pixels were written; collapse to an empty range.
-            xx_min = xx_max;
+            // Empty range signal: x0 > x1.
+            *x0 = 0;
+            *x1 = -1;
+            return;
         }
         *x0 = xx_min / aa;
         *x1 = (xx_max - 1) / aa;

@@ -40,23 +40,35 @@ impl HalftoneScreen {
     /// should be rendered as white (returns `true`) or black (`false`).
     ///
     /// Matches `SplashScreen::test` in `SplashScreen.h`.
-    ///
-    /// # Panics
-    ///
-    /// This function builds the threshold matrix on first call via an internal
-    /// `unwrap()` that is safe because `create_matrix` always sets `self.mat`.
     #[inline]
     pub fn test(&mut self, x: i32, y: i32, value: u8) -> bool {
         if self.mat.is_none() {
             self.create_matrix();
         }
-        let mat = self.mat.as_ref().unwrap();
-        // rem_euclid handles negative coordinates correctly: result is always
-        // in [0, size), and size is a power of 2 so this is equivalent to
-        // (x & size_m1) for non-negative x.
-        let size_i32 = i32::try_from(self.size).unwrap_or(i32::MAX);
-        let xx = usize::try_from(x.rem_euclid(size_i32)).unwrap_or(0);
-        let yy = usize::try_from(y.rem_euclid(size_i32)).unwrap_or(0);
+        // SAFETY: create_matrix always initialises self.mat; the is_none check
+        // above ensures create_matrix ran, so the unwrap_or branch is unreachable.
+        let mat = self.mat.as_deref().unwrap_or(&[]);
+        debug_assert!(!mat.is_empty(), "test: mat must be set after create_matrix");
+        // size always fits i32: create_matrix builds size by doubling from 2
+        // up to params.size (which is i32), so size ≤ i32::MAX + 1. The saturating
+        // loop prevents wrap; in practice size ≤ 2^31 always fits.
+        debug_assert!(
+            i32::try_from(self.size).is_ok(),
+            "test: size={} exceeds i32::MAX; rem_euclid modulus would be wrong",
+            self.size
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "size always fits i32: bounded by params.size (i32) in create_matrix"
+        )]
+        let size_i32 = self.size as i32;
+        // rem_euclid returns a value in [0, size_i32), which is always non-negative,
+        // so the cast to usize is safe. Clippy does not fire cast_sign_loss here
+        // because the compiler recognises rem_euclid's return type is i32 and the
+        // cast is unconditional — no annotation needed.
+        let xx = x.rem_euclid(size_i32) as usize;
+        let yy = y.rem_euclid(size_i32) as usize;
         value >= mat[(yy << self.log2_size) + xx]
     }
 
@@ -69,16 +81,21 @@ impl HalftoneScreen {
         // Find smallest power-of-2 size ≥ params.size.
         let mut size = 2usize;
         let mut log2 = 1u32;
+        // i32::try_from(size) fits while size ≤ i32::MAX; once size exceeds
+        // i32::MAX the comparison saturates and the loop exits (params.size is i32).
         while i32::try_from(size).unwrap_or(i32::MAX) < self.params.size {
-            size *= 2;
-            log2 += 1;
+            size = size.saturating_mul(2);
+            log2 = log2.saturating_add(1);
         }
         // For stochastic clustered: ensure size ≥ 2 × dot_radius.
         if self.params.kind == ScreenType::StochasticClustered {
+            // dot_radius is i32 ≥ 0 (validated by ScreenParams::validate); the
+            // product 2 * dot_radius fits in usize. unwrap_or(0) is a safe
+            // fallback for the impossible-negative case.
             let min_size = usize::try_from(2 * self.params.dot_radius).unwrap_or(0);
             while size < min_size {
-                size *= 2;
-                log2 += 1;
+                size = size.saturating_mul(2);
+                log2 = log2.saturating_add(1);
             }
         }
         self.size = size;
@@ -98,7 +115,9 @@ impl HalftoneScreen {
             ScreenType::Dispersed => build_dispersed(&mut mat, size, log2),
             ScreenType::Clustered => build_clustered(&mut mat, size),
             ScreenType::StochasticClustered => {
-                let dot_radius = usize::try_from(self.params.dot_radius).unwrap_or(0);
+                // dot_radius ≥ 0 (ScreenParams invariant); try_from succeeds.
+                let dot_radius = usize::try_from(self.params.dot_radius)
+                    .expect("dot_radius must be non-negative");
                 build_stochastic_clustered(&mut mat, size, dot_radius);
             }
         }
@@ -146,14 +165,16 @@ fn build_dispersed(mat: &mut [u8], size: usize, log2_size: u32) {
         "size*size={} exceeds u32::MAX",
         size * size
     );
-    let total = u32::try_from(size * size).unwrap_or(u32::MAX);
+    // debug_assert above verified size*size fits u32.
+    let total = u32::try_from(size * size).expect("size*size verified to fit u32 above");
     for y in 0..size {
         for x in 0..size {
             // Compute the Bayer index for (x, y) at this size.
             let v = bayer_index(x, y, log2_size);
-            // Scale to [1, 255].
+            // Scale to [1, 255]. The clamp guarantees the value fits in u8.
             mat[y * size + x] =
-                u8::try_from(((v * 255 + total / 2) / total).clamp(1, 255)).unwrap_or(255);
+                u8::try_from(((v * 255 + total / 2) / total).clamp(1, 255))
+                    .expect("clamped to [1, 255]; always fits u8");
         }
     }
 }
@@ -225,7 +246,7 @@ fn build_clustered(mat: &mut [u8], size: usize) {
         "size/2={} exceeds u32::MAX",
         size / 2
     );
-    let half = f64::from(u32::try_from(size / 2).unwrap_or(u32::MAX));
+    let half = f64::from(u32::try_from(size / 2).expect("size/2 verified to fit u32 above"));
     let cx = half;
     let cy = half;
     let max_dist = cx * cx + cy * cy;
@@ -241,8 +262,8 @@ fn build_clustered(mat: &mut [u8], size: usize) {
                 u32::try_from(x).is_ok() && u32::try_from(y).is_ok(),
                 "x={x} or y={y} exceeds u32::MAX"
             );
-            let dx = f64::from(u32::try_from(x).unwrap_or(u32::MAX)) - cx;
-            let dy = f64::from(u32::try_from(y).unwrap_or(u32::MAX)) - cy;
+            let dx = f64::from(u32::try_from(x).expect("x < size <= u32::MAX (verified above)")) - cx;
+            let dy = f64::from(u32::try_from(y).expect("y < size <= u32::MAX (verified above)")) - cy;
             let dist = dx.mul_add(dx, dy * dy);
             // Known false-positive: value is clamped to [0.5, 254.5] so
             // truncation to u8 is safe. #[expect] errors if clippy ever fixes
@@ -297,8 +318,10 @@ fn build_stochastic_clustered(mat: &mut [u8], size: usize, dot_radius: usize) {
     thresholds.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     for (rank, (idx, _)) in thresholds.iter().enumerate() {
         // rank < n, so rank * 254 / n is in [0, 254]; fits in u8.
+        // rank < n, so rank * 254 / n ∈ [0, 254]; `.clamp(0, 255)` makes the
+        // bound explicit for the type-checker; always fits u8.
         mat[*idx] = u8::try_from((rank * 254 / n).clamp(0, 255))
-            .unwrap_or(255)
+            .expect("rank * 254 / n ∈ [0, 254]; clamped to [0, 255]; fits u8")
             .max(1);
     }
 }
@@ -362,7 +385,7 @@ fn torus_dist(a: usize, b: usize, size: usize) -> f64 {
         u32::try_from(d).is_ok(),
         "torus_dist: d={d} exceeds u32::MAX"
     );
-    f64::from(u32::try_from(d).unwrap_or(u32::MAX))
+    f64::from(u32::try_from(d).expect("d <= size/2; size bounded by i32 params so d fits u32"))
 }
 
 #[cfg(test)]

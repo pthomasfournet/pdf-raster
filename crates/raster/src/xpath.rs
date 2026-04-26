@@ -164,7 +164,7 @@ impl XPath {
             .map(|p| transform(matrix, p.x, p.y))
             .collect();
 
-        // Build stroke-adjust records from the path hints (if any).
+        // Phase 1 always uses adjust_lines=false, line_pos_i=0 (thin-line adjustment is Phase 2).
         let adjusts = build_adjusts(&path.hints, &tpts, false, 0);
 
         // Apply stroke adjustments to the transformed points.
@@ -402,12 +402,27 @@ pub const fn transform(m: &[f64; 6], xi: f64, yi: f64) -> PathPoint {
 /// Hints whose control-point indices are out of range for `tpts` are also
 /// silently dropped rather than panicking, so that malformed PDF content
 /// cannot cause crashes.
+///
+/// # Parameters `adjust_lines` and `line_pos_i`
+///
+/// These parameters are **reserved for Phase 2 thin-line stroke adjustment**
+/// and are currently always called with `(false, 0)`. When `adjust_lines` is
+/// `false` the `line_pos_i` value is unused and the `XPathAdjust::new` branch
+/// that computes adjusted `r0`/`r1` from `line_pos_i` is never reached.
+///
+/// Do **not** remove these parameters; they will be wired up in Phase 2.
 fn build_adjusts(
     hints: &[StrokeAdjustHint],
     tpts: &[PathPoint],
     adjust_lines: bool,
     line_pos_i: i32,
 ) -> Vec<XPathAdjust> {
+    // Document the current calling convention; Phase 2 will relax this.
+    debug_assert!(
+        !adjust_lines && line_pos_i == 0,
+        "build_adjusts: adjust_lines={adjust_lines} line_pos_i={line_pos_i}; \
+         Phase 2 thin-line adjustment not yet implemented"
+    );
     let mut adjusts = Vec::with_capacity(hints.len());
     for h in hints {
         // Validate indices: each hint references two consecutive point pairs.
