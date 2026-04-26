@@ -8,6 +8,7 @@ members = [
     "crates/pdf_bridge",
     "crates/cli",
     "crates/gpu",
+    "crates/bench",
 ]
 
 [workspace.dependencies]

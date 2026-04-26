@@ -1,0 +1,21 @@
+[package]
+name    = "bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+raster    = { path = "../raster" }
+color     = { path = "../color" }
+vello_cpu = "0.0.7"
+
+[lints.rust]
+unsafe_code  = "deny"
+missing_docs = "allow"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
