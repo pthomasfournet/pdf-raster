@@ -1,12 +1,11 @@
 [package]
 name = "encode"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-color   = { path = "../color" }
-raster  = { path = "../raster" }
-bytemuck = { workspace = true }
+color  = { path = "../color" }
+raster = { path = "../raster" }
 
 # PNG output — pure Rust, no system libs required.
 png = "0.17"

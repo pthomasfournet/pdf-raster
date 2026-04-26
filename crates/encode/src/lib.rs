@@ -8,8 +8,8 @@
 //! | [`write_pgm`] | Netpbm P5 binary | `Gray8` |
 //! | [`write_png`] | PNG | `Rgb8`, `Gray8`, `Rgba8` |
 //!
-//! All functions consume the output sink (`W: Write`) rather than borrowing
-//! `&mut W`, matching the convention of format-specific writer types.
+//! All functions consume the output sink (`W: Write`).  Wrap in
+//! [`std::io::BufWriter`] at the call site if buffering is needed.
 //!
 //! # CMYK handling
 //!

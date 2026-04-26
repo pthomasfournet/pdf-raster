@@ -17,19 +17,22 @@
 
 use std::io::{self, Write};
 
-use color::{Cmyk8, DeviceN8, Pixel, PixelMode};
+use color::{Pixel, PixelMode};
 use raster::Bitmap;
 
 use crate::EncodeError;
 
 /// Write `bitmap` to `out` as a binary PPM (`P6`) image.
 ///
+/// The sink `out` is consumed; wrap in `std::io::BufWriter` if buffering is
+/// needed.
+///
 /// # Errors
 ///
 /// Returns [`EncodeError::UnsupportedMode`] for grayscale or 1-bit modes —
 /// use [`write_pgm`][crate::write_pgm] for those.
 /// Returns [`EncodeError::Io`] on any I/O failure.
-pub fn write_ppm<P: Pixel, W: Write>(bitmap: &Bitmap<P>, out: &mut W) -> Result<(), EncodeError> {
+pub fn write_ppm<P: Pixel, W: Write>(bitmap: &Bitmap<P>, mut out: W) -> Result<(), EncodeError> {
     match P::MODE {
         PixelMode::Mono1 | PixelMode::Mono8 => {
             return Err(EncodeError::UnsupportedMode(
@@ -43,8 +46,8 @@ pub fn write_ppm<P: Pixel, W: Write>(bitmap: &Bitmap<P>, out: &mut W) -> Result<
         | PixelMode::DeviceN8 => {}
     }
 
-    write_ppm_header(out, bitmap.width, bitmap.height)?;
-    write_ppm_pixels::<P, W>(bitmap, out)?;
+    write_ppm_header(&mut out, bitmap.width, bitmap.height)?;
+    write_ppm_pixels::<P, W>(bitmap, &mut out)?;
     out.flush()?;
     Ok(())
 }
@@ -72,56 +75,45 @@ fn write_ppm_pixels<P: Pixel, W: Write>(bitmap: &Bitmap<P>, out: &mut W) -> io::
 }
 
 /// Convert one source row (any supported pixel mode) into RGB bytes.
+///
+/// `dst` must be at least `width * 3` bytes long.
+/// `src` must be at least `width * P::BYTES` bytes long.
 #[inline]
 fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
     match P::MODE {
         PixelMode::Rgb8 => {
             // Copy exactly 3 bytes per pixel — stride padding excluded via width.
-            let n = width * 3;
-            dst[..n].copy_from_slice(&src[..n]);
+            dst[..width * 3].copy_from_slice(&src[..width * 3]);
         }
         PixelMode::Bgr8 => {
+            // Source: [B, G, R] → dest: [R, G, B].
             for (i, chunk) in src[..width * 3].chunks_exact(3).enumerate() {
-                dst[i * 3] = chunk[2]; // R ← B-channel
-                dst[i * 3 + 1] = chunk[1]; // G
-                dst[i * 3 + 2] = chunk[0]; // B ← R-channel
+                dst[i * 3] = chunk[2]; // R ← src[2]
+                dst[i * 3 + 1] = chunk[1]; // G ← src[1]
+                dst[i * 3 + 2] = chunk[0]; // B ← src[0]
             }
         }
         PixelMode::Xbgr8 => {
-            // Layout: X B G R (little-endian 32-bit word).
+            // Source: [X, B, G, R] (little-endian 32-bit word) → dest: [R, G, B].
             for (i, chunk) in src[..width * 4].chunks_exact(4).enumerate() {
-                dst[i * 3] = chunk[3]; // R
-                dst[i * 3 + 1] = chunk[2]; // G
-                dst[i * 3 + 2] = chunk[1]; // B
+                dst[i * 3] = chunk[3]; // R ← src[3]
+                dst[i * 3 + 1] = chunk[2]; // G ← src[2]
+                dst[i * 3 + 2] = chunk[1]; // B ← src[1]
             }
         }
         PixelMode::Cmyk8 => {
+            // Source: [C, M, Y, K] → dest: [R, G, B].
             for (i, chunk) in src[..width * 4].chunks_exact(4).enumerate() {
-                let px = Cmyk8 {
-                    c: chunk[0],
-                    m: chunk[1],
-                    y: chunk[2],
-                    k: chunk[3],
-                };
-                let [r, g, b] = cmyk_to_rgb(px.c, px.m, px.y, px.k);
+                let [r, g, b] = cmyk_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
                 dst[i * 3] = r;
                 dst[i * 3 + 1] = g;
                 dst[i * 3 + 2] = b;
             }
         }
         PixelMode::DeviceN8 => {
+            // Source: [C, M, Y, K, spot0..3] — use only CMYK (bytes 0..4).
             for (i, chunk) in src[..width * 8].chunks_exact(8).enumerate() {
-                // Use only the CMYK portion (bytes 0..4); spot channels are ignored.
-                let px = DeviceN8 {
-                    cmyk: Cmyk8 {
-                        c: chunk[0],
-                        m: chunk[1],
-                        y: chunk[2],
-                        k: chunk[3],
-                    },
-                    spots: [chunk[4], chunk[5], chunk[6], chunk[7]],
-                };
-                let [r, g, b] = cmyk_to_rgb(px.cmyk.c, px.cmyk.m, px.cmyk.y, px.cmyk.k);
+                let [r, g, b] = cmyk_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
                 dst[i * 3] = r;
                 dst[i * 3 + 1] = g;
                 dst[i * 3 + 2] = b;
@@ -136,25 +128,17 @@ fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
 
 /// Simple CMYK → RGB: `R = 255 − C − K`, clamped to `[0, 255]`.
 ///
-/// This is the naïve ink-density formula used by poppler's `pdftoppm` and
-/// matches the Splash rasterizer's own CMYK-to-RGB path.
+/// Matches the naïve ink-density formula used by poppler's `pdftoppm` and
+/// the Splash rasterizer's own CMYK-to-RGB path.
 #[inline]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "each channel is clamped to [0, 255] before the cast; value is always non-negative"
+)]
 fn cmyk_to_rgb(cyan: u8, magenta: u8, yellow: u8, black: u8) -> [u8; 3] {
     let k = i32::from(black);
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "clamped to [0, 255] before cast; value is always non-negative"
-    )]
     let r = (255 - i32::from(cyan) - k).clamp(0, 255) as u8;
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "clamped to [0, 255] before cast; value is always non-negative"
-    )]
     let g = (255 - i32::from(magenta) - k).clamp(0, 255) as u8;
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "clamped to [0, 255] before cast; value is always non-negative"
-    )]
     let b = (255 - i32::from(yellow) - k).clamp(0, 255) as u8;
     [r, g, b]
 }
@@ -162,7 +146,7 @@ fn cmyk_to_rgb(cyan: u8, magenta: u8, yellow: u8, black: u8) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use color::{Cmyk8, Rgb8};
+    use color::{Cmyk8, DeviceN8, Rgb8, Rgba8};
     use raster::Bitmap;
 
     fn make_rgb_bitmap(w: u32, h: u32, fill: [u8; 3]) -> Bitmap<Rgb8> {
@@ -176,13 +160,27 @@ mod tests {
         bmp
     }
 
+    /// Parse the P6 header and return the byte offset of the first pixel.
+    fn header_len(out: &[u8]) -> usize {
+        // Header format: "P6\n{w} {h}\n255\n" — find the third newline.
+        let mut newlines = 0usize;
+        for (i, &b) in out.iter().enumerate() {
+            if b == b'\n' {
+                newlines += 1;
+                if newlines == 3 {
+                    return i + 1;
+                }
+            }
+        }
+        panic!("malformed PPM header");
+    }
+
     #[test]
     fn rgb_ppm_header_and_pixels() {
         let bmp = make_rgb_bitmap(2, 1, [255, 128, 0]);
         let mut out = Vec::new();
         write_ppm::<Rgb8, _>(&bmp, &mut out).unwrap();
 
-        // The header is ASCII text; pixels follow as raw binary.
         let expected_header = b"P6\n2 1\n255\n";
         assert!(
             out.starts_with(expected_header),
@@ -190,11 +188,26 @@ mod tests {
             &out[..expected_header.len().min(out.len())]
         );
 
-        // Pixels: 2 × 3 bytes = 6 bytes after header.
         let pixels = &out[expected_header.len()..];
-        assert_eq!(pixels.len(), 6);
+        assert_eq!(pixels.len(), 6, "2 pixels × 3 bytes");
         assert_eq!(&pixels[..3], &[255, 128, 0]);
         assert_eq!(&pixels[3..6], &[255, 128, 0]);
+    }
+
+    #[test]
+    fn rgba8_xbgr_ppm_channel_swap() {
+        // Rgba8 has MODE=Xbgr8; memory layout is [X/A, B, G, R].
+        let mut bmp: Bitmap<Rgba8> = Bitmap::new(1, 1, 1, false);
+        // [A=255, B=10, G=20, R=30]
+        bmp.row_bytes_mut(0).copy_from_slice(&[255, 10, 20, 30]);
+        let mut out = Vec::new();
+        write_ppm::<Rgba8, _>(&bmp, &mut out).unwrap();
+        let hlen = header_len(&out);
+        assert_eq!(
+            &out[hlen..],
+            &[30, 20, 10],
+            "Xbgr8 must become RGB (channels swapped)"
+        );
     }
 
     #[test]
@@ -204,9 +217,8 @@ mod tests {
         bmp.row_bytes_mut(0).copy_from_slice(&[0, 0, 0, 255]);
         let mut out = Vec::new();
         write_ppm::<Cmyk8, _>(&bmp, &mut out).unwrap();
-        let header_len = "P6\n1 1\n255\n".len();
-        let pixels = &out[header_len..];
-        assert_eq!(pixels, &[0, 0, 0], "CMYK black should map to RGB (0,0,0)");
+        let hlen = header_len(&out);
+        assert_eq!(&out[hlen..], &[0, 0, 0], "CMYK black → RGB (0,0,0)");
     }
 
     #[test]
@@ -216,9 +228,39 @@ mod tests {
         bmp.row_bytes_mut(0).copy_from_slice(&[0, 0, 0, 0]);
         let mut out = Vec::new();
         write_ppm::<Cmyk8, _>(&bmp, &mut out).unwrap();
-        let header_len = "P6\n1 1\n255\n".len();
-        let pixels = &out[header_len..];
-        assert_eq!(pixels, &[255, 255, 255], "CMYK white → RGB white");
+        let hlen = header_len(&out);
+        assert_eq!(&out[hlen..], &[255, 255, 255], "CMYK white → RGB white");
+    }
+
+    #[test]
+    fn devicen_uses_only_cmyk_portion() {
+        let mut bmp: Bitmap<DeviceN8> = Bitmap::new(1, 1, 1, false);
+        // DeviceN8: CMYK=(0,0,0,0) → white; spot channels ignored.
+        bmp.row_bytes_mut(0)
+            .copy_from_slice(&[0, 0, 0, 0, 99, 99, 99, 99]);
+        let mut out = Vec::new();
+        write_ppm::<DeviceN8, _>(&bmp, &mut out).unwrap();
+        let hlen = header_len(&out);
+        assert_eq!(
+            &out[hlen..],
+            &[255, 255, 255],
+            "DeviceN spot channels must be ignored"
+        );
+    }
+
+    #[test]
+    fn stride_padding_not_written() {
+        // width=1, pad=4 → stride=4 for Rgb8 (3 bytes/px rounded up to 4).
+        let bmp: Bitmap<Rgb8> = Bitmap::new(1, 1, 4, false);
+        let mut out = Vec::new();
+        write_ppm::<Rgb8, _>(&bmp, &mut out).unwrap();
+        let hlen = header_len(&out);
+        // Must be exactly 3 pixel bytes, not 4 (stride).
+        assert_eq!(
+            out.len() - hlen,
+            3,
+            "stride padding must not appear in PPM output"
+        );
     }
 
     #[test]
