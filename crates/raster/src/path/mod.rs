@@ -459,6 +459,16 @@ impl PathBuilder {
         });
     }
 
+    /// Returns the current point (last appended endpoint), if any.
+    ///
+    /// Returns `None` when there is no current point — i.e. on a freshly
+    /// created builder or immediately after a successful [`Self::close`].
+    /// Delegates to [`Path::current_point`].
+    #[must_use]
+    pub fn cur_pt(&self) -> Option<PathPoint> {
+        self.path.current_point()
+    }
+
     /// Returns the number of points accumulated in the builder so far.
     ///
     /// This is a read-only view used by callers that need to record point

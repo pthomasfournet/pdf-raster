@@ -1,20 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/color", "crates/raster", "crates/encode"]
+members = ["crates/color", "crates/raster", "crates/encode", "crates/font"]
 
 [workspace.dependencies]
-# bytemuck 1.21 introduced `#[derive(Pod, Zeroable)]` stability improvements
-# used throughout; 1.25 is the current release as of 2026-04.
 bytemuck  = { version = ">=1.21, <2", features = ["derive"] }
-# smallvec 1.13 stabilised the `union` feature on stable Rust; 1.15 is current.
 smallvec  = { version = ">=1.13, <2", features = ["union"] }
-# bitflags 2.0 introduced the stable bitflags! macro 2nd-gen syntax; 2.11 is current.
 bitflags  = { version = ">=2.0,  <3" }
-# proptest 1.0 is the stable API baseline; 1.11 is current.
 proptest  = { version = ">=1.0,  <2" }
 
 [workspace.lints.rust]
-# Deny a focused set of soundness-critical lints at the workspace level.
 unsafe_code          = "deny"
 missing_docs         = "warn"
 unused_results       = "warn"
