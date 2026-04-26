@@ -319,16 +319,14 @@ impl<'doc> PageRenderer<'doc> {
             }
             Operator::MoveNextLineShow(bytes) => {
                 self.gstate.current_mut().text.next_line();
-                let bytes = bytes.clone();
-                self.show_text(&bytes);
+                self.show_text(bytes);
             }
             Operator::MoveNextLineShowSpaced { aw, ac, text, .. } => {
                 let gs = self.gstate.current_mut();
                 gs.text.word_spacing = *aw;
                 gs.text.char_spacing = *ac;
                 gs.text.next_line();
-                let text = text.clone();
-                self.show_text(&text);
+                self.show_text(text);
             }
 
             // ── XObjects / images / shading ────────────────────────────────────
@@ -377,7 +375,11 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
 
-        // Render modes 3+ are invisible (clip or no-op for our purposes).
+        // PDF render modes 0–2 paint (fill/stroke/both); mode 3 is invisible;
+        // modes 4–7 are the same as 0–3 but also add to the clip path.
+        // We skip all modes ≥ 3 here — modes 4–6 would normally still paint,
+        // but since clip accumulation is not yet implemented, skipping them is
+        // the conservative choice (text is not drawn but also not used as clip).
         if self.gstate.current().text.render_mode >= 3 {
             return;
         }
@@ -387,9 +389,12 @@ impl<'doc> PageRenderer<'doc> {
         let font_size = self.gstate.current().text.font_size;
         let char_spacing = self.gstate.current().text.char_spacing;
         let word_spacing = self.gstate.current().text.word_spacing;
-        // PDF Tz is a percentage; 0 % means zero-advance (degenerate — treat as 100 %).
+        // PDF Tz is a percentage (default 100 %).  A value of 0 % is degenerate
+        // (zero horizontal advance); we map it to 100 % to avoid invisible text.
+        // This overrides an explicit `Tz 0` instruction — rare in practice.
         let raw_hz = self.gstate.current().text.horiz_scaling;
         let horiz_scaling = if raw_hz.abs() < f64::EPSILON {
+            log::debug!("pdf_interp: Tz is 0 %, substituting 100 %");
             1.0
         } else {
             raw_hz / 100.0
@@ -415,6 +420,9 @@ impl<'doc> PageRenderer<'doc> {
         {
             // Trm[2×2] = font_size × Tm[2×2] × CTM[2×2] — the text rendering
             // matrix in device pixels, encoding actual size and skew/rotation.
+            // The 2×2 submatrix (indices 0–3) is stable across the glyph loop
+            // because only the translation components (indices 4–5) change as
+            // the pen advances — the orientation and size don't change mid-string.
             let tm2x2 = mat2x2_mul(&tm, &ctm);
             let trm = tm2x2.map(|v| v * font_size);
 
@@ -439,7 +447,8 @@ impl<'doc> PageRenderer<'doc> {
                     });
                 }
 
-                // Advance text matrix.
+                // Advance regardless of whether the glyph rendered — PDF §9.4.4
+                // requires the pen to advance even for missing/invisible glyphs.
                 let advance_glyph = face.glyph_advance(u32::from(byte)).max(0.0);
                 let extra = if byte == b' ' { word_spacing } else { 0.0 };
                 let tx_adv = (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
@@ -650,6 +659,11 @@ impl<'doc> PageRenderer<'doc> {
         reason = "device pixel coords are always in page bounds after clamping; safe casts"
     )]
     fn blit_image(&mut self, img: &crate::resources::ImageDescriptor) {
+        // Degenerate image — nothing to blit.
+        if img.width == 0 || img.height == 0 {
+            return;
+        }
+
         let ctm = self.gstate.current().ctm;
         // Copy fill colour as [u8; 3] — RasterColor::as_slice always returns 3 bytes.
         let fill_color = {
@@ -664,6 +678,17 @@ impl<'doc> PageRenderer<'doc> {
         let (x10, y10) = ctm_transform(&ctm, 1.0, 0.0);
         let (x01, y01) = ctm_transform(&ctm, 0.0, 1.0);
         let (x11, y11) = ctm_transform(&ctm, 1.0, 1.0);
+
+        // Guard against a non-finite CTM (malformed PDF).  A NaN or Inf corner
+        // would produce i64::MIN/MAX after the floor/ceil cast, corrupting the
+        // bounding box calculation.
+        if ![x00, y00, x10, y10, x01, y01, x11, y11]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            log::warn!("pdf_interp: blit_image: non-finite CTM corner — skipping image");
+            return;
+        }
 
         // Bounding box of the 4 corners in device space (y-flipped).
         let dx0 = x00.min(x10).min(x01).min(x11).floor() as i64;

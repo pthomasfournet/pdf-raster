@@ -111,6 +111,10 @@ impl FontCache {
         // different sizes or skews needs distinct FreeType faces.
         let mat_key = trm.map(f64::to_bits);
         let key = (name.to_vec(), mat_key);
+        // Can't use the entry API here: `self.load_face` borrows `&self` while
+        // `self.faces.entry(..)` holds a mutable borrow of `self.faces`.
+        // Use contains_key + insert instead — the double lookup is one pointer
+        // comparison per hit and acceptable given the per-page cache size.
         if !self.faces.contains_key(&key) {
             let face = self.load_face(descriptor, trm);
             if face.is_none() {
@@ -125,12 +129,14 @@ impl FontCache {
     }
 
     fn load_face(&self, desc: &FontDescriptor, trm: [f64; 4]) -> Option<FontFace> {
-        // Validate that the matrix is not degenerate (NaN, Inf, or zero scale).
-        // hypot(trm[2], trm[3]) is the y-column magnitude — used by FontFace::new
-        // as the pixel size.  A zero or non-finite value produces a useless face.
-        let size_f = f64::hypot(trm[2], trm[3]);
-        if !size_f.is_finite() || size_f < 1.0 {
-            log::debug!("font_cache: degenerate trm (size={size_f:.1}), skipping face load");
+        // Pre-flight: reject degenerate matrices before paying the mutex cost.
+        // The y-column magnitude (hypot of indices 2 & 3) is the pixel size used by
+        // FontFace::new; a value < 1.0 or non-finite produces an unusable face.
+        if !trm_pixel_size_valid(trm) {
+            log::debug!(
+                "font_cache: degenerate trm (size={:.1}), skipping face load",
+                f64::hypot(trm[2], trm[3])
+            );
             return None;
         }
 
@@ -138,10 +144,16 @@ impl FontCache {
             kind: to_font_kind(desc.kind),
             code_to_gid: desc.code_to_gid.clone(),
             mat: trm,
+            // text_mat and mat are the same here: we use a single unified Trm.
+            // For path decomposition (glyph_path) this may differ from Splash's
+            // model, but for raster-only rendering it is sufficient.
             text_mat: trm,
         };
 
-        let mut eng = self.engine.lock().expect("FontEngine mutex poisoned");
+        let mut eng = self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner); // recover from poisoned mutex
 
         if let Some(bytes) = &desc.bytes {
             eng.load_memory_face(bytes.clone(), 0, params)
@@ -155,4 +167,16 @@ impl FontCache {
                 .ok()
         }
     }
+}
+
+// ── Shared size-validation ────────────────────────────────────────────────────
+
+/// Return `true` if the y-column magnitude of `trm` (used by `FontFace::new`
+/// as the nominal pixel size) is a finite value ≥ 1.0.
+///
+/// This mirrors the validation inside `FontFace::new` and is used as an early
+/// rejection to avoid the mutex lock cost for obviously degenerate matrices.
+pub(crate) fn trm_pixel_size_valid(trm: [f64; 4]) -> bool {
+    let size = f64::hypot(trm[2], trm[3]);
+    size.is_finite() && size >= 1.0
 }

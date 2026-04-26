@@ -83,21 +83,27 @@ impl FontFace {
             text_mat,
         } = params;
 
+        // Size is the magnitude of the y-column [c, d] of the font matrix —
+        // this matches FreeType's nominal pixel-height for the face.
         let size_f = f64::hypot(mat[2], mat[3]).round();
-        if size_f < 1.0 || size_f > f64::from(u16::MAX) {
+        // Guard NaN/Inf (hypot returns Inf if either input is Inf; NaN if both are NaN)
+        // and out-of-range values before the cast to u16.
+        if !size_f.is_finite() || size_f < 1.0 || size_f > f64::from(u16::MAX) {
             return None;
         }
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "size_f is clamped to [1, 65535] by the check above"
+            reason = "size_f is finite and clamped to [1, 65535] by the checks above"
         )]
         let size_px = size_f as u16;
 
         let text_scale = f64::hypot(text_mat[2], text_mat[3]) / f64::from(size_px);
 
         let units_per_em = face.raw().units_per_EM;
-        if text_scale == 0.0 || units_per_em == 0 {
+        // text_scale near-zero means the text matrix has a degenerate y-column;
+        // use EPSILON rather than exact-zero to catch subnormal inputs.
+        if text_scale < f64::EPSILON || units_per_em == 0 {
             return None;
         }
 
@@ -185,11 +191,17 @@ impl FontFace {
         }
         #[expect(clippy::cast_sign_loss, reason = "raw_pitch >= 0 checked above")]
         let pitch = raw_pitch as usize;
+        // FreeType guarantees pitch ≥ row_bytes for valid bitmaps; guard anyway
+        // so a corrupt/adversarial glyph doesn't cause a slice-bounds panic.
+        if pitch < row_bytes {
+            return None;
+        }
         let raw = ft_bmp.buffer();
 
         let mut data = Vec::with_capacity(row_bytes * h as usize);
         for row in 0..h as usize {
-            let src = row * pitch;
+            // Use checked_mul to guard against overflow on pathological glyph dims.
+            let src = row.checked_mul(pitch)?;
             data.extend_from_slice(&raw[src..src + row_bytes]);
         }
 
@@ -212,7 +224,8 @@ impl FontFace {
     /// bitmap-only font).
     #[must_use]
     pub fn glyph_path(&self, char_code: u32) -> Option<Path> {
-        if self.text_scale == 0.0 {
+        // Mirror the near-zero check used in FontFace::new to catch subnormals.
+        if self.text_scale < f64::EPSILON {
             return None;
         }
 
@@ -268,12 +281,15 @@ impl FontFace {
     /// codepoint.  This is correct for standard encodings (`WinAnsi`, `MacRoman`,
     /// `Standard`) where byte values in the printable ASCII range are Unicode.
     fn resolve_gid(&self, char_code: u32) -> u32 {
-        if let Some(&gid) = self.code_to_gid.get(char_code as usize) {
+        // Safe cast: PDF char codes are 0–255 (single-byte), so u32→usize is lossless
+        // on all supported targets (usize ≥ 32 bits).
+        let idx = char_code as usize;
+        if let Some(&gid) = self.code_to_gid.get(idx) {
             return gid;
         }
-        self.face
-            .get_char_index(char_code as usize)
-            .unwrap_or(char_code)
+        // Fall through to FreeType's active charmap.  Returns 0 (.notdef) on miss —
+        // using char_code directly as a GID would produce garbage for Type1 fonts.
+        self.face.get_char_index(idx).unwrap_or(0)
     }
 }
 

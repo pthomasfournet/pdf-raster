@@ -35,12 +35,20 @@ pub fn ctm_multiply(a: &Ctm, b: &Ctm) -> Ctm {
     ]
 }
 
-/// Multiply the 2×2 linear parts of two CTMs, returning a 2×2 matrix `[a,b,c,d]`.
+/// Multiply the 2×2 linear parts of two CTMs (`a × b`), returning `[a,b,c,d]`.
 ///
-/// Drops the translation column.  Used to compute the text rendering matrix
-/// `Trm[2×2] = Tm[2×2] × CTM[2×2]` without the translation terms.
+/// A CTM is stored as `[a, b, c, d, e, f]` (PDF §8.3.4).  Indices 4–5 are the
+/// translation vector and are dropped; only indices 0–3 (the linear submatrix)
+/// participate in the product.  The result is a 4-element array in the same
+/// `[a, b, c, d]` layout.
+///
+/// Used to compute `Trm[2×2] = font_size × Tm[2×2] × CTM[2×2]` — the size and
+/// orientation of rendered glyphs in device space.
 #[must_use]
 pub fn mat2x2_mul(a: &Ctm, b: &Ctm) -> [f64; 4] {
+    // Standard row-major 2×2 matrix product:
+    // result[row][col] = Σ_k  a[row][k] × b[k][col]
+    // With PDF [a,b,c,d] layout: row 0 = [a[0],a[1]], row 1 = [a[2],a[3]].
     [
         a[0].mul_add(b[0], a[1] * b[2]),
         a[0].mul_add(b[1], a[1] * b[3]),
@@ -198,5 +206,41 @@ mod tests {
         let mut stack = GStateStack::new();
         stack.restore(); // should not panic
         stack.restore(); // still should not panic
+    }
+
+    #[test]
+    fn mat2x2_mul_identity() {
+        let id: Ctm = CTM_IDENTITY;
+        let b: Ctm = [2.0, 3.0, 4.0, 5.0, 0.0, 0.0];
+        let r = mat2x2_mul(&id, &b);
+        // Identity × B should equal B's 2×2 part.
+        assert!((r[0] - 2.0).abs() < 1e-12);
+        assert!((r[1] - 3.0).abs() < 1e-12);
+        assert!((r[2] - 4.0).abs() < 1e-12);
+        assert!((r[3] - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mat2x2_mul_scaling() {
+        // [2, 0, 0, 3, ·, ·] × [4, 0, 0, 5, ·, ·] = [8, 0, 0, 15, ·, ·]
+        let a: Ctm = [2.0, 0.0, 0.0, 3.0, 99.0, 99.0]; // translations ignored
+        let b: Ctm = [4.0, 0.0, 0.0, 5.0, 99.0, 99.0];
+        let r = mat2x2_mul(&a, &b);
+        assert!((r[0] - 8.0).abs() < 1e-12);
+        assert!((r[1] - 0.0).abs() < 1e-12);
+        assert!((r[2] - 0.0).abs() < 1e-12);
+        assert!((r[3] - 15.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mat2x2_mul_rotation() {
+        // 90° rotation matrix: [0,-1, 1, 0] (in PDF [a,b,c,d] = [0,-1,1,0])
+        // Squaring it should give 180° = [-1, 0, 0, -1].
+        let rot90: Ctm = [0.0, -1.0, 1.0, 0.0, 0.0, 0.0];
+        let r = mat2x2_mul(&rot90, &rot90);
+        assert!((r[0] - (-1.0)).abs() < 1e-12);
+        assert!((r[1] - 0.0).abs() < 1e-12);
+        assert!((r[2] - 0.0).abs() < 1e-12);
+        assert!((r[3] - (-1.0)).abs() < 1e-12);
     }
 }
