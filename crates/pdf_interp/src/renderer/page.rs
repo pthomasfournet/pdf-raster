@@ -616,8 +616,10 @@ impl<'doc> PageRenderer<'doc> {
     /// skipped until recursive content-stream execution is added.
     fn do_xobject(&mut self, name: &[u8]) {
         let Some(img) = self.resources.image(name) else {
+            // Possible causes: Form XObject (not yet implemented), unsupported
+            // filter (DCTDecode / JBIG2 / JPX), or a missing resource entry.
             log::debug!(
-                "pdf_interp: Do /{} — no image XObject (may be a Form XObject or unsupported filter)",
+                "pdf_interp: Do /{} skipped (Form XObject, unsupported filter, or missing resource)",
                 String::from_utf8_lossy(name)
             );
             return;
@@ -640,7 +642,11 @@ impl<'doc> PageRenderer<'doc> {
     )]
     fn blit_image(&mut self, img: &crate::resources::ImageDescriptor) {
         let ctm = self.gstate.current().ctm;
-        let fill_color = self.gstate.current().fill_color.as_slice().to_vec();
+        // Copy fill colour as [u8; 3] — RasterColor::as_slice always returns 3 bytes.
+        let fill_color = {
+            let s = self.gstate.current().fill_color.as_slice();
+            [s[0], s[1], s[2]]
+        };
         let page_h = f64::from(self.height);
 
         // PDF CTM maps (0,0)→(1,0)→(1,1)→(0,1) (bottom-left origin).
@@ -693,42 +699,34 @@ impl<'doc> PageRenderer<'doc> {
                 let tx = ((f64::from(dx) - origin_x) / span_x).clamp(0.0, 1.0);
                 let ty = 1.0 - ((f64::from(dy) - origin_y) / span_y).clamp(0.0, 1.0);
 
-                // Nearest-neighbour sample from the image.
+                // Nearest-neighbour sample.  Clamp so ix < img.width, iy < img.height.
                 let ix = (tx * img_w).min(img_w - 1.0).max(0.0) as usize;
                 let iy = ((1.0 - ty) * img_h).min(img_h - 1.0).max(0.0) as usize;
                 let img_idx = iy * img.width as usize + ix;
 
+                // Safety: bx0..bx1 and by0..by1 are clamped to bitmap bounds above,
+                // so pixel_off is always in range for a valid Rgb8 bitmap.
                 let pixel_off = dy as usize * stride + dx as usize * 3;
-                if pixel_off + 2 >= data.len() {
-                    continue;
-                }
 
                 match img.color_space {
                     ImageColorSpace::Rgb => {
                         let src = img_idx * 3;
-                        if src + 2 < img.data.len() {
-                            data[pixel_off] = img.data[src];
-                            data[pixel_off + 1] = img.data[src + 1];
-                            data[pixel_off + 2] = img.data[src + 2];
+                        // img.data length is validated in decode_raw.
+                        if let Some(rgb) = img.data.get(src..src + 3) {
+                            data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                         }
                     }
                     ImageColorSpace::Gray => {
-                        if img_idx < img.data.len() {
-                            let v = img.data[img_idx];
+                        if let Some(&v) = img.data.get(img_idx) {
                             data[pixel_off] = v;
                             data[pixel_off + 1] = v;
                             data[pixel_off + 2] = v;
                         }
                     }
                     ImageColorSpace::Mask => {
-                        // 0 = paint with fill colour; non-zero = transparent.
-                        if img_idx < img.data.len()
-                            && img.data[img_idx] == 0
-                            && fill_color.len() == 3
-                        {
-                            data[pixel_off] = fill_color[0];
-                            data[pixel_off + 1] = fill_color[1];
-                            data[pixel_off + 2] = fill_color[2];
+                        // 0x00 = paint with fill colour; any other value = transparent.
+                        if img.data.get(img_idx) == Some(&0x00) {
+                            data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
                         }
                     }
                 }

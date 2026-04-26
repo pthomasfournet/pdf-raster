@@ -24,10 +24,8 @@ pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
 ///
 /// Passed by reference to rendering helpers that need to resolve resources.
 pub struct PageResources<'doc> {
-    /// The lopdf document being rendered.
-    pub doc: &'doc Document,
-    /// The page object ID within the document.
-    pub page_id: ObjectId,
+    doc: &'doc Document,
+    page_id: ObjectId,
 }
 
 impl<'doc> PageResources<'doc> {
