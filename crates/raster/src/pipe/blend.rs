@@ -440,11 +440,17 @@ mod tests {
     }
 
     #[test]
-    fn screen_clamp_never_exceeds_255() {
+    fn screen_result_is_always_valid_u8() {
+        // Screen(s,d) = s + d - div255(s*d). Mathematically ≤ 255; verify exhaustively.
         for s in 0u8..=255 {
             for d in 0u8..=255 {
                 let result = blend_screen(s, d);
-                assert!(result <= 255);
+                // result is u8 so it's always ≤ 255; check it's ≥ max(s,d) isn't true,
+                // but it should be ≥ both (Screen is always ≥ each input).
+                assert!(
+                    result >= s || result >= d,
+                    "screen({s},{d})={result} below both inputs"
+                );
             }
         }
     }

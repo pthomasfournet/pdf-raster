@@ -210,7 +210,10 @@ fn emit_run<P: Pixel>(
 /// bitmaps **must** convert vertex colours to device RGB before calling this
 /// function.  Violating this constraint triggers `debug_assert!` in debug
 /// builds; release builds return silently without painting.
-#[expect(clippy::too_many_lines, reason = "single-function triangle rasterizer; extracted helpers would obscure the scan-conversion algorithm")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-function triangle rasterizer; extracted helpers would obscure the scan-conversion algorithm"
+)]
 pub fn gouraud_triangle_fill<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,

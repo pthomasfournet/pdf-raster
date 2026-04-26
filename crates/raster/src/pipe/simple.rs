@@ -4,7 +4,7 @@
 //! Mono1 is excluded: 1-bit packed bitmaps require bit-level addressing that
 //! belongs in the fill/stroke caller, not a generic span function.
 
-use crate::pipe::{PipeSrc, PipeState};
+use crate::pipe::{self, PipeSrc, PipeState};
 use crate::types::BlendMode;
 use color::Pixel;
 
@@ -45,7 +45,7 @@ pub(crate) fn render_span_simple<P: Pixel>(
                 ncomps <= 8,
                 "ncomps {ncomps} > 8; only modes up to DeviceN8 supported"
             );
-            apply_transfer_to_color(pipe, color, &mut applied[..ncomps]);
+            pipe::apply_transfer_pixel(pipe, color, &mut applied[..ncomps]);
             let applied = &applied[..ncomps];
 
             for chunk in dst_pixels.chunks_exact_mut(ncomps) {
@@ -59,7 +59,7 @@ pub(crate) fn render_span_simple<P: Pixel>(
             pat.fill_span(y, x0, x1, &mut pat_buf);
             // Apply transfer to each pixel.
             for chunk in pat_buf.chunks_exact_mut(ncomps) {
-                apply_transfer_in_place(pipe, chunk);
+                pipe::apply_transfer_in_place(pipe, chunk);
             }
             dst_pixels.copy_from_slice(&pat_buf);
         }
@@ -67,7 +67,7 @@ pub(crate) fn render_span_simple<P: Pixel>(
 
     // Overprint: mask determines which channels are written.
     if pipe.overprint_mask != 0xFFFF_FFFF {
-        apply_overprint_simple(pipe, dst_pixels, ncomps, count);
+        apply_overprint_simple(pipe, ncomps);
     }
 
     // Set destination alpha to fully opaque.
@@ -79,80 +79,19 @@ pub(crate) fn render_span_simple<P: Pixel>(
     }
 }
 
-/// Apply transfer tables to `color` (in place) into `out`.
+/// Guard: overprint in the simple path requires the general pipe.
 ///
-/// The mapping depends on the number of components.
-fn apply_transfer_to_color(pipe: &PipeState<'_>, color: &[u8], out: &mut [u8]) {
-    let t = &pipe.transfer;
-    match out.len() {
-        1 => {
-            // Gray
-            out[0] = t.gray[color[0] as usize];
-        }
-        3 => {
-            // RGB / BGR (caller has already re-ordered if needed)
-            out[0] = t.rgb[0][color[0] as usize];
-            out[1] = t.rgb[1][color[1] as usize];
-            out[2] = t.rgb[2][color[2] as usize];
-        }
-        4 => {
-            // CMYK or XBGR8 (4-byte formats)
-            // For XBGR8 channels 0-2 are B,G,R and channel 3 is padding (always 255).
-            // Using cmyk transfer for the first 4 channels; callers that use Xbgr8
-            // should map to rgb_transfer externally, but for simplicity we use
-            // cmyk here — correctness for XBGR8 is handled by pixel-mode-specific callers.
-            out[0] = t.cmyk[0][color[0] as usize];
-            out[1] = t.cmyk[1][color[1] as usize];
-            out[2] = t.cmyk[2][color[2] as usize];
-            out[3] = t.cmyk[3][color[3] as usize];
-        }
-        8 => {
-            // DeviceN8: 4 CMYK + 4 spot channels
-            for (i, (&c, o)) in color.iter().zip(out.iter_mut()).enumerate() {
-                *o = t.device_n[i][c as usize];
-            }
-        }
-        n => {
-            // Fallback: identity (should not happen with supported pixel modes)
-            debug_assert!(false, "apply_transfer_to_color: unexpected ncomps={n}");
-            out.copy_from_slice(color);
-        }
-    }
-}
-
-/// Apply transfer tables in-place to a single pixel (`ncomps` bytes).
-fn apply_transfer_in_place(pipe: &PipeState<'_>, pixel: &mut [u8]) {
-    let mut tmp = [0u8; 8];
-    let n = pixel.len();
-    debug_assert!(n <= 8);
-    tmp[..n].copy_from_slice(pixel);
-    apply_transfer_to_color(pipe, &tmp[..n], pixel);
-}
-
-/// For overprinting: restore destination bytes for channels whose bit in
-/// `overprint_mask` is 0.  For additive overprint, the caller must handle
-/// the accumulation before calling this function.
-fn apply_overprint_simple(
-    pipe: &PipeState<'_>,
-    dst_pixels: &mut [u8],
-    ncomps: usize,
-    count: usize,
-) {
-    // This function is only called when overprint_mask != 0xFFFF_FFFF, meaning some
-    // channels should NOT be painted.  But since we already wrote to dst_pixels, we
-    // need to restore the channels that should be left untouched.
-    //
-    // The simple pipe is called when no_transparency() is true, which means we
-    // have the source value ready but haven't preserved the destination.  In
-    // overprint mode the caller (fill/stroke) must provide the original destination
-    // bytes so we can restore them. This is a known limitation of the span-level API:
-    // for now we assert that full overprint (0xFFFF_FFFF) is used in the simple path.
-    // The general pipe handles overprint correctly by reading the destination first.
+/// The simple pipe overwrites `dst_pixels` before we can read the original
+/// destination, so channel-selective restore is impossible here.  The caller
+/// in `render_span` must route overprint operations through `render_span_general`.
+/// This function exists only to produce a loud diagnostic if the invariant breaks.
+fn apply_overprint_simple(pipe: &PipeState<'_>, ncomps: usize) {
     debug_assert_eq!(
         pipe.overprint_mask, 0xFFFF_FFFF,
-        "simple pipe: overprint_mask != 0xFFFF_FFFF requires general pipe (pixel destination was already overwritten)"
+        "simple pipe reached with overprint_mask {:#010x} and ncomps={ncomps}; \
+         route overprint through render_span_general instead",
+        pipe.overprint_mask,
     );
-    let _ = (dst_pixels, ncomps, count);
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@
 //!    `c_result = ((a_result - a_src) * c_dst + a_src * c_src) / a_result`.
 //!    Then apply transfer LUT.
 
-use crate::pipe::{PipeSrc, PipeState};
+use crate::pipe::{self, PipeSrc, PipeState};
 use crate::types::BlendMode;
 use color::Pixel;
 use color::convert::div255;
@@ -87,8 +87,8 @@ pub(crate) fn render_span_aa<P: Pixel>(
                 let a_src = u32::from(div255(a_input * shape_v));
                 let a_dst = u32::from(dst_alpha[i]);
 
-                let (a_result, c_result_fn) = if a_src == 255 {
-                    (255u32, true) // fully opaque: skip read-back
+                let (a_result, fully_opaque_src) = if a_src == 255 {
+                    (255u32, true) // fully opaque: skip read-back, copy src directly
                 } else if a_src == 0 && a_dst == 0 {
                     // Transparent source over transparent dest: zero output.
                     let base = i * ncomps;
@@ -104,9 +104,9 @@ pub(crate) fn render_span_aa<P: Pixel>(
                 let src_px = &src_pixels[base..base + ncomps];
                 let dst_px = &mut dst_pixels[base..base + ncomps];
 
-                if c_result_fn {
-                    // Full coverage: just apply transfer to src.
-                    apply_transfer_pixel(pipe, src_px, dst_px);
+                if fully_opaque_src {
+                    // Full coverage: transfer src directly without blending.
+                    pipe::apply_transfer_pixel(pipe, src_px, dst_px);
                 } else {
                     // Partial coverage: blend src over dst, then apply transfer.
                     for j in 0..ncomps {
@@ -122,7 +122,7 @@ pub(crate) fn render_span_aa<P: Pixel>(
                             dst_px[j] = blended as u8;
                         }
                     }
-                    apply_transfer_in_place(pipe, dst_px);
+                    pipe::apply_transfer_in_place(pipe, dst_px);
                 }
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -150,61 +150,8 @@ pub(crate) fn render_span_aa<P: Pixel>(
                         div255((255 - a_src) * u32::from(dst_px[j]) + a_src * u32::from(src_px[j]));
                     dst_px[j] = blended;
                 }
-                apply_transfer_in_place(pipe, dst_px);
+                pipe::apply_transfer_in_place(pipe, dst_px);
             }
-        }
-    }
-}
-
-fn apply_transfer_pixel(pipe: &PipeState<'_>, src: &[u8], dst: &mut [u8]) {
-    let t = &pipe.transfer;
-    match src.len() {
-        1 => dst[0] = t.gray[src[0] as usize],
-        3 => {
-            dst[0] = t.rgb[0][src[0] as usize];
-            dst[1] = t.rgb[1][src[1] as usize];
-            dst[2] = t.rgb[2][src[2] as usize];
-        }
-        4 => {
-            dst[0] = t.cmyk[0][src[0] as usize];
-            dst[1] = t.cmyk[1][src[1] as usize];
-            dst[2] = t.cmyk[2][src[2] as usize];
-            dst[3] = t.cmyk[3][src[3] as usize];
-        }
-        8 => {
-            for (i, (&s, d)) in src.iter().zip(dst.iter_mut()).enumerate() {
-                *d = t.device_n[i][s as usize];
-            }
-        }
-        n => {
-            debug_assert!(false, "apply_transfer_pixel: unexpected ncomps={n}");
-            dst.copy_from_slice(src);
-        }
-    }
-}
-
-fn apply_transfer_in_place(pipe: &PipeState<'_>, px: &mut [u8]) {
-    let t = &pipe.transfer;
-    match px.len() {
-        1 => px[0] = t.gray[px[0] as usize],
-        3 => {
-            px[0] = t.rgb[0][px[0] as usize];
-            px[1] = t.rgb[1][px[1] as usize];
-            px[2] = t.rgb[2][px[2] as usize];
-        }
-        4 => {
-            px[0] = t.cmyk[0][px[0] as usize];
-            px[1] = t.cmyk[1][px[1] as usize];
-            px[2] = t.cmyk[2][px[2] as usize];
-            px[3] = t.cmyk[3][px[3] as usize];
-        }
-        8 => {
-            for (i, b) in px.iter_mut().enumerate() {
-                *b = t.device_n[i][*b as usize];
-            }
-        }
-        n => {
-            debug_assert!(false, "apply_transfer_in_place: unexpected ncomps={n}");
         }
     }
 }

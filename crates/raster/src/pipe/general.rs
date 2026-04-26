@@ -372,21 +372,32 @@ fn apply_blend_fn(
     }
 }
 
-/// Apply the per-channel transfer LUT to a single blended byte.
+/// Apply the per-channel transfer LUT for one blended byte.
+///
+/// Channel mapping:
+/// - 0 → RGB[0] (or gray / CMYK[0] for mono/subtractive modes — callers that need
+///   full per-channel dispatch must call [`apply_transfer_pixel_general`] instead).
+/// - 1 → RGB[1] (green / CMYK[1])
+/// - 2 → RGB[2] (blue / CMYK[2])
+/// - 3 → CMYK[3] (K / alpha)
+/// - 4..7 → `device_n` spot channels
+/// - other → identity (should not occur with supported pixel modes)
 #[inline]
-const fn apply_transfer_channel(pipe: &PipeState<'_>, channel: usize, v: u8) -> u8 {
+fn apply_transfer_channel(pipe: &PipeState<'_>, channel: usize, v: u8) -> u8 {
     let t = &pipe.transfer;
     match channel {
-        0 => match pipe.transfer.rgb.len() {
-            _ if pipe.transfer.gray[v as usize] == v => {
-                // Determine mode by ncomps context; use gray for mono.
-                // This helper doesn't know ncomps; callers that need per-channel
-                // transfer should use the table directly.  Default to rgb[0].
-                t.rgb[0][v as usize]
-            }
-            _ => t.rgb[0][v as usize],
-        },
-        _ => v, // fallback: identity
+        0 => t.rgb[0][v as usize],
+        1 => t.rgb[1][v as usize],
+        2 => t.rgb[2][v as usize],
+        3 => t.cmyk[3][v as usize],
+        n @ 4..=7 => t.device_n[n][v as usize],
+        _ => {
+            debug_assert!(
+                false,
+                "apply_transfer_channel: unexpected channel={channel}"
+            );
+            v
+        }
     }
 }
 

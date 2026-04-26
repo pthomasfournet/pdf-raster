@@ -193,16 +193,65 @@ pub fn render_span<P: Pixel>(
     }
 }
 
+// ── Shared transfer helpers ───────────────────────────────────────────────────
+//
+// Identical transfer logic was duplicated across `aa`, `simple`, and `general`.
+// These `pub(crate)` functions are the single canonical implementations.
+
+/// Apply the per-channel transfer LUTs to `src` and write the result into `dst`.
+///
+/// Both slices must have the same length and match the pixel mode:
+/// 1 byte → gray, 3 → RGB, 4 → CMYK/XBGR, 8 → `DeviceN`.
+#[inline]
+pub(crate) fn apply_transfer_pixel(pipe: &PipeState<'_>, src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(
+        src.len(),
+        dst.len(),
+        "apply_transfer_pixel: length mismatch"
+    );
+    let t = &pipe.transfer;
+    match src.len() {
+        1 => dst[0] = t.gray[src[0] as usize],
+        3 => {
+            dst[0] = t.rgb[0][src[0] as usize];
+            dst[1] = t.rgb[1][src[1] as usize];
+            dst[2] = t.rgb[2][src[2] as usize];
+        }
+        4 => {
+            dst[0] = t.cmyk[0][src[0] as usize];
+            dst[1] = t.cmyk[1][src[1] as usize];
+            dst[2] = t.cmyk[2][src[2] as usize];
+            dst[3] = t.cmyk[3][src[3] as usize];
+        }
+        8 => {
+            for (i, (&s, d)) in src.iter().zip(dst.iter_mut()).enumerate() {
+                *d = t.device_n[i][s as usize];
+            }
+        }
+        n => {
+            debug_assert!(false, "apply_transfer_pixel: unexpected ncomps={n}");
+            dst.copy_from_slice(src);
+        }
+    }
+}
+
+/// Apply transfer LUTs in-place to a single pixel slice.
+#[inline]
+pub(crate) fn apply_transfer_in_place(pipe: &PipeState<'_>, px: &mut [u8]) {
+    // Avoid allocating: for ncomps ≤ 8 copy into a stack buffer, apply, copy back.
+    let n = px.len();
+    debug_assert!(n <= 8, "apply_transfer_in_place: ncomps={n} > 8");
+    let mut tmp = [0u8; 8];
+    tmp[..n].copy_from_slice(px);
+    apply_transfer_pixel(pipe, &tmp[..n], px);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::TransferSet;
     use crate::types::BlendMode;
-    use color::{Rgb8, TransferLut};
-
-    fn identity_transfer() -> TransferLut {
-        TransferLut::IDENTITY
-    }
+    use color::Rgb8;
 
     fn make_pipe(a_input: u8, blend: BlendMode) -> PipeState<'static> {
         PipeState {
