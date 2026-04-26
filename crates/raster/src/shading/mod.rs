@@ -25,14 +25,27 @@ use crate::fill;
 use crate::path::Path;
 use crate::pipe::{Pattern, PipeSrc, PipeState};
 use color::Pixel;
+use color::convert::lerp_u8;
+
+/// Linearly interpolate an RGB triple from `a` to `b` with `frac ∈ [0, 256]`.
+///
+/// Shared by [`axial`] and [`radial`] to avoid duplicating the per-channel lerp.
+/// `frac = 0` → `a`; `frac = 256` → `b`.
+#[inline]
+pub(super) fn lerp_color(a: [u8; 3], b: [u8; 3], frac: u32, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 3, "lerp_color: out must be exactly 3 bytes");
+    out[0] = lerp_u8(a[0], b[0], frac);
+    out[1] = lerp_u8(a[1], b[1], frac);
+    out[2] = lerp_u8(a[2], b[2], frac);
+}
 
 /// Fill `path` using a shading pattern as the colour source.
 ///
 /// Equivalent to `Splash::shadedFill`.  The path defines the shading's bounding
-/// shape; `pattern` supplies per-pixel colour.  `eo` selects even-odd vs. non-zero
-/// winding.  `clip_to_stroke` selects stroke alpha (not currently wired — caller
-/// sets `pipe.a_input` directly).
-#[expect(clippy::too_many_arguments, reason = "mirrors shadedFill signature")]
+/// shape; `pattern` supplies per-pixel colour via the [`Pattern`] trait.
+/// `eo` selects even-odd vs. non-zero winding rule.
+/// The caller sets `pipe.a_input` to control fill/stroke opacity.
+#[expect(clippy::too_many_arguments, reason = "mirrors shadedFill signature: bitmap+clip+path+pipe+pattern+matrix+flatness+aa+eo")]
 pub fn shaded_fill<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
@@ -101,14 +114,13 @@ mod tests {
         let pipe = simple_pipe();
         let path = rect_path(1.0, 1.0, 6.0, 6.0);
 
-        // Horizontal axial gradient: x=1→black, x=6→white.
         let pattern = AxialPattern::new(
             [0u8, 0, 0],
             [255u8, 255, 255],
-            1.0, 3.5,  // p0_x, p0_y
-            6.0, 3.5,  // p1_x, p1_y
-            0.0, 1.0,  // t0, t1 (full range)
-            false, false, // extend_start, extend_end
+            1.0, 3.5,
+            6.0, 3.5,
+            0.0, 1.0,
+            false, false,
         );
 
         shaded_fill::<Rgb8>(
@@ -116,11 +128,30 @@ mod tests {
             &identity_matrix(), 1.0, false, false,
         );
 
-        // The interior should be painted — check that the fill happened.
-        // Row 3, column 1 should be near-black; column 5 should be near-white.
         let r3 = bmp.row(3);
         assert!(r3[1].r < 60,  "x=1 should be near-black (got {})", r3[1].r);
         assert!(r3[5].r > 180, "x=5 should be near-white (got {})", r3[5].r);
+    }
+
+    #[test]
+    fn shaded_fill_eo_and_nonzero_both_work() {
+        // Same rect path, eo=true vs eo=false — single contour, both should fill.
+        let mut bmp_nz: Bitmap<Rgb8> = Bitmap::new(8, 8, 4, false);
+        let mut bmp_eo: Bitmap<Rgb8> = Bitmap::new(8, 8, 4, false);
+        let clip = Clip::new(0.0, 0.0, 7.999, 7.999, false);
+        let pipe = simple_pipe();
+        let path = rect_path(1.0, 1.0, 6.0, 6.0);
+        let pattern = AxialPattern::new(
+            [200u8, 0, 0], [200u8, 0, 0],
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 1.0, true, true,
+        );
+        shaded_fill::<Rgb8>(&mut bmp_nz, &clip, &path, &pipe, &pattern,
+            &identity_matrix(), 1.0, false, false);
+        shaded_fill::<Rgb8>(&mut bmp_eo, &clip, &path, &pipe, &pattern,
+            &identity_matrix(), 1.0, false, true);
+        assert_eq!(bmp_nz.row(3)[3].r, bmp_eo.row(3)[3].r,
+            "non-zero and eo must agree for a simple convex path");
     }
 
     #[test]
