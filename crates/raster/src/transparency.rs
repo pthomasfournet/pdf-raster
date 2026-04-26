@@ -153,6 +153,8 @@ pub fn begin_group<P: Pixel>(
 
     let gw = gx1.saturating_sub(gx0).max(1);
     let gh = gy1.saturating_sub(gy0).max(1);
+    // Safe: gw/gh are u32 derived from parent dims (≤ u32::MAX); usize widening
+    // before multiplication prevents overflow on any realistic bitmap size.
     let pixel_count = gw as usize * gh as usize;
     let ncomps = P::BYTES;
 
@@ -374,6 +376,7 @@ pub fn extract_soft_mask<P: Pixel>(group: &GroupBitmap<P>) -> Vec<u8> {
                     let b = i32::from(row[off + 2]);
                     // BT.709 integer luma; coefficients sum to 256, so the result
                     // is always in [0, 255] — the cast is exact.
+                    // Max value: (256*255 + 0x80) >> 8 = (65280 + 128) >> 8 = 255.
                     #[expect(
                         clippy::cast_possible_truncation,
                         clippy::cast_sign_loss,
@@ -383,6 +386,15 @@ pub fn extract_soft_mask<P: Pixel>(group: &GroupBitmap<P>) -> Vec<u8> {
                     mask.push(((77 * r + 151 * g + 28 * b + 0x80) >> 8) as u8);
                 }
             }
+            debug_assert_eq!(
+                mask.len(),
+                pixel_count,
+                "extract_soft_mask: loop produced {} bytes, expected {} ({w}×{h})",
+                mask.len(),
+                pixel_count,
+                w = bitmap.width,
+                h = bitmap.height,
+            );
             mask
         }
     }

@@ -173,7 +173,14 @@ fn emit_run<P: Pixel>(
     )]
     let buf_off = (run_x0 - buf_x0) as usize * 3;
     #[expect(clippy::cast_sign_loss, reason = "run_x1 >= run_x0")]
-    let buf_end = buf_off + (run_x1 - run_x0 + 1) as usize * 3;
+    let run_len = (run_x1 - run_x0 + 1) as usize;
+    let buf_end = buf_off + run_len * 3;
+    assert!(
+        buf_end <= span_color.len(),
+        "emit_run: buf_end={buf_end} exceeds span_color.len()={} \
+         (run_x0={run_x0} run_x1={run_x1} buf_x0={buf_x0})",
+        span_color.len(),
+    );
     let src = RowSrc {
         data: &span_color[buf_off..buf_end],
     };
@@ -264,7 +271,10 @@ pub fn gouraud_triangle_fill<P: Pixel>(
 
     // Determine which side the long edge occupies.
     // When y0 == y1 (flat top), upper_edge has zero length — sample lower_edge
-    // at y1+1 instead.  Guard against y1 == i32::MAX (pathological input).
+    // at y1+1 instead.  saturating_add handles the pathological y1 == i32::MAX
+    // case by clamping the sample to i32::MAX; at that coordinate the bitmap
+    // scan range (scan_y0..=scan_y2) is already empty, so the wrong edge
+    // assignment never affects any painted pixel.
     let long_is_left = if y0 == y1 {
         let sample_y = y1.saturating_add(1);
         let (xl, _) = long_edge.eval(f64::from(sample_y));
