@@ -635,7 +635,7 @@ impl<'doc> PageRenderer<'doc> {
     fn do_xobject(&mut self, name: &[u8]) {
         let Some(img) = self.resources.image(name) else {
             // Possible causes: Form XObject (not yet implemented), unsupported
-            // filter (DCTDecode / JBIG2 / JPX), or a missing resource entry.
+            // filter (JBIG2Decode / CCITTFaxDecode Group 3), or a missing resource entry.
             log::debug!(
                 "pdf_interp: Do /{} skipped (Form XObject, unsupported filter, or missing resource)",
                 String::from_utf8_lossy(name)

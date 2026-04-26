@@ -11,6 +11,9 @@ encode = { path = "../encode" }
 lopdf  = "0.40"
 log    = { workspace = true }
 fax = "0.2.6"
+zune-jpeg = "0.5.15"
+zune-core = "0.5.1"
+jpeg2k = { version = "0.10.1", default-features = false, features = ["image", "openjpeg-sys"] }
 
 [dev-dependencies]
 env_logger = { workspace = true }

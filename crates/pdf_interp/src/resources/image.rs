@@ -11,9 +11,9 @@
 //! | `CCITTFaxDecode` (`K<0`, Group 4 / T.6) | yes/no | yes |
 //! | `FlateDecode` | yes/no | yes |
 //! | none (raw) | yes/no | yes |
-//! | `DCTDecode` (JPEG) | no | stub — logs and returns `None` |
+//! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`) |
+//! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`) |
 //! | `JBIG2Decode` | — | stub |
-//! | `JPXDecode` | — | stub |
 //! | `CCITTFaxDecode` (`K≥0`, Group 3) | — | stub |
 //!
 //! # Pixel layout in `ImageDescriptor::data`
@@ -26,7 +26,12 @@
 
 use std::borrow::Cow;
 
+use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
 use lopdf::{Dictionary, Document, Object, ObjectId};
+use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace as ZColorSpace;
+use zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -116,11 +121,10 @@ pub fn resolve_image(
             let parms = stream.dict.get(b"DecodeParms").ok();
             decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
         }
-        Some("DCTDecode" | "JBIG2Decode" | "JPXDecode") => {
-            log::debug!(
-                "image: filter {:?} not yet implemented",
-                filter.as_deref().unwrap_or("(none)")
-            );
+        Some("DCTDecode") => decode_dct(stream.content.as_slice(), w, h),
+        Some("JPXDecode") => decode_jpx(stream.content.as_slice(), w, h),
+        Some("JBIG2Decode") => {
+            log::debug!("image: filter \"JBIG2Decode\" not yet implemented");
             None
         }
         Some(other) => {
@@ -344,6 +348,239 @@ fn decode_ccitt(
         color_space: cs,
         data: data_out,
     })
+}
+
+// ── DCTDecode (JPEG) ──────────────────────────────────────────────────────────
+
+/// Decode a `DCTDecode` (JPEG) stream.
+///
+/// `w` and `h` from the PDF stream dict are used only for a size sanity check;
+/// the actual dimensions come from the JPEG SOF marker and are authoritative.
+///
+/// CMYK JPEGs (4-component) are converted to RGB by naive complement inversion
+/// (`R = 255 - C`, etc.) — sufficient for typical PDF CMYK images which are
+/// already in "print ready" form with inverted ink values.
+#[allow(clippy::many_single_char_names)]
+fn decode_dct(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
+    // First pass: decode headers to learn the colorspace, then choose output.
+    let mut probe = JpegDecoder::new(ZCursor::new(data));
+    probe.decode_headers().ok()?;
+    let info = probe.info()?;
+    let components = info.components;
+
+    // Choose the output colorspace zune-jpeg should produce.
+    let out_cs = match components {
+        1 => ZColorSpace::Luma,
+        3 => ZColorSpace::RGB,
+        // CMYK — request raw CMYK output (4 bytes/pixel), we convert below.
+        4 => ZColorSpace::CMYK,
+        n => {
+            log::warn!("image: DCTDecode: unexpected component count {n}");
+            return None;
+        }
+    };
+
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(out_cs);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+    let pixels = decoder
+        .decode()
+        .map_err(|e| log::warn!("image: DCTDecode decode error: {e}"))
+        .ok()?;
+
+    let jpeg_info = decoder.info()?;
+    let jw = u32::from(jpeg_info.width);
+    let jh = u32::from(jpeg_info.height);
+
+    if jw != pdf_w || jh != pdf_h {
+        log::debug!(
+            "image: DCTDecode: PDF dict says {pdf_w}×{pdf_h}, JPEG reports {jw}×{jh} — using JPEG dims"
+        );
+    }
+
+    match out_cs {
+        ZColorSpace::Luma => Some(ImageDescriptor {
+            width: jw,
+            height: jh,
+            color_space: ImageColorSpace::Gray,
+            data: pixels,
+        }),
+        ZColorSpace::RGB => Some(ImageDescriptor {
+            width: jw,
+            height: jh,
+            color_space: ImageColorSpace::Rgb,
+            data: pixels,
+        }),
+        ZColorSpace::CMYK => {
+            // Convert CMYK (ink values, 0=no ink, 255=full ink) to RGB.
+            // PDF CMYK images store inverted ink densities: 0 = full ink, 255 = no ink.
+            // zune-jpeg returns the raw CMYK bytes. We apply naive CMY→RGB + K.
+            if pixels.len() != (jw as usize) * (jh as usize) * 4 {
+                log::warn!("image: DCTDecode: CMYK pixel buffer size mismatch");
+                return None;
+            }
+            let mut rgb = Vec::with_capacity((jw as usize) * (jh as usize) * 3);
+            for chunk in pixels.chunks_exact(4) {
+                // PDF convention: values are "ink density" (0=no ink, 255=full ink),
+                // but JPEG CMYK in PDF is typically stored as the complement (0=full, 255=none).
+                let (c, m, y, k) = (
+                    u16::from(255 - chunk[0]),
+                    u16::from(255 - chunk[1]),
+                    u16::from(255 - chunk[2]),
+                    u16::from(255 - chunk[3]),
+                );
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "value = 255*(255-k)/255 ≤ 255"
+                )]
+                let r = (255u16.saturating_sub(c + k).saturating_mul(255) / 255) as u8;
+                #[expect(clippy::cast_possible_truncation, reason = "value ≤ 255")]
+                let g = (255u16.saturating_sub(m + k).saturating_mul(255) / 255) as u8;
+                #[expect(clippy::cast_possible_truncation, reason = "value ≤ 255")]
+                let b = (255u16.saturating_sub(y + k).saturating_mul(255) / 255) as u8;
+                rgb.push(r);
+                rgb.push(g);
+                rgb.push(b);
+            }
+            Some(ImageDescriptor {
+                width: jw,
+                height: jh,
+                color_space: ImageColorSpace::Rgb,
+                data: rgb,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+// ── JPXDecode (JPEG 2000) ─────────────────────────────────────────────────────
+
+/// Decode a `JPXDecode` (JPEG 2000) stream via `jpeg2k` (`OpenJPEG` bindings).
+///
+/// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
+/// format (`.jp2`).  `jpeg2k::Image::from_bytes` auto-detects the format from
+/// the first bytes of the stream.
+#[allow(clippy::too_many_lines)]
+fn decode_jpx(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
+    let img = Jp2Image::from_bytes(data)
+        .map_err(|e| log::warn!("image: JPXDecode open error: {e}"))
+        .ok()?;
+
+    let img_data = img
+        .get_pixels(None)
+        .map_err(|e| log::warn!("image: JPXDecode get_pixels error: {e}"))
+        .ok()?;
+
+    if img_data.width != pdf_w || img_data.height != pdf_h {
+        log::debug!(
+            "image: JPXDecode: PDF dict says {pdf_w}×{pdf_h}, JP2 reports {}×{} — using JP2 dims",
+            img_data.width,
+            img_data.height
+        );
+    }
+
+    let jw = img_data.width;
+    let jh = img_data.height;
+
+    match img_data.format {
+        ImageFormat::L8 => {
+            if let ImagePixelData::L8(pixels) = img_data.data {
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Gray,
+                    data: pixels,
+                });
+            }
+        }
+        ImageFormat::La8 => {
+            // Drop the alpha channel — extract luma bytes (every other byte).
+            if let ImagePixelData::La8(pixels) = img_data.data {
+                let gray: Vec<u8> = pixels.chunks_exact(2).map(|c| c[0]).collect();
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Gray,
+                    data: gray,
+                });
+            }
+        }
+        ImageFormat::Rgb8 => {
+            if let ImagePixelData::Rgb8(pixels) = img_data.data {
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Rgb,
+                    data: pixels,
+                });
+            }
+        }
+        ImageFormat::Rgba8 => {
+            // Drop the alpha channel.
+            if let ImagePixelData::Rgba8(pixels) = img_data.data {
+                let rgb: Vec<u8> = pixels
+                    .chunks_exact(4)
+                    .flat_map(|c| [c[0], c[1], c[2]])
+                    .collect();
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Rgb,
+                    data: rgb,
+                });
+            }
+        }
+        ImageFormat::L16 => {
+            // Downscale 16-bit → 8-bit by taking the high byte (v >> 8 ≤ 255, no truncation).
+            if let ImagePixelData::L16(pixels) = img_data.data {
+                let gray: Vec<u8> = pixels.iter().map(|&v| (v >> 8) as u8).collect();
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Gray,
+                    data: gray,
+                });
+            }
+        }
+        ImageFormat::Rgb16 => {
+            if let ImagePixelData::Rgb16(pixels) = img_data.data {
+                let rgb: Vec<u8> = pixels.iter().map(|&v| (v >> 8) as u8).collect();
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Rgb,
+                    data: rgb,
+                });
+            }
+        }
+        ImageFormat::La16 => {
+            if let ImagePixelData::La16(pixels) = img_data.data {
+                let gray: Vec<u8> = pixels.chunks_exact(2).map(|c| (c[0] >> 8) as u8).collect();
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Gray,
+                    data: gray,
+                });
+            }
+        }
+        ImageFormat::Rgba16 => {
+            if let ImagePixelData::Rgba16(pixels) = img_data.data {
+                let rgb: Vec<u8> = pixels
+                    .chunks_exact(4)
+                    .flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8])
+                    .collect();
+                return Some(ImageDescriptor {
+                    width: jw,
+                    height: jh,
+                    color_space: ImageColorSpace::Rgb,
+                    data: rgb,
+                });
+            }
+        }
+    }
+
+    log::warn!("image: JPXDecode: unexpected format/data mismatch");
+    None
 }
 
 // ── Color space helpers ───────────────────────────────────────────────────────
