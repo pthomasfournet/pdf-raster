@@ -2,8 +2,13 @@
 //!
 //! `composite_aa_rgb8` performs per-pixel Porter-Duff source-over compositing
 //! for RGB pixels with a separate alpha plane and a per-pixel shape (coverage)
-//! byte.  This is the same logic as `pipe/aa.rs`; full SIMD vectorisation of
-//! the division-by-`a_result` step is deferred to Phase 4.
+//! byte.
+//!
+//! The arithmetic mirrors `pipe/aa.rs` but is expressed as a standalone
+//! function so that callers outside the pipe (e.g. transparency group collapse)
+//! can invoke it without constructing a `PipeState`.  Unifying them would
+//! require either pulling `PipeState` into this module or exposing internals of
+//! `pipe/aa.rs` — both worse than the current small duplication.
 
 use color::convert::div255;
 

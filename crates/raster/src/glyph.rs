@@ -178,6 +178,8 @@ fn blit_aa<P: Pixel>(
     row_bytes: usize,
 ) {
     let data = glyph.data;
+    // Hoisted above the row loop to avoid per-row heap allocation.
+    let mut run_shape: Vec<u8> = Vec::new();
 
     for yy in 0..yy_limit {
         #[expect(
@@ -189,7 +191,7 @@ fn blit_aa<P: Pixel>(
         let row_off = (y_data_skip + yy) * row_bytes + x_data_skip;
 
         let mut run_start: Option<i32> = None;
-        let mut run_shape: Vec<u8> = Vec::new();
+        run_shape.clear();
 
         for xx in 0..xx_limit {
             #[expect(
