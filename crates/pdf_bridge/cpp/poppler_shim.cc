@@ -45,7 +45,7 @@ struct PopplerShimImage {
 // ---------------------------------------------------------------------------
 
 extern "C" void poppler_shim_set_data_dir(const char *path) {
-    poppler::set_data_dir(std::string(path));
+    if (path) poppler::set_data_dir(std::string(path));
 }
 
 // ---------------------------------------------------------------------------
@@ -169,12 +169,15 @@ extern "C" PopplerShimImage *poppler_shim_page_render(
 
     poppler::page_renderer renderer;
 
-    // Map format constant.
+    // Map format constant.  Unknown values fall back to RGB24 (safe default;
+    // the Rust layer validates the format before calling, so this path is only
+    // reachable if the shim constants fall out of sync).
     switch (format) {
         case SHIM_FORMAT_MONO:   renderer.set_image_format(poppler::image::format_mono);   break;
         case SHIM_FORMAT_GRAY8:  renderer.set_image_format(poppler::image::format_gray8);  break;
         case SHIM_FORMAT_ARGB32: renderer.set_image_format(poppler::image::format_argb32); break;
         case SHIM_FORMAT_BGR24:  renderer.set_image_format(poppler::image::format_bgr24);  break;
+        case SHIM_FORMAT_RGB24:
         default:                 renderer.set_image_format(poppler::image::format_rgb24);  break;
     }
 

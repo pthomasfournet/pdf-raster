@@ -157,6 +157,8 @@ pub enum Error {
     RenderFailed,
     /// An argument contains a null byte and cannot be passed to C.
     NulByte(std::ffi::NulError),
+    /// The data buffer is too large to pass to poppler (exceeds `i32::MAX` bytes).
+    DataTooLarge(usize),
 }
 
 impl std::fmt::Display for Error {
@@ -171,6 +173,10 @@ impl std::fmt::Display for Error {
             }
             Self::RenderFailed => write!(f, "poppler render_page returned an invalid image"),
             Self::NulByte(e) => write!(f, "argument contains a null byte: {e}"),
+            Self::DataTooLarge(len) => write!(
+                f,
+                "PDF data buffer ({len} bytes) exceeds the 2 GiB limit for in-memory loading"
+            ),
         }
     }
 }
@@ -238,6 +244,7 @@ impl Document {
     /// # Errors
     ///
     /// Returns [`Error::Open`] if the data is not a valid PDF or the password is wrong.
+    /// Returns [`Error::DataTooLarge`] if the buffer exceeds `i32::MAX` bytes.
     pub fn from_bytes(
         data: &[u8],
         owner_password: Option<&str>,
@@ -246,7 +253,7 @@ impl Document {
         let c_owner = CString::new(owner_password.unwrap_or(""))?;
         let c_user = CString::new(user_password.unwrap_or(""))?;
 
-        let len = i32::try_from(data.len()).unwrap_or(i32::MAX);
+        let len = i32::try_from(data.len()).map_err(|_| Error::DataTooLarge(data.len()))?;
         let ptr = unsafe {
             poppler_shim_document_load_from_data(
                 data.as_ptr().cast::<std::ffi::c_char>(),
@@ -331,29 +338,19 @@ impl Page<'_> {
     }
 
     /// Width of the rendered image in pixels at the given DPI.
+    ///
+    /// Returns 0 if the page dimension is non-positive or the DPI is not finite.
     #[must_use]
     pub fn pixel_width(&self, x_dpi: f64) -> u32 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "page dimensions are non-negative; result fits in u32 for any sane DPI"
-        )]
-        {
-            ((self.width_pt() / 72.0) * x_dpi).round() as u32
-        }
+        pts_to_pixels(self.width_pt(), x_dpi)
     }
 
     /// Height of the rendered image in pixels at the given DPI.
+    ///
+    /// Returns 0 if the page dimension is non-positive or the DPI is not finite.
     #[must_use]
     pub fn pixel_height(&self, y_dpi: f64) -> u32 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "page dimensions are non-negative; result fits in u32 for any sane DPI"
-        )]
-        {
-            ((self.height_pt() / 72.0) * y_dpi).round() as u32
-        }
+        pts_to_pixels(self.height_pt(), y_dpi)
     }
 
     /// Render this page to a pixel buffer.
@@ -402,34 +399,19 @@ impl RenderedPage {
     /// Image width in pixels.
     #[must_use]
     pub fn width(&self) -> u32 {
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "poppler never returns a negative width for valid images"
-        )]
-        let w = unsafe { poppler_shim_image_width(self.ptr) } as u32;
-        w
+        nonneg_i32_to_u32(unsafe { poppler_shim_image_width(self.ptr) })
     }
 
     /// Image height in pixels.
     #[must_use]
     pub fn height(&self) -> u32 {
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "poppler never returns a negative height for valid images"
-        )]
-        let h = unsafe { poppler_shim_image_height(self.ptr) } as u32;
-        h
+        nonneg_i32_to_u32(unsafe { poppler_shim_image_height(self.ptr) })
     }
 
     /// Bytes per row (may include stride padding).
     #[must_use]
     pub fn bytes_per_row(&self) -> usize {
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "poppler never returns a negative stride for valid images"
-        )]
-        let s = unsafe { poppler_shim_image_bytes_per_row(self.ptr) } as usize;
-        s
+        nonneg_i32_to_u32(unsafe { poppler_shim_image_bytes_per_row(self.ptr) }) as usize
     }
 
     /// Pixel format of the image.
@@ -440,9 +422,14 @@ impl RenderedPage {
     }
 
     /// Raw pixel data slice (length = `bytes_per_row() * height()`).
+    ///
+    /// The slice includes any stride padding; use [`RenderedPage::to_packed_vec`]
+    /// or iterate with [`RenderedPage::row`] to strip it.
     #[must_use]
     pub fn data(&self) -> &[u8] {
-        let len = self.bytes_per_row() * self.height() as usize;
+        let bpr = self.bytes_per_row();
+        let h = self.height() as usize;
+        let len = bpr.saturating_mul(h);
         if len == 0 {
             return &[];
         }
@@ -452,34 +439,30 @@ impl RenderedPage {
         }
     }
 
-    /// Row `y` as a byte slice (0-indexed from the top).
+    /// Row `y` as a byte slice (0-indexed from the top), or `None` if out of range.
     ///
-    /// Useful for writing rows without first copying to a flat buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `y >= self.height()`.
+    /// The returned slice is `bytes_per_row()` long and may include stride padding.
     #[must_use]
-    pub fn row(&self, y: u32) -> &[u8] {
-        assert!(
-            y < self.height(),
-            "row {y} out of range (height {})",
-            self.height()
-        );
+    pub fn row(&self, y: u32) -> Option<&[u8]> {
+        if y >= self.height() {
+            return None;
+        }
         let bpr = self.bytes_per_row();
-        &self.data()[y as usize * bpr..(y as usize + 1) * bpr]
+        let start = (y as usize).saturating_mul(bpr);
+        Some(&self.data()[start..start + bpr])
     }
 
     /// Copy the pixel data into a contiguous `Vec<u8>`, removing any stride
     /// padding.  Row stride is `width * bytes_per_pixel`.
     ///
-    /// Returns `None` for `Mono` format (bit-packed; no simple byte-per-pixel
-    /// count).
+    /// Returns `None` for [`ImageFormat::Mono`] (bit-packed; no simple
+    /// bytes-per-pixel count) or if the image has an unrecognised format.
     #[must_use]
     pub fn to_packed_vec(&self) -> Option<Vec<u8>> {
         let fmt = self.format()?;
         let bpp = fmt.bytes_per_pixel();
         if bpp == 0 {
+            // Mono is bit-packed — a simple bpp copy is not meaningful.
             return None;
         }
         let w = self.width() as usize;
@@ -521,7 +504,43 @@ pub fn poppler_version() -> (i32, i32, i32) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (require a PDF file at runtime — skipped in CI by default)
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a non-negative i32 returned by poppler to u32.
+///
+/// Negative values (which indicate an error in the C API) are clamped to 0
+/// so callers see an empty/zero-size image rather than a wrapped-around value.
+#[inline]
+fn nonneg_i32_to_u32(v: i32) -> u32 {
+    v.max(0).cast_unsigned()
+}
+
+/// Convert a page dimension in points at a given DPI to a pixel count.
+///
+/// Returns 0 for non-positive dimensions or non-finite DPI values.
+#[inline]
+fn pts_to_pixels(pts: f64, dpi: f64) -> u32 {
+    if pts <= 0.0 || !dpi.is_finite() || dpi <= 0.0 {
+        return 0;
+    }
+    let px = (pts / 72.0 * dpi).round();
+    // Clamp to u32::MAX rather than panicking on overflow for absurd DPI values.
+    // The `px > u32::MAX` guard means the cast cannot truncate or lose sign.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "px is non-negative (pts and dpi are both positive) and bounded by u32::MAX above"
+    )]
+    if px > f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        px as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -563,6 +582,36 @@ mod tests {
         assert_eq!(RenderParams::default().hint_flags(), 0x03);
     }
 
+    #[test]
+    fn pts_to_pixels_edge_cases() {
+        assert_eq!(pts_to_pixels(0.0, 150.0), 0, "zero pts");
+        assert_eq!(pts_to_pixels(-1.0, 150.0), 0, "negative pts");
+        assert_eq!(pts_to_pixels(72.0, 0.0), 0, "zero dpi");
+        assert_eq!(pts_to_pixels(72.0, f64::NAN), 0, "NaN dpi");
+        assert_eq!(
+            pts_to_pixels(72.0, f64::INFINITY),
+            0,
+            "infinite dpi is not valid"
+        );
+        assert_eq!(pts_to_pixels(72.0, 72.0), 72, "1 inch at 72 dpi");
+        assert_eq!(pts_to_pixels(72.0, 150.0), 150, "1 inch at 150 dpi");
+    }
+
+    #[test]
+    fn nonneg_i32_to_u32_clamps_negative() {
+        assert_eq!(nonneg_i32_to_u32(-1), 0);
+        assert_eq!(nonneg_i32_to_u32(0), 0);
+        assert_eq!(nonneg_i32_to_u32(42), 42);
+    }
+
+    #[test]
+    fn data_too_large_error_displayed() {
+        let e = Error::DataTooLarge(3 * 1024 * 1024 * 1024);
+        let s = e.to_string();
+        assert!(s.contains("3221225472"), "should include byte count: {s}");
+        assert!(s.contains("2 GiB"), "should mention limit: {s}");
+    }
+
     /// Integration test: requires a real PDF at the path below.
     /// Run with: `POPPLER_TEST_PDF=/path/to/file.pdf cargo test -p pdf_bridge`
     #[test]
@@ -587,5 +636,7 @@ mod tests {
         assert!(img.height() > 0);
         assert_eq!(img.format(), Some(ImageFormat::Rgb24));
         assert!(!img.data().is_empty());
+        assert!(img.row(0).is_some());
+        assert!(img.row(img.height()).is_none());
     }
 }

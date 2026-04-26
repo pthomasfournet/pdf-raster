@@ -20,8 +20,15 @@ pub enum RenderError {
     Bridge(pdf_bridge::Error),
     /// The encoder rejected the bitmap.
     Encode(EncodeError),
-    /// The rendered pixel format was unexpected.
+    /// The rendered pixel format was not one the CLI knows how to encode.
     UnexpectedFormat(Option<ImageFormat>),
+    /// The requested output format is not supported for this pixel mode.
+    UnsupportedFormatCombination {
+        /// The output format requested by the user.
+        output: OutputFormat,
+        /// The pixel format that was rendered.
+        pixel: Option<ImageFormat>,
+    },
 }
 
 impl std::fmt::Display for RenderError {
@@ -31,11 +38,24 @@ impl std::fmt::Display for RenderError {
             Self::Bridge(e) => write!(f, "render error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
             Self::UnexpectedFormat(fmt) => write!(f, "unexpected pixel format: {fmt:?}"),
+            Self::UnsupportedFormatCombination { output, pixel } => write!(
+                f,
+                "output format {output:?} is not supported for pixel format {pixel:?}"
+            ),
         }
     }
 }
 
-impl std::error::Error for RenderError {}
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Bridge(e) => Some(e),
+            Self::Encode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for RenderError {
     fn from(e: std::io::Error) -> Self {
@@ -65,6 +85,16 @@ pub fn render_page(
     let page = doc.page(page_num - 1)?; // 0-based index
 
     let format = args.output_format();
+
+    // JPEG, JPEG-CMYK, and TIFF are not yet implemented; report clearly rather
+    // than silently producing a wrong output format or panicking.
+    if matches!(format, OutputFormat::Jpeg | OutputFormat::Tiff) {
+        return Err(RenderError::UnsupportedFormatCombination {
+            output: format,
+            pixel: None,
+        });
+    }
+
     let pop_format = if args.gray || args.mono {
         ImageFormat::Gray8
     } else {
@@ -98,11 +128,16 @@ fn write_page_rgb<W: std::io::Write>(
     format: OutputFormat,
     out: W,
 ) -> Result<(), RenderError> {
-    let bitmap = rendered_to_bitmap_rgb(img);
+    let bitmap = rendered_to_bitmap::<Rgb8, 3>(img);
     match format {
         OutputFormat::Ppm => write_ppm(&bitmap, out)?,
         OutputFormat::Png => write_png(&bitmap, out)?,
-        _ => unreachable!("caller ensures only PPM/PNG reach here for RGB"),
+        OutputFormat::Jpeg | OutputFormat::Tiff => {
+            return Err(RenderError::UnsupportedFormatCombination {
+                output: format,
+                pixel: Some(ImageFormat::Rgb24),
+            });
+        }
     }
     Ok(())
 }
@@ -112,44 +147,38 @@ fn write_page_gray<W: std::io::Write>(
     format: OutputFormat,
     out: W,
 ) -> Result<(), RenderError> {
-    let bitmap = rendered_to_bitmap_gray(img);
+    let bitmap = rendered_to_bitmap::<Gray8, 1>(img);
     match format {
         OutputFormat::Ppm => write_pgm(&bitmap, out)?,
         OutputFormat::Png => write_png(&bitmap, out)?,
-        _ => unreachable!("caller ensures only PPM/PNG reach here for grey"),
+        OutputFormat::Jpeg | OutputFormat::Tiff => {
+            return Err(RenderError::UnsupportedFormatCombination {
+                output: format,
+                pixel: Some(ImageFormat::Gray8),
+            });
+        }
     }
     Ok(())
 }
 
-/// Copy poppler RGB24 image into a `Bitmap<Rgb8>`, stripping stride padding.
-fn rendered_to_bitmap_rgb(img: &RenderedPage) -> Bitmap<Rgb8> {
+/// Copy a poppler image into a `Bitmap<P>`, stripping any stride padding.
+///
+/// `BPP` is the number of bytes per pixel (must match `P`'s in-memory layout).
+fn rendered_to_bitmap<P, const BPP: usize>(img: &RenderedPage) -> Bitmap<P>
+where
+    P: color::Pixel,
+{
     let w = img.width();
     let h = img.height();
     let bpr_src = img.bytes_per_row();
-    let bpr_dst = w as usize * 3;
+    let bpr_dst = w as usize * BPP;
     let src = img.data();
 
-    let mut bitmap = Bitmap::<Rgb8>::new(w, h, 1, false);
+    let mut bitmap = Bitmap::<P>::new(w, h, 1, false);
     let dst = bitmap.data_mut();
     for row in 0..h as usize {
         dst[row * bpr_dst..(row + 1) * bpr_dst]
             .copy_from_slice(&src[row * bpr_src..row * bpr_src + bpr_dst]);
-    }
-    bitmap
-}
-
-/// Copy poppler Gray8 image into a `Bitmap<Gray8>`, stripping stride padding.
-fn rendered_to_bitmap_gray(img: &RenderedPage) -> Bitmap<Gray8> {
-    let w = img.width();
-    let h = img.height();
-    let bpr_src = img.bytes_per_row();
-    let src = img.data();
-
-    let mut bitmap = Bitmap::<Gray8>::new(w, h, 1, false);
-    let dst = bitmap.data_mut();
-    for row in 0..h as usize {
-        dst[row * w as usize..(row + 1) * w as usize]
-            .copy_from_slice(&src[row * bpr_src..row * bpr_src + w as usize]);
     }
     bitmap
 }
