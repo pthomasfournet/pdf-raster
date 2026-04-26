@@ -61,6 +61,10 @@ pub struct ImageDescriptor {
     pub color_space: ImageColorSpace,
     /// Raw pixel bytes — layout defined by `color_space` (see module doc).
     pub data: Vec<u8>,
+    /// Optional soft-mask (SMask): one byte per pixel, same dimensions as
+    /// `data`.  `0x00` = fully transparent (skip pixel); `0xFF` = fully
+    /// opaque.  `None` means the image is fully opaque.
+    pub smask: Option<Vec<u8>>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -105,7 +109,7 @@ pub fn resolve_image(
 
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
 
-    match filter.as_deref() {
+    let mut img = match filter.as_deref() {
         None => decode_raw(stream.content.as_slice(), w, h, is_mask, &stream.dict),
         Some("FlateDecode") => match stream.decompressed_content() {
             Ok(data) => decode_raw(&data, w, h, is_mask, &stream.dict),
@@ -128,7 +132,125 @@ pub fn resolve_image(
             log::warn!("image: unknown filter {other:?}");
             None
         }
+    }?;
+
+    // Resolve and decode the soft mask (`SMask`), if present.
+    if let Ok(Object::Reference(smask_id)) = stream.dict.get(b"SMask") {
+        if let Some(alpha) = decode_smask(doc, *smask_id, img.width, img.height) {
+            img.smask = Some(alpha);
+        } else {
+            // `SMask` is present but could not be decoded.  Blitting without a
+            // mask would paint the image's colour over a large area it should
+            // not cover (e.g. a solid-colour overlay that is transparent
+            // everywhere the mask is zero).  Skip the image instead.
+            log::debug!(
+                "image: skipping image — SMask (object {smask_id:?}) could not be decoded"
+            );
+            return None;
+        }
     }
+
+    Some(img)
+}
+
+// ── SMask decoding ────────────────────────────────────────────────────────────
+
+/// Decode a soft-mask (`SMask`) image stream into a flat `Vec<u8>` of grayscale
+/// alpha values (0 = transparent, 255 = opaque), one byte per pixel.
+///
+/// Returns `None` if the `SMask` stream cannot be resolved or its filter is not
+/// supported (caller should skip the image rather than blit without a mask).
+fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<Vec<u8>> {
+    let obj = doc.get_object(id).ok()?;
+    let stream = obj.as_stream().ok()?;
+
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "SMask Width/Height validated positive and ≤ image dims (already validated ≤ 65536)"
+    )]
+    let (sm_w, sm_h) = (
+        stream.dict.get_i64(b"Width")? as u32,
+        stream.dict.get_i64(b"Height")? as u32,
+    );
+
+    let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
+
+    let raw: Vec<u8> = match filter.as_deref() {
+        None => stream.content.clone(),
+        Some("FlateDecode") => stream.decompressed_content().ok()?,
+        Some("CCITTFaxDecode") => {
+            let parms = stream.dict.get(b"DecodeParms").ok();
+            let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, true, parms)?;
+            // decode_ccitt returns Mask-space; convert to alpha: 0x00 mask → opaque (0xFF alpha)
+            let alpha = sm_desc
+                .data
+                .iter()
+                .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
+                .collect();
+            // Resize to match image dimensions if needed (simple nearest-neighbour).
+            return Some(scale_smask(alpha, sm_w, sm_h, img_w, img_h));
+        }
+        Some("JBIG2Decode") => {
+            log::debug!("image: SMask filter \"JBIG2Decode\" not yet supported");
+            return None;
+        }
+        Some(other) => {
+            log::debug!("image: SMask filter {other:?} not yet supported");
+            return None;
+        }
+    };
+
+    let bpc = stream.dict.get_i64(b"BitsPerComponent").unwrap_or(8);
+
+    // Decode raw bytes to one-byte-per-pixel alpha.
+    let alpha: Vec<u8> = match bpc {
+        1 => {
+            // Expand 1bpp to 8bpp; 1-bit = opaque (0xFF), 0-bit = transparent (0x00).
+            let cols = usize::try_from(sm_w).ok()?;
+            let rows = usize::try_from(sm_h).ok()?;
+            let row_bytes = cols.div_ceil(8);
+            let mut out = Vec::with_capacity(cols * rows);
+            for row in raw.chunks(row_bytes) {
+                for x in 0..cols {
+                    let byte = row.get(x / 8).copied().unwrap_or(0);
+                    let bit = (byte >> (7 - (x % 8))) & 1;
+                    out.push(if bit == 1 { 0xFF } else { 0x00 });
+                }
+            }
+            out
+        }
+        8 => raw,
+        other => {
+            log::debug!("image: SMask {other} bpc not yet supported");
+            return None;
+        }
+    };
+
+    Some(scale_smask(alpha, sm_w, sm_h, img_w, img_h))
+}
+
+/// Nearest-neighbour resize of a flat grayscale buffer from `(sw, sh)` to `(dw, dh)`.
+fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    if sw == dw && sh == dh {
+        return src;
+    }
+    let src_w = u64::from(sw);
+    let src_h = u64::from(sh);
+    let dst_w = u64::from(dw);
+    let dst_h = u64::from(dh);
+    let mut out = Vec::with_capacity(usize::try_from(dst_w * dst_h).unwrap_or(0));
+    for dy in 0..dh {
+        #[expect(clippy::cast_possible_truncation, reason = "nearest-neighbour: result ≤ sh-1")]
+        let sy = (u64::from(dy) * src_h / dst_h) as u32;
+        for dx in 0..dw {
+            #[expect(clippy::cast_possible_truncation, reason = "nearest-neighbour: result ≤ sw-1")]
+            let sx = (u64::from(dx) * src_w / dst_w) as u32;
+            #[expect(clippy::cast_possible_truncation, reason = "sy*sw+sx ≤ sw*sh ≤ u32::MAX for validated dims")]
+            out.push(src[(u64::from(sy) * src_w + u64::from(sx)) as usize]);
+        }
+    }
+    out
 }
 
 // ── XObject lookup ────────────────────────────────────────────────────────────
@@ -209,6 +331,7 @@ fn decode_raw(
                 height,
                 color_space: cs,
                 data: pixels,
+                smask: None,
             })
         }
         8 => {
@@ -235,6 +358,7 @@ fn decode_raw(
                 height,
                 color_space: cs,
                 data: data[..expected].to_vec(),
+                smask: None,
             })
         }
         other => {
@@ -292,7 +416,9 @@ fn decode_ccitt(
     let k = parms_dict.and_then(|d| d.get_i64(b"K")).unwrap_or(0);
 
     // BlackIs1: when true, 1-bits encode black (the reverse of the default).
-    let black_is_1 = parms_dict.and_then(|d| d.get_bool(b"BlackIs1")).unwrap_or(false);
+    let black_is_1 = parms_dict
+        .and_then(|d| d.get_bool(b"BlackIs1"))
+        .unwrap_or(false);
 
     if k >= 0 {
         log::debug!("image: CCITTFaxDecode K={k} (Group 3) not yet implemented");
@@ -345,6 +471,7 @@ fn decode_ccitt(
         height,
         color_space: cs,
         data: data_out,
+        smask: None,
     })
 }
 
@@ -419,12 +546,14 @@ fn decode_dct(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
             height: jh,
             color_space: ImageColorSpace::Gray,
             data: pixels,
+            smask: None,
         }),
         ZColorSpace::RGB => Some(ImageDescriptor {
             width: jw,
             height: jh,
             color_space: ImageColorSpace::Rgb,
             data: pixels,
+            smask: None,
         }),
         ZColorSpace::CMYK => cmyk_to_rgb(&pixels, jw, jh),
         // out_cs is always Luma, RGB, or CMYK — set from the components match above.
@@ -499,6 +628,7 @@ fn cmyk_to_rgb(pixels: &[u8], width: u32, height: u32) -> Option<ImageDescriptor
         height,
         color_space: ImageColorSpace::Rgb,
         data: rgb,
+        smask: None,
     })
 }
 
@@ -618,6 +748,7 @@ const fn jpx_gray(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
         height,
         color_space: ImageColorSpace::Gray,
         data,
+        smask: None,
     }
 }
 
@@ -629,6 +760,7 @@ const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
         height,
         color_space: ImageColorSpace::Rgb,
         data,
+        smask: None,
     }
 }
 

@@ -12,9 +12,9 @@
 //! ([`super::renderer::font_cache`]) rather than here, so this module
 //! stays stateless and easy to test.
 
+pub(crate) mod dict_ext;
 pub mod font;
 pub mod image;
-pub(crate) mod dict_ext;
 
 use lopdf::{Document, ObjectId};
 

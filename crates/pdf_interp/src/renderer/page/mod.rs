@@ -745,6 +745,15 @@ impl<'doc> PageRenderer<'doc> {
                 let iy = ((1.0 - ty) * img_h).min(img_h - 1.0).max(0.0) as usize;
                 let img_idx = iy * img.width as usize + ix;
 
+                // If a soft mask is present, skip fully-transparent pixels.
+                if img
+                    .smask
+                    .as_deref()
+                    .is_some_and(|s| s.get(img_idx).copied().unwrap_or(0) == 0)
+                {
+                    continue;
+                }
+
                 // Safety: bx0..bx1 and by0..by1 are clamped to bitmap bounds above,
                 // so pixel_off is always in range for a valid Rgb8 bitmap.
                 let pixel_off = dy as usize * stride + dx as usize * 3;
