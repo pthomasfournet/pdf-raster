@@ -7,28 +7,32 @@
 
 /// Approximate x / 255 using the (x + (x>>8) + 0x80) >> 8 idiom.
 /// Matches the C++ `div255` in Splash.cc:71. Saturates to 255 for x ≥ 65025.
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn div255(x: u32) -> u8 {
     ((x + (x >> 8) + 0x80) >> 8).min(255) as u8
 }
 
 /// Bilinear lerp between two u8 values, weight t ∈ [0, 256].
 /// t=0 → a, t=256 → b.
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn lerp_u8(a: u8, b: u8, t: u32) -> u8 {
-    div255(a as u32 * (256 - t) + b as u32 * t)
+    div255(u32::from(a) * (256 - t) + u32::from(b) * t)
 }
 
 /// Porter-Duff src-over for a single channel.
-/// src_a is the source alpha in [0, 255]; dst is the existing destination value.
-#[inline(always)]
+/// `src_a` is the source alpha in [0, 255]; `dst` is the existing destination value.
+#[inline]
+#[must_use]
 pub fn over_u8(src: u8, src_a: u8, dst: u8) -> u8 {
-    let inv = 255 - src_a as u32;
-    div255(src as u32 * src_a as u32 + dst as u32 * inv)
+    let inv = 255 - u32::from(src_a);
+    div255(u32::from(src) * u32::from(src_a) + u32::from(dst) * inv)
 }
 
 /// Clamp a u32 to [0, 255].
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn clip255(x: u32) -> u8 {
     x.min(255) as u8
 }
@@ -36,44 +40,49 @@ pub fn clip255(x: u32) -> u8 {
 // ── Alpha premultiplication ───────────────────────────────────────────────────
 
 /// Premultiply RGB by alpha (all in [0, 255]).
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn premul(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
-    let a = a as u32;
+    let aa = u32::from(a);
     [
-        div255(r as u32 * a),
-        div255(g as u32 * a),
-        div255(b as u32 * a),
+        div255(u32::from(r) * aa),
+        div255(u32::from(g) * aa),
+        div255(u32::from(b) * aa),
     ]
 }
 
 /// Undo premultiplication. Returns (r, g, b) in [0, 255]. Safe when a=0.
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn unpremul(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
     if a == 0 {
         return [0, 0, 0];
     }
-    let a = a as u32;
+    let aa = u32::from(a);
     [
-        ((r as u32 * 255 + a / 2) / a).min(255) as u8,
-        ((g as u32 * 255 + a / 2) / a).min(255) as u8,
-        ((b as u32 * 255 + a / 2) / a).min(255) as u8,
+        ((u32::from(r) * 255 + aa / 2) / aa).min(255) as u8,
+        ((u32::from(g) * 255 + aa / 2) / aa).min(255) as u8,
+        ((u32::from(b) * 255 + aa / 2) / aa).min(255) as u8,
     ]
 }
 
 // ── Color space conversion ────────────────────────────────────────────────────
 
 /// CMYK → RGB. Simple subtractive model matching poppler's cmykToRGBMatrixMultiplication.
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
-    let k = k as u32;
-    let r = 255u32.saturating_sub(c as u32 + k);
-    let g = 255u32.saturating_sub(m as u32 + k);
-    let b = 255u32.saturating_sub(y as u32 + k);
-    (r as u8, g as u8, b as u8)
+    let kk = u32::from(k);
+    // saturating_sub guarantees values ≤ 255 so clip255 is lossless.
+    let red = clip255(255u32.saturating_sub(u32::from(c) + kk));
+    let green = clip255(255u32.saturating_sub(u32::from(m) + kk));
+    let blue = clip255(255u32.saturating_sub(u32::from(y) + kk));
+    (red, green, blue)
 }
 
-#[inline(always)]
-pub fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
+#[inline]
+#[must_use]
+pub const fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
     (v, v, v)
 }
 
@@ -82,39 +91,53 @@ pub fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
 // poppler uses `int` with 16.16 fixed-point: gfxColorComp1 = 0x10000.
 // These match GfxState.h:115–158.
 
-/// u8 byte → 16.16 fixed-point GfxColorComp.
+/// u8 byte → 16.16 fixed-point `GfxColorComp`.
 /// Matches: (x << 8) | x  (equivalent to x * 257).
-#[inline(always)]
-pub fn byte_to_col(x: u8) -> i32 {
-    let x = x as i32;
-    (x << 8) | x
+#[inline]
+#[must_use]
+pub const fn byte_to_col(x: u8) -> i32 {
+    let xi = x as i32;
+    (xi << 8) | xi
 }
 
-/// 16.16 fixed-point GfxColorComp → u8, with rounding.
+/// 16.16 fixed-point `GfxColorComp` → u8, with rounding.
 /// Matches poppler's colToByte.
-#[inline(always)]
+#[inline]
+#[must_use]
 pub fn col_to_byte(x: i32) -> u8 {
-    ((x + 0x80) >> 8).clamp(0, 255) as u8
+    // clamp ensures the value is in [0, 255]; try_from then succeeds infallibly.
+    u8::try_from(((x + 0x80) >> 8).clamp(0, 255)).unwrap_or(0)
 }
 
 // ── Geometry rounding (matching SplashMath.h portable fallbacks) ──────────────
 
-/// Equivalent to C++ splashFloor — matches the portable fallback path on x86-64.
-#[inline(always)]
+/// Equivalent to C++ `splashFloor` — matches the portable fallback path on x86-64.
+#[inline]
+#[must_use]
 pub fn splash_floor(x: f64) -> i32 {
-    x.floor() as i32
+    // floor() returns a whole-number f64. Convert via i64 (no overflow for PDF
+    // coordinates), then clamp to i32 range via try_from.
+    // SAFETY: f64::floor() always returns a whole-number value; casting to i64
+    // is well-defined for any finite f64 whose absolute value fits in i64.
+    let v: i64 = unsafe { x.floor().to_int_unchecked() };
+    i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
 }
 
-/// Equivalent to C++ splashCeil.
-#[inline(always)]
+/// Equivalent to C++ `splashCeil` — matches the portable fallback path on x86-64.
+#[inline]
+#[must_use]
 pub fn splash_ceil(x: f64) -> i32 {
-    x.ceil() as i32
+    // SAFETY: f64::ceil() always returns a whole-number value; casting to i64
+    // is well-defined for any finite f64 whose absolute value fits in i64.
+    let v: i64 = unsafe { x.ceil().to_int_unchecked() };
+    i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
 }
 
-/// Equivalent to C++ splashRound — floor(x + 0.5).
-#[inline(always)]
+/// Equivalent to C++ `splashRound` — rounds half-integers toward positive infinity.
+#[inline]
+#[must_use]
 pub fn splash_round(x: f64) -> i32 {
-    (x + 0.5).floor() as i32
+    splash_floor(x + 0.5)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -157,7 +180,10 @@ mod tests {
         // t=256: a*(256-256) + b*256 = 200*256; div255(51200) ≈ 201 due to rounding.
         // The lerp domain is [0, 256] with t=256 being "almost b", not exact b.
         let v = lerp_u8(100, 200, 256);
-        assert!((v as i32 - 200).abs() <= 1, "lerp t=256 gave {v}, expected ≈200");
+        assert!(
+            (v as i32 - 200).abs() <= 1,
+            "lerp t=256 gave {v}, expected ≈200"
+        );
     }
 
     #[test]

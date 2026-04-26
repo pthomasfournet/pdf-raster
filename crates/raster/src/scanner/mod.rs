@@ -8,7 +8,7 @@
 //!
 //! The C++ `SplashXPathScanner` stores `std::vector<SplashIntersect>` (or
 //! `boost::container::small_vector<SplashIntersect, 4>`) per scanline — one
-//! heap allocation per row. This replacement uses a **flat SoA layout**:
+//! heap allocation per row. This replacement uses a **flat `SoA` layout**:
 //!
 //! - `row_start[i]` is the index into `intersects` of the first intersection
 //!   on scanline `y_min + i`.
@@ -22,7 +22,7 @@
 pub mod iter;
 
 use crate::bitmap::AaBuf;
-use crate::types::{splash_floor, AA_SIZE};
+use crate::types::{AA_SIZE, splash_floor};
 use crate::xpath::{XPath, XPathFlags};
 
 // ── Intersect ─────────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ use crate::xpath::{XPath, XPathFlags};
 /// One intersection entry for a scanline.
 ///
 /// Matches `SplashIntersect` in `splash/SplashXPathScanner.h`.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct Intersect {
     pub x0: i32, // left pixel (inclusive)
     pub x1: i32, // right pixel (inclusive)
@@ -63,6 +63,11 @@ impl XPathScanner {
     ///
     /// If the xpath is empty or the y-ranges don't overlap, returns an empty
     /// scanner (`is_empty()` returns true).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y_max < y_min` after clamping (cannot happen when clip range is valid).
+    #[must_use]
     pub fn new(xpath: &XPath, eo: bool, clip_y_min: i32, clip_y_max: i32) -> Self {
         if xpath.segs.is_empty() || clip_y_min > clip_y_max {
             return Self::empty(eo);
@@ -81,7 +86,7 @@ impl XPathScanner {
             }
             let sy_min = seg.y0.min(seg.y1);
             let sy_max = seg.y0.max(seg.y1);
-            if sy_min >= (clip_y_max + 1) as f64 || sy_max < clip_y_min as f64 {
+            if sy_min >= f64::from(clip_y_max + 1) || sy_max < f64::from(clip_y_min) {
                 continue;
             }
             x_min_fp = x_min_fp.min(seg.x0).min(seg.x1);
@@ -103,84 +108,21 @@ impl XPathScanner {
             return Self::empty(eo);
         }
 
-        let n_rows = (y_max - y_min + 1) as usize;
+        let n_rows = usize::try_from(y_max - y_min + 1).expect("y_max >= y_min");
 
-        // Accumulate intersections into per-row buckets.
-        // We use a two-pass approach: first count per row, then fill.
-        // To keep allocations simple, collect into a Vec<Vec<Intersect>> first,
-        // then flatten. For Phase 1 correctness this is fine; Phase 3 can
-        // optimize this to a single-pass radix sort.
+        // Accumulate intersections into per-row buckets, then flatten.
         let mut buckets: Vec<Vec<Intersect>> = vec![Vec::new(); n_rows];
-
-        for seg in &xpath.segs {
-            if seg.x0.is_nan() || seg.y0.is_nan() {
-                continue;
-            }
-
-            let seg_y_min = seg.y0.min(seg.y1);
-            let seg_y_max = seg.y0.max(seg.y1);
-
-            let row_y0 = splash_floor(seg_y_min).max(y_min);
-            let row_y1 = splash_floor(seg_y_max).min(y_max);
-
-            if seg.flags.contains(XPathFlags::HORIZ) {
-                // Horizontal segments: count = 0 (no winding contribution).
-                let row = splash_floor(seg_y_min);
-                if row >= y_min && row <= y_max {
-                    let x0 = splash_floor(seg.x0.min(seg.x1));
-                    let x1 = splash_floor(seg.x0.max(seg.x1));
-                    add_intersection(&mut buckets[(row - y_min) as usize], x0, x1, 0, true);
-                }
-            } else if seg.flags.contains(XPathFlags::VERT) {
-                // Vertical segments.
-                let count = if seg.flags.contains(XPathFlags::FLIPPED) {
-                    1
-                } else {
-                    -1
-                };
-                let x = splash_floor(seg.x0);
-                for row in row_y0..=row_y1 {
-                    // Count is 0 on the topmost row (seg_y_min < row), matching C++.
-                    let c = if seg_y_min < row as f64 { count } else { 0 };
-                    add_intersection(&mut buckets[(row - y_min) as usize], x, x, c, false);
-                }
-            } else {
-                // Sloped segment: interpolate x across the scanline range.
-                let count = if seg.flags.contains(XPathFlags::FLIPPED) {
-                    1
-                } else {
-                    -1
-                };
-                let x_base = seg.x0 - seg.y0 * seg.dxdy;
-                let seg_x_min = seg.x0.min(seg.x1);
-                let seg_x_max = seg.x0.max(seg.x1);
-
-                let mut xx0 = seg.x0;
-                if row_y0 as f64 > seg.y0 {
-                    xx0 = x_base + row_y0 as f64 * seg.dxdy;
-                }
-                xx0 = xx0.clamp(seg_x_min, seg_x_max);
-                let mut px0 = splash_floor(xx0);
-
-                for row in row_y0..=row_y1 {
-                    let xx1 = (x_base + (row + 1) as f64 * seg.dxdy).clamp(seg_x_min, seg_x_max);
-                    let px1 = splash_floor(xx1);
-                    let c = if seg_y_min < row as f64 { count } else { 0 };
-                    add_intersection(&mut buckets[(row - y_min) as usize], px0, px1, c, false);
-                    px0 = px1;
-                }
-            }
-        }
+        fill_buckets(xpath, y_min, y_max, &mut buckets);
 
         // Sort each row's intersections by x0, then flatten into the SoA layout.
         let mut row_start = Vec::with_capacity(n_rows + 1);
         let mut intersects = Vec::new();
         for bucket in &mut buckets {
-            row_start.push(intersects.len() as u32);
+            row_start.push(u32::try_from(intersects.len()).unwrap_or(u32::MAX));
             bucket.sort_unstable_by_key(|i| i.x0);
             intersects.extend_from_slice(bucket);
         }
-        row_start.push(intersects.len() as u32);
+        row_start.push(u32::try_from(intersects.len()).unwrap_or(u32::MAX));
 
         Self {
             eo,
@@ -193,7 +135,7 @@ impl XPathScanner {
         }
     }
 
-    fn empty(eo: bool) -> Self {
+    const fn empty(eo: bool) -> Self {
         Self {
             eo,
             x_min: 1,
@@ -206,22 +148,29 @@ impl XPathScanner {
     }
 
     /// True when the scanner covers no scanlines.
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.x_min > self.x_max
     }
 
     /// The intersections for scanline `y`, sorted by `x0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y < y_min` (cannot happen when `y` is within range).
+    #[must_use]
     pub fn row(&self, y: i32) -> &[Intersect] {
         if y < self.y_min || y > self.y_max {
             return &[];
         }
-        let i = (y - self.y_min) as usize;
+        let i = usize::try_from(y - self.y_min).expect("y >= y_min");
         let s = self.row_start[i] as usize;
         let e = self.row_start[i + 1] as usize;
         &self.intersects[s..e]
     }
 
     /// Test whether pixel `(x, y)` is inside the path.
+    #[must_use]
     pub fn test(&self, x: i32, y: i32) -> bool {
         let row = self.row(y);
         let eo_mask: i32 = if self.eo { 1 } else { !0 };
@@ -239,6 +188,7 @@ impl XPathScanner {
     }
 
     /// Test whether the entire span `[x0, x1]` on scanline `y` is inside.
+    #[must_use]
     pub fn test_span(&self, x0: i32, x1: i32, y: i32) -> bool {
         let row = self.row(y);
         let eo_mask: i32 = if self.eo { 1 } else { !0 };
@@ -264,10 +214,15 @@ impl XPathScanner {
     /// Render the AA supersampled row to `aa_buf` and update `[x0, x1]` output range.
     ///
     /// Matches `SplashXPathScanner::renderAALine`. `y` is in device-pixel space;
-    /// the scanner must have been built from an `aa_scale()`'d XPath.
+    /// the scanner must have been built from an `aa_scale()`'d `XPath`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any AA sub-row index `yy` is negative (impossible since `AA_SIZE` > 0).
     pub fn render_aa_line(&self, aa_buf: &mut AaBuf, x0: &mut i32, x1: &mut i32, y: i32) {
         aa_buf.clear();
-        let mut xx_min = aa_buf.width as i32;
+        let aa_width_i32 = i32::try_from(aa_buf.width).unwrap_or(i32::MAX);
+        let mut xx_min = aa_width_i32;
         let mut xx_max = -1i32;
 
         let eo_mask: i32 = if self.eo { 1 } else { !0 };
@@ -284,7 +239,7 @@ impl XPathScanner {
                 let _span_x0 = if i < row.len() {
                     row[i].x0
                 } else {
-                    aa_buf.width as i32
+                    aa_width_i32
                 };
                 // Advance past entries that are before the current position.
                 if (count & eo_mask) == 0 {
@@ -301,7 +256,7 @@ impl XPathScanner {
                 let mut span_x1;
                 loop {
                     if i >= row.len() {
-                        span_x1 = aa_buf.width as i32;
+                        span_x1 = aa_width_i32;
                         break;
                     }
                     count = count.wrapping_add(row[i].count);
@@ -311,15 +266,17 @@ impl XPathScanner {
                         break;
                     }
                 }
-                let bx0 = xx.max(0) as usize;
-                let bx1 = span_x1.min(aa_buf.width as i32) as usize;
+                let bx0 = usize::try_from(xx.max(0)).unwrap_or(0);
+                let bx1 = usize::try_from(span_x1.min(aa_width_i32)).unwrap_or(0);
                 if bx0 < bx1 {
-                    aa_buf.set_span(yy as usize, bx0, bx1);
-                    if (bx0 as i32) < xx_min {
-                        xx_min = bx0 as i32;
+                    aa_buf.set_span(usize::try_from(yy).expect("yy >= 0"), bx0, bx1);
+                    let bx0_i32 = i32::try_from(bx0).unwrap_or(i32::MAX);
+                    let bx1_i32 = i32::try_from(bx1).unwrap_or(i32::MAX);
+                    if bx0_i32 < xx_min {
+                        xx_min = bx0_i32;
                     }
-                    if (bx1 as i32) > xx_max {
-                        xx_max = bx1 as i32;
+                    if bx1_i32 > xx_max {
+                        xx_max = bx1_i32;
                     }
                 }
                 xx = span_x1;
@@ -331,6 +288,78 @@ impl XPathScanner {
         }
         *x0 = xx_min / aa;
         *x1 = (xx_max - 1) / aa;
+    }
+}
+
+// ── Bucket filling ────────────────────────────────────────────────────────────
+
+/// Distribute all path segments from `xpath` into `buckets` (one bucket per
+/// scanline `y_min..=y_max`). Called only from `XPathScanner::new`.
+fn fill_buckets(xpath: &XPath, y_min: i32, y_max: i32, buckets: &mut [Vec<Intersect>]) {
+    for seg in &xpath.segs {
+        if seg.x0.is_nan() || seg.y0.is_nan() {
+            continue;
+        }
+
+        let seg_y_min = seg.y0.min(seg.y1);
+        let seg_y_max = seg.y0.max(seg.y1);
+
+        let row_y0 = splash_floor(seg_y_min).max(y_min);
+        let row_y1 = splash_floor(seg_y_max).min(y_max);
+
+        if seg.flags.contains(XPathFlags::HORIZ) {
+            // Horizontal segments: count = 0 (no winding contribution).
+            let row = splash_floor(seg_y_min);
+            if row >= y_min && row <= y_max {
+                let x0 = splash_floor(seg.x0.min(seg.x1));
+                let x1 = splash_floor(seg.x0.max(seg.x1));
+                let bucket_idx = usize::try_from(row - y_min).expect("row >= y_min");
+                add_intersection(&mut buckets[bucket_idx], x0, x1, 0, true);
+            }
+        } else if seg.flags.contains(XPathFlags::VERT) {
+            // Vertical segments.
+            let count = if seg.flags.contains(XPathFlags::FLIPPED) {
+                1
+            } else {
+                -1
+            };
+            let x = splash_floor(seg.x0);
+            for row in row_y0..=row_y1 {
+                // Count is 0 on the topmost row (seg_y_min < row), matching C++.
+                let c = if seg_y_min < f64::from(row) { count } else { 0 };
+                let bucket_idx = usize::try_from(row - y_min).expect("row >= y_min");
+                add_intersection(&mut buckets[bucket_idx], x, x, c, false);
+            }
+        } else {
+            // Sloped segment: interpolate x across the scanline range.
+            let count = if seg.flags.contains(XPathFlags::FLIPPED) {
+                1
+            } else {
+                -1
+            };
+            let x_base = seg.y0.mul_add(-seg.dxdy, seg.x0);
+            let sloped_x_min = seg.x0.min(seg.x1);
+            let sloped_x_max = seg.x0.max(seg.x1);
+
+            let xx0 = if f64::from(row_y0) > seg.y0 {
+                f64::from(row_y0).mul_add(seg.dxdy, x_base)
+            } else {
+                seg.x0
+            };
+            let xx0 = xx0.clamp(sloped_x_min, sloped_x_max);
+            let mut px0 = splash_floor(xx0);
+
+            for row in row_y0..=row_y1 {
+                let xx1 = f64::from(row + 1)
+                    .mul_add(seg.dxdy, x_base)
+                    .clamp(sloped_x_min, sloped_x_max);
+                let px1 = splash_floor(xx1);
+                let c = if seg_y_min < f64::from(row) { count } else { 0 };
+                let bucket_idx = usize::try_from(row - y_min).expect("row >= y_min");
+                add_intersection(&mut buckets[bucket_idx], px0, px1, c, false);
+                px0 = px1;
+            }
+        }
     }
 }
 

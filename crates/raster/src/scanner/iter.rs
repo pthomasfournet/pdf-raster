@@ -24,6 +24,7 @@ impl<'a> ScanIterator<'a> {
     /// If `y` is outside the scanner's range, the iterator is immediately
     /// exhausted (matching C++ behaviour where the empty `allIntersections[0]`
     /// row is returned with `interIdx = line.size()`).
+    #[must_use]
     pub fn new(scanner: &'a XPathScanner, y: i32) -> Self {
         let row = scanner.row(y);
         let eo_mask = if scanner.eo { 1 } else { !0 };

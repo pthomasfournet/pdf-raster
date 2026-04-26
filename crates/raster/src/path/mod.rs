@@ -28,7 +28,8 @@ pub struct PathPoint {
 }
 
 impl PathPoint {
-    pub fn new(x: f64, y: f64) -> Self {
+    #[must_use]
+    pub const fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
 }
@@ -59,7 +60,7 @@ pub struct StrokeAdjustHint {
     pub ctrl0: usize,
     /// Index of the second control segment.
     pub ctrl1: usize,
-    /// Range of points to adjust: [first_pt, last_pt].
+    /// Range of points to adjust: `[first_pt, last_pt]`.
     pub first_pt: usize,
     pub last_pt: usize,
 }
@@ -95,6 +96,7 @@ pub struct Path {
 }
 
 impl Path {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -103,23 +105,27 @@ impl Path {
 
     /// True when there is no current point (fresh path or after close).
     #[inline]
-    pub fn no_current_point(&self) -> bool {
+    #[must_use]
+    pub const fn no_current_point(&self) -> bool {
         self.cur_subpath == self.pts.len()
     }
 
     /// True after exactly one `moveTo` with no subsequent `lineTo`/`curveTo`.
     #[inline]
-    pub fn one_point_subpath(&self) -> bool {
+    #[must_use]
+    pub const fn one_point_subpath(&self) -> bool {
         !self.pts.is_empty() && self.cur_subpath == self.pts.len() - 1
     }
 
     /// True when the current subpath has at least two points.
     #[inline]
-    pub fn open_subpath(&self) -> bool {
+    #[must_use]
+    pub const fn open_subpath(&self) -> bool {
         !self.pts.is_empty() && self.cur_subpath < self.pts.len() - 1
     }
 
     /// Current point (last point appended), if any.
+    #[must_use]
     pub fn current_point(&self) -> Option<PathPoint> {
         if self.no_current_point() {
             None
@@ -142,7 +148,7 @@ impl Path {
     ///
     /// `cur_subpath` is updated to `self.pts.len() + other.cur_subpath` before
     /// appending, matching `SplashPath::append`.
-    pub fn append(&mut self, other: &Path) {
+    pub fn append(&mut self, other: &Self) {
         let base = self.pts.len();
         self.cur_subpath = base + other.cur_subpath;
         self.pts.extend_from_slice(&other.pts);
@@ -168,11 +174,14 @@ pub struct PathBuilder {
 }
 
 impl PathBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self { path: Path::new() }
     }
 
     /// Begin a new subpath at (x, y). Equivalent to the PDF `m` operator.
+    ///
+    /// # Errors
     ///
     /// Returns `Err(BogusPath)` if called while a one-point subpath is active
     /// (matching `SplashPath::moveTo` error semantics).
@@ -189,7 +198,14 @@ impl PathBuilder {
 
     /// Add a line segment from the current point to (x, y). PDF `l` operator.
     ///
+    /// # Errors
+    ///
     /// Returns `Err(NoCurPt)` if there is no current point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the flags vector is empty despite having a current point
+    /// (invariant violation).
     pub fn line_to(&mut self, x: f64, y: f64) -> Result<(), PathError> {
         if self.path.no_current_point() {
             return Err(PathError::NoCurPt);
@@ -205,7 +221,15 @@ impl PathBuilder {
     /// Add a cubic Bezier curve. PDF `c` operator.
     ///
     /// `(x1,y1)` and `(x2,y2)` are control points; `(x3,y3)` is the endpoint.
+    ///
+    /// # Errors
+    ///
     /// Returns `Err(NoCurPt)` if there is no current point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the flags vector is empty despite having a current point
+    /// (invariant violation).
     pub fn curve_to(
         &mut self,
         x1: f64,
@@ -234,6 +258,9 @@ impl PathBuilder {
     ///
     /// If `force` is true a closing `lineTo` is always added; otherwise it is
     /// skipped only when the subpath is already closed (last == first point).
+    ///
+    /// # Errors
+    ///
     /// Returns `Err(NoCurPt)` if there is no current point.
     pub fn close(&mut self, force: bool) -> Result<(), PathError> {
         if self.path.no_current_point() {
@@ -278,6 +305,7 @@ impl PathBuilder {
     }
 
     /// Consume the builder and return the completed [`Path`].
+    #[must_use]
     pub fn build(self) -> Path {
         self.path
     }

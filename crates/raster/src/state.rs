@@ -11,19 +11,107 @@
 //! - Stroke/fill alpha = 1.0
 //! - Line cap = Butt, line join = Miter, miter limit = 10.0, flatness = 1.0
 //! - All transfer LUTs = identity
-//! - Overprint mask = 0xFFFF_FFFF
+//! - Overprint mask = `0xFFFF_FFFF`
 //! - Clip rect = `[0, 0, width-0.001, height-0.001]` (intentional sub-pixel inset)
 //!
 //! ## `set_transfer` semantics
 //!
-//! Matches `SplashState::setTransfer`: the CMYK and DeviceN[0..4] LUTs are
+//! Matches `SplashState::setTransfer`: the CMYK and `DeviceN`[0..4] LUTs are
 //! derived from the **inverted** RGB/gray LUTs *before* the RGB/gray LUTs are
 //! overwritten. See `SplashState.cc` for the detailed rationale.
 
 use crate::bitmap::AnyBitmap;
 use crate::clip::Clip;
-use crate::types::{LineCap, LineJoin, ScreenParams, SPOT_NCOMPS};
+use crate::types::{LineCap, LineJoin, SPOT_NCOMPS, ScreenParams};
 use color::TransferLut;
+
+// ── StateFlags ────────────────────────────────────────────────────────────────
+
+/// Boolean flags packed into a single byte to avoid `struct_excessive_bools`.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct StateFlags {
+    bits: u8,
+}
+
+impl StateFlags {
+    const MULTIPLY_PATTERN_ALPHA: u8 = 1 << 0;
+    const STROKE_ADJUST: u8 = 1 << 1;
+    const DELETE_SOFT_MASK: u8 = 1 << 2;
+    const IN_NON_ISOLATED_GROUP: u8 = 1 << 3;
+    const IN_KNOCKOUT_GROUP: u8 = 1 << 4;
+    const FILL_OVERPRINT: u8 = 1 << 5;
+    const STROKE_OVERPRINT: u8 = 1 << 6;
+    const OVERPRINT_ADDITIVE: u8 = 1 << 7;
+
+    const fn get(self, mask: u8) -> bool {
+        self.bits & mask != 0
+    }
+    const fn set(&mut self, mask: u8, v: bool) {
+        if v {
+            self.bits |= mask;
+        } else {
+            self.bits &= !mask;
+        }
+    }
+
+    #[must_use]
+    pub const fn multiply_pattern_alpha(self) -> bool {
+        self.get(Self::MULTIPLY_PATTERN_ALPHA)
+    }
+    #[must_use]
+    pub const fn stroke_adjust(self) -> bool {
+        self.get(Self::STROKE_ADJUST)
+    }
+    #[must_use]
+    pub const fn delete_soft_mask(self) -> bool {
+        self.get(Self::DELETE_SOFT_MASK)
+    }
+    #[must_use]
+    pub const fn in_non_isolated_group(self) -> bool {
+        self.get(Self::IN_NON_ISOLATED_GROUP)
+    }
+    #[must_use]
+    pub const fn in_knockout_group(self) -> bool {
+        self.get(Self::IN_KNOCKOUT_GROUP)
+    }
+    #[must_use]
+    pub const fn fill_overprint(self) -> bool {
+        self.get(Self::FILL_OVERPRINT)
+    }
+    #[must_use]
+    pub const fn stroke_overprint(self) -> bool {
+        self.get(Self::STROKE_OVERPRINT)
+    }
+    #[must_use]
+    pub const fn overprint_additive(self) -> bool {
+        self.get(Self::OVERPRINT_ADDITIVE)
+    }
+
+    pub const fn set_multiply_pattern_alpha(&mut self, v: bool) {
+        self.set(Self::MULTIPLY_PATTERN_ALPHA, v);
+    }
+    pub const fn set_stroke_adjust(&mut self, v: bool) {
+        self.set(Self::STROKE_ADJUST, v);
+    }
+    pub const fn set_delete_soft_mask(&mut self, v: bool) {
+        self.set(Self::DELETE_SOFT_MASK, v);
+    }
+    pub const fn set_in_non_isolated_group(&mut self, v: bool) {
+        self.set(Self::IN_NON_ISOLATED_GROUP, v);
+    }
+    pub const fn set_in_knockout_group(&mut self, v: bool) {
+        self.set(Self::IN_KNOCKOUT_GROUP, v);
+    }
+    pub const fn set_fill_overprint(&mut self, v: bool) {
+        self.set(Self::FILL_OVERPRINT, v);
+    }
+    pub const fn set_stroke_overprint(&mut self, v: bool) {
+        self.set(Self::STROKE_OVERPRINT, v);
+    }
+    pub const fn set_overprint_additive(&mut self, v: bool) {
+        self.set(Self::OVERPRINT_ADDITIVE, v);
+    }
+}
 
 // ── GraphicsState ─────────────────────────────────────────────────────────────
 
@@ -42,7 +130,6 @@ pub struct GraphicsState {
 
     pub stroke_alpha: f64,
     pub fill_alpha: f64,
-    pub multiply_pattern_alpha: bool,
     pub pattern_stroke_alpha: f64,
     pub pattern_fill_alpha: f64,
 
@@ -54,19 +141,12 @@ pub struct GraphicsState {
 
     pub line_dash: Vec<f64>,
     pub line_dash_phase: f64,
-    pub stroke_adjust: bool,
 
     pub clip: Clip,
 
     /// Soft mask bitmap (None if no soft mask is active).
     pub soft_mask: Option<Box<AnyBitmap>>,
-    /// True when the state owns `soft_mask` and should drop it on restore.
-    pub delete_soft_mask: bool,
 
-    pub in_non_isolated_group: bool,
-    pub in_knockout_group: bool,
-    pub fill_overprint: bool,
-    pub stroke_overprint: bool,
     pub overprint_mode: i32,
 
     /// Transfer LUTs — RGB channels (R=0, G=1, B=2).
@@ -74,11 +154,49 @@ pub struct GraphicsState {
     pub gray_transfer: TransferLut,
     /// Transfer LUTs — CMYK channels (C=0, M=1, Y=2, K=3).
     pub cmyk_transfer: [TransferLut; 4],
-    /// Transfer LUTs — DeviceN channels (indices 0..SPOT_NCOMPS+4 = 8).
+    /// Transfer LUTs — `DeviceN` channels (indices `0..SPOT_NCOMPS+4` = 8).
     pub device_n_transfer: Vec<[u8; 256]>,
 
     pub overprint_mask: u32,
-    pub overprint_additive: bool,
+
+    /// Boolean flags (replaces individual bool fields to satisfy `struct_excessive_bools`).
+    pub flags: StateFlags,
+}
+
+// Convenience accessors mirroring the old public bool fields.
+impl GraphicsState {
+    #[must_use]
+    pub const fn multiply_pattern_alpha(&self) -> bool {
+        self.flags.multiply_pattern_alpha()
+    }
+    #[must_use]
+    pub const fn stroke_adjust(&self) -> bool {
+        self.flags.stroke_adjust()
+    }
+    #[must_use]
+    pub const fn delete_soft_mask(&self) -> bool {
+        self.flags.delete_soft_mask()
+    }
+    #[must_use]
+    pub const fn in_non_isolated_group(&self) -> bool {
+        self.flags.in_non_isolated_group()
+    }
+    #[must_use]
+    pub const fn in_knockout_group(&self) -> bool {
+        self.flags.in_knockout_group()
+    }
+    #[must_use]
+    pub const fn fill_overprint(&self) -> bool {
+        self.flags.fill_overprint()
+    }
+    #[must_use]
+    pub const fn stroke_overprint(&self) -> bool {
+        self.flags.stroke_overprint()
+    }
+    #[must_use]
+    pub const fn overprint_additive(&self) -> bool {
+        self.flags.overprint_additive()
+    }
 }
 
 impl GraphicsState {
@@ -86,12 +204,13 @@ impl GraphicsState {
     ///
     /// `clip` is set to `[0, 0, width-0.001, height-0.001]` — the intentional
     /// 0.001 inset matches `SplashState` constructor and avoids edge-pixel issues.
+    #[must_use]
     pub fn new(width: u32, height: u32, vector_antialias: bool) -> Self {
         let clip = Clip::new(
             0.0,
             0.0,
-            width as f64 - 0.001,
-            height as f64 - 0.001,
+            f64::from(width) - 0.001,
+            f64::from(height) - 0.001,
             vector_antialias,
         );
         Self {
@@ -99,7 +218,6 @@ impl GraphicsState {
             screen: ScreenParams::default(),
             stroke_alpha: 1.0,
             fill_alpha: 1.0,
-            multiply_pattern_alpha: false,
             pattern_stroke_alpha: 1.0,
             pattern_fill_alpha: 1.0,
             line_width: 1.0,
@@ -109,14 +227,8 @@ impl GraphicsState {
             flatness: 1.0,
             line_dash: Vec::new(),
             line_dash_phase: 0.0,
-            stroke_adjust: false,
             clip,
             soft_mask: None,
-            delete_soft_mask: false,
-            in_non_isolated_group: false,
-            in_knockout_group: false,
-            fill_overprint: false,
-            stroke_overprint: false,
             overprint_mode: 0,
             rgb_transfer: [
                 TransferLut::IDENTITY,
@@ -134,17 +246,17 @@ impl GraphicsState {
                 .map(|_| {
                     let mut lut = [0u8; 256];
                     for (i, v) in lut.iter_mut().enumerate() {
-                        *v = i as u8;
+                        *v = u8::try_from(i).unwrap_or(255);
                     }
                     lut
                 })
                 .collect(),
             overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
+            flags: StateFlags::default(),
         }
     }
 
-    /// Apply new RGB and gray transfer functions, deriving CMYK and DeviceN[0..4]
+    /// Apply new RGB and gray transfer functions, deriving CMYK and `DeviceN`[0..4]
     /// from the **inverted** current RGB/gray values before overwriting them.
     ///
     /// Matches `SplashState::setTransfer` in `SplashState.cc`:
@@ -188,13 +300,13 @@ impl GraphicsState {
     ///
     /// Clip scanners are shared via `Arc` (matching C++ `shared_ptr` semantics).
     /// The soft mask is NOT inherited — the new state starts with `soft_mask = None`.
+    #[must_use]
     pub fn save_clone(&self) -> Self {
         Self {
             matrix: self.matrix,
             screen: self.screen,
             stroke_alpha: self.stroke_alpha,
             fill_alpha: self.fill_alpha,
-            multiply_pattern_alpha: self.multiply_pattern_alpha,
             pattern_stroke_alpha: self.pattern_stroke_alpha,
             pattern_fill_alpha: self.pattern_fill_alpha,
             line_width: self.line_width,
@@ -204,21 +316,20 @@ impl GraphicsState {
             flatness: self.flatness,
             line_dash: self.line_dash.clone(),
             line_dash_phase: self.line_dash_phase,
-            stroke_adjust: self.stroke_adjust,
             clip: self.clip.clone_shared(),
             soft_mask: None, // new state does not own the parent's soft mask
-            delete_soft_mask: false,
-            in_non_isolated_group: self.in_non_isolated_group,
-            in_knockout_group: self.in_knockout_group,
-            fill_overprint: self.fill_overprint,
-            stroke_overprint: self.stroke_overprint,
             overprint_mode: self.overprint_mode,
             rgb_transfer: self.rgb_transfer.clone(),
             gray_transfer: self.gray_transfer.clone(),
             cmyk_transfer: self.cmyk_transfer.clone(),
             device_n_transfer: self.device_n_transfer.clone(),
             overprint_mask: self.overprint_mask,
-            overprint_additive: self.overprint_additive,
+            flags: {
+                let mut f = self.flags;
+                // The new state should not inherit delete_soft_mask.
+                f.set_delete_soft_mask(false);
+                f
+            },
         }
     }
 }
@@ -235,6 +346,7 @@ pub struct StateStack {
 
 impl StateStack {
     /// Create a new stack with `initial` as the bottom state.
+    #[must_use]
     pub fn new(initial: GraphicsState) -> Self {
         Self {
             stack: vec![initial],
@@ -242,16 +354,29 @@ impl StateStack {
     }
 
     /// Borrow the current (top) state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stack is empty (cannot happen; the stack always has at least one entry).
+    #[must_use]
     pub fn current(&self) -> &GraphicsState {
         self.stack.last().expect("StateStack is empty")
     }
 
     /// Mutably borrow the current state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stack is empty (cannot happen; the stack always has at least one entry).
     pub fn current_mut(&mut self) -> &mut GraphicsState {
         self.stack.last_mut().expect("StateStack is empty")
     }
 
     /// Save: push a clone of the current state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stack is empty (cannot happen; the stack always has at least one entry).
     pub fn save(&mut self) {
         let cloned = self.stack.last().expect("StateStack is empty").save_clone();
         self.stack.push(cloned);
@@ -267,7 +392,8 @@ impl StateStack {
     }
 
     /// Current nesting depth (1 = only the initial state, no saves).
-    pub fn depth(&self) -> usize {
+    #[must_use]
+    pub const fn depth(&self) -> usize {
         self.stack.len()
     }
 }

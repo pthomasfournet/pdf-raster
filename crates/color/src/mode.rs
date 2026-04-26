@@ -1,4 +1,4 @@
-//! Pixel color modes, mirroring SplashColorMode from SplashTypes.h.
+//! Pixel color modes, mirroring `SplashColorMode` from SplashTypes.h.
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -18,8 +18,9 @@ pub enum PixelMode {
 pub const NCOMPS: [usize; 7] = [0, 1, 3, 3, 4, 4, 8];
 
 impl PixelMode {
-    #[inline(always)]
-    pub fn bytes_per_pixel(self) -> usize {
+    #[inline]
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> usize {
         NCOMPS[self as usize]
     }
 }

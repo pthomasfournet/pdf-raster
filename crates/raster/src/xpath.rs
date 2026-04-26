@@ -21,8 +21,8 @@
 //! ```
 //! (column-vector convention matching `SplashXPath::transform`.)
 
-use crate::path::adjust::{stroke_adjust, XPathAdjust};
-use crate::path::flatten::{flatten_curve, CurveData};
+use crate::path::adjust::{XPathAdjust, stroke_adjust};
+use crate::path::flatten::{CurveData, flatten_curve};
 use crate::path::{Path, PathFlags, PathPoint, StrokeAdjustHint};
 use crate::types::AA_SIZE;
 use bitflags::bitflags;
@@ -70,7 +70,7 @@ pub struct XPath {
 
 impl XPath {
     /// Create an empty XPath (for tests and internal use).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             segs: Vec::new(),
@@ -83,6 +83,7 @@ impl XPath {
     /// - `flatness`: maximum chord deviation (in device pixels) for Bezier subdivision.
     /// - `close_subpaths`: if true, an implicit closing segment is added from the last
     ///   point of each subpath back to its first point (matching `SplashXPath` ctor).
+    #[must_use]
     pub fn new(path: &Path, matrix: &[f64; 6], flatness: f64, close_subpaths: bool) -> Self {
         let flatness_sq = flatness * flatness;
         let mut xpath = Self {
@@ -103,7 +104,7 @@ impl XPath {
         // Apply stroke adjustments to the transformed points.
         let mut tpts = tpts;
         for adj in &adjusts {
-            for pt in tpts[adj.first_pt..=adj.last_pt].iter_mut() {
+            for pt in &mut tpts[adj.first_pt..=adj.last_pt] {
                 let (x, y) = (&mut pt.x, &mut pt.y);
                 stroke_adjust(adj, x, y);
             }
@@ -178,7 +179,7 @@ impl XPath {
     /// `dxdy` (the slope) is invariant under uniform scaling and is not modified.
     /// Matches `SplashXPath::aaScale()`.
     pub fn aa_scale(&mut self) {
-        let s = AA_SIZE as f64;
+        let s = f64::from(AA_SIZE);
         for seg in &mut self.segs {
             seg.x0 *= s;
             seg.y0 *= s;
@@ -196,10 +197,12 @@ impl XPath {
     fn add_segment(&mut self, mut x0: f64, mut y0: f64, mut x1: f64, mut y1: f64) {
         let mut flags = XPathFlags::empty();
 
-        if y0 == y1 {
+        // Exact bit-equality is intentional: checking for axis-aligned segments
+        // that were constructed with the same coordinate value.
+        if y0.to_bits() == y1.to_bits() {
             // Horizontal segment.
             flags.insert(XPathFlags::HORIZ);
-            if x0 == x1 {
+            if x0.to_bits() == x1.to_bits() {
                 flags.insert(XPathFlags::VERT);
             }
             self.segs.push(XPathSeg {
@@ -212,7 +215,7 @@ impl XPath {
             });
             return; // Horizontal segments are NOT flipped.
         }
-        if x0 == x1 {
+        if x0.to_bits() == x1.to_bits() {
             flags.insert(XPathFlags::VERT);
         }
         let dxdy = if flags.contains(XPathFlags::VERT) {
@@ -245,9 +248,13 @@ impl XPath {
 /// x_out = xi*m[0] + yi*m[2] + m[4]
 /// y_out = xi*m[1] + yi*m[3] + m[5]
 /// ```
-#[inline(always)]
-pub fn transform(m: &[f64; 6], xi: f64, yi: f64) -> PathPoint {
-    PathPoint::new(xi * m[0] + yi * m[2] + m[4], xi * m[1] + yi * m[3] + m[5])
+#[inline]
+#[must_use]
+pub const fn transform(m: &[f64; 6], xi: f64, yi: f64) -> PathPoint {
+    PathPoint::new(
+        xi.mul_add(m[0], yi.mul_add(m[2], m[4])),
+        xi.mul_add(m[1], yi.mul_add(m[3], m[5])),
+    )
 }
 
 // ── Stroke adjust record construction ────────────────────────────────────────
@@ -270,9 +277,9 @@ fn build_adjusts(
         let p01 = tpts[h.ctrl0 + 1];
         let p10 = tpts[h.ctrl1];
         let p11 = tpts[h.ctrl1 + 1];
-        // Determine orientation.
-        let vert = (p00.x == p01.x) && (p10.x == p11.x);
-        let horiz = (p00.y == p01.y) && (p10.y == p11.y);
+        // Determine orientation using bit-exact comparison (axis-aligned check).
+        let vert = (p00.x.to_bits() == p01.x.to_bits()) && (p10.x.to_bits() == p11.x.to_bits());
+        let horiz = (p00.y.to_bits() == p01.y.to_bits()) && (p10.y.to_bits() == p11.y.to_bits());
         if !vert && !horiz {
             continue;
         }

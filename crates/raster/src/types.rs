@@ -4,8 +4,8 @@
 //! this crate only need `use crate::types::*`.
 
 pub use color::{
-    convert::*, AnyColor, Cmyk8, DeviceN8, Gray8, Pixel, PixelMode, Rgb8, Rgba8, TransferLut,
-    NCOMPS,
+    AnyColor, Cmyk8, DeviceN8, Gray8, NCOMPS, Pixel, PixelMode, Rgb8, Rgba8, TransferLut,
+    convert::*,
 };
 
 // ── Rasterizer constants (from SplashTypes.h) ─────────────────────────────────
@@ -20,14 +20,14 @@ pub const MAX_CURVE_SPLITS: i32 = 1024;
 
 /// Control-point ratio for approximating a quarter-circle with a cubic Bezier.
 /// Value: 4 * (√2 − 1) / 3 ≈ 0.55228475  (bezierCircle in Splash.cc).
-pub const BEZIER_CIRCLE: f64 = 0.55228475;
+pub const BEZIER_CIRCLE: f64 = 0.552_284_75;
 
-/// Number of spot color channels in DeviceN8 (SPOT_NCOMPS = 4).
+/// Number of spot color channels in `DeviceN8` (`SPOT_NCOMPS` = 4).
 pub const SPOT_NCOMPS: usize = 4;
 
 // ── Enums matching SplashTypes.h ─────────────────────────────────────────────
 
-/// Thin-line rendering treatment (SplashThinLineMode).
+/// Thin-line rendering treatment (`SplashThinLineMode`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ThinLineMode {
     #[default]
@@ -36,7 +36,7 @@ pub enum ThinLineMode {
     Shape, // use shape anti-aliasing
 }
 
-/// Stroke line-cap style (SplashLineCap).
+/// Stroke line-cap style (`SplashLineCap`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum LineCap {
     #[default]
@@ -45,7 +45,7 @@ pub enum LineCap {
     Projecting, // square extending half line-width beyond endpoint
 }
 
-/// Stroke line-join style (SplashLineJoin).
+/// Stroke line-join style (`SplashLineJoin`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum LineJoin {
     #[default]
@@ -54,7 +54,7 @@ pub enum LineJoin {
     Bevel, // cut-off corner
 }
 
-/// Halftone screen type (SplashScreenType).
+/// Halftone screen type (`SplashScreenType`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ScreenType {
     #[default]

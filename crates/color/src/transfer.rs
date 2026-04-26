@@ -1,6 +1,8 @@
-//! Transfer function LUT — a [u8; 256] lookup table applied per channel at
-//! compositing write time, matching `SplashState`'s `rgbTransferR/G/B`,
-//! `grayTransfer`, `cmykTransfer*`, and `deviceNTransfer` arrays.
+//! Transfer function LUT — a `[u8; 256]` lookup table applied per channel at
+//! compositing write time.
+//!
+//! Matches `SplashState`'s `rgbTransferR/G/B`, `grayTransfer`,
+//! `cmykTransfer*`, and `deviceNTransfer` arrays.
 //!
 //! The identity LUT (`IDENTITY`) is the default: every value maps to itself.
 //! Non-identity LUTs implement PDF transfer functions and halftone screen
@@ -17,18 +19,22 @@ impl TransferLut {
     /// Identity mapping: every value i maps to i.
     pub const IDENTITY: Self = {
         let mut t = [0u8; 256];
-        let mut i = 0usize;
-        // const-loop workaround (while loop is stable in const context)
-        while i < 256 {
-            t[i] = i as u8;
+        // Use a u8 loop variable so the index→byte cast is lossless by type.
+        let mut i = 0u8;
+        loop {
+            t[i as usize] = i;
+            if i == 255 {
+                break;
+            }
             i += 1;
         }
         Self(t)
     };
 
     /// Apply the LUT to a single byte.
-    #[inline(always)]
-    pub fn apply(&self, v: u8) -> u8 {
+    #[inline]
+    #[must_use]
+    pub const fn apply(&self, v: u8) -> u8 {
         self.0[v as usize]
     }
 
@@ -37,12 +43,15 @@ impl TransferLut {
     /// The slice may span multiple channels; callers that want per-channel
     /// application must stride through the slice themselves.
     pub fn apply_row(&self, row: &mut [u8]) {
-        row.iter_mut().for_each(|b| *b = self.apply(*b));
+        for b in row.iter_mut() {
+            *b = self.apply(*b);
+        }
     }
 
     /// Invert: produce a new LUT where output[i] = 255 - self[255 - i].
     /// Used by `GraphicsState::set_transfer` to derive the CMYK LUTs from
     /// the RGB/gray LUTs (matching `SplashState::setTransfer` in SplashState.cc).
+    #[must_use]
     pub fn invert_complement(&self) -> Self {
         let mut out = [0u8; 256];
         for (i, v) in out.iter_mut().enumerate() {
@@ -52,7 +61,8 @@ impl TransferLut {
     }
 
     /// Return the raw table, e.g. for memcpy into a state block.
-    pub fn as_array(&self) -> &[u8; 256] {
+    #[must_use]
+    pub const fn as_array(&self) -> &[u8; 256] {
         &self.0
     }
 }
@@ -108,8 +118,8 @@ mod tests {
     fn invert_complement_nontrivial() {
         // Build a LUT that maps i → 255 - i (inversion).
         let mut t = [0u8; 256];
-        for i in 0usize..256 {
-            t[i] = 255 - i as u8;
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = u8::try_from(255 - i).unwrap_or(0);
         }
         let lut = TransferLut(t);
         let inv = lut.invert_complement();

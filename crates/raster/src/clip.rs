@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::bitmap::AaBuf;
 use crate::scanner::XPathScanner;
-use crate::types::{splash_ceil, splash_floor, AA_SIZE};
+use crate::types::{AA_SIZE, splash_ceil, splash_floor};
 use crate::xpath::XPath;
 
 // ── ClipResult ────────────────────────────────────────────────────────────────
@@ -52,6 +52,7 @@ impl Clip {
     /// Create a new clip region from a rectangle.
     ///
     /// Matches `SplashClip(x0, y0, x1, y1, antialiasA)` in `SplashClip.cc`.
+    #[must_use]
     pub fn new(x0: f64, y0: f64, x1: f64, y1: f64, antialias: bool) -> Self {
         let mut clip = Self {
             antialias,
@@ -70,6 +71,7 @@ impl Clip {
     }
 
     /// Clone, sharing all path-clip scanners via `Arc`.
+    #[must_use]
     pub fn clone_shared(&self) -> Self {
         Self {
             antialias: self.antialias,
@@ -107,7 +109,7 @@ impl Clip {
     /// If the path resolves to a simple axis-aligned rectangle (4 segments,
     /// axis-aligned), it is reduced to `clip_to_rect`. Otherwise a new
     /// [`XPathScanner`] is pushed onto the scanner stack.
-    pub fn clip_to_path(&mut self, xpath: XPath, eo: bool) {
+    pub fn clip_to_path(&mut self, xpath: &XPath, eo: bool) {
         if xpath.segs.is_empty() {
             // Force empty.
             self.x_max = self.x_min - 1.0;
@@ -116,7 +118,7 @@ impl Clip {
             return;
         }
         // Detect axis-aligned rect (4 segments, 2 horiz + 2 vert, forming a closed box).
-        if let Some((rx0, ry0, rx1, ry1)) = detect_rect(&xpath) {
+        if let Some((rx0, ry0, rx1, ry1)) = detect_rect(xpath) {
             self.clip_to_rect(rx0, ry0, rx1, ry1);
             return;
         }
@@ -126,7 +128,7 @@ impl Clip {
         } else {
             (self.y_min_i, self.y_max_i)
         };
-        let scanner = XPathScanner::new(&xpath, eo, y_lo, y_hi);
+        let scanner = XPathScanner::new(xpath, eo, y_lo, y_hi);
         self.scanners.push(Arc::new(scanner));
     }
 
@@ -134,6 +136,7 @@ impl Clip {
 
     /// Test whether pixel `(x, y)` is inside the clip region.
     #[inline]
+    #[must_use]
     pub fn test(&self, x: i32, y: i32) -> bool {
         if x < self.x_min_i || x > self.x_max_i || y < self.y_min_i || y > self.y_max_i {
             return false;
@@ -142,26 +145,21 @@ impl Clip {
     }
 
     /// Test a pixel rectangle against the clip region.
-    pub fn test_rect(
-        &self,
-        rect_x_min: i32,
-        rect_y_min: i32,
-        rect_x_max: i32,
-        rect_y_max: i32,
-    ) -> ClipResult {
-        // Half-open pixel rect: [rXMin, rXMax+1) × [rYMin, rYMax+1).
+    #[must_use]
+    pub fn test_rect(&self, left: i32, top: i32, right: i32, bottom: i32) -> ClipResult {
+        // Half-open pixel rect: [left, right+1) × [top, bottom+1).
         // Clip rect: [x_min, x_max) × [y_min, y_max).
-        if (rect_x_max + 1) as f64 <= self.x_min
-            || rect_x_min as f64 >= self.x_max
-            || (rect_y_max + 1) as f64 <= self.y_min
-            || rect_y_min as f64 >= self.y_max
+        if f64::from(right + 1) <= self.x_min
+            || f64::from(left) >= self.x_max
+            || f64::from(bottom + 1) <= self.y_min
+            || f64::from(top) >= self.y_max
         {
             return ClipResult::AllOutside;
         }
-        if rect_x_min as f64 >= self.x_min
-            && (rect_x_max + 1) as f64 <= self.x_max
-            && rect_y_min as f64 >= self.y_min
-            && (rect_y_max + 1) as f64 <= self.y_max
+        if f64::from(left) >= self.x_min
+            && f64::from(right + 1) <= self.x_max
+            && f64::from(top) >= self.y_min
+            && f64::from(bottom + 1) <= self.y_max
             && self.scanners.is_empty()
         {
             return ClipResult::AllInside;
@@ -170,6 +168,7 @@ impl Clip {
     }
 
     /// Test whether the span `[x0, x1]` on scanline `y` is fully inside.
+    #[must_use]
     pub fn test_span(&self, x0: i32, x1: i32, y: i32) -> ClipResult {
         let result = self.test_rect(x0, y, x1, y);
         if result != ClipResult::AllInside {
@@ -192,11 +191,14 @@ impl Clip {
     /// Clip an AA buffer row, zeroing bits outside the clip region.
     ///
     /// Matches `SplashClip::clipAALine` in `SplashClip.cc`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `AA_SIZE` is negative (it is a positive constant so this never happens).
     pub fn clip_aa_line(&self, aa_buf: &mut AaBuf, x0: &mut i32, x1: &mut i32, y: i32) {
-        let aa = AA_SIZE as usize;
+        let aa = usize::try_from(AA_SIZE).expect("AA_SIZE >= 0");
         // Zero bits outside the rect clip (left and right bands).
-        let left_edge = (self.x_min_i as usize) * aa;
-        let _right_edge = (self.x_max_i as usize + 1) * aa;
+        let left_edge = usize::try_from(self.x_min_i).unwrap_or(0) * aa;
         for row in 0..aa {
             // Zero left band.
             for bx in 0..left_edge.min(aa_buf.width) {
@@ -245,7 +247,7 @@ impl Clip {
 
 // ── Rectangle detection ───────────────────────────────────────────────────────
 
-/// Detect whether an XPath is an axis-aligned rectangle.
+/// Detect whether an `XPath` is an axis-aligned rectangle.
 /// Returns `Some((x0, y0, x1, y1))` if it is, `None` otherwise.
 ///
 /// Matches `SplashClip::isRect` logic in `SplashClip.cc`.
@@ -279,10 +281,10 @@ fn detect_rect(xpath: &XPath) -> Option<(f64, f64, f64, f64)> {
         .filter(|s| s.flags.contains(XPathFlags::HORIZ))
         .flat_map(|s| [s.y0, s.y1])
         .collect();
-    let x0 = xs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let x1 = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let y0 = ys.iter().cloned().fold(f64::INFINITY, f64::min);
-    let y1 = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let x0 = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let x1 = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y0 = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let y1 = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     Some((x0, y0, x1, y1))
 }
 
@@ -293,10 +295,10 @@ mod tests {
     #[test]
     fn new_clip_rect_bounds() {
         let c = Clip::new(1.5, 2.5, 10.5, 8.5, false);
-        assert_eq!(c.x_min_i, 1);   // floor(1.5) = 1
-        assert_eq!(c.y_min_i, 2);   // floor(2.5) = 2
-        assert_eq!(c.x_max_i, 10);  // ceil(10.5) - 1 = 11 - 1 = 10
-        assert_eq!(c.y_max_i, 8);   // ceil(8.5) - 1 = 9 - 1 = 8
+        assert_eq!(c.x_min_i, 1); // floor(1.5) = 1
+        assert_eq!(c.y_min_i, 2); // floor(2.5) = 2
+        assert_eq!(c.x_max_i, 10); // ceil(10.5) - 1 = 11 - 1 = 10
+        assert_eq!(c.y_max_i, 8); // ceil(8.5) - 1 = 9 - 1 = 8
     }
 
     #[test]

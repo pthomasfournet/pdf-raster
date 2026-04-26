@@ -7,6 +7,24 @@
 //! pipeline. Monomorphization over `P` is how we avoid runtime mode dispatch in
 //! hot loops — the compiler generates one code path per pixel format.
 
+/// Convert a `f32` value already clamped to `[0.0, 255.0]` into a `u8`.
+///
+/// The truncation of any fractional part is intentional: callers use
+/// `.mul_add(255.0, 0.5)` to add a 0.5 rounding bias before clamping, so the
+/// truncation here acts as a rounded conversion.
+///
+/// # Safety
+/// The caller must ensure `v` is in `[0.0, 255.0]` (guaranteed by the
+/// preceding `.clamp(0.0, 255.0)` call), making the `to_int_unchecked`
+/// conversion well-defined.
+#[must_use]
+#[inline]
+fn f32_to_u8_clamped(v: f32) -> u8 {
+    // SAFETY: v is clamped to [0.0, 255.0] by the caller, so it is
+    // representable as u8 after truncation of the fractional part.
+    unsafe { v.to_int_unchecked() }
+}
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::mode::PixelMode;
@@ -22,9 +40,11 @@ pub trait Pixel: Copy + Pod + Zeroable + Send + Sync + 'static {
     const BYTES: usize;
 
     /// Convert to linear RGBA f32, with alpha = 1.0 unless the type carries alpha.
+    #[must_use]
     fn to_rgba_f32(self) -> [f32; 4];
 
     /// Convert from linear RGBA f32. Clamps to [0, 1] before quantising.
+    #[must_use]
     fn from_rgba_f32(v: [f32; 4]) -> Self;
 }
 
@@ -45,18 +65,18 @@ impl Pixel for Rgb8 {
 
     fn to_rgba_f32(self) -> [f32; 4] {
         [
-            self.r as f32 / 255.0,
-            self.g as f32 / 255.0,
-            self.b as f32 / 255.0,
+            f32::from(self.r) / 255.0,
+            f32::from(self.g) / 255.0,
+            f32::from(self.b) / 255.0,
             1.0,
         ]
     }
 
     fn from_rgba_f32(v: [f32; 4]) -> Self {
         Self {
-            r: (v[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
-            g: (v[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
-            b: (v[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+            r: f32_to_u8_clamped(v[0].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
+            g: f32_to_u8_clamped(v[1].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
+            b: f32_to_u8_clamped(v[2].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
         }
     }
 }
@@ -77,19 +97,19 @@ impl Pixel for Rgba8 {
 
     fn to_rgba_f32(self) -> [f32; 4] {
         [
-            self.r as f32 / 255.0,
-            self.g as f32 / 255.0,
-            self.b as f32 / 255.0,
-            self.a as f32 / 255.0,
+            f32::from(self.r) / 255.0,
+            f32::from(self.g) / 255.0,
+            f32::from(self.b) / 255.0,
+            f32::from(self.a) / 255.0,
         ]
     }
 
     fn from_rgba_f32(v: [f32; 4]) -> Self {
         Self {
-            r: (v[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
-            g: (v[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
-            b: (v[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
-            a: (v[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+            r: f32_to_u8_clamped(v[0].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
+            g: f32_to_u8_clamped(v[1].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
+            b: f32_to_u8_clamped(v[2].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
+            a: f32_to_u8_clamped(v[3].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0)),
         }
     }
 }
@@ -106,14 +126,16 @@ impl Pixel for Gray8 {
     const BYTES: usize = 1;
 
     fn to_rgba_f32(self) -> [f32; 4] {
-        let f = self.v as f32 / 255.0;
+        let f = f32::from(self.v) / 255.0;
         [f, f, f, 1.0]
     }
 
     fn from_rgba_f32(v: [f32; 4]) -> Self {
-        let lum = (0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]).clamp(0.0, 1.0);
+        let lum = 0.0722_f32
+            .mul_add(v[2], 0.2126_f32.mul_add(v[0], 0.7152 * v[1]))
+            .clamp(0.0, 1.0);
         Self {
-            v: (lum * 255.0 + 0.5) as u8,
+            v: f32_to_u8_clamped(lum.mul_add(255.0, 0.5).clamp(0.0, 255.0)),
         }
     }
 }
@@ -133,32 +155,54 @@ impl Pixel for Cmyk8 {
     const BYTES: usize = 4;
 
     fn to_rgba_f32(self) -> [f32; 4] {
-        let (r, g, b) = crate::convert::cmyk_to_rgb(self.c, self.m, self.y, self.k);
-        [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+        let (red, green, blue) = crate::convert::cmyk_to_rgb(self.c, self.m, self.y, self.k);
+        [
+            f32::from(red) / 255.0,
+            f32::from(green) / 255.0,
+            f32::from(blue) / 255.0,
+            1.0,
+        ]
     }
 
     fn from_rgba_f32(v: [f32; 4]) -> Self {
-        let r = (v[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        let g = (v[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        let b = (v[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        let k = 255u8.saturating_sub(r.max(g).max(b));
-        let dk = 255u8.saturating_sub(k);
-        let c = if dk == 0 {
+        let red = f32_to_u8_clamped(v[0].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0));
+        let green = f32_to_u8_clamped(v[1].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0));
+        let blue = f32_to_u8_clamped(v[2].clamp(0.0, 1.0).mul_add(255.0, 0.5).clamp(0.0, 255.0));
+        let black = 255u8.saturating_sub(red.max(green).max(blue));
+        let dk = 255u8.saturating_sub(black);
+        let cyan = if dk == 0 {
             0
         } else {
-            (255u32.saturating_sub(r as u32 + k as u32) * 255 / dk as u32).min(255) as u8
+            u8::try_from(
+                (255u32.saturating_sub(u32::from(red) + u32::from(black)) * 255 / u32::from(dk))
+                    .min(255),
+            )
+            .unwrap_or(255)
         };
-        let m = if dk == 0 {
+        let magenta = if dk == 0 {
             0
         } else {
-            (255u32.saturating_sub(g as u32 + k as u32) * 255 / dk as u32).min(255) as u8
+            u8::try_from(
+                (255u32.saturating_sub(u32::from(green) + u32::from(black)) * 255 / u32::from(dk))
+                    .min(255),
+            )
+            .unwrap_or(255)
         };
-        let y = if dk == 0 {
+        let yellow = if dk == 0 {
             0
         } else {
-            (255u32.saturating_sub(b as u32 + k as u32) * 255 / dk as u32).min(255) as u8
+            u8::try_from(
+                (255u32.saturating_sub(u32::from(blue) + u32::from(black)) * 255 / u32::from(dk))
+                    .min(255),
+            )
+            .unwrap_or(255)
         };
-        Self { c, m, y, k }
+        Self {
+            c: cyan,
+            m: magenta,
+            y: yellow,
+            k: black,
+        }
     }
 }
 
@@ -201,17 +245,19 @@ pub struct AnyColor {
 }
 
 impl AnyColor {
-    pub fn black(mode: PixelMode) -> Self {
+    #[must_use]
+    pub const fn black(mode: PixelMode) -> Self {
         Self {
             bytes: [0; 8],
             mode,
         }
     }
 
-    pub fn white(mode: PixelMode) -> Self {
+    #[must_use]
+    pub const fn white(mode: PixelMode) -> Self {
         let mut bytes = [0u8; 8];
         match mode {
-            PixelMode::Mono8 => bytes[0] = 255,
+            PixelMode::Mono1 | PixelMode::Mono8 => bytes[0] = 255,
             PixelMode::Rgb8 | PixelMode::Bgr8 => {
                 bytes[0] = 255;
                 bytes[1] = 255;
@@ -225,7 +271,6 @@ impl AnyColor {
             }
             // CMYK white = no ink
             PixelMode::Cmyk8 | PixelMode::DeviceN8 => {}
-            PixelMode::Mono1 => bytes[0] = 0xff,
         }
         Self { bytes, mode }
     }

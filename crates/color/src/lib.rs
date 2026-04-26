@@ -20,6 +20,6 @@ pub mod mode;
 pub mod pixel;
 pub mod transfer;
 
-pub use mode::{PixelMode, NCOMPS};
+pub use mode::{NCOMPS, PixelMode};
 pub use pixel::{AnyColor, Cmyk8, DeviceN8, Gray8, Pixel, Rgb8, Rgba8};
 pub use transfer::TransferLut;

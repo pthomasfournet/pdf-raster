@@ -44,7 +44,9 @@ impl XPathAdjust {
     ///
     /// `adjust_lines` and `line_pos_i` implement the same special-case logic as
     /// in `SplashXPath` constructor: when the two rounded endpoints coincide and
-    /// `adjust_lines` is true, the span is expanded to [line_pos_i, line_pos_i+1].
+    /// `adjust_lines` is true, the span is expanded to
+    /// `[line_pos_i, line_pos_i + 1]`.
+    #[must_use]
     pub fn new(
         first_pt: usize,
         last_pt: usize,
@@ -54,13 +56,15 @@ impl XPathAdjust {
         adjust_lines: bool,
         line_pos_i: i32,
     ) -> Self {
-        let mid = (adj0 + adj1) * 0.5;
-        let mut r0 = splash_round(adj0) as f64;
-        let mut r1 = splash_round(adj1) as f64;
-        if r0 == r1 {
+        let mid = adj0.midpoint(adj1);
+        let mut r0 = f64::from(splash_round(adj0));
+        let mut r1 = f64::from(splash_round(adj1));
+        // r0 and r1 are both whole-number f64 values (from i32::round), so
+        // comparing them with == is exact and intentional.
+        if r0.to_bits() == r1.to_bits() {
             if adjust_lines {
-                r0 = line_pos_i as f64;
-                r1 = line_pos_i as f64 + 1.0;
+                r0 = f64::from(line_pos_i);
+                r1 = f64::from(line_pos_i) + 1.0;
             } else {
                 r1 += 1.0;
             }
@@ -74,7 +78,7 @@ impl XPathAdjust {
             x0: r0,
             xma: mid - 0.01,
             xmb: mid + 0.01,
-            xm: (r0 + r1) * 0.5,
+            xm: r0.midpoint(r1),
             x1a: adj1 - 0.01,
             x1b: adj1 + 0.01,
             x1: r1 - 0.01,

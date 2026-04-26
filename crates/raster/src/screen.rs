@@ -9,7 +9,7 @@
 //! Three matrix types:
 //! - **Dispersed** (Bayer-style): even dot distribution, low correlation.
 //! - **Clustered**: traditional clustered dot, good for offset printing.
-//! - **StochasticClustered**: randomized large-dot screen at ≥ 300 dpi.
+//! - **`StochasticClustered`**: randomized large-dot screen at ≥ 300 dpi.
 
 use crate::types::{ScreenParams, ScreenType};
 
@@ -25,7 +25,8 @@ pub struct HalftoneScreen {
 impl HalftoneScreen {
     /// Create a screen with the given parameters.
     /// The threshold matrix is built lazily on the first `test()` call.
-    pub fn new(params: ScreenParams) -> Self {
+    #[must_use]
+    pub const fn new(params: ScreenParams) -> Self {
         Self {
             params,
             mat: None,
@@ -39,14 +40,23 @@ impl HalftoneScreen {
     /// should be rendered as white (returns `true`) or black (`false`).
     ///
     /// Matches `SplashScreen::test` in `SplashScreen.h`.
+    ///
+    /// # Panics
+    ///
+    /// This function builds the threshold matrix on first call via an internal
+    /// `unwrap()` that is safe because `create_matrix` always sets `self.mat`.
     #[inline]
     pub fn test(&mut self, x: i32, y: i32, value: u8) -> bool {
         if self.mat.is_none() {
             self.create_matrix();
         }
         let mat = self.mat.as_ref().unwrap();
-        let xx = (x as usize) & self.size_m1;
-        let yy = (y as usize) & self.size_m1;
+        // rem_euclid handles negative coordinates correctly: result is always
+        // in [0, size), and size is a power of 2 so this is equivalent to
+        // (x & size_m1) for non-negative x.
+        let size_i32 = i32::try_from(self.size).unwrap_or(i32::MAX);
+        let xx = usize::try_from(x.rem_euclid(size_i32)).unwrap_or(0);
+        let yy = usize::try_from(y.rem_euclid(size_i32)).unwrap_or(0);
         value >= mat[(yy << self.log2_size) + xx]
     }
 
@@ -56,13 +66,13 @@ impl HalftoneScreen {
         // Find smallest power-of-2 size ≥ params.size.
         let mut size = 2usize;
         let mut log2 = 1u32;
-        while (size as i32) < self.params.size {
+        while i32::try_from(size).unwrap_or(i32::MAX) < self.params.size {
             size *= 2;
             log2 += 1;
         }
         // For stochastic clustered: ensure size ≥ 2 × dot_radius.
         if self.params.kind == ScreenType::StochasticClustered {
-            let min_size = (2 * self.params.dot_radius) as usize;
+            let min_size = usize::try_from(2 * self.params.dot_radius).unwrap_or(0);
             while size < min_size {
                 size *= 2;
                 log2 += 1;
@@ -77,7 +87,8 @@ impl HalftoneScreen {
             ScreenType::Dispersed => build_dispersed(&mut mat, size, log2),
             ScreenType::Clustered => build_clustered(&mut mat, size),
             ScreenType::StochasticClustered => {
-                build_stochastic_clustered(&mut mat, size, self.params.dot_radius as usize);
+                let dot_radius = usize::try_from(self.params.dot_radius).unwrap_or(0);
+                build_stochastic_clustered(&mut mat, size, dot_radius);
             }
         }
         // Clamp all entries to ≥ 1 so that value=0 is always black.
@@ -96,13 +107,14 @@ impl HalftoneScreen {
 /// Matches `SplashScreen::buildDispersedMatrix` in `SplashScreen.cc`.
 fn build_dispersed(mat: &mut [u8], size: usize, log2_size: u32) {
     // Fill using the recursive Bayer pattern.
-    let total = (size * size) as u32;
+    let total = u32::try_from(size * size).unwrap_or(u32::MAX);
     for y in 0..size {
         for x in 0..size {
             // Compute the Bayer index for (x, y) at this size.
             let v = bayer_index(x, y, log2_size);
             // Scale to [1, 255].
-            mat[y * size + x] = ((v * 255 + total / 2) / total).clamp(1, 255) as u8;
+            mat[y * size + x] =
+                u8::try_from(((v * 255 + total / 2) / total).clamp(1, 255)).unwrap_or(255);
         }
     }
 }
@@ -133,15 +145,20 @@ fn bayer_index(mut x: usize, mut y: usize, log2_size: u32) -> u32 {
 
 /// Simple clustered dot screen. Generates a radially clustered threshold matrix.
 fn build_clustered(mat: &mut [u8], size: usize) {
-    let cx = (size / 2) as f64;
-    let cy = (size / 2) as f64;
+    // size is a small power of 2 (≤ 64 in practice); cast through u32 to avoid
+    // cast_precision_loss lint (u32 → f64 is always lossless).
+    let half = f64::from(u32::try_from(size / 2).unwrap_or(u32::MAX));
+    let cx = half;
+    let cy = half;
     let max_dist = cx * cx + cy * cy;
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f64 - cx;
-            let dy = y as f64 - cy;
-            let dist = dx * dx + dy * dy;
-            let v = ((1.0 - dist / max_dist) * 254.0 + 0.5) as u8;
+            let dx = f64::from(u32::try_from(x).unwrap_or(u32::MAX)) - cx;
+            let dy = f64::from(u32::try_from(y).unwrap_or(u32::MAX)) - cy;
+            let dist = dx.mul_add(dx, dy * dy);
+            let val = (1.0 - dist / max_dist).mul_add(254.0, 0.5);
+            // val is in [0.5, 254.5] after clamping; safe to convert via unsafe.
+            let v: u8 = unsafe { val.clamp(0.5, 254.5).to_int_unchecked() };
             mat[y * size + x] = v.max(1);
         }
     }
@@ -168,7 +185,9 @@ fn build_stochastic_clustered(mat: &mut [u8], size: usize, dot_radius: usize) {
         .collect();
     thresholds.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     for (rank, (idx, _)) in thresholds.iter().enumerate() {
-        mat[*idx] = ((rank * 254 / n) as u8).max(1);
+        mat[*idx] = u8::try_from((rank * 254 / n).clamp(0, 255))
+            .unwrap_or(255)
+            .max(1);
     }
 }
 
@@ -181,7 +200,7 @@ fn nearest_dot_dist(x: usize, y: usize, size: usize, dot_radius: usize) -> f64 {
         while cy < size {
             let dx = torus_dist(x, cx, size);
             let dy = torus_dist(y, cy, size);
-            let d = dx * dx + dy * dy;
+            let d = dx.mul_add(dx, dy * dy);
             if d < min_d {
                 min_d = d;
             }
@@ -193,8 +212,11 @@ fn nearest_dot_dist(x: usize, y: usize, size: usize, dot_radius: usize) -> f64 {
 }
 
 fn torus_dist(a: usize, b: usize, size: usize) -> f64 {
-    let d = (a as i32 - b as i32).unsigned_abs() as usize;
-    d.min(size - d) as f64
+    // a and b are < size (both are valid pixel indices), so the difference
+    // fits in u32 (size ≤ 64 in practice, always < 2^31).
+    let d = a.abs_diff(b).min(size - a.abs_diff(b));
+    // d ≤ size ≤ 64; cast through u32 to avoid cast_precision_loss lint.
+    f64::from(u32::try_from(d).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -255,7 +277,7 @@ mod tests {
         let mut screen = HalftoneScreen::new(params);
         screen.create_matrix();
         let mat = screen.mat.as_ref().unwrap();
-        let sum: u32 = mat.iter().map(|&v| v as u32).sum();
+        let sum: u32 = mat.iter().map(|&v| u32::from(v)).sum();
         assert!(sum > 0);
         assert_eq!(mat.len(), screen.size * screen.size);
     }
