@@ -44,31 +44,32 @@ use sys::{
 /// `RUST_LOG=pdf_bridge=debug` (or coarser).  Real load failures are still
 /// surfaced via `Err` returns from the public API; these messages are only
 /// informational noise from quirky-but-readable PDFs.
+///
+/// # Safety
+///
+/// `msg` must be a valid, non-null, null-terminated byte string that remains
+/// valid for the duration of this call.  Poppler guarantees this for all
+/// messages it emits.
 unsafe extern "C" fn log_trampoline(msg: *const c_char) {
-    // SAFETY: poppler always passes a valid, null-terminated UTF-8 string.
-    if let Ok(s) = unsafe { CStr::from_ptr(msg) }.to_str() {
-        log::debug!(target: "pdf_bridge::poppler", "{s}");
-    }
+    // SAFETY: caller guarantees msg is a valid null-terminated string.
+    let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+    log::debug!(target: "pdf_bridge::poppler", "{s}");
 }
 
 /// Redirect poppler's internal diagnostics to the [`log`] crate.
 ///
 /// Call once at program startup, before opening any document.  Without this
-/// call the C++ shim still suppresses stderr output — messages are simply
+/// call the C++ shim still suppresses stderr output — messages are silently
 /// dropped.  After this call they become visible at `DEBUG` level under the
 /// `pdf_bridge::poppler` target.
 ///
-/// # Safety
-///
-/// The function pointer installed here is valid for the lifetime of the
-/// process.  Calling this function concurrently with document operations is
-/// safe because the C++ shim stores the pointer atomically through the C
-/// `static` assignment, and poppler's error function is called only from
-/// within poppler's own code, never concurrently from multiple threads on the
-/// same invocation.
+/// Calling this function multiple times is safe and simply overwrites the
+/// previous callback atomically (the C++ side uses `std::atomic`).
 pub fn install_log_callback() {
-    // SAFETY: log_trampoline has the correct extern "C" signature and is
-    // valid for the entire process lifetime.
+    // SAFETY: `log_trampoline` has the correct `extern "C"` signature, its
+    // pointer is valid for the entire process lifetime, and the C++ shim
+    // stores it in a `std::atomic` so concurrent reads from poppler's error
+    // callback thread are safe.
     unsafe { poppler_shim_set_log_callback(Some(log_trampoline)) };
 }
 

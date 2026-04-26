@@ -18,6 +18,7 @@ namespace poppler {
     unsigned int version_micro();
 }
 
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -44,25 +45,34 @@ struct PopplerShimImage {
 // Library initialisation
 // ---------------------------------------------------------------------------
 
-// Rust-provided callback: receives a null-terminated UTF-8 message.
-// Declared extern "C" so Rust can supply a plain fn pointer with no mangling.
+// Rust-provided callback: receives a null-terminated message string.
+// Function pointer type uses extern "C" calling convention so Rust can supply
+// a plain fn pointer without name mangling.
 using RustLogFn = void (*)(const char *msg);
-static RustLogFn g_rust_log = nullptr;
+
+// Atomic so concurrent reads from poppler's error callback (which may fire on
+// any thread) are safe against a concurrent write from set_log_callback.
+// relaxed store/load is sufficient: we only need to see either null or a valid
+// stable function pointer, never a partially-written value.
+static std::atomic<RustLogFn> g_rust_log{nullptr};
 
 static void poppler_log_bridge(const std::string &msg, void * /*closure*/) {
-    if (g_rust_log) g_rust_log(msg.c_str());
+    // Load once; if null between check and call that is impossible (fn ptrs
+    // are pointer-sized and atomically loaded).
+    RustLogFn fn = g_rust_log.load(std::memory_order_relaxed);
+    if (fn) fn(msg.c_str());
 }
 
 /// Install a Rust log callback and redirect poppler's stderr through it.
 ///
-/// Must be called before any document is opened.  Pass null to keep poppler
-/// messages silently dropped (the default — no output to stderr).
+/// Safe to call from any thread.  Must be called before any document is opened
+/// to guarantee all messages are captured; later calls update the pointer
+/// atomically.  Pass null to revert to silent discard.
 extern "C" void poppler_shim_set_log_callback(RustLogFn fn) {
-    g_rust_log = fn;
-    // Wire poppler's error output through our bridge regardless of whether fn
-    // is null.  When fn is null the bridge runs but g_rust_log is null so
-    // messages are dropped; this is still better than the default which prints
-    // to stderr.
+    g_rust_log.store(fn, std::memory_order_relaxed);
+    // Wire poppler's output through our bridge unconditionally.  When fn is
+    // null the bridge still runs but discards messages — better than the
+    // default which writes directly to stderr.
     poppler::set_debug_error_function(poppler_log_bridge, nullptr);
 }
 

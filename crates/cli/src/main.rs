@@ -9,8 +9,10 @@ use args::Args;
 use pdf_bridge::{Document, install_log_callback};
 
 fn main() {
-    env_logger::init();
+    // Silence poppler's stderr before opening any document.  Must come first.
     install_log_callback();
+    // try_init so tests and embedders that already called init() don't panic.
+    let _ = env_logger::try_init();
 
     let args = Args::parse();
 
