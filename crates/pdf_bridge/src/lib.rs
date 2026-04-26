@@ -22,7 +22,7 @@
 
 pub mod sys;
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString, c_char};
 use sys::{
     OpaqueDocument, OpaqueImage, OpaquePage, poppler_shim_document_create_page,
     poppler_shim_document_free, poppler_shim_document_load_from_data,
@@ -30,9 +30,47 @@ use sys::{
     poppler_shim_image_bytes_per_row, poppler_shim_image_data, poppler_shim_image_format,
     poppler_shim_image_free, poppler_shim_image_height, poppler_shim_image_width,
     poppler_shim_page_free, poppler_shim_page_height, poppler_shim_page_render,
-    poppler_shim_page_rotation, poppler_shim_page_width, poppler_shim_version_major,
-    poppler_shim_version_micro, poppler_shim_version_minor,
+    poppler_shim_page_rotation, poppler_shim_page_width, poppler_shim_set_log_callback,
+    poppler_shim_version_major, poppler_shim_version_micro, poppler_shim_version_minor,
 };
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+/// Trampoline called by the C++ shim for every poppler diagnostic message.
+///
+/// Routes to [`log::debug!`] so output is suppressed unless the caller enables
+/// `RUST_LOG=pdf_bridge=debug` (or coarser).  Real load failures are still
+/// surfaced via `Err` returns from the public API; these messages are only
+/// informational noise from quirky-but-readable PDFs.
+unsafe extern "C" fn log_trampoline(msg: *const c_char) {
+    // SAFETY: poppler always passes a valid, null-terminated UTF-8 string.
+    if let Ok(s) = unsafe { CStr::from_ptr(msg) }.to_str() {
+        log::debug!(target: "pdf_bridge::poppler", "{s}");
+    }
+}
+
+/// Redirect poppler's internal diagnostics to the [`log`] crate.
+///
+/// Call once at program startup, before opening any document.  Without this
+/// call the C++ shim still suppresses stderr output — messages are simply
+/// dropped.  After this call they become visible at `DEBUG` level under the
+/// `pdf_bridge::poppler` target.
+///
+/// # Safety
+///
+/// The function pointer installed here is valid for the lifetime of the
+/// process.  Calling this function concurrently with document operations is
+/// safe because the C++ shim stores the pointer atomically through the C
+/// `static` assignment, and poppler's error function is called only from
+/// within poppler's own code, never concurrently from multiple threads on the
+/// same invocation.
+pub fn install_log_callback() {
+    // SAFETY: log_trampoline has the correct extern "C" signature and is
+    // valid for the entire process lifetime.
+    unsafe { poppler_shim_set_log_callback(Some(log_trampoline)) };
+}
 
 // ---------------------------------------------------------------------------
 // Image format

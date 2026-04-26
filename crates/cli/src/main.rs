@@ -6,9 +6,12 @@ use clap::Parser;
 use rayon::prelude::*;
 
 use args::Args;
-use pdf_bridge::Document;
+use pdf_bridge::{Document, install_log_callback};
 
 fn main() {
+    env_logger::init();
+    install_log_callback();
+
     let args = Args::parse();
 
     // Build rayon thread pool.

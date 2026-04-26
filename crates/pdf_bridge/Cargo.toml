@@ -6,6 +6,7 @@ build   = "build.rs"
 
 [dependencies]
 color = { path = "../color" }
+log   = { workspace = true }
 
 [build-dependencies]
 cc = { workspace = true }

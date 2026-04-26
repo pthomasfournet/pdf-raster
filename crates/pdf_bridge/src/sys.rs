@@ -22,6 +22,7 @@ pub struct OpaqueImage(());
 unsafe extern "C" {
     // Library init
     pub fn poppler_shim_set_data_dir(path: *const c_char);
+    pub fn poppler_shim_set_log_callback(f: Option<unsafe extern "C" fn(*const c_char)>);
 
     // Document
     pub fn poppler_shim_document_load_from_file(

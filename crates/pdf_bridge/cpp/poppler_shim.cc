@@ -44,6 +44,28 @@ struct PopplerShimImage {
 // Library initialisation
 // ---------------------------------------------------------------------------
 
+// Rust-provided callback: receives a null-terminated UTF-8 message.
+// Declared extern "C" so Rust can supply a plain fn pointer with no mangling.
+using RustLogFn = void (*)(const char *msg);
+static RustLogFn g_rust_log = nullptr;
+
+static void poppler_log_bridge(const std::string &msg, void * /*closure*/) {
+    if (g_rust_log) g_rust_log(msg.c_str());
+}
+
+/// Install a Rust log callback and redirect poppler's stderr through it.
+///
+/// Must be called before any document is opened.  Pass null to keep poppler
+/// messages silently dropped (the default — no output to stderr).
+extern "C" void poppler_shim_set_log_callback(RustLogFn fn) {
+    g_rust_log = fn;
+    // Wire poppler's error output through our bridge regardless of whether fn
+    // is null.  When fn is null the bridge runs but g_rust_log is null so
+    // messages are dropped; this is still better than the default which prints
+    // to stderr.
+    poppler::set_debug_error_function(poppler_log_bridge, nullptr);
+}
+
 extern "C" void poppler_shim_set_data_dir(const char *path) {
     if (path) poppler::set_data_dir(std::string(path));
 }
