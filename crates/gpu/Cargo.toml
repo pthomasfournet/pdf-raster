@@ -1,0 +1,20 @@
+[package]
+name    = "gpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cudarc = { version = "0.19", features = ["cuda-12080"] }
+color  = { path = "../color" }
+
+# unsafe_code must be "allow" here because cudarc requires unsafe blocks.
+# We do not inherit workspace lints so we can override unsafe_code.
+[lints.rust]
+unsafe_code      = "allow"
+missing_docs     = "warn"
+unused_results   = "warn"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }

@@ -7,6 +7,7 @@ members = [
     "crates/font",
     "crates/pdf_bridge",
     "crates/cli",
+    "crates/gpu",
 ]
 
 [workspace.dependencies]
