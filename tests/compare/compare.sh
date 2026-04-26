@@ -5,18 +5,19 @@
 #   compare.sh [OPTIONS] <PDF>
 #
 # Options:
-#   -r DPI          Resolution (default: 150)
-#   -f PAGE         First page (default: 1)
-#   -l PAGE         Last page  (default: all)
-#   -t THRESHOLD    Max allowed RMSE per page (0-255 scale, default: 2.0)
-#   -v              Verbose: print per-pixel stats for passing pages too
-#   -o DIR          Write diff images to DIR instead of discarding them
-#   -n              Dry run: print render commands without executing them
+#   -r DPI          Resolution in DPI (default: 150)
+#   -f PAGE         First page, 1-based (default: 1)
+#   -l PAGE         Last page, 1-based (default: all)
+#   -t THRESHOLD    Max allowed RMSE per page, 0-255 scale (default: 2.0)
+#   -v              Verbose: print per-page stats even when passing
+#   -o DIR          Write diff images to DIR (default: discarded)
+#   -n              Dry run: print commands without executing
 #
-# Exit code: 0 if every page is within threshold, 1 otherwise.
-# In dry-run mode exit code is always 0.
+# Exit code: 0 = all pages within threshold; 1 = failures or errors.
+# Dry-run always exits 0.
 #
-# Requires: pdftoppm, pdf-raster, ImageMagick (compare/identify/convert), bc
+# Requires: pdftoppm, pdf-raster (release build),
+#           ImageMagick (compare, identify, convert), bc
 
 set -euo pipefail
 
@@ -28,7 +29,7 @@ RASTER_BIN="${REPO_ROOT}/target/release/pdf-raster"
 DPI=150
 FIRST=1
 LAST=""
-THRESHOLD=2.0
+THRESHOLD="2.0"
 VERBOSE=false
 OUT_DIR=""
 DRY_RUN=false
@@ -37,6 +38,11 @@ usage() {
     grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
     exit 0
 }
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+is_positive_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+is_pos_number()   { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 
 while getopts ":r:f:l:t:vo:nh" opt; do
     case $opt in
@@ -48,17 +54,24 @@ while getopts ":r:f:l:t:vo:nh" opt; do
         o) OUT_DIR="$OPTARG" ;;
         n) DRY_RUN=true ;;
         h) usage ;;
-        :) echo "Error: option -$OPTARG requires an argument." >&2; exit 1 ;;
-       \?) echo "Error: unknown option -$OPTARG." >&2; exit 1 ;;
+        :) die "option -$OPTARG requires an argument." ;;
+       \?) die "unknown option -$OPTARG." ;;
     esac
 done
 shift $((OPTIND - 1))
 
+# ── input validation ──────────────────────────────────────────────────────────
 [[ $# -lt 1 ]] && { echo "Error: PDF argument required." >&2; usage; }
 PDF="$1"
-[[ -f "$PDF" ]] || { echo "Error: file not found: $PDF" >&2; exit 1; }
+[[ -f "$PDF" ]] || die "file not found: $PDF"
 
-# Build argument lists early so dry-run can print them.
+is_positive_int "$DPI"   || die "-r DPI must be a positive integer, got: $DPI"
+is_positive_int "$FIRST" || die "-f PAGE must be a positive integer, got: $FIRST"
+[[ -z "$LAST" ]] || is_positive_int "$LAST" || die "-l PAGE must be a positive integer, got: $LAST"
+is_pos_number "$THRESHOLD" || die "-t THRESHOLD must be a non-negative number, got: $THRESHOLD"
+[[ -n "$LAST" && "$LAST" -lt "$FIRST" ]] && die "-l ($LAST) must be >= -f ($FIRST)"
+
+# ── build argument lists early (dry-run needs them) ───────────────────────────
 ref_args=(-r "$DPI" -f "$FIRST")
 [[ -n "$LAST" ]] && ref_args+=(-l "$LAST")
 new_args=(-r "$DPI" -f "$FIRST")
@@ -80,7 +93,7 @@ fi
 
 # ── dependency check ──────────────────────────────────────────────────────────
 for cmd in pdftoppm compare identify convert bc; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found in PATH" >&2; exit 1; }
+    command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found in PATH"
 done
 [[ -x "$RASTER_BIN" ]] || {
     echo "Error: pdf-raster not built at $RASTER_BIN" >&2
@@ -99,10 +112,18 @@ DIFF_DIR="${OUT_DIR:-${WORK_DIR}/diff}"
 mkdir -p "$REF_DIR" "$NEW_DIR" "$DIFF_DIR"
 
 # ── render: reference pdftoppm ────────────────────────────────────────────────
-pdftoppm "${ref_args[@]}" "$PDF" "${REF_DIR}/page" 2>/dev/null
+if ! pdftoppm "${ref_args[@]}" "$PDF" "${REF_DIR}/page" 2>"${WORK_DIR}/ref.log"; then
+    echo "Error: pdftoppm failed — see log:" >&2
+    cat "${WORK_DIR}/ref.log" >&2
+    exit 1
+fi
 
 # ── render: pdf-raster ────────────────────────────────────────────────────────
-"$RASTER_BIN" "${new_args[@]}" "$PDF" "${NEW_DIR}/page" 2>/dev/null
+if ! "$RASTER_BIN" "${new_args[@]}" "$PDF" "${NEW_DIR}/page" 2>"${WORK_DIR}/new.log"; then
+    echo "Error: pdf-raster failed — see log:" >&2
+    cat "${WORK_DIR}/new.log" >&2
+    exit 1
+fi
 
 # ── compare page by page ──────────────────────────────────────────────────────
 fail=0
@@ -116,13 +137,19 @@ ref_pages=("${REF_DIR}"/page-*.ppm)
 shopt -u nullglob
 
 if [[ ${#ref_pages[@]} -eq 0 ]]; then
-    echo "Error: pdftoppm produced no output for ${PDF}" >&2
+    echo "Error: pdftoppm produced no output pages for ${PDF}" >&2
+    if [[ -s "${WORK_DIR}/ref.log" ]]; then
+        echo "  pdftoppm stderr:" >&2
+        cat "${WORK_DIR}/ref.log" >&2
+    fi
     exit 1
 fi
 
 for ref_file in "${ref_pages[@]}"; do
     page_tag="$(basename "$ref_file" .ppm)"   # e.g. "page-001"
     new_file="${NEW_DIR}/${page_tag}.ppm"
+    # Per-page resized file so concurrent pages don't clobber each other.
+    resized_file="${WORK_DIR}/resized-${page_tag}.ppm"
     diff_file="${DIFF_DIR}/${page_tag}-diff.png"
 
     if [[ ! -f "$new_file" ]]; then
@@ -131,25 +158,35 @@ for ref_file in "${ref_pages[@]}"; do
         continue
     fi
 
-    # Normalise dimensions: pdftoppm and pdf-raster may differ by ±1 pixel due
-    # to independent rounding; resize new to match reference before diffing.
-    ref_dim="$(identify -format "%wx%h" "$ref_file" 2>/dev/null)"
-    new_dim="$(identify -format "%wx%h" "$new_file" 2>/dev/null)"
+    # Normalise dimensions: renderers may differ by ±1px due to independent
+    # rounding; resize new to match reference geometry before diffing.
+    ref_dim="$(identify -format "%wx%h" "$ref_file" 2>/dev/null)" \
+        || die "identify failed on ref image: $ref_file"
+    new_dim="$(identify -format "%wx%h" "$new_file" 2>/dev/null)" \
+        || die "identify failed on new image: $new_file"
+
     cmp_file="$new_file"
     if [[ "$ref_dim" != "$new_dim" ]]; then
-        resized="${WORK_DIR}/resized.ppm"
-        convert "$new_file" -resize "${ref_dim}!" -filter Point "$resized"
-        cmp_file="$resized"
+        convert "$new_file" -resize "${ref_dim}!" -filter Point "$resized_file" \
+            || die "convert resize failed for $page_tag"
+        cmp_file="$resized_file"
     fi
 
-    # compare exits 1 when images differ; capture the metric line regardless.
-    rmse_line="$(compare -metric RMSE "$ref_file" "$cmp_file" "$diff_file" 2>&1 || true)"
+    # compare exits 1 when images differ (expected); 2 means a real error.
+    rmse_line="$(compare -metric RMSE "$ref_file" "$cmp_file" "$diff_file" 2>&1)" \
+        || { ec=$?; [[ $ec -eq 1 ]] || die "compare failed ($ec) for $page_tag: $rmse_line"; }
 
     # Output format: "<absolute> (<normalized>)" e.g. "3.14 (0.0123)"
-    rmse_norm="$(printf '%s' "$rmse_line" | grep -oP '(?<=\()[\d.e+-]+(?=\))' || echo "0")"
+    # Use POSIX-compatible grep extended regex — no PCRE required.
+    rmse_norm="$(printf '%s' "$rmse_line" | grep -Eo '\([0-9.e+-]+\)' | tr -d '()')"
+    if [[ -z "$rmse_norm" ]]; then
+        echo "Warning: could not parse RMSE from compare output for ${page_tag}: ${rmse_line}" >&2
+        rmse_norm="0"
+    fi
 
     # Scale normalised [0,1] RMSE to the intuitive 0-255 range.
-    rmse_255="$(bc -l <<< "scale=4; ${rmse_norm} * 255")"
+    rmse_255="$(bc -l <<< "scale=4; ${rmse_norm} * 255")" \
+        || die "bc arithmetic failed for $page_tag (rmse_norm='$rmse_norm')"
 
     total_rmse="$(bc -l <<< "scale=4; ${total_rmse} + ${rmse_255}")"
 

@@ -15,9 +15,9 @@
 # Options:
 #   -d    Dry run: print cargo commands without building
 #
-# The AVX-512 variants require that the host CPU supports avx512vpopcntdq.
-# Check with: grep avx512_vpopcntdq /proc/cpuinfo
-# If unsupported they will be skipped with a warning.
+# AVX-512 variants require avx512vpopcntdq CPU support.
+# Check with: grep -c avx512_vpopcntdq /proc/cpuinfo
+# Unsupported variants are skipped with a warning; exit code is still 0.
 #
 # Requires: cargo
 
@@ -33,32 +33,36 @@ usage() {
     exit 0
 }
 
+die() { echo "Error: $*" >&2; exit 1; }
+
 while getopts ":dh" opt; do
     case $opt in
         d) DRY_RUN=true ;;
         h) usage ;;
-        :) echo "Error: option -$OPTARG requires an argument." >&2; exit 1 ;;
-       \?) echo "Error: unknown option -$OPTARG." >&2; exit 1 ;;
+        :) die "option -$OPTARG requires an argument." ;;
+       \?) die "unknown option -$OPTARG." ;;
     esac
 done
 
-command -v cargo >/dev/null 2>&1 || { echo "Error: cargo not found in PATH" >&2; exit 1; }
+command -v cargo >/dev/null 2>&1 || die "cargo not found in PATH"
 
-# Detect AVX-512 VPOPCNTDQ support on this host.
+# Detect AVX-512 VPOPCNTDQ — Linux only; defaults to false on other platforms.
 has_avx512=false
 if grep -q avx512_vpopcntdq /proc/cpuinfo 2>/dev/null; then
     has_avx512=true
 fi
 
-# AVX-512 RUSTFLAGS: enable the ISA extensions the code actually uses.
+# ISA extensions actually used by the avx512 code path.
 AVX512_RUSTFLAGS="-C target-feature=+avx512f,+avx512bw,+avx512vl,+avx512vpopcntdq"
 
-# build <out_name> <features> [<rustflags>]
+# ── build <out_name> <features> [<rustflags>] ─────────────────────────────────
+# Compiles with --no-default-features + optional feature list,
+# then copies the resulting binary to BINS_DIR/<out_name>.
 build() {
     local out_name="$1" features="$2" rustflags="${3:-}"
     local dest="${BINS_DIR}/${out_name}"
 
-    local cargo_cmd=(
+    local -a cargo_cmd=(
         cargo build --release -p pdf-raster
         --no-default-features
     )
@@ -80,8 +84,10 @@ build() {
     else
         "${cargo_cmd[@]}"
     fi
-    mkdir -p "$BINS_DIR"
-    cp "${REPO_ROOT}/target/release/pdf-raster" "$dest"
+
+    local built="${REPO_ROOT}/target/release/pdf-raster"
+    [[ -f "$built" ]] || die "cargo succeeded but $built was not produced"
+    cp "$built" "$dest"
     echo "   → ${dest}"
     echo ""
 }
@@ -89,8 +95,12 @@ build() {
 if $DRY_RUN; then
     echo "DRY RUN — cargo commands that would be executed:"
     echo ""
+else
+    # Create bins dir before the first build so errors are clear.
+    mkdir -p "$BINS_DIR"
 fi
 
+# All cargo invocations run from the workspace root.
 cd "$REPO_ROOT"
 
 build "pdf-raster-scalar"       ""
@@ -99,13 +109,13 @@ build "pdf-raster-rayon"        "raster/rayon"
 build "pdf-raster-avx2-rayon"   "raster/simd-avx2,raster/rayon"
 
 if $has_avx512; then
-    build "pdf-raster-avx512"         "raster/simd-avx512"          "$AVX512_RUSTFLAGS"
-    build "pdf-raster-avx512-rayon"   "raster/simd-avx512,raster/rayon" "$AVX512_RUSTFLAGS"
+    build "pdf-raster-avx512"        "raster/simd-avx512"              "$AVX512_RUSTFLAGS"
+    build "pdf-raster-avx512-rayon"  "raster/simd-avx512,raster/rayon" "$AVX512_RUSTFLAGS"
 else
     echo "Warning: CPU does not support avx512_vpopcntdq — skipping avx512 variants." >&2
 fi
 
 if ! $DRY_RUN; then
     echo "── Done ─────────────────────────────────────────────────────────────────"
-    ls -lh "$BINS_DIR/"
+    ls -lh "${BINS_DIR}/"
 fi
