@@ -15,7 +15,8 @@
 //!
 //! # Not yet implemented
 //!
-//! - `XObjects` / inline images — requires `XObject` resource resolver
+//! - Image `XObjects`: `DCTDecode` (JPEG), `JBIG2Decode`, `JPXDecode`
+//! - Form `XObjects` — recursive content streams
 //! - Shading (`sh`) — requires shading resource lookup
 //! - Extended graphics state (`gs`) — requires `ExtGState` dict lookup
 //! - Clip paths (W W*) — stub; page-rect clip used as fallback
@@ -44,7 +45,7 @@ use super::color::RasterColor;
 use super::font_cache::FontCache;
 use super::gstate::{GStateStack, InterpGState, ctm_multiply, ctm_transform};
 use crate::content::{Operator, TextArrayElement};
-use crate::resources::PageResources;
+use crate::resources::{ImageColorSpace, PageResources};
 
 /// Identity CTM for passing to raster functions — coordinate transform is
 /// already baked into the path points by `to_device`.
@@ -330,12 +331,9 @@ impl<'doc> PageRenderer<'doc> {
                 self.show_text(&text);
             }
 
-            // ── XObjects / images / shading (resource resolver pending) ───────
+            // ── XObjects / images / shading ────────────────────────────────────
             Operator::PaintXObject(name) => {
-                log::debug!(
-                    "pdf_interp: Do /{} not yet implemented",
-                    String::from_utf8_lossy(name)
-                );
+                self.do_xobject(name);
             }
             Operator::InlineImage { .. } => {
                 log::debug!("pdf_interp: inline image not yet implemented");
@@ -608,6 +606,134 @@ impl<'doc> PageRenderer<'doc> {
             &DEVICE_MATRIX,
             &params,
         );
+    }
+
+    // ── XObject rendering ─────────────────────────────────────────────────────
+
+    /// Execute a `Do` operator: look up and render the named `XObject`.
+    ///
+    /// Only image `XObject`s are implemented; form `XObject`s are logged and
+    /// skipped until recursive content-stream execution is added.
+    fn do_xobject(&mut self, name: &[u8]) {
+        let Some(img) = self.resources.image(name) else {
+            log::debug!(
+                "pdf_interp: Do /{} — no image XObject (may be a Form XObject or unsupported filter)",
+                String::from_utf8_lossy(name)
+            );
+            return;
+        };
+        self.blit_image(&img);
+    }
+
+    /// Blit a decoded image `XObject` onto the bitmap using the current CTM.
+    ///
+    /// The PDF convention is that the CTM maps the unit square `[0,1]×[0,1]`
+    /// (image space) to the target rectangle on the page.  We sample each
+    /// output pixel by inverse-mapping it back to image space.
+    ///
+    /// For axis-aligned transforms (the common case) this is just a scaled copy.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "device pixel coords are always in page bounds after clamping; safe casts"
+    )]
+    fn blit_image(&mut self, img: &crate::resources::ImageDescriptor) {
+        let ctm = self.gstate.current().ctm;
+        let fill_color = self.gstate.current().fill_color.as_slice().to_vec();
+        let page_h = f64::from(self.height);
+
+        // PDF CTM maps (0,0)→(1,0)→(1,1)→(0,1) (bottom-left origin).
+        // y-flip converts PDF bottom-left to device top-left origin.
+        let (x00, y00) = ctm_transform(&ctm, 0.0, 0.0);
+        let (x10, y10) = ctm_transform(&ctm, 1.0, 0.0);
+        let (x01, y01) = ctm_transform(&ctm, 0.0, 1.0);
+        let (x11, y11) = ctm_transform(&ctm, 1.0, 1.0);
+
+        // Bounding box of the 4 corners in device space (y-flipped).
+        let dx0 = x00.min(x10).min(x01).min(x11).floor() as i64;
+        let dx1 = x00.max(x10).max(x01).max(x11).ceil() as i64;
+        let dy0 = (page_h - y00)
+            .min(page_h - y10)
+            .min(page_h - y01)
+            .min(page_h - y11)
+            .floor() as i64;
+        let dy1 = (page_h - y00)
+            .max(page_h - y10)
+            .max(page_h - y01)
+            .max(page_h - y11)
+            .ceil() as i64;
+
+        // Clamp to bitmap (all values fit u32 after clamping ≥ 0 and < dim).
+        let bx0 = dx0.max(0) as u32;
+        let bx1 = dx1.min(i64::from(self.width)) as u32;
+        let by0 = dy0.max(0) as u32;
+        let by1 = dy1.min(i64::from(self.height)) as u32;
+
+        if bx0 >= bx1 || by0 >= by1 {
+            return;
+        }
+
+        // For each output pixel, compute image-space coordinates by
+        // inverse-mapping from bounding-box coordinates.  Exact for
+        // axis-aligned transforms; approximate otherwise.
+        let img_w = f64::from(img.width);
+        let img_h = f64::from(img.height);
+        let span_x = (dx1 - dx0).max(1) as f64;
+        let span_y = (dy1 - dy0).max(1) as f64;
+        let origin_x = dx0 as f64;
+        let origin_y = dy0 as f64;
+
+        let data = self.bitmap.data_mut();
+        let stride = self.width as usize * 3; // Rgb8: 3 bytes per pixel
+
+        for dy in by0..by1 {
+            for dx in bx0..bx1 {
+                // tx ∈ [0,1] left→right; ty ∈ [0,1] bottom→top (PDF convention).
+                let tx = ((f64::from(dx) - origin_x) / span_x).clamp(0.0, 1.0);
+                let ty = 1.0 - ((f64::from(dy) - origin_y) / span_y).clamp(0.0, 1.0);
+
+                // Nearest-neighbour sample from the image.
+                let ix = (tx * img_w).min(img_w - 1.0).max(0.0) as usize;
+                let iy = ((1.0 - ty) * img_h).min(img_h - 1.0).max(0.0) as usize;
+                let img_idx = iy * img.width as usize + ix;
+
+                let pixel_off = dy as usize * stride + dx as usize * 3;
+                if pixel_off + 2 >= data.len() {
+                    continue;
+                }
+
+                match img.color_space {
+                    ImageColorSpace::Rgb => {
+                        let src = img_idx * 3;
+                        if src + 2 < img.data.len() {
+                            data[pixel_off] = img.data[src];
+                            data[pixel_off + 1] = img.data[src + 1];
+                            data[pixel_off + 2] = img.data[src + 2];
+                        }
+                    }
+                    ImageColorSpace::Gray => {
+                        if img_idx < img.data.len() {
+                            let v = img.data[img_idx];
+                            data[pixel_off] = v;
+                            data[pixel_off + 1] = v;
+                            data[pixel_off + 2] = v;
+                        }
+                    }
+                    ImageColorSpace::Mask => {
+                        // 0 = paint with fill colour; non-zero = transparent.
+                        if img_idx < img.data.len()
+                            && img.data[img_idx] == 0
+                            && fill_color.len() == 3
+                        {
+                            data[pixel_off] = fill_color[0];
+                            data[pixel_off + 1] = fill_color[1];
+                            data[pixel_off + 2] = fill_color[2];
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

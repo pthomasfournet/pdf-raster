@@ -10,6 +10,7 @@ font   = { path = "../font" }
 encode = { path = "../encode" }
 lopdf  = "0.40"
 log    = { workspace = true }
+fax = "0.2.6"
 
 [dev-dependencies]
 env_logger = { workspace = true }

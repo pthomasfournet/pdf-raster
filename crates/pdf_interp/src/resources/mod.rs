@@ -13,10 +13,12 @@
 //! stays stateless and easy to test.
 
 pub mod font;
+pub mod image;
 
 use lopdf::{Document, ObjectId};
 
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
+pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
 
 /// Thin accessor wrapping a `(Document, page_id)` pair.
 ///
@@ -44,5 +46,15 @@ impl<'doc> PageResources<'doc> {
         let fonts = self.doc.get_page_fonts(self.page_id).ok()?;
         let dict = fonts.get(name)?;
         Some(font::resolve_font(self.doc, dict))
+    }
+
+    /// Decode the named image `XObject` from the page resource dictionary.
+    ///
+    /// Returns `None` if the name is absent, the object is not an image, or
+    /// decoding fails (a warning is logged in that case).
+    #[must_use]
+    pub fn image(&self, name: &[u8]) -> Option<image::ImageDescriptor> {
+        let page_dict = self.doc.get_dictionary(self.page_id).ok()?;
+        image::resolve_image(self.doc, page_dict, name)
     }
 }
