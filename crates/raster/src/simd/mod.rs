@@ -11,7 +11,8 @@
 //! - [`popcnt`]        — set-bit count for `AaBuf` rows (`popcnt_aa_row`)
 //! - [`glyph_unpack`]  — 1-bit-per-pixel mono glyph expansion (`unpack_mono_row`)
 
-#![allow(unsafe_code)]
+// SIMD functions are inherently unsafe; unsafe_code is required throughout this module tree.
+#![expect(unsafe_code, reason = "SIMD intrinsics require unsafe throughout this module tree")]
 
 pub mod blend;
 pub mod composite;

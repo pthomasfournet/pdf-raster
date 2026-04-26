@@ -135,14 +135,12 @@ impl GpuCtx {
 
         let cfg = launch_cfg(n);
         let mut builder = stream.launch_builder(&self.kernels.composite_rgba8);
-        // PushKernelArg::arg returns &mut Self (builder pattern); results intentionally dropped.
-        #[allow(unused_results)]
-        {
-            builder.arg(&d_src);
-            builder.arg(&mut d_dst);
-            builder.arg(&n_u32);
-            unsafe { builder.launch(cfg) }?;
-        }
+        // PushKernelArg::arg returns &mut Self (builder pattern); chain results are intentionally unused.
+        let _ = builder.arg(&d_src);
+        let _ = builder.arg(&mut d_dst);
+        let _ = builder.arg(&n_u32);
+        // SAFETY: kernel arguments match the PTX signature; n_u32 bounds are verified above.
+        unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
         stream.memcpy_dtoh(&d_dst, dst)?;
@@ -163,14 +161,12 @@ impl GpuCtx {
 
         let cfg = launch_cfg(n);
         let mut builder = stream.launch_builder(&self.kernels.apply_soft_mask);
-        // PushKernelArg::arg returns &mut Self (builder pattern); results intentionally dropped.
-        #[allow(unused_results)]
-        {
-            builder.arg(&mut d_pixels);
-            builder.arg(&d_mask);
-            builder.arg(&n_u32);
-            unsafe { builder.launch(cfg) }?;
-        }
+        // PushKernelArg::arg returns &mut Self (builder pattern); chain results are intentionally unused.
+        let _ = builder.arg(&mut d_pixels);
+        let _ = builder.arg(&d_mask);
+        let _ = builder.arg(&n_u32);
+        // SAFETY: kernel arguments match the PTX signature; n_u32 bounds are verified above.
+        unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
         stream.memcpy_dtoh(&d_pixels, pixels)?;
@@ -178,7 +174,10 @@ impl GpuCtx {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "n.div_ceil(256) ≤ u32::MAX for any practical pixel count (≤ 4B pixels)"
+)]
 const fn launch_cfg(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
@@ -219,7 +218,7 @@ pub fn apply_soft_mask_cpu(pixels: &mut [u8], mask: &[u8]) {
         let a = u32::from(p[3]);
         let m = u32::from(m);
         // a*m is at most 255*255 = 65025; +127 = 65152 < u32::MAX; /255 ≤ 255: safe cast.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation, reason = "result ≤ 255, always fits u8")]
         let scaled = ((a * m + 127) / 255) as u8;
         p[3] = scaled;
     }
@@ -292,7 +291,7 @@ mod tests {
     // --- GPU tests ---
     // If GpuCtx::init() fails (no CUDA device), tests skip gracefully via early return.
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation, reason = "i % 256 always fits u8")]
     fn make_composite_data(n_pixels: usize) -> (Vec<u8>, Vec<u8>) {
         let mut src = Vec::with_capacity(n_pixels * 4);
         let mut dst = Vec::with_capacity(n_pixels * 4);
@@ -334,7 +333,7 @@ mod tests {
         );
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation, reason = "i % 256 always fits u8")]
     #[test]
     fn gpu_soft_mask_matches_cpu() {
         let ctx = match GpuCtx::init() {

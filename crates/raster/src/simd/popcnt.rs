@@ -11,8 +11,6 @@
 //! 2. **`popcnt`**: process 8 bytes at a time with the hardware `popcnt` instruction.
 //! 3. **Scalar**: `u8::count_ones` per byte.
 
-#![allow(unsafe_code)]
-
 /// Scalar fallback: count set bits in `row`.
 #[inline]
 pub(super) fn popcnt_aa_row_scalar(row: &[u8]) -> u32 {

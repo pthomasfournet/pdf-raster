@@ -10,8 +10,6 @@
 //!   iteration using bit-isolating masks and `_mm_cmpeq_epi8`.
 //! - **Scalar**: one byte at a time, 8 output bytes per iteration.
 
-#![allow(unsafe_code)]
-
 /// Scalar implementation: expand `width` MSB-first packed bits into `out`.
 #[inline]
 pub(super) fn unpack_mono_row_scalar(packed: &[u8], width: usize, out: &mut [u8]) {

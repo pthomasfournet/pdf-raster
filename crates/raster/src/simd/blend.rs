@@ -6,11 +6,10 @@
 //! On x86-64 with AVX2 both functions use 256-bit stores; on all other
 //! targets (or when AVX2 is absent at runtime) they fall back to scalar code.
 
-#![allow(unsafe_code)]
-
 /// Fill `count` RGB pixels in `dst` with `color` using a scalar loop.
 #[inline]
 pub(super) fn blend_solid_rgb8_scalar(dst: &mut [u8], color: [u8; 3], count: usize) {
+    debug_assert!(dst.len() >= count * 3, "dst too short: {} < {}", dst.len(), count * 3);
     for chunk in dst[..count * 3].chunks_exact_mut(3) {
         chunk.copy_from_slice(&color);
     }
@@ -19,11 +18,13 @@ pub(super) fn blend_solid_rgb8_scalar(dst: &mut [u8], color: [u8; 3], count: usi
 /// Fill `count` grayscale pixels in `dst` with `color`.
 #[inline]
 pub(super) fn blend_solid_gray8_scalar(dst: &mut [u8], color: u8, count: usize) {
+    debug_assert!(dst.len() >= count, "dst too short: {} < {}", dst.len(), count);
     dst[..count].fill(color);
 }
 
 // ── AVX2 paths ────────────────────────────────────────────────────────────────
 
+// AVX2 functions use unsafe SIMD intrinsics — required, not lazy.
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
 /// Fill `count` RGB pixels in `dst` with `color` using 96-byte AVX2 chunks.
 ///
