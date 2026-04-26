@@ -746,10 +746,12 @@ impl<'doc> PageRenderer<'doc> {
                 let img_idx = iy * img.width as usize + ix;
 
                 // If a soft mask is present, skip fully-transparent pixels.
+                // Out-of-bounds access (smask shorter than expected) defaults to
+                // 0xFF (opaque) so a truncated mask never silently erases pixels.
                 if img
                     .smask
                     .as_deref()
-                    .is_some_and(|s| s.get(img_idx).copied().unwrap_or(0) == 0)
+                    .is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0)
                 {
                     continue;
                 }

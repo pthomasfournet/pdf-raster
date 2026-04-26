@@ -61,9 +61,10 @@ pub struct ImageDescriptor {
     pub color_space: ImageColorSpace,
     /// Raw pixel bytes — layout defined by `color_space` (see module doc).
     pub data: Vec<u8>,
-    /// Optional soft-mask (SMask): one byte per pixel, same dimensions as
-    /// `data`.  `0x00` = fully transparent (skip pixel); `0xFF` = fully
-    /// opaque.  `None` means the image is fully opaque.
+    /// Optional soft-mask (`SMask`): one alpha byte per pixel, with exactly
+    /// `width × height` entries matching the image grid.  `0x00` = fully
+    /// transparent (pixel is skipped during blit); `0xFF` = fully opaque.
+    /// `None` means every pixel is fully opaque.
     pub smask: Option<Vec<u8>>,
 }
 
@@ -155,41 +156,49 @@ pub fn resolve_image(
 
 // ── SMask decoding ────────────────────────────────────────────────────────────
 
-/// Decode a soft-mask (`SMask`) image stream into a flat `Vec<u8>` of grayscale
-/// alpha values (0 = transparent, 255 = opaque), one byte per pixel.
+/// Decode a soft-mask (`SMask`) image stream into a flat alpha buffer.
 ///
-/// Returns `None` if the `SMask` stream cannot be resolved or its filter is not
-/// supported (caller should skip the image rather than blit without a mask).
+/// Returns exactly `img_w * img_h` bytes, one alpha value per pixel:
+/// `0x00` = fully transparent, `0xFF` = fully opaque.  The `SMask` stream may
+/// have different dimensions from the parent image; if so, the buffer is
+/// resampled to match via nearest-neighbour scaling.
+///
+/// Returns `None` when the stream is unresolvable, its filter is unsupported,
+/// or its dimensions are degenerate.  The caller must skip the image in that
+/// case rather than blit it without a mask.
 fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<Vec<u8>> {
     let obj = doc.get_object(id).ok()?;
     let stream = obj.as_stream().ok()?;
 
+    let w_raw = stream.dict.get_i64(b"Width")?;
+    let h_raw = stream.dict.get_i64(b"Height")?;
+    if w_raw <= 0 || h_raw <= 0 || w_raw > 65536 || h_raw > 65536 {
+        log::debug!("image: SMask degenerate dimensions {w_raw}×{h_raw}, skipping");
+        return None;
+    }
     #[expect(
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation,
-        reason = "SMask Width/Height validated positive and ≤ image dims (already validated ≤ 65536)"
+        reason = "w_raw and h_raw validated > 0 and ≤ 65536 above; safe to cast to u32"
     )]
-    let (sm_w, sm_h) = (
-        stream.dict.get_i64(b"Width")? as u32,
-        stream.dict.get_i64(b"Height")? as u32,
-    );
+    let (sm_w, sm_h) = (w_raw as u32, h_raw as u32);
 
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
+    let bpc = stream.dict.get_i64(b"BitsPerComponent").unwrap_or(8);
 
-    let raw: Vec<u8> = match filter.as_deref() {
-        None => stream.content.clone(),
-        Some("FlateDecode") => stream.decompressed_content().ok()?,
+    // Decode the compressed stream to a raw byte buffer, then interpret by bpc.
+    // CCITTFaxDecode is handled separately because decode_ccitt returns Mask-space
+    // (0x00 = paint, 0xFF = transparent), which must be inverted to alpha-space.
+    let alpha: Vec<u8> = match filter.as_deref() {
         Some("CCITTFaxDecode") => {
             let parms = stream.dict.get(b"DecodeParms").ok();
             let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, true, parms)?;
-            // decode_ccitt returns Mask-space; convert to alpha: 0x00 mask → opaque (0xFF alpha)
-            let alpha = sm_desc
+            // Mask-space polarity: 0x00 = fill (opaque in alpha) ↔ 0xFF = skip (transparent).
+            sm_desc
                 .data
                 .iter()
                 .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
-                .collect();
-            // Resize to match image dimensions if needed (simple nearest-neighbour).
-            return Some(scale_smask(alpha, sm_w, sm_h, img_w, img_h));
+                .collect()
         }
         Some("JBIG2Decode") => {
             log::debug!("image: SMask filter \"JBIG2Decode\" not yet supported");
@@ -199,39 +208,59 @@ fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<
             log::debug!("image: SMask filter {other:?} not yet supported");
             return None;
         }
-    };
-
-    let bpc = stream.dict.get_i64(b"BitsPerComponent").unwrap_or(8);
-
-    // Decode raw bytes to one-byte-per-pixel alpha.
-    let alpha: Vec<u8> = match bpc {
-        1 => {
-            // Expand 1bpp to 8bpp; 1-bit = opaque (0xFF), 0-bit = transparent (0x00).
-            let cols = usize::try_from(sm_w).ok()?;
-            let rows = usize::try_from(sm_h).ok()?;
-            let row_bytes = cols.div_ceil(8);
-            let mut out = Vec::with_capacity(cols * rows);
-            for row in raw.chunks(row_bytes) {
-                for x in 0..cols {
-                    let byte = row.get(x / 8).copied().unwrap_or(0);
-                    let bit = (byte >> (7 - (x % 8))) & 1;
-                    out.push(if bit == 1 { 0xFF } else { 0x00 });
+        // Raw or FlateDecode: decode to bytes then interpret via bpc.
+        filter_opt => {
+            let raw: Vec<u8> = match filter_opt {
+                None => stream.content.clone(),
+                Some("FlateDecode") => stream.decompressed_content().ok()?,
+                _ => unreachable!("matched above"),
+            };
+            match bpc {
+                1 => expand_smask_1bpp(&raw, sm_w, sm_h)?,
+                8 => raw,
+                other => {
+                    log::debug!("image: SMask {other} bpc not yet supported");
+                    return None;
                 }
             }
-            out
-        }
-        8 => raw,
-        other => {
-            log::debug!("image: SMask {other} bpc not yet supported");
-            return None;
         }
     };
 
     Some(scale_smask(alpha, sm_w, sm_h, img_w, img_h))
 }
 
-/// Nearest-neighbour resize of a flat grayscale buffer from `(sw, sh)` to `(dw, dh)`.
+/// Expand a 1-bit-per-pixel packed `SMask` buffer to one byte per pixel.
+///
+/// Bit 1 (MSB-first) = opaque (0xFF); bit 0 = transparent (0x00).
+/// Truncated rows are defensively treated as all-transparent (0-bit padding).
+/// Returns `None` if `sm_w × sm_h` overflows `usize`.
+fn expand_smask_1bpp(raw: &[u8], sm_w: u32, sm_h: u32) -> Option<Vec<u8>> {
+    let cols = usize::try_from(sm_w).ok()?;
+    let rows = usize::try_from(sm_h).ok()?;
+    let total = cols.checked_mul(rows)?;
+    let row_bytes = cols.div_ceil(8);
+    let mut out = Vec::with_capacity(total);
+    for row in raw.chunks(row_bytes) {
+        for x in 0..cols {
+            let byte = row.get(x / 8).copied().unwrap_or(0);
+            let bit = (byte >> (7 - (x % 8))) & 1;
+            out.push(if bit != 0 { 0xFF } else { 0x00 });
+        }
+    }
+    Some(out)
+}
+
+/// Nearest-neighbour resample of a flat grayscale `src` buffer from `(sw×sh)`
+/// to `(dw×dh)`.  Returns `src` unchanged when dimensions already match.
+///
+/// Precondition: `dw > 0` and `dh > 0` (callers must ensure this; both are
+/// validated as part of image-dimension checks before `decode_smask` is called).
+/// `src` should have exactly `sw * sh` bytes; extra bytes are ignored.
 fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    // Guard against degenerate output dimensions that would cause division-by-zero.
+    if dw == 0 || dh == 0 {
+        return Vec::new();
+    }
     if sw == dw && sh == dh {
         return src;
     }
@@ -241,12 +270,16 @@ fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let dst_h = u64::from(dh);
     let mut out = Vec::with_capacity(usize::try_from(dst_w * dst_h).unwrap_or(0));
     for dy in 0..dh {
-        #[expect(clippy::cast_possible_truncation, reason = "nearest-neighbour: result ≤ sh-1")]
+        // sy = floor(dy * src_h / dst_h); since dy < dst_h, result < src_h ≤ u32::MAX.
+        #[expect(clippy::cast_possible_truncation, reason = "dy < dst_h ⟹ sy < src_h ≤ 65536")]
         let sy = (u64::from(dy) * src_h / dst_h) as u32;
         for dx in 0..dw {
-            #[expect(clippy::cast_possible_truncation, reason = "nearest-neighbour: result ≤ sw-1")]
+            // sx = floor(dx * src_w / dst_w); since dx < dst_w, result < src_w ≤ u32::MAX.
+            #[expect(clippy::cast_possible_truncation, reason = "dx < dst_w ⟹ sx < src_w ≤ 65536")]
             let sx = (u64::from(dx) * src_w / dst_w) as u32;
-            #[expect(clippy::cast_possible_truncation, reason = "sy*sw+sx ≤ sw*sh ≤ u32::MAX for validated dims")]
+            // sy * src_w + sx < src_h * src_w ≤ 65536² = 2³², fits in usize on any target
+            // (pdf_interp only runs on 32-bit+ systems; usize is at least 32 bits).
+            #[expect(clippy::cast_possible_truncation, reason = "index < src_h*src_w ≤ 65536² = 4G; usize ≥ 32 bits")]
             out.push(src[(u64::from(sy) * src_w + u64::from(sx)) as usize]);
         }
     }
