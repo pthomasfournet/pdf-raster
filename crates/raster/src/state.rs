@@ -462,6 +462,22 @@ pub struct TransferSet<'a> {
 }
 
 impl TransferSet<'_> {
+    /// Return `true` if all three RGB transfer tables are the identity `v → v`.
+    ///
+    /// Used by the AA fast path to skip the transfer step entirely when it would
+    /// be a no-op.  Checking pointer equality against the static identity table
+    /// is O(1) and covers the common case; a full element-by-element comparison
+    /// is the fallback for non-static tables that happen to be identity.
+    #[must_use]
+    pub fn is_identity_rgb(&self) -> bool {
+        use color::TransferLut;
+        let id = TransferLut::IDENTITY.as_array();
+        self.rgb.iter().all(|lut| {
+            // Fast path: same pointer (static identity table).
+            std::ptr::eq(*lut, id) || *lut == id
+        })
+    }
+
     /// Return a `TransferSet` backed by identity (pass-through) arrays.
     ///
     /// Useful in tests and for the initial no-transfer state.

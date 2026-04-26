@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 
 use crate::pipe::{self, PipeSrc, PipeState};
+use crate::simd::composite_aa_rgb8_opaque;
 use crate::types::BlendMode;
 use color::Pixel;
 use color::convert::div255;
@@ -65,7 +66,24 @@ pub(crate) fn render_span_aa<P: Pixel>(
     match src {
         PipeSrc::Solid(color) => {
             debug_assert_eq!(color.len(), ncomps);
-            // Read colour directly from the fixed slice — no allocation.
+
+            // Fast path: solid RGB source, no alpha plane, identity transfer.
+            // composite_aa_rgb8_opaque processes 16 pixels/iter via [u16;16] lanes
+            // that LLVM auto-vectorizes into AVX2/AVX-512.
+            if dst_alpha.is_none()
+                && ncomps == 3
+                && pipe.transfer.is_identity_rgb()
+            {
+                composite_aa_rgb8_opaque(
+                    dst_pixels,
+                    [color[0], color[1], color[2]],
+                    pipe.a_input,
+                    shape,
+                );
+                return;
+            }
+
+            // General solid path: read colour directly — no allocation.
             render_span_aa_inner(
                 pipe,
                 |_i| color,

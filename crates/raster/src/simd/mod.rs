@@ -20,6 +20,6 @@ pub mod glyph_unpack;
 pub mod popcnt;
 
 pub use blend::{blend_solid_gray8, blend_solid_rgb8};
-pub use composite::composite_aa_rgb8;
+pub use composite::{composite_aa_rgb8, composite_aa_rgb8_opaque};
 pub use glyph_unpack::unpack_mono_row;
 pub use popcnt::popcnt_aa_row;
