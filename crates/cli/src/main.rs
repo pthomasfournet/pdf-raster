@@ -9,7 +9,7 @@ use clap::Parser;
 use rayon::prelude::*;
 
 use args::Args;
-use pdf_bridge::{Document, install_log_callback};
+use pdf_bridge::{Document as PopplerDoc, install_log_callback};
 
 fn main() {
     // Silence poppler's stderr before opening any document.  Must come first.
@@ -25,26 +25,114 @@ fn main() {
         .build()
         .expect("failed to build thread pool");
 
-    // Open the PDF document.
-    let doc = Document::from_file(
-        &args.input,
-        args.owner_password.as_deref(),
-        args.user_password.as_deref(),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("pdf-raster: {e}");
-        std::process::exit(1);
-    });
+    // ── Document opening ──────────────────────────────────────────────────────
 
-    let total = doc.page_count();
-    if total <= 0 {
-        eprintln!("pdf-raster: document has no pages");
-        std::process::exit(1);
+    // For the native path, open with lopdf.  For the poppler path, open with
+    // pdf_bridge.  We always silence poppler callbacks regardless of the path
+    // because the install_log_callback call above is harmless.
+
+    let total: i32;
+    let pages: Vec<i32>;
+
+    if args.native {
+        let doc = pdf_interp::open(&args.input).unwrap_or_else(|e| {
+            eprintln!("pdf-raster: failed to open PDF: {e}");
+            std::process::exit(1);
+        });
+
+        let n = pdf_interp::page_count(&doc);
+        if n == 0 {
+            eprintln!("pdf-raster: document has no pages");
+            std::process::exit(1);
+        }
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "n ≤ u32::MAX; real documents have far fewer pages than i32::MAX"
+        )]
+        let n_i32 = n as i32;
+        total = n_i32;
+
+        pages = build_page_list(total, &args);
+        if pages.is_empty() {
+            eprintln!("pdf-raster: no pages match the requested range and filter");
+            std::process::exit(1);
+        }
+
+        let n_pages = pages.len();
+        let done = AtomicU32::new(0);
+        let start = Instant::now();
+
+        // total ≥ 1 (checked above) and ≤ u32::MAX (pdf_interp::page_count returns u32).
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "total validated ≥ 1 and ≤ i32::MAX above; cast to u32 is safe"
+        )]
+        let total_u32 = total as u32;
+
+        let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
+            pages
+                .par_iter()
+                .filter_map(|&page_num| {
+                    // page_num ≥ 1 (enforced by build_page_list).
+                    #[expect(
+                        clippy::cast_sign_loss,
+                        reason = "page_num ≥ 1; safe to cast to u32"
+                    )]
+                    let page_u32 = page_num as u32;
+                    let result =
+                        render::render_page_native(&doc, page_u32, total_u32, &args);
+                    report_progress(&args, &done, n_pages, &start, page_num);
+                    result.err().map(|e| (page_num, e))
+                })
+                .collect()
+        });
+
+        report_errors_and_exit(errors);
+    } else {
+        let doc = PopplerDoc::from_file(
+            &args.input,
+            args.owner_password.as_deref(),
+            args.user_password.as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("pdf-raster: {e}");
+            std::process::exit(1);
+        });
+
+        total = doc.page_count();
+        if total <= 0 {
+            eprintln!("pdf-raster: document has no pages");
+            std::process::exit(1);
+        }
+
+        pages = build_page_list(total, &args);
+        if pages.is_empty() {
+            eprintln!("pdf-raster: no pages match the requested range and filter");
+            std::process::exit(1);
+        }
+
+        let n_pages = pages.len();
+        let done = AtomicU32::new(0);
+        let start = Instant::now();
+
+        let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
+            pages
+                .par_iter()
+                .filter_map(|&page_num| {
+                    let result =
+                        render::render_page_poppler(&doc, page_num, total, &args);
+                    report_progress(&args, &done, n_pages, &start, page_num);
+                    result.err().map(|e| (page_num, e))
+                })
+                .collect()
+        });
+
+        report_errors_and_exit(errors);
     }
+}
 
-    // Resolve page range (1-based inclusive).
-    // Clamp silently would hide user mistakes, so warn when the requested
-    // range exceeds the document.
+/// Build the filtered, clamped list of 1-based page numbers to render.
+fn build_page_list(total: i32, args: &Args) -> Vec<i32> {
     let requested_first = args.first_page;
     let requested_last = args.last_page.unwrap_or(total);
 
@@ -65,8 +153,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Collect page numbers to render, applying odd/even filter.
-    let pages: Vec<i32> = (first..=last)
+    (first..=last)
         .filter(|&p| match (args.odd_only, args.even_only) {
             (true, false) => p % 2 == 1,
             (false, true) => p % 2 == 0,
@@ -74,70 +161,50 @@ fn main() {
             (true, true) | (false, false) => true,
         })
         .take(if args.single_file { 1 } else { usize::MAX })
-        .collect();
+        .collect()
+}
 
-    if pages.is_empty() {
-        eprintln!("pdf-raster: no pages match the requested range and filter");
-        std::process::exit(1);
+/// Print per-page progress to stderr if `--progress` was requested.
+fn report_progress(
+    args: &Args,
+    done: &AtomicU32,
+    n_pages: usize,
+    start: &Instant,
+    page_num: i32,
+) {
+    if !args.progress {
+        return;
     }
+    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = f64::from(completed) / elapsed;
+    let remaining = n_pages - completed as usize;
+    if rate > 0.0 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "ETA display; ±1s accuracy is sufficient"
+        )]
+        let eta_s = remaining as f64 / rate;
+        eprintln!(
+            "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
+             {elapsed:.1}s elapsed  ~{eta_s:.1}s remaining"
+        );
+    } else {
+        eprintln!("pdf-raster: page {page_num} done  [{completed}/{n_pages}]");
+    }
+}
 
-    // Render pages in parallel and collect failures.
-    // Errors are printed immediately by the collecting thread after the
-    // parallel section so output ordering is deterministic.
-    let n_pages = pages.len();
-    let done = AtomicU32::new(0);
-    let start = Instant::now();
-
-    let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
-        pages
-            .par_iter()
-            .filter_map(|&page_num| {
-                let result = render::render_page(&doc, page_num, total, &args);
-
-                if args.progress {
-                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    let elapsed = start.elapsed().as_secs_f64();
-                    // Rate is pages per second; guard against division by zero
-                    // and the first-page estimate being wildly off.
-                    let rate = f64::from(completed) / elapsed;
-                    let remaining = n_pages - completed as usize;
-                    if rate > 0.0 && completed > 0 {
-                        // remaining ≤ n_pages which is bounded by i32::MAX in practice;
-                        // precision loss is irrelevant for an ETA display.
-                        #[expect(
-                            clippy::cast_precision_loss,
-                            reason = "ETA display; ±1s accuracy is sufficient"
-                        )]
-                        let eta_s = remaining as f64 / rate;
-                        eprintln!(
-                            "pdf-raster: page {page_num} done  \
-                             [{completed}/{n_pages}]  \
-                             {elapsed:.1}s elapsed  \
-                             ~{eta_s:.1}s remaining"
-                        );
-                    } else {
-                        eprintln!("pdf-raster: page {page_num} done  [{completed}/{n_pages}]");
-                    }
-                }
-
-                result.err().map(|e| (page_num, e))
-            })
-            .collect()
-    });
-
-    // Report all failures; sort by page number for a predictable order.
-    let mut errors = errors;
+/// Print all render errors sorted by page number, then exit with status 1.
+fn report_errors_and_exit(mut errors: Vec<(i32, render::RenderError)>) {
     errors.sort_by_key(|(p, _)| *p);
     for (page, err) in &errors {
         eprintln!("pdf-raster: page {page}: {err}");
-        // Walk the error chain to surface the root cause.
         let mut src = std::error::Error::source(err);
         while let Some(cause) = src {
             eprintln!("  caused by: {cause}");
             src = cause.source();
         }
     }
-
     if !errors.is_empty() {
         std::process::exit(1);
     }

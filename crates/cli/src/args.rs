@@ -158,6 +158,14 @@ pub struct Args {
     #[arg(long = "forcenum", value_name = "DIGITS")]
     pub force_num_digits: Option<usize>,
 
+    // ── Renderer ──────────────────────────────────────────────────────────────
+    /// Use the native Rust renderer instead of poppler.
+    ///
+    /// The native renderer does not depend on libpoppler.  It is under active
+    /// development; complex documents may render differently from poppler.
+    #[arg(long = "native", default_value_t = false)]
+    pub native: bool,
+
     // ── Progress ─────────────────────────────────────────────────────────────
     /// Print progress to stderr: pages done, elapsed time, and ETA.
     #[arg(short = 'P', long = "progress", default_value_t = false)]
