@@ -10,10 +10,17 @@
 //!    `c_result = ((a_result - a_src) * c_dst + a_src * c_src) / a_result`.
 //!    Then apply transfer LUT.
 
+use std::cell::RefCell;
+
 use crate::pipe::{self, PipeSrc, PipeState};
 use crate::types::BlendMode;
 use color::Pixel;
 use color::convert::div255;
+
+// Per-thread scratch buffer for pattern spans — grow-never-shrink, zero per-span alloc.
+thread_local! {
+    static PAT_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Composite a span with per-pixel shape (AA coverage) bytes.
 ///
@@ -53,44 +60,52 @@ pub(crate) fn render_span_aa<P: Pixel>(
     debug_assert_eq!(shape.len(), count, "shape length must equal pixel count");
     debug_assert_eq!(dst_pixels.len(), count * ncomps);
 
-    // Resolve pattern into a scratch buffer if needed.
-    let src_buf_storage;
-    let src_pixels: &[u8] = match src {
-        PipeSrc::Solid(color) => {
-            debug_assert_eq!(color.len(), ncomps);
-            // Repeat the solid colour into a scratch buffer so the inner loop
-            // can be written uniformly.  For large spans this is a minor cost;
-            // for the simple case (a_src==255 everywhere) the loop fast-paths anyway.
-            src_buf_storage = color
-                .iter()
-                .cycle()
-                .take(count * ncomps)
-                .copied()
-                .collect::<Vec<_>>();
-            &src_buf_storage
-        }
-        PipeSrc::Pattern(pat) => {
-            let mut buf = vec![0u8; count * ncomps];
-            pat.fill_span(y, x0, x1, &mut buf);
-            src_buf_storage = buf;
-            &src_buf_storage
-        }
-    };
-
     let a_input = u32::from(pipe.a_input);
 
+    match src {
+        PipeSrc::Solid(color) => {
+            debug_assert_eq!(color.len(), ncomps);
+            // Read the solid colour directly — no allocation.
+            render_span_aa_solid(pipe, color, dst_pixels, dst_alpha, shape, count, ncomps, a_input);
+        }
+        PipeSrc::Pattern(pat) => {
+            // Fill the thread-local scratch buffer with pattern pixels — one allocation
+            // ever per thread, grown as needed, never shrunk.
+            PAT_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.resize(count * ncomps, 0);
+                pat.fill_span(y, x0, x1, &mut buf);
+                render_span_aa_pixels(pipe, &buf, dst_pixels, dst_alpha, shape, count, ncomps, a_input);
+            });
+        }
+    }
+}
+
+/// Inner loop for the solid-source AA path.
+///
+/// Reads source colour directly from the fixed `color` slice — no intermediate buffer.
+#[inline]
+#[expect(clippy::too_many_arguments, reason = "all params are necessary; extracted to avoid duplication with pattern path")]
+fn render_span_aa_solid(
+    pipe: &PipeState<'_>,
+    color: &[u8],
+    dst_pixels: &mut [u8],
+    dst_alpha: Option<&mut [u8]>,
+    shape: &[u8],
+    count: usize,
+    ncomps: usize,
+    a_input: u32,
+) {
     match dst_alpha {
         Some(dst_alpha) => {
-            debug_assert_eq!(dst_alpha.len(), count);
             for i in 0..count {
                 let shape_v = u32::from(shape[i]);
                 let a_src = u32::from(div255(a_input * shape_v));
                 let a_dst = u32::from(dst_alpha[i]);
 
                 let (a_result, fully_opaque_src) = if a_src == 255 {
-                    (255u32, true) // fully opaque: skip read-back, copy src directly
+                    (255u32, true)
                 } else if a_src == 0 && a_dst == 0 {
-                    // Transparent source over transparent dest: zero output.
                     let base = i * ncomps;
                     dst_pixels[base..base + ncomps].fill(0);
                     dst_alpha[i] = 0;
@@ -101,18 +116,14 @@ pub(crate) fn render_span_aa<P: Pixel>(
                 };
 
                 let base = i * ncomps;
-                let src_px = &src_pixels[base..base + ncomps];
                 let dst_px = &mut dst_pixels[base..base + ncomps];
 
                 if fully_opaque_src {
-                    // Full coverage: transfer src directly without blending.
-                    pipe::apply_transfer_pixel(pipe, src_px, dst_px);
+                    pipe::apply_transfer_pixel(pipe, color, dst_px);
                 } else {
-                    // Partial coverage: blend src over dst, then apply transfer.
                     for j in 0..ncomps {
-                        let c_src = u32::from(src_px[j]);
+                        let c_src = u32::from(color[j]);
                         let c_dst = u32::from(dst_px[j]);
-                        // ((a_result - a_src) * c_dst + a_src * c_src) / a_result
                         let blended = ((a_result - a_src) * c_dst + a_src * c_src) / a_result;
                         #[expect(
                             clippy::cast_possible_truncation,
@@ -134,17 +145,92 @@ pub(crate) fn render_span_aa<P: Pixel>(
             }
         }
         None => {
-            // No separate alpha plane (Mono8 without alpha, or opaque bitmaps).
-            // aDest is implicitly 0xFF; the compositing formula simplifies.
             for (i, &sh) in shape.iter().enumerate().take(count) {
                 let shape_v = u32::from(sh);
                 let a_src = u32::from(div255(a_input * shape_v));
-                // aDest = 255; alpha2 = aResult = 255
+                let base = i * ncomps;
+                let dst_px = &mut dst_pixels[base..base + ncomps];
+                for j in 0..ncomps {
+                    let blended =
+                        div255((255 - a_src) * u32::from(dst_px[j]) + a_src * u32::from(color[j]));
+                    dst_px[j] = blended;
+                }
+                pipe::apply_transfer_in_place(pipe, dst_px);
+            }
+        }
+    }
+}
+
+/// Inner loop for the pattern-source AA path — `src_pixels` is the pre-filled
+/// pattern buffer (reused thread-local scratch, length = count * ncomps).
+#[inline]
+#[expect(clippy::too_many_arguments, reason = "all params are necessary; extracted to avoid duplication with solid path")]
+fn render_span_aa_pixels(
+    pipe: &PipeState<'_>,
+    src_pixels: &[u8],
+    dst_pixels: &mut [u8],
+    dst_alpha: Option<&mut [u8]>,
+    shape: &[u8],
+    count: usize,
+    ncomps: usize,
+    a_input: u32,
+) {
+    match dst_alpha {
+        Some(dst_alpha) => {
+            for i in 0..count {
+                let shape_v = u32::from(shape[i]);
+                let a_src = u32::from(div255(a_input * shape_v));
+                let a_dst = u32::from(dst_alpha[i]);
+
+                let (a_result, fully_opaque_src) = if a_src == 255 {
+                    (255u32, true)
+                } else if a_src == 0 && a_dst == 0 {
+                    let base = i * ncomps;
+                    dst_pixels[base..base + ncomps].fill(0);
+                    dst_alpha[i] = 0;
+                    continue;
+                } else {
+                    let ar = a_src + a_dst - u32::from(div255(a_src * a_dst));
+                    (ar, false)
+                };
+
                 let base = i * ncomps;
                 let src_px = &src_pixels[base..base + ncomps];
                 let dst_px = &mut dst_pixels[base..base + ncomps];
 
-                // c_result = div255((255 - a_src) * c_dst + a_src * c_src)
+                if fully_opaque_src {
+                    pipe::apply_transfer_pixel(pipe, src_px, dst_px);
+                } else {
+                    for j in 0..ncomps {
+                        let c_src = u32::from(src_px[j]);
+                        let c_dst = u32::from(dst_px[j]);
+                        let blended = ((a_result - a_src) * c_dst + a_src * c_src) / a_result;
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "blended = (weighted sum) / a_result ≤ 255"
+                        )]
+                        {
+                            dst_px[j] = blended as u8;
+                        }
+                    }
+                    pipe::apply_transfer_in_place(pipe, dst_px);
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a_result is clamped via Porter-Duff; ≤ 255"
+                )]
+                {
+                    dst_alpha[i] = a_result as u8;
+                }
+            }
+        }
+        None => {
+            for (i, &sh) in shape.iter().enumerate().take(count) {
+                let shape_v = u32::from(sh);
+                let a_src = u32::from(div255(a_input * shape_v));
+                let base = i * ncomps;
+                let src_px = &src_pixels[base..base + ncomps];
+                let dst_px = &mut dst_pixels[base..base + ncomps];
                 for j in 0..ncomps {
                     let blended =
                         div255((255 - a_src) * u32::from(dst_px[j]) + a_src * u32::from(src_px[j]));

@@ -4,11 +4,18 @@
 //! Mono1 is excluded: 1-bit packed bitmaps require bit-level addressing that
 //! belongs in the fill/stroke caller, not a generic span function.
 
+use std::cell::RefCell;
+
 use crate::pipe::{self, PipeSrc, PipeState};
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
 use crate::simd;
 use crate::types::BlendMode;
 use color::Pixel;
+
+// Per-thread scratch buffer for pattern spans — grow-never-shrink.
+thread_local! {
+    static PAT_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Write `x1 - x0 + 1` pixels of solid source colour directly into the
 /// destination row, applying the transfer function.  Destination alpha is
@@ -74,15 +81,15 @@ pub(crate) fn render_span_simple<P: Pixel>(
             }
         }
         PipeSrc::Pattern(pat) => {
-            // For static patterns, sample once and replicate.
-            // For dynamic patterns, sample the whole span at once.
-            let mut pat_buf = vec![0u8; count * ncomps];
-            pat.fill_span(y, x0, x1, &mut pat_buf);
-            // Apply transfer to each pixel.
-            for chunk in pat_buf.chunks_exact_mut(ncomps) {
-                pipe::apply_transfer_in_place(pipe, chunk);
-            }
-            dst_pixels.copy_from_slice(&pat_buf);
+            PAT_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.resize(count * ncomps, 0);
+                pat.fill_span(y, x0, x1, &mut buf);
+                for chunk in buf[..count * ncomps].chunks_exact_mut(ncomps) {
+                    pipe::apply_transfer_in_place(pipe, chunk);
+                }
+                dst_pixels.copy_from_slice(&buf[..count * ncomps]);
+            });
         }
     }
 

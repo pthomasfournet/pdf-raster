@@ -15,12 +15,19 @@
 //! For blend mode `Normal`, `blend(c_src, c_dst) = c_src` so the formula reduces
 //! to the standard Porter-Duff over.
 
+use std::cell::RefCell;
+
 use crate::pipe::{PipeSrc, PipeState, blend};
 use crate::types::BlendMode;
 use color::Pixel;
 use color::convert::div255;
 
 const MAX_COMPS: usize = 8; // DeviceN8: 4 CMYK + 4 spot = 8 bytes
+
+// Per-thread scratch buffer for pattern spans — grow-never-shrink.
+thread_local! {
+    static PAT_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// General-purpose compositing span function.
 ///
@@ -29,10 +36,6 @@ const MAX_COMPS: usize = 8; // DeviceN8: 4 CMYK + 4 spot = 8 bytes
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors C++ SplashPipe API; all parameters are necessary"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "compositing formula has many branches that cannot be meaningfully split"
 )]
 pub(crate) fn render_span_general<P: Pixel>(
     pipe: &PipeState<'_>,
@@ -56,19 +59,6 @@ pub(crate) fn render_span_general<P: Pixel>(
         debug_assert_eq!(sh.len(), count);
     }
 
-    // Resolve source pixels into a buffer.
-    let src_buf: Vec<u8> = match src {
-        PipeSrc::Solid(color) => {
-            debug_assert_eq!(color.len(), ncomps);
-            color.iter().cycle().take(count * ncomps).copied().collect()
-        }
-        PipeSrc::Pattern(pat) => {
-            let mut buf = vec![0u8; count * ncomps];
-            pat.fill_span(y, x0, x1, &mut buf);
-            buf
-        }
-    };
-
     let a_input = u32::from(pipe.a_input);
     let is_nonseparable = matches!(
         pipe.blend_mode,
@@ -81,11 +71,59 @@ pub(crate) fn render_span_general<P: Pixel>(
     let soft_mask_at = |i: usize| pipe.soft_mask.map_or(0xFFu8, |s| s[i]);
     let alpha0_at = |i: usize| pipe.alpha0.map(|a| a[i]);
 
+    match src {
+        PipeSrc::Solid(color) => {
+            debug_assert_eq!(color.len(), ncomps);
+            render_span_general_inner(
+                pipe, color, true, dst_pixels, dst_alpha, shape,
+                count, ncomps, a_input, is_nonseparable, is_cmyk_like,
+                &shape_at, &soft_mask_at, &alpha0_at,
+            );
+        }
+        PipeSrc::Pattern(pat) => {
+            PAT_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.resize(count * ncomps, 0);
+                pat.fill_span(y, x0, x1, &mut buf);
+                render_span_general_inner(
+                    pipe, &buf, false, dst_pixels, dst_alpha, shape,
+                    count, ncomps, a_input, is_nonseparable, is_cmyk_like,
+                    &shape_at, &soft_mask_at, &alpha0_at,
+                );
+            });
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "all params necessary; extracted to avoid code duplication")]
+#[expect(clippy::too_many_lines, reason = "compositing formula has many branches that cannot be meaningfully split")]
+fn render_span_general_inner(
+    pipe: &PipeState<'_>,
+    src_buf: &[u8],
+    src_is_solid: bool,
+    dst_pixels: &mut [u8],
+    dst_alpha: Option<&mut [u8]>,
+    shape: Option<&[u8]>,
+    count: usize,
+    ncomps: usize,
+    a_input: u32,
+    is_nonseparable: bool,
+    is_cmyk_like: bool,
+    shape_at: &dyn Fn(usize) -> u8,
+    soft_mask_at: &dyn Fn(usize) -> u8,
+    alpha0_at: &dyn Fn(usize) -> Option<u8>,
+) {
+    // For solid sources, every pixel uses the same src_buf[0..ncomps].
+    // For patterns, pixel i uses src_buf[i*ncomps..(i+1)*ncomps].
+    let src_px_at = |i: usize| -> &[u8] {
+        if src_is_solid { &src_buf[..ncomps] } else { &src_buf[i * ncomps..(i + 1) * ncomps] }
+    };
+
     match dst_alpha {
         Some(dst_alpha) => {
             debug_assert_eq!(dst_alpha.len(), count);
             for i in 0..count {
-                let src_px = &src_buf[i * ncomps..(i + 1) * ncomps];
+                let src_px = src_px_at(i);
                 let dst_px = &mut dst_pixels[i * ncomps..(i + 1) * ncomps];
                 let a_dst = u32::from(dst_alpha[i]);
                 let shape_v = u32::from(shape_at(i));
@@ -199,7 +237,7 @@ pub(crate) fn render_span_general<P: Pixel>(
             // No separate alpha plane: aDest = 0xFF implicitly.
             // Simplifies: aResult = aSrc + 255 - div255(aSrc * 255) = 255, alpha_i = 255.
             for i in 0..count {
-                let src_px = &src_buf[i * ncomps..(i + 1) * ncomps];
+                let src_px = src_px_at(i);
                 let dst_px = &mut dst_pixels[i * ncomps..(i + 1) * ncomps];
                 let shape_v = u32::from(shape_at(i));
                 let soft_v = u32::from(soft_mask_at(i));
