@@ -92,40 +92,9 @@ mod tests {
     use crate::bitmap::Bitmap;
     use crate::clip::Clip;
     use crate::path::PathBuilder;
-    use crate::pipe::PipeState;
     use crate::shading::axial::AxialPattern;
-    use crate::state::TransferSet;
-    use crate::types::BlendMode;
+    use crate::testutil::{identity_matrix, rect_path, simple_pipe};
     use color::Rgb8;
-
-    fn identity_matrix() -> [f64; 6] {
-        [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-    }
-
-    fn simple_pipe() -> PipeState<'static> {
-        PipeState {
-            blend_mode: BlendMode::Normal,
-            a_input: 255,
-            overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
-            transfer: TransferSet::identity_rgb(),
-            soft_mask: None,
-            alpha0: None,
-            knockout: false,
-            knockout_opacity: 255,
-            non_isolated_group: false,
-        }
-    }
-
-    fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
-        let mut b = PathBuilder::new();
-        b.move_to(x0, y0).unwrap();
-        b.line_to(x1, y0).unwrap();
-        b.line_to(x1, y1).unwrap();
-        b.line_to(x0, y1).unwrap();
-        b.close(true).unwrap();
-        b.build()
-    }
 
     #[test]
     fn shaded_fill_axial_paints_interior() {

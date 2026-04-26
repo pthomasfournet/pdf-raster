@@ -28,6 +28,8 @@ use std::borrow::Cow;
 
 use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
 use lopdf::{Dictionary, Document, Object, ObjectId};
+
+use crate::resources::dict_ext::DictExt;
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace as ZColorSpace;
 use zune_core::options::DecoderOptions;
@@ -82,12 +84,12 @@ pub fn resolve_image(
     let stream = obj.as_stream().ok()?;
 
     // Must be an Image subtype.
-    if stream.dict.get(b"Subtype").ok()?.as_name().ok()? != b"Image" {
+    if stream.dict.get_name(b"Subtype")? != b"Image" {
         return None;
     }
 
-    let w_raw = stream.dict.get(b"Width").ok()?.as_i64().ok()?;
-    let h_raw = stream.dict.get(b"Height").ok()?.as_i64().ok()?;
+    let w_raw = stream.dict.get_i64(b"Width")?;
+    let h_raw = stream.dict.get_i64(b"Height")?;
     if w_raw <= 0 || h_raw <= 0 || w_raw > 65536 || h_raw > 65536 {
         log::warn!("image: degenerate dimensions {w_raw}×{h_raw}, skipping");
         return None;
@@ -99,12 +101,7 @@ pub fn resolve_image(
     )]
     let (w, h) = (w_raw as u32, h_raw as u32);
 
-    let is_mask = stream
-        .dict
-        .get(b"ImageMask")
-        .ok()
-        .and_then(|o| o.as_bool().ok())
-        .unwrap_or(false);
+    let is_mask = stream.dict.get_bool(b"ImageMask").unwrap_or(false);
 
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
 
@@ -195,11 +192,7 @@ fn decode_raw(
     is_mask: bool,
     dict: &Dictionary,
 ) -> Option<ImageDescriptor> {
-    let bpc = dict
-        .get(b"BitsPerComponent")
-        .ok()
-        .and_then(|o| o.as_i64().ok())
-        .unwrap_or(8);
+    let bpc = dict.get_i64(b"BitsPerComponent").unwrap_or(8);
 
     let cs = if is_mask {
         ImageColorSpace::Mask
@@ -296,16 +289,10 @@ fn decode_ccitt(
     // Resolve DecodeParms once; both K and BlackIs1 live in the same dict.
     let parms_dict = parms.and_then(|o| o.as_dict().ok());
 
-    let k = parms_dict
-        .and_then(|d| d.get(b"K").ok())
-        .and_then(|o| o.as_i64().ok())
-        .unwrap_or(0);
+    let k = parms_dict.and_then(|d| d.get_i64(b"K")).unwrap_or(0);
 
     // BlackIs1: when true, 1-bits encode black (the reverse of the default).
-    let black_is_1 = parms_dict
-        .and_then(|d| d.get(b"BlackIs1").ok())
-        .and_then(|o| o.as_bool().ok())
-        .unwrap_or(false);
+    let black_is_1 = parms_dict.and_then(|d| d.get_bool(b"BlackIs1")).unwrap_or(false);
 
     if k >= 0 {
         log::debug!("image: CCITTFaxDecode K={k} (Group 3) not yet implemented");

@@ -1460,31 +1460,9 @@ mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
     use crate::clip::Clip;
-    use crate::pipe::{PipeSrc, PipeState};
-    use crate::state::TransferSet;
-    use crate::types::BlendMode;
+    use crate::pipe::PipeSrc;
+    use crate::testutil::{make_clip, simple_pipe};
     use color::Rgb8;
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
-    fn simple_pipe() -> PipeState<'static> {
-        PipeState {
-            blend_mode: BlendMode::Normal,
-            a_input: 255,
-            overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
-            transfer: TransferSet::identity_rgb(),
-            soft_mask: None,
-            alpha0: None,
-            knockout: false,
-            knockout_opacity: 255,
-            non_isolated_group: false,
-        }
-    }
-
-    fn full_clip(w: u32, h: u32) -> Clip {
-        Clip::new(0.0, 0.0, w as f64 - 0.001, h as f64 - 0.001, false)
-    }
 
     // ── MaskSource / ImageSource stubs ────────────────────────────────────────
 
@@ -1529,7 +1507,7 @@ mod tests {
     #[test]
     fn fill_image_mask_solid_paints_rect() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
         let color = [255u8, 0, 0]; // red
         let src = PipeSrc::Solid(&color);
@@ -1552,7 +1530,7 @@ mod tests {
     #[test]
     fn fill_image_mask_vflip_no_crash() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
         let color = [0u8, 255, 0];
         let src = PipeSrc::Solid(&color);
@@ -1568,7 +1546,7 @@ mod tests {
     #[test]
     fn fill_image_mask_singular_matrix() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
         let color = [0u8, 0, 0];
         let src = PipeSrc::Solid(&color);
@@ -1583,7 +1561,7 @@ mod tests {
     #[test]
     fn draw_image_solid_color() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
 
         let mut img_src = SolidColor { r: 0, g: 0, b: 200 };
@@ -1615,7 +1593,7 @@ mod tests {
     #[test]
     fn draw_image_arbitrary_transform_skipped() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
         let mut img_src = SolidColor {
             r: 100,
@@ -1642,7 +1620,7 @@ mod tests {
     #[test]
     fn draw_image_zero_size() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
         let mut img_src = SolidColor { r: 1, g: 2, b: 3 };
 
@@ -1665,7 +1643,7 @@ mod tests {
     #[test]
     fn draw_image_upsample_2x2_to_4x4() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
 
         let mut img_src = SolidColor {
@@ -1699,7 +1677,7 @@ mod tests {
     #[test]
     fn draw_image_downsample_4x4_to_2x2() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
 
         let mut img_src = SolidColor {
@@ -1731,7 +1709,7 @@ mod tests {
     #[test]
     fn fill_image_mask_checker_partial() {
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 1, false);
-        let clip = full_clip(8, 8);
+        let clip = make_clip(8, 8);
         let pipe = simple_pipe();
         let color = [255u8, 255, 0]; // yellow
         let src = PipeSrc::Solid(&color);
@@ -1812,7 +1790,7 @@ mod tests {
         }
 
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(4, 4, 1, false);
-        let clip = full_clip(4, 4);
+        let clip = make_clip(4, 4);
         let pipe = simple_pipe();
 
         // mat=[2,0,0,-2,0,2]: positive X scale 2, negative Y scale -2 (vflip), translate (0,2).

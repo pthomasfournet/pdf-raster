@@ -25,6 +25,8 @@
 
 use lopdf::{Dictionary, Document, Object};
 
+use crate::resources::dict_ext::DictExt;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// The kind of font outline — used to select `FreeType` hinting flags.
@@ -81,11 +83,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
 // ── Kind classification ───────────────────────────────────────────────────────
 
 fn classify_kind(dict: &Dictionary) -> PdfFontKind {
-    let subtype = dict
-        .get(b"Subtype")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .unwrap_or(b"");
+    let subtype = dict.get_name(b"Subtype").unwrap_or(b"");
 
     match subtype {
         b"Type1" | b"MMType1" => PdfFontKind::Type1,
@@ -169,9 +167,7 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
         reason = "FirstChar is filtered to >= 0 and < 256; safe to cast to u32"
     )]
     let first = dict
-        .get(b"FirstChar")
-        .ok()
-        .and_then(|o| o.as_i64().ok())
+        .get_i64(b"FirstChar")
         .filter(|&v| v >= 0)
         .map_or(0u32, |v| v as u32);
 
@@ -202,11 +198,7 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
 fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: PdfFontKind) -> Vec<u32> {
     // Type 0 / CID composite fonts: the descendant font carries the GID map.
     // For now, return identity — full CMap support is phase 2.
-    let subtype = dict
-        .get(b"Subtype")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .unwrap_or(b"");
+    let subtype = dict.get_name(b"Subtype").unwrap_or(b"");
     if matches!(subtype, b"Type0") {
         return vec![];
     }

@@ -37,6 +37,9 @@ pub mod transparency;
 pub mod types;
 pub mod xpath;
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 #[cfg(feature = "rayon")]
 pub use bitmap::BitmapBand;
 pub use bitmap::{AaBuf, Bitmap};

@@ -406,30 +406,8 @@ pub fn extract_soft_mask<P: Pixel>(group: &GroupBitmap<P>) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::clip::Clip;
-    use crate::pipe::PipeState;
-    use crate::state::TransferSet;
-    use crate::types::BlendMode;
+    use crate::testutil::{make_clip, simple_pipe};
     use color::Rgb8;
-
-    fn make_clip(w: u32, h: u32) -> Clip {
-        Clip::new(0.0, 0.0, f64::from(w) - 0.001, f64::from(h) - 0.001, false)
-    }
-
-    fn opaque_pipe() -> PipeState<'static> {
-        PipeState {
-            blend_mode: BlendMode::Normal,
-            a_input: 255,
-            overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
-            transfer: TransferSet::identity_rgb(),
-            soft_mask: None,
-            alpha0: None,
-            knockout: false,
-            knockout_opacity: 255,
-            non_isolated_group: false,
-        }
-    }
 
     fn default_params(x_min: i32, y_min: i32, x_max: i32, y_max: i32) -> GroupParams {
         GroupParams {
@@ -478,7 +456,7 @@ mod tests {
     fn paint_group_opaque_white_over_black() {
         let mut parent: Bitmap<Rgb8> = Bitmap::new(4, 4, 4, true);
         let clip = make_clip(4, 4);
-        let pipe = opaque_pipe();
+        let pipe = simple_pipe();
 
         let params = default_params(1, 1, 2, 2); // 2×2 group at (1,1)
         let mut group = begin_group::<Rgb8>(&parent, &clip, params);
@@ -566,7 +544,7 @@ mod tests {
         // Set parent pixel (0,0) to blue.
         parent.row_bytes_mut(0)[..3].copy_from_slice(&[0, 0, 255]);
         let clip = make_clip(4, 4);
-        let pipe = opaque_pipe();
+        let pipe = simple_pipe();
         let params = default_params(0, 0, 0, 0); // 1×1 group
         let group = begin_group::<Rgb8>(&parent, &clip, params);
         // group.alpha is all 0 (isolated, not painted into).

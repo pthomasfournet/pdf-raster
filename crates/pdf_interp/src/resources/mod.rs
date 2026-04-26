@@ -14,6 +14,7 @@
 
 pub mod font;
 pub mod image;
+pub(crate) mod dict_ext;
 
 use lopdf::{Document, ObjectId};
 

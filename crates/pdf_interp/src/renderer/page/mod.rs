@@ -4,6 +4,9 @@
 //! over a decoded operator sequence, and calls into the `raster` crate for
 //! each painting operator.
 //!
+//! Sub-modules:
+//! - [`text_ops`] — `GlyphRecord` and `text_to_device`, used by `show_text`.
+//!
 //! # What is implemented
 //!
 //! - Graphics state: `q Q cm w J j M d ri i`
@@ -23,6 +26,10 @@
 //! - Char-to-glyph Differences encoding (phase 2)
 //! - Type 0 / `CIDFont` composite fonts (phase 2)
 //! - Type 3 paint-procedure fonts (phase 2)
+
+mod text_ops;
+
+use self::text_ops::{GlyphRecord, text_to_device};
 
 use lopdf::{Document, ObjectId};
 
@@ -630,7 +637,7 @@ impl<'doc> PageRenderer<'doc> {
 
     /// Execute a `Do` operator: look up and render the named `XObject`.
     ///
-    /// Only image `XObject`s are implemented; form `XObject`s are logged and
+    /// Only image `XObjects` are implemented; form `XObject`s are logged and
     /// skipped until recursive content-stream execution is added.
     fn do_xobject(&mut self, name: &[u8]) {
         let Some(img) = self.resources.image(name) else {
@@ -767,47 +774,6 @@ impl<'doc> PageRenderer<'doc> {
             }
         }
     }
-}
-
-// ── Glyph record ─────────────────────────────────────────────────────────────
-
-/// Holds rasterized glyph data for two-phase text rendering.
-struct GlyphRecord {
-    pen_x: i32,
-    pen_y: i32,
-    x_off: i32,
-    y_off: i32,
-    width: u32,
-    height: u32,
-    aa: bool,
-    data: Vec<u8>,
-}
-
-// ── Coordinate helpers ────────────────────────────────────────────────────────
-
-/// Map a text-space point through the text matrix and CTM to device-pixel
-/// coordinates with y-flip (PDF origin = bottom-left; device origin = top-left).
-///
-/// `tm[6]` is `[a, b, c, d, e, f]` in PDF column-major form.
-/// The full mapping is: `device = CTM × Tm × (tx, ty+rise)`.
-#[expect(clippy::many_single_char_names, reason = "PDF matrix components")]
-fn text_to_device(ctm: &[f64; 6], tm: &[f64; 6], tx: f64, ty: f64, page_h: u32) -> (i32, i32) {
-    // Apply text matrix: user_space = Tm * (tx, ty).
-    let [a, b, c, d, e, f] = *tm;
-    let ux = a.mul_add(tx, c * ty) + e;
-    let uy = b.mul_add(tx, d * ty) + f;
-
-    // Apply CTM: device = CTM * (ux, uy).
-    let (dx, dy) = ctm_transform(ctm, ux, uy);
-
-    // y-flip.
-    let dy_flipped = f64::from(page_h) - dy;
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "device pixels are always in [0, page_h|w]; round() output fits i32 for any real page"
-    )]
-    (dx.round() as i32, dy_flipped.round() as i32)
 }
 
 // ── Component → colour helpers ────────────────────────────────────────────────
