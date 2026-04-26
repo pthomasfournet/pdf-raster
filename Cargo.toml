@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/color", "crates/raster"]
+members = ["crates/color", "crates/raster", "crates/encode"]
 
 [workspace.dependencies]
 # bytemuck 1.21 introduced `#[derive(Pod, Zeroable)]` stability improvements
