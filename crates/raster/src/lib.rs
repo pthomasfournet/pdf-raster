@@ -23,6 +23,7 @@
 pub mod bitmap;
 pub mod clip;
 pub mod fill;
+pub mod glyph;
 pub mod path;
 pub mod pipe;
 pub mod scanner;
@@ -34,6 +35,7 @@ pub mod xpath;
 
 pub use bitmap::{AaBuf, Bitmap};
 pub use fill::{eo_fill, fill};
+pub use glyph::{GlyphBitmap, blit_glyph, fill_glyph};
 pub use clip::{Clip, ClipResult};
 pub use path::{Path, PathBuilder, PathFlags, PathPoint, StrokeAdjustHint};
 pub use pipe::{Pattern, PipeState, PipeSrc};
