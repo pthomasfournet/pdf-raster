@@ -143,8 +143,15 @@ impl FontEngine {
     }
 
     /// Allocate the next `FaceId`, incrementing the internal counter.
-    const fn alloc_id(&mut self) -> FaceId {
+    ///
+    /// `FaceId`s wrap at `u32::MAX` — in practice a process loads at most tens of
+    /// thousands of faces, so wrap-around never occurs.
+    fn alloc_id(&mut self) -> FaceId {
         let id = FaceId(self.next_id);
+        debug_assert!(
+            self.next_id < u32::MAX,
+            "FaceId counter wrapped; too many font faces loaded in this process"
+        );
         self.next_id = self.next_id.wrapping_add(1);
         id
     }
@@ -170,8 +177,4 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-impl std::error::Error for LoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        None
-    }
-}
+impl std::error::Error for LoadError {}

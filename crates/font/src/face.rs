@@ -169,7 +169,14 @@ impl FontFace {
         } else {
             w.div_ceil(8) as usize
         };
-        let pitch = ft_bmp.pitch().unsigned_abs() as usize;
+        // FreeType pitch is negative for bottom-up bitmaps. We only handle
+        // top-down (positive pitch) layouts; treat bottom-up as a render failure.
+        let raw_pitch = ft_bmp.pitch();
+        if raw_pitch < 0 {
+            return None;
+        }
+        #[expect(clippy::cast_sign_loss, reason = "raw_pitch >= 0 checked above")]
+        let pitch = raw_pitch as usize;
         let raw = ft_bmp.buffer();
 
         let mut data = Vec::with_capacity(row_bytes * h as usize);
