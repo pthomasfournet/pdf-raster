@@ -69,9 +69,12 @@ const fn to_font_kind(k: PdfFontKind) -> FontKind {
 pub struct FontCache {
     engine: SharedEngine,
     /// Shared process-wide glyph bitmap cache.
-    pub glyph_cache: GlyphCache,
-    /// Map from PDF resource name to loaded face.
-    faces: HashMap<Vec<u8>, Option<FontFace>>,
+    glyph_cache: GlyphCache,
+    /// Map from (PDF resource name, `size_in_subpixels`) to loaded face.
+    ///
+    /// Font size is part of the key because `FaceParams::mat` encodes the size;
+    /// different sizes need distinct `FreeType` faces.
+    faces: HashMap<(Vec<u8>, u64), Option<FontFace>>,
 }
 
 impl FontCache {
@@ -85,6 +88,11 @@ impl FontCache {
         }
     }
 
+    /// Return a mutable reference to the glyph bitmap cache.
+    pub const fn glyph_cache_mut(&mut self) -> &mut GlyphCache {
+        &mut self.glyph_cache
+    }
+
     /// Return a reference to the [`FontFace`] for `name`, loading it from
     /// `descriptor` on first use.
     ///
@@ -96,22 +104,30 @@ impl FontCache {
         descriptor: &FontDescriptor,
         font_size: f64,
     ) -> Option<&FontFace> {
-        if !self.faces.contains_key(name) {
+        // Key includes size because FaceParams::mat embeds it; same name at a
+        // different size requires a different FreeType face.
+        let size_key = font_size.to_bits();
+        let key = (name.to_vec(), size_key);
+        if !self.faces.contains_key(&key) {
             let face = self.load_face(descriptor, font_size);
             if face.is_none() {
                 log::warn!(
-                    "font_cache: could not load face for /{}",
+                    "font_cache: could not load face for /{} at size {font_size}",
                     String::from_utf8_lossy(name)
                 );
             }
-            self.faces.insert(name.to_vec(), face);
+            self.faces.insert(key.clone(), face);
         }
-        self.faces.get(name)?.as_ref()
+        self.faces.get(&key)?.as_ref()
     }
 
     fn load_face(&self, desc: &FontDescriptor, font_size: f64) -> Option<FontFace> {
-        // Uniform scale matrix — rotation/skew from Tm is applied at placement.
-        let s = font_size.max(1.0); // guard degenerate 0-size fonts
+        // Clamp to a sane range: 0-pt or NaN/Inf would produce a degenerate face.
+        let s = if font_size.is_finite() && font_size > 0.0 {
+            font_size
+        } else {
+            1.0
+        };
         let mat: [f64; 4] = [s, 0.0, 0.0, s];
 
         let params = FaceParams {
@@ -125,13 +141,13 @@ impl FontCache {
 
         if let Some(bytes) = &desc.bytes {
             eng.load_memory_face(bytes.clone(), 0, params)
-                .map_err(|e| log::debug!("font_cache: memory face error: {e}"))
+                .inspect_err(|e| log::debug!("font_cache: memory face error: {e}"))
                 .ok()
         } else {
             // Fall back to system font.
             let path = fallback_font_path()?;
             eng.load_file_face(path, 0, params)
-                .map_err(|e| log::debug!("font_cache: file face error ({path}): {e}"))
+                .inspect_err(|e| log::debug!("font_cache: file face error ({path}): {e}"))
                 .ok()
         }
     }

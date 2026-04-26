@@ -19,7 +19,7 @@ pub enum Token<'a> {
     /// Literal string operand (`(…)`) or hex string (`<…>`), decoded.
     String(Vec<u8>),
     /// Array operand (`[…]`), elements already decoded.
-    Array(Vec<Token<'a>>),
+    Array(Vec<Self>),
     /// Operator keyword — slice into the source buffer.
     Op(&'a [u8]),
     /// Inline image: parameter dictionary bytes + raw pixel data bytes.
@@ -43,7 +43,7 @@ pub struct Tokenizer<'a> {
 impl<'a> Tokenizer<'a> {
     /// Create a tokenizer over `src`.
     #[must_use]
-    pub fn new(src: &'a [u8]) -> Self {
+    pub const fn new(src: &'a [u8]) -> Self {
         Self { src, pos: 0 }
     }
 
@@ -55,7 +55,7 @@ impl<'a> Tokenizer<'a> {
         self.src.get(self.pos).copied()
     }
 
-    fn advance(&mut self) {
+    const fn advance(&mut self) {
         if self.pos < self.src.len() {
             self.pos += 1;
         }
@@ -166,6 +166,7 @@ impl<'a> Tokenizer<'a> {
                             }
                         }
                         // Truncate to low byte; values >255 are malformed PDF.
+                        #[expect(clippy::cast_possible_truncation, reason = "intentional: malformed PDF octal values >255 are truncated per spec leniency")]
                         out.push(val as u8);
                     }
                     _ => {} // Unrecognised escape — PDF spec says ignore the backslash.
@@ -250,7 +251,7 @@ impl<'a> Tokenizer<'a> {
                 && self
                     .remaining()
                     .get(2)
-                    .map_or(true, |&b| is_whitespace(b) || is_delimiter(b))
+                    .is_none_or(|&b| is_whitespace(b) || is_delimiter(b))
             {
                 let end = self.pos;
                 self.pos += 2; // consume `ID`
@@ -279,7 +280,7 @@ impl<'a> Tokenizer<'a> {
                 && self
                     .remaining()
                     .get(2)
-                    .map_or(true, |&b| is_whitespace(b) || is_delimiter(b))
+                    .is_none_or(|&b| is_whitespace(b) || is_delimiter(b))
             {
                 // data_end is the position of the preceding whitespace byte,
                 // which is not part of the image data.
@@ -356,10 +357,10 @@ impl<'a> Tokenizer<'a> {
                 }
 
                 // Try parsing as an integer or real number.
-                if let Ok(s) = std::str::from_utf8(word) {
-                    if let Ok(n) = s.parse::<f64>() {
-                        return Some(Token::Number(n));
-                    }
+                if let Ok(s) = std::str::from_utf8(word)
+                    && let Ok(n) = s.parse::<f64>()
+                {
+                    return Some(Token::Number(n));
                 }
 
                 // Inline image: consume params + data into a single token so
@@ -382,12 +383,12 @@ impl<'a> Iterator for Tokenizer<'a> {
 }
 
 /// Returns `true` for the six PDF whitespace characters (PDF §7.2.2).
-fn is_whitespace(b: u8) -> bool {
+const fn is_whitespace(b: u8) -> bool {
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0C' | b'\r' | b' ')
 }
 
 /// Returns `true` for the ten PDF delimiter characters (PDF §7.2.2).
-fn is_delimiter(b: u8) -> bool {
+const fn is_delimiter(b: u8) -> bool {
     matches!(
         b,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
@@ -396,7 +397,7 @@ fn is_delimiter(b: u8) -> bool {
 
 /// Convert a single ASCII hex character to its nibble value.
 /// Non-hex characters return 0 (matches Acrobat's lenient behaviour).
-fn hex_nibble(b: u8) -> u8 {
+const fn hex_nibble(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
         b'a'..=b'f' => b - b'a' + 10,

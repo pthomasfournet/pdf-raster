@@ -16,6 +16,10 @@ pub fn pop_f64(stack: &mut Vec<Token<'_>>) -> f64 {
 }
 
 /// Pop the topmost token as a truncated integer. Returns 0 on underflow.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "intentional truncating cast: PDF integers are used as small values (cap style, render mode, etc.)"
+)]
 pub fn pop_i32(stack: &mut Vec<Token<'_>>) -> i32 {
     pop_f64(stack) as i32
 }
@@ -63,6 +67,7 @@ pub fn drain_numbers(stack: &mut Vec<Token<'_>>) -> Vec<f64> {
 }
 
 /// Pop the topmost token as a flat array of numbers.
+///
 /// If the top is a `Token::Array`, extract numbers from it.
 /// If the top is a bare number, treat the entire numeric prefix as the array.
 /// Returns an empty `Vec` on underflow.
@@ -110,6 +115,7 @@ pub fn pop4(stack: &mut Vec<Token<'_>>) -> (f64, f64, f64, f64) {
 }
 
 /// Pop the top 6 numbers as a PDF matrix `[a b c d e f]` in stream order.
+#[expect(clippy::many_single_char_names, reason = "PDF matrix components")]
 pub fn pop_matrix(stack: &mut Vec<Token<'_>>) -> [f64; 6] {
     let f = pop_f64(stack);
     let e = pop_f64(stack);

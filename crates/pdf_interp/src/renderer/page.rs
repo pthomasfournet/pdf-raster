@@ -11,16 +11,16 @@
 //! - Path painting: `S s f F f* B B* b b* n`
 //! - Colour: `g G rg RG k K sc scn SC SCN cs CS`
 //! - Text objects + state: `BT ET Tf Tc Tw Tz TL Ts Tr Td TD Tm T*`
-//! - Text showing: `Tj TJ ' "` (via FreeType through font crate)
+//! - Text showing: `Tj TJ ' "` (via `FreeType` through font crate)
 //!
 //! # Not yet implemented
 //!
-//! - XObjects / inline images — requires XObject resource resolver
+//! - `XObjects` / inline images — requires `XObject` resource resolver
 //! - Shading (`sh`) — requires shading resource lookup
-//! - Extended graphics state (`gs`) — requires ExtGState dict lookup
+//! - Extended graphics state (`gs`) — requires `ExtGState` dict lookup
 //! - Clip paths (W W*) — stub; page-rect clip used as fallback
 //! - Char-to-glyph Differences encoding (phase 2)
-//! - Type 0 / CIDFont composite fonts (phase 2)
+//! - Type 0 / `CIDFont` composite fonts (phase 2)
 //! - Type 3 paint-procedure fonts (phase 2)
 
 use lopdf::{Document, ObjectId};
@@ -81,6 +81,11 @@ impl<'doc> PageRenderer<'doc> {
     /// Create a renderer with an initial uniform scale in the CTM.
     ///
     /// `scale = dpi / 72.0` maps PDF points to device pixels.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `scale` is not a positive finite number, or if `FreeType`
+    /// initialisation fails.
     #[must_use]
     pub fn new_scaled(
         width: u32,
@@ -89,6 +94,11 @@ impl<'doc> PageRenderer<'doc> {
         doc: &'doc Document,
         page_id: ObjectId,
     ) -> Self {
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "PageRenderer::new_scaled: scale must be a positive finite number, got {scale}"
+        );
+
         let mut bitmap = Bitmap::<Rgb8>::new(width, height, 1, false);
         bitmap.data_mut().fill(255u8); // white background
 
@@ -128,6 +138,14 @@ impl<'doc> PageRenderer<'doc> {
     }
 
     #[expect(clippy::too_many_lines, reason = "operator dispatch table")]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "intentional stubs for unimplemented operators"
+    )]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "PDF matrix components and PDF spec variable names"
+    )]
     fn execute_one(&mut self, op: &Operator) {
         match op {
             // ── Graphics state ────────────────────────────────────────────────
@@ -161,7 +179,7 @@ impl<'doc> PageRenderer<'doc> {
             Operator::SetStrokeGray(g) => self.set_stroke(RasterColor::gray(*g)),
             Operator::SetStrokeRgb(r, g, b) => self.set_stroke(RasterColor::rgb(*r, *g, *b)),
             Operator::SetStrokeCmyk(c, m, y, k) => {
-                self.set_stroke(RasterColor::cmyk(*c, *m, *y, *k))
+                self.set_stroke(RasterColor::cmyk(*c, *m, *y, *k));
             }
             Operator::SetStrokeColor(comps) => self.set_stroke(components_to_color(comps)),
             Operator::SetStrokeColorSpace(_) => {}
@@ -183,14 +201,15 @@ impl<'doc> PageRenderer<'doc> {
             }
             Operator::CurveToV(x2, y2, x3, y3) => {
                 // `v`: first control point = current point.
-                let cp = self
-                    .path_builder()
-                    .cur_pt()
-                    .map(|p| (p.x, p.y))
-                    .unwrap_or((0.0, 0.0));
+                let cp = self.path_builder().cur_pt().map(|p| (p.x, p.y));
+                if cp.is_none() {
+                    log::debug!("pdf_interp: CurveToV with no current point — operator ignored");
+                    return;
+                }
+                let (cpx, cpy) = cp.expect("checked above");
                 let (dx2, dy2) = self.to_device(*x2, *y2);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
-                let _ = self.path_builder().curve_to(cp.0, cp.1, dx2, dy2, dx3, dy3);
+                let _ = self.path_builder().curve_to(cpx, cpy, dx2, dy2, dx3, dy3);
             }
             Operator::CurveToY(x1, y1, x3, y3) => {
                 // `y`: second control point = endpoint.
@@ -255,7 +274,7 @@ impl<'doc> PageRenderer<'doc> {
             // ── Text state ────────────────────────────────────────────────────
             Operator::SetFont { name, size } => {
                 let ts = &mut self.gstate.current_mut().text;
-                ts.font_name = name.clone();
+                ts.font_name.clone_from(name);
                 ts.font_size = *size;
             }
             Operator::SetCharSpacing(v) => self.gstate.current_mut().text.char_spacing = *v,
@@ -339,7 +358,7 @@ impl<'doc> PageRenderer<'doc> {
             }
 
             // Compile-time exhaustiveness guard.
-            #[allow(unreachable_patterns)]
+            #[expect(unreachable_patterns, reason = "future Operator variants are caught here")]
             _ => {}
         }
     }
@@ -350,7 +369,8 @@ impl<'doc> PageRenderer<'doc> {
     ///
     /// Two-phase design to satisfy the borrow checker:
     /// 1. Rasterize all glyphs while holding the `font_cache` borrow (no bitmap access).
-    /// 2. Blit the pre-rasterized bitmaps, using `bitmap` mutably (no font_cache access).
+    /// 2. Blit the pre-rasterized bitmaps, using `bitmap` mutably (no `font_cache` access).
+    #[expect(clippy::many_single_char_names, reason = "PDF matrix components")]
     fn show_text(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -366,46 +386,34 @@ impl<'doc> PageRenderer<'doc> {
         let font_size = self.gstate.current().text.font_size;
         let char_spacing = self.gstate.current().text.char_spacing;
         let word_spacing = self.gstate.current().text.word_spacing;
-        let horiz_scaling = self.gstate.current().text.horiz_scaling / 100.0;
+        // PDF Tz is a percentage; 0 % means zero-advance (degenerate — treat as 100 %).
+        let raw_hz = self.gstate.current().text.horiz_scaling;
+        let horiz_scaling = if raw_hz.abs() < f64::EPSILON { 1.0 } else { raw_hz / 100.0 };
         let ctm = self.gstate.current().ctm;
         let rise = self.gstate.current().text.rise;
         let mut tm = self.gstate.current().text.text_matrix;
 
         // Resolve font descriptor (immutable borrow of resources).
-        let descriptor = match self.resources.font_dict(&font_name) {
-            Some(d) => d,
-            None => {
-                log::debug!(
-                    "pdf_interp: no font dict for /{}",
-                    String::from_utf8_lossy(&font_name)
-                );
-                return;
-            }
+        let Some(descriptor) = self.resources.font_dict(&font_name) else {
+            log::debug!(
+                "pdf_interp: no font dict for /{}",
+                String::from_utf8_lossy(&font_name)
+            );
+            return;
         };
 
         // Phase 1: rasterize all glyphs.
         // We collect (pen_x, pen_y, GlyphBitmap data) as owned Vecs so that the
         // `font_cache` borrow is released before we touch `self.bitmap`.
-        struct GlyphRecord {
-            pen_x: i32,
-            pen_y: i32,
-            x_off: i32,
-            y_off: i32,
-            width: u32,
-            height: u32,
-            aa: bool,
-            data: Vec<u8>,
-        }
         let mut records: Vec<GlyphRecord> = Vec::with_capacity(bytes.len());
 
         {
             // Load (or retrieve cached) FreeType face — mutable borrow of font_cache.
-            let face = match self
+            let Some(face) = self
                 .font_cache
                 .get_or_load(&font_name, &descriptor, font_size)
-            {
-                Some(f) => f,
-                None => return,
+            else {
+                return;
             };
 
             for &byte in bytes {
@@ -436,10 +444,14 @@ impl<'doc> PageRenderer<'doc> {
         // Phase 2: blit rasterized glyphs — mutable borrow of bitmap only.
         let fill_bytes = self.gstate.current().fill_color.as_slice().to_vec();
         let clip = self.page_clip();
-        let (_, pipe) = Self::make_pipe(self.gstate.current());
+        let pipe = Self::make_pipe(self.gstate.current());
         let src = PipeSrc::Solid(&fill_bytes);
 
         for rec in &records {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "glyph dimensions are always small (sub-pixel-sized); cannot exceed i32::MAX"
+            )]
             let glyph = GlyphBitmap {
                 data: &rec.data,
                 x: rec.x_off,
@@ -495,9 +507,11 @@ impl<'doc> PageRenderer<'doc> {
         )
     }
 
-    fn make_pipe(_gs: &InterpGState) -> (TransferSet<'static>, PipeState<'static>) {
-        let transfer = TransferSet::identity_rgb();
-        let pipe = PipeState {
+    /// Build a [`PipeState`] for Normal-blend, fully-opaque, identity-transfer
+    /// rendering.  Extended graphics state fields (opacity, soft mask, etc.) are
+    /// Phase-2 work; the parameter is reserved for when we read `ExtGState` dicts.
+    fn make_pipe(_gs: &InterpGState) -> PipeState<'static> {
+        PipeState {
             blend_mode: BlendMode::Normal,
             a_input: 255,
             overprint_mask: 0xFFFF_FFFF,
@@ -508,52 +522,21 @@ impl<'doc> PageRenderer<'doc> {
             knockout: false,
             knockout_opacity: 255,
             non_isolated_group: false,
-        };
-        (transfer, pipe)
+        }
     }
 
     fn do_fill(&mut self, even_odd: bool) {
         let Some(builder) = self.path.take() else {
             return;
         };
-        let path = builder.build();
-        let gs = self.gstate.current();
-        let color = gs.fill_color.as_slice().to_vec();
-        let clip = self.page_clip();
-        let flatness = gs.flatness.max(0.1);
-        let (_, pipe) = Self::make_pipe(gs);
-        let src = PipeSrc::Solid(&color);
-        if even_odd {
-            eo_fill(
-                &mut self.bitmap,
-                &clip,
-                &path,
-                &pipe,
-                &src,
-                &DEVICE_MATRIX,
-                flatness,
-                true,
-            );
-        } else {
-            fill(
-                &mut self.bitmap,
-                &clip,
-                &path,
-                &pipe,
-                &src,
-                &DEVICE_MATRIX,
-                flatness,
-                true,
-            );
-        }
+        self.fill_path(&builder.build(), even_odd);
     }
 
     fn do_stroke(&mut self) {
         let Some(builder) = self.path.take() else {
             return;
         };
-        let path = builder.build();
-        self.stroke_path(&path);
+        self.stroke_path(&builder.build());
     }
 
     fn do_fill_then_stroke(&mut self, even_odd: bool) {
@@ -561,18 +544,24 @@ impl<'doc> PageRenderer<'doc> {
             return;
         };
         let path = builder.build();
+        self.fill_path(&path, even_odd);
+        self.stroke_path(&path);
+    }
 
+    /// Fill `path` using the current fill colour.  Shared by `do_fill` and
+    /// `do_fill_then_stroke`.
+    fn fill_path(&mut self, path: &raster::path::Path, even_odd: bool) {
         let gs = self.gstate.current();
-        let fill_color = gs.fill_color.as_slice().to_vec();
+        let color = gs.fill_color.as_slice().to_vec();
         let clip = self.page_clip();
         let flatness = gs.flatness.max(0.1);
-        let (_, pipe) = Self::make_pipe(gs);
-        let src = PipeSrc::Solid(&fill_color);
+        let pipe = Self::make_pipe(gs);
+        let src = PipeSrc::Solid(&color);
         if even_odd {
             eo_fill(
                 &mut self.bitmap,
                 &clip,
-                &path,
+                path,
                 &pipe,
                 &src,
                 &DEVICE_MATRIX,
@@ -583,7 +572,7 @@ impl<'doc> PageRenderer<'doc> {
             fill(
                 &mut self.bitmap,
                 &clip,
-                &path,
+                path,
                 &pipe,
                 &src,
                 &DEVICE_MATRIX,
@@ -591,15 +580,13 @@ impl<'doc> PageRenderer<'doc> {
                 true,
             );
         }
-
-        self.stroke_path(&path);
     }
 
     fn stroke_path(&mut self, path: &raster::path::Path) {
         let gs = self.gstate.current();
         let color = gs.stroke_color.as_slice().to_vec();
         let clip = self.page_clip();
-        let (_, pipe) = Self::make_pipe(gs);
+        let pipe = Self::make_pipe(gs);
         let src = PipeSrc::Solid(&color);
         let params = StrokeParams {
             line_width: gs.line_width,
@@ -624,6 +611,20 @@ impl<'doc> PageRenderer<'doc> {
     }
 }
 
+// ── Glyph record ─────────────────────────────────────────────────────────────
+
+/// Holds rasterized glyph data for two-phase text rendering.
+struct GlyphRecord {
+    pen_x: i32,
+    pen_y: i32,
+    x_off: i32,
+    y_off: i32,
+    width: u32,
+    height: u32,
+    aa: bool,
+    data: Vec<u8>,
+}
+
 // ── Coordinate helpers ────────────────────────────────────────────────────────
 
 /// Map a text-space point through the text matrix and CTM to device-pixel
@@ -631,11 +632,12 @@ impl<'doc> PageRenderer<'doc> {
 ///
 /// `tm[6]` is `[a, b, c, d, e, f]` in PDF column-major form.
 /// The full mapping is: `device = CTM × Tm × (tx, ty+rise)`.
+#[expect(clippy::many_single_char_names, reason = "PDF matrix components")]
 fn text_to_device(ctm: &[f64; 6], tm: &[f64; 6], tx: f64, ty: f64, page_h: u32) -> (i32, i32) {
     // Apply text matrix: user_space = Tm * (tx, ty).
     let [a, b, c, d, e, f] = *tm;
-    let ux = a * tx + c * ty + e;
-    let uy = b * tx + d * ty + f;
+    let ux = a.mul_add(tx, c * ty) + e;
+    let uy = b.mul_add(tx, d * ty) + f;
 
     // Apply CTM: device = CTM * (ux, uy).
     let (dx, dy) = ctm_transform(ctm, ux, uy);

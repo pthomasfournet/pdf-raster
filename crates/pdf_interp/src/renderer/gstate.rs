@@ -26,12 +26,12 @@ pub fn ctm_multiply(a: &Ctm, b: &Ctm) -> Ctm {
     // | a2 a3 0 | × | b2 b3 0 |
     // | a4 a5 1 |   | b4 b5 1 |
     [
-        a[0] * b[0] + a[1] * b[2],
-        a[0] * b[1] + a[1] * b[3],
-        a[2] * b[0] + a[3] * b[2],
-        a[2] * b[1] + a[3] * b[3],
-        a[4] * b[0] + a[5] * b[2] + b[4],
-        a[4] * b[1] + a[5] * b[3] + b[5],
+        a[0].mul_add(b[0], a[1] * b[2]),
+        a[0].mul_add(b[1], a[1] * b[3]),
+        a[2].mul_add(b[0], a[3] * b[2]),
+        a[2].mul_add(b[1], a[3] * b[3]),
+        a[4].mul_add(b[0], a[5] * b[2]) + b[4],
+        a[4].mul_add(b[1], a[5] * b[3]) + b[5],
     ]
 }
 
@@ -39,8 +39,8 @@ pub fn ctm_multiply(a: &Ctm, b: &Ctm) -> Ctm {
 #[must_use]
 pub fn ctm_transform(ctm: &Ctm, x: f64, y: f64) -> (f64, f64) {
     (
-        ctm[0] * x + ctm[2] * y + ctm[4],
-        ctm[1] * x + ctm[3] * y + ctm[5],
+        ctm[0].mul_add(x, ctm[2] * y) + ctm[4],
+        ctm[1].mul_add(x, ctm[3] * y) + ctm[5],
     )
 }
 
@@ -110,6 +110,11 @@ impl GStateStack {
     }
 
     /// Return a shared reference to the current graphics state.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice — the stack always contains at least the
+    /// page-level state pushed by [`GStateStack::new`].
     #[must_use]
     pub fn current(&self) -> &InterpGState {
         // SAFETY: stack always has at least one element (the page-level state).
@@ -117,6 +122,11 @@ impl GStateStack {
     }
 
     /// Return a mutable reference to the current graphics state.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice — the stack always contains at least the
+    /// page-level state pushed by [`GStateStack::new`].
     pub fn current_mut(&mut self) -> &mut InterpGState {
         self.stack
             .last_mut()

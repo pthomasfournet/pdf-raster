@@ -61,7 +61,7 @@ impl Default for TextState {
 
 impl TextState {
     /// `BT` — reset text and line matrices to identity.
-    pub fn begin_text(&mut self) {
+    pub const fn begin_text(&mut self) {
         self.text_matrix = TEXT_MATRIX_IDENTITY;
         self.line_matrix = TEXT_MATRIX_IDENTITY;
     }
@@ -71,8 +71,8 @@ impl TextState {
     /// Updates both the text matrix and the line matrix.
     pub fn move_by(&mut self, tx: f64, ty: f64) {
         // New line matrix = translate(tx, ty) × old line matrix
-        self.line_matrix[4] += tx * self.line_matrix[0] + ty * self.line_matrix[2];
-        self.line_matrix[5] += tx * self.line_matrix[1] + ty * self.line_matrix[3];
+        self.line_matrix[4] += tx.mul_add(self.line_matrix[0], ty * self.line_matrix[2]);
+        self.line_matrix[5] += tx.mul_add(self.line_matrix[1], ty * self.line_matrix[3]);
         self.text_matrix = self.line_matrix;
     }
 
@@ -88,7 +88,7 @@ impl TextState {
     }
 
     /// `Tm` — set both text matrix and line matrix directly.
-    pub fn set_matrix(&mut self, m: TextMatrix) {
+    pub const fn set_matrix(&mut self, m: TextMatrix) {
         self.text_matrix = m;
         self.line_matrix = m;
     }
@@ -96,7 +96,7 @@ impl TextState {
     /// Return the current text origin in user space (the `e` and `f` components
     /// of the text matrix, which encode the translation part).
     #[must_use]
-    pub fn origin(&self) -> (f64, f64) {
+    pub const fn origin(&self) -> (f64, f64) {
         (self.text_matrix[4], self.text_matrix[5])
     }
 }

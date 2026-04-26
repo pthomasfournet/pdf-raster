@@ -80,9 +80,9 @@ pub fn page_count(doc: &Document) -> u32 {
     u32::try_from(doc.get_pages().len()).unwrap_or(u32::MAX)
 }
 
-/// Return the MediaBox dimensions (width_pts, height_pts) for page `page_num` (1-based).
+/// Return the `MediaBox` dimensions (`width_pts`, `height_pts`) for page `page_num` (1-based).
 ///
-/// Falls back to US Letter (612 × 792 pt) if the MediaBox cannot be read.
+/// Falls back to US Letter (612 × 792 pt) if the `MediaBox` cannot be read.
 ///
 /// # Errors
 /// Returns [`InterpError::PageOutOfRange`] if the page number is invalid.
@@ -102,9 +102,8 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<(f64, f64), Interp
 
     let fallback = (612.0, 792.0); // US Letter
 
-    let dict = match doc.get_dictionary(page_id) {
-        Ok(d) => d,
-        Err(_) => return Ok(fallback),
+    let Ok(dict) = doc.get_dictionary(page_id) else {
+        return Ok(fallback);
     };
 
     let media_box = match dict.get(b"MediaBox") {
@@ -112,8 +111,12 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<(f64, f64), Interp
         _ => return Ok(fallback),
     };
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "PDF page sizes are at most a few thousand points; i64 → f64 precision loss is negligible"
+    )]
     let to_f64 = |o: &lopdf::Object| match o {
-        lopdf::Object::Real(r) => *r as f64,
+        lopdf::Object::Real(r) => f64::from(*r),
         lopdf::Object::Integer(i) => *i as f64,
         _ => 0.0,
     };

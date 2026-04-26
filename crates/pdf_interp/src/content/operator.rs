@@ -150,21 +150,21 @@ pub enum Operator {
     SetFillColor(Vec<f64>),
     /// `SC` / `SCN` — set stroke colour (components in current stroke space).
     SetStrokeColor(Vec<f64>),
-    /// `g` — set fill colour to gray level (DeviceGray shorthand).
+    /// `g` — set fill colour to gray level (`DeviceGray` shorthand).
     SetFillGray(f64),
-    /// `G` — set stroke colour to gray level (DeviceGray shorthand).
+    /// `G` — set stroke colour to gray level (`DeviceGray` shorthand).
     SetStrokeGray(f64),
-    /// `rg r g b` — set fill colour (DeviceRGB shorthand).
+    /// `rg r g b` — set fill colour (`DeviceRGB` shorthand).
     SetFillRgb(f64, f64, f64),
-    /// `RG r g b` — set stroke colour (DeviceRGB shorthand).
+    /// `RG r g b` — set stroke colour (`DeviceRGB` shorthand).
     SetStrokeRgb(f64, f64, f64),
-    /// `k c m y k` — set fill colour (DeviceCMYK shorthand).
+    /// `k c m y k` — set fill colour (`DeviceCMYK` shorthand).
     SetFillCmyk(f64, f64, f64, f64),
-    /// `K c m y k` — set stroke colour (DeviceCMYK shorthand).
+    /// `K c m y k` — set stroke colour (`DeviceCMYK` shorthand).
     SetStrokeCmyk(f64, f64, f64, f64),
 
     // ── XObjects & images ─────────────────────────────────────────────────────
-    /// `Do name` — paint an XObject (image or form XObject).
+    /// `Do name` — paint an `XObject` (image or form `XObject`).
     PaintXObject(Vec<u8>),
     /// `BI … ID … EI` — paint an inline image.
     InlineImage {
@@ -209,6 +209,7 @@ pub enum TextArrayElement {
     clippy::too_many_lines,
     reason = "operator dispatch table — splitting adds no clarity"
 )]
+#[expect(clippy::many_single_char_names, reason = "PDF matrix components")]
 pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
     let result = match op {
         // ── Graphics state ────────────────────────────────────────────────────

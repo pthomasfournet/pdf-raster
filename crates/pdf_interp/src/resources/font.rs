@@ -27,7 +27,7 @@ use lopdf::{Dictionary, Document, Object};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// The kind of font outline — used to select FreeType hinting flags.
+/// The kind of font outline — used to select `FreeType` hinting flags.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PdfFontKind {
     /// Type 1 / Type 1C (CFF-wrapped).
@@ -38,10 +38,10 @@ pub enum PdfFontKind {
     Other,
 }
 
-/// Everything needed to load a FreeType face for one PDF font resource.
+/// Everything needed to load a `FreeType` face for one PDF font resource.
 #[derive(Debug)]
 pub struct FontDescriptor {
-    /// Kind of font outline — controls FreeType hinting strategy.
+    /// Kind of font outline — controls `FreeType` hinting strategy.
     pub kind: PdfFontKind,
     /// Raw font bytes.  `Some` if embedded in the PDF, `None` if we must fall
     /// back to a substitute.
@@ -52,7 +52,7 @@ pub struct FontDescriptor {
     /// First char code covered by `widths`.
     pub first_char: u32,
     /// Glyph-index table: `code_to_gid[char_code]` → FT glyph index.
-    /// Empty means the identity map (char_code == glyph index).
+    /// Empty means the identity map (`char_code` == glyph index).
     pub code_to_gid: Vec<u32>,
 }
 
@@ -67,7 +67,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     let kind = classify_kind(dict);
     let bytes = extract_bytes(doc, dict);
     let (first_char, widths) = extract_widths(dict);
-    let code_to_gid = extract_code_to_gid(doc, dict, &kind);
+    let code_to_gid = extract_code_to_gid(doc, dict, kind);
 
     FontDescriptor {
         kind,
@@ -96,19 +96,23 @@ fn classify_kind(dict: &Dictionary) -> PdfFontKind {
 
 // ── Embedded byte extraction ──────────────────────────────────────────────────
 
-/// Try to read embedded font bytes from the FontDescriptor sub-dict.
+/// Try to read embedded font bytes from the `FontDescriptor` sub-dict.
 ///
-/// Priority: `FontFile2` (TT) → `FontFile3` (CFF/OTF) → `FontFile` (Type 1).
+/// Key priority varies by font kind:
+/// - Type 1 → `FontFile` first, then `FontFile3` (CFF-wrapped Type 1)
+/// - TrueType / Other → `FontFile2` (TT), then `FontFile3` (CFF/OTF)
+///
 /// Returns `None` if nothing is embedded.
 fn extract_bytes(doc: &Document, dict: &Dictionary) -> Option<Vec<u8>> {
-    // Resolve FontDescriptor indirect reference.
     let fd = resolve_fd(doc, dict)?;
 
-    for key in [
-        b"FontFile2".as_ref(),
-        b"FontFile3".as_ref(),
-        b"FontFile".as_ref(),
-    ] {
+    let kind = classify_kind(dict);
+    let priority: &[&[u8]] = match kind {
+        PdfFontKind::Type1 => &[b"FontFile", b"FontFile3"],
+        _ => &[b"FontFile2", b"FontFile3", b"FontFile"],
+    };
+
+    for key in priority {
         if let Some(bytes) = read_stream(doc, fd, key) {
             return Some(bytes);
         }
@@ -126,15 +130,31 @@ fn resolve_fd<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a Diction
     }
 }
 
+/// Maximum decompressed font stream size (64 MiB).
+///
+/// Protects against deflate bombs embedded in malicious PDFs.  Real font
+/// programs are measured in kilobytes; 64 MiB is a generous upper bound.
+const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Read and decompress a stream at `dict[key]`, following an indirect ref if
-/// necessary.  Returns `None` on any error.
+/// necessary.  Returns `None` on any error or if the stream exceeds
+/// [`MAX_FONT_BYTES`] after decompression.
 fn read_stream(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<Vec<u8>> {
     let obj = match dict.get(key).ok()? {
         Object::Reference(id) => doc.get_object(*id).ok()?,
         other => other,
     };
     let stream = obj.as_stream().ok()?;
-    stream.decompressed_content().ok()
+    let bytes = stream.decompressed_content().ok()?;
+    if bytes.len() > MAX_FONT_BYTES {
+        log::warn!(
+            "font: embedded stream for key {} is {} bytes — exceeds {MAX_FONT_BYTES} limit, skipping",
+            String::from_utf8_lossy(key),
+            bytes.len(),
+        );
+        return None;
+    }
+    Some(bytes)
 }
 
 // ── Advance-width extraction ──────────────────────────────────────────────────
@@ -143,6 +163,11 @@ fn read_stream(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<Vec<u8>>
 ///
 /// Returns `(0, vec![])` if either key is absent.
 fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "FirstChar is filtered to >= 0 and < 256; safe to cast to u32"
+    )]
     let first = dict
         .get(b"FirstChar")
         .ok()
@@ -150,6 +175,10 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
         .filter(|&v| v >= 0)
         .map_or(0u32, |v| v as u32);
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "PDF glyph advance widths are always in [0, 4096]; safe to cast to i32"
+    )]
     let widths = dict
         .get(b"Widths")
         .ok()
@@ -170,7 +199,7 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
 ///
 /// Returns an empty `Vec` when the identity map is appropriate (most CID fonts,
 /// or simple fonts with no explicit encoding).
-fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: &PdfFontKind) -> Vec<u32> {
+fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: PdfFontKind) -> Vec<u32> {
     // Type 0 / CID composite fonts: the descendant font carries the GID map.
     // For now, return identity — full CMap support is phase 2.
     let subtype = dict
@@ -182,9 +211,8 @@ fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: &PdfFontKind) ->
         return vec![];
     }
 
-    let encoding = match dict.get(b"Encoding").ok() {
-        Some(e) => e,
-        None => return vec![],
+    let Some(encoding) = dict.get(b"Encoding").ok() else {
+        return vec![];
     };
 
     match encoding {
@@ -202,7 +230,7 @@ fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: &PdfFontKind) ->
 /// Produce a code→glyph table for a standard named encoding.
 ///
 /// Returns an empty `Vec` for encodings that use the identity map
-/// (WinAnsiEncoding, MacRomanEncoding, StandardEncoding), since FreeType
+/// (`WinAnsiEncoding`, `MacRomanEncoding`, `StandardEncoding`), since `FreeType`
 /// can handle these itself via `FT_Get_Char_Index`.
 ///
 /// `Symbol` and `ZapfDingbats` have non-standard mappings, but they are rare
@@ -211,10 +239,8 @@ fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: &PdfFontKind) ->
     clippy::missing_const_for_fn,
     reason = "vec![] is not const; clippy false-positive for this pattern"
 )]
-fn standard_encoding_table(name: &[u8]) -> Vec<u32> {
+fn standard_encoding_table(_name: &[u8]) -> Vec<u32> {
     // For all standard encodings, FreeType's charmap handles the mapping.
-    // Return empty → identity map.
-    let _ = name;
     vec![]
 }
 
@@ -230,7 +256,7 @@ fn standard_encoding_table(name: &[u8]) -> Vec<u32> {
     clippy::missing_const_for_fn,
     reason = "vec![] is not const; clippy false-positive for this pattern"
 )]
-fn dict_encoding_table(_doc: &Document, _dict: &Dictionary, _kind: &PdfFontKind) -> Vec<u32> {
+fn dict_encoding_table(_doc: &Document, _dict: &Dictionary, _kind: PdfFontKind) -> Vec<u32> {
     // TODO(phase2): parse BaseEncoding + Differences array and build
     // a proper 256-entry code_to_gid table via FT_Get_Name_Index.
     vec![]

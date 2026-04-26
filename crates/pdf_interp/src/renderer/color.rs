@@ -4,7 +4,7 @@
 //! understood by the raster crate.
 
 /// Convert a PDF grey level [0.0, 1.0] to an 8-bit grey byte.
-/// Values outside [0, 1] are clamped.
+/// Values outside [0, 1] are clamped; NaN maps to 0.
 #[inline]
 #[must_use]
 pub fn gray_to_u8(g: f64) -> u8 {
@@ -28,13 +28,14 @@ pub fn rgb_to_bytes(r: f64, g: f64, b: f64) -> [u8; 3] {
 /// Convert PDF CMYK components [0.0, 1.0] each to RGB bytes via naive formula.
 ///
 /// This is the `DeviceCMYK` → `DeviceRGB` mapping from PDF §10.3.3 (no ICC profile):
-/// `R = 1 − min(1, C + K)`, etc.
+/// `R = 1 − min(1, C + K)`, etc.  NaN inputs are treated as 0.
 #[inline]
 #[must_use]
+#[expect(clippy::many_single_char_names, reason = "PDF CMYK channel names")]
 pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
-    let r = (1.0 - (c + k).min(1.0)).max(0.0);
-    let g = (1.0 - (m + k).min(1.0)).max(0.0);
-    let b = (1.0 - (y + k).min(1.0)).max(0.0);
+    let r = 1.0 - (c.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
+    let g = 1.0 - (m.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
+    let b = 1.0 - (y.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
     rgb_to_bytes(r, g, b)
 }
 
@@ -46,7 +47,7 @@ pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
 ///
 /// `gray()` expands to equal R=G=B channels; `cmyk()` converts via naive
 /// PDF §10.3.3.  Full ICC-profile conversion is a later phase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RasterColor {
     bytes: [u8; 3],
 }
