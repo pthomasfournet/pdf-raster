@@ -157,6 +157,11 @@ pub struct Args {
     /// Zero-pad page numbers to at least N digits.
     #[arg(long = "forcenum", value_name = "DIGITS")]
     pub force_num_digits: Option<usize>,
+
+    // ── Progress ─────────────────────────────────────────────────────────────
+    /// Print progress to stderr: pages done, elapsed time, and ETA.
+    #[arg(short = 'P', long = "progress", default_value_t = false)]
+    pub progress: bool,
 }
 
 /// Yes/no flag for anti-aliasing options.

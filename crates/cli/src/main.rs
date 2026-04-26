@@ -2,6 +2,9 @@ mod args;
 mod naming;
 mod render;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
+
 use clap::Parser;
 use rayon::prelude::*;
 
@@ -81,13 +84,42 @@ fn main() {
     // Render pages in parallel and collect failures.
     // Errors are printed immediately by the collecting thread after the
     // parallel section so output ordering is deterministic.
+    let n_pages = pages.len();
+    let done = AtomicU32::new(0);
+    let start = Instant::now();
+
     let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
         pages
             .par_iter()
             .filter_map(|&page_num| {
-                render::render_page(&doc, page_num, total, &args)
-                    .err()
-                    .map(|e| (page_num, e))
+                let result = render::render_page(&doc, page_num, total, &args);
+
+                if args.progress {
+                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    // Rate is pages per second; guard against division by zero
+                    // and the first-page estimate being wildly off.
+                    let rate = f64::from(completed) / elapsed;
+                    let remaining = n_pages - completed as usize;
+                    if rate > 0.0 && completed > 0 {
+                        // remaining ≤ n_pages which is bounded by i32::MAX in practice;
+                        // precision loss is irrelevant for an ETA display.
+                        #[expect(clippy::cast_precision_loss, reason = "ETA display; ±1s accuracy is sufficient")]
+                        let eta_s = remaining as f64 / rate;
+                        eprintln!(
+                            "pdf-raster: page {page_num} done  \
+                             [{completed}/{n_pages}]  \
+                             {elapsed:.1}s elapsed  \
+                             ~{eta_s:.1}s remaining"
+                        );
+                    } else {
+                        eprintln!(
+                            "pdf-raster: page {page_num} done  [{completed}/{n_pages}]"
+                        );
+                    }
+                }
+
+                result.err().map(|e| (page_num, e))
             })
             .collect()
     });
