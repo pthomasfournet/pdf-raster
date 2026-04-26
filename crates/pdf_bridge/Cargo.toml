@@ -1,0 +1,22 @@
+[package]
+name    = "pdf_bridge"
+version = "0.1.0"
+edition = "2024"
+build   = "build.rs"
+
+[dependencies]
+color = { path = "../color" }
+
+[build-dependencies]
+cc = { workspace = true }
+
+[lints.rust]
+# pdf_bridge wraps C++ via extern "C"; unsafe is unavoidable in sys.rs.
+unsafe_code      = "allow"
+missing_docs     = "warn"
+unused_results   = "warn"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }

@@ -1,12 +1,20 @@
 [workspace]
 resolver = "2"
-members = ["crates/color", "crates/raster", "crates/encode", "crates/font"]
+members = [
+    "crates/color",
+    "crates/raster",
+    "crates/encode",
+    "crates/font",
+    "crates/pdf_bridge",
+    "crates/cli",
+]
 
 [workspace.dependencies]
 bytemuck  = { version = ">=1.21, <2", features = ["derive"] }
 smallvec  = { version = ">=1.13, <2", features = ["union"] }
 bitflags  = { version = ">=2.0,  <3" }
 proptest  = { version = ">=1.0,  <2" }
+cc        = { version = ">=1.0,  <2" }
 
 [workspace.lints.rust]
 unsafe_code          = "deny"

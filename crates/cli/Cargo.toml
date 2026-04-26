@@ -1,0 +1,28 @@
+[package]
+name    = "pdf-raster"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pdf-raster"
+path = "src/main.rs"
+
+[dependencies]
+pdf_bridge = { path = "../pdf_bridge" }
+encode     = { path = "../encode" }
+color      = { path = "../color" }
+raster     = { path = "../raster" }
+clap       = { version = "4", features = ["derive"] }
+rayon      = "1"
+anyhow     = "1"
+
+[lints.rust]
+# cli binary: unsafe_code only allowed in pdf_bridge (the FFI crate)
+unsafe_code    = "deny"
+missing_docs   = "allow"   # binary crate; public docs are not required
+unused_results = "warn"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
