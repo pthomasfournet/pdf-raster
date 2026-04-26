@@ -209,6 +209,32 @@ impl<P: Pixel> Bitmap<P> {
         self.alpha.is_some()
     }
 
+    /// Simultaneous mutable access to the pixel row and the alpha row.
+    ///
+    /// Returns `(pixel_row_bytes, Some(alpha_row))` or `(pixel_row_bytes, None)`.
+    /// This avoids the borrow-checker conflict of calling `row_bytes_mut` and
+    /// `alpha_row_mut` separately on the same `&mut self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y >= height`.
+    pub fn row_and_alpha_mut(&mut self, y: u32) -> (&mut [u8], Option<&mut [u8]>) {
+        assert!(
+            y < self.height,
+            "row index {y} is out of bounds for bitmap height {}",
+            self.height
+        );
+        let stride = self.stride;
+        let w = u32_to_usize(self.width);
+        let off = u32_to_usize(y) * stride;
+        let pixels = &mut self.data[off..off + stride];
+        let alpha = self.alpha.as_mut().map(|a| {
+            let aoff = u32_to_usize(y) * w;
+            &mut a[aoff..aoff + w]
+        });
+        (pixels, alpha)
+    }
+
     // ── Bulk operations ───────────────────────────────────────────────────────
 
     /// Fill the entire bitmap with a solid colour and an alpha value.
