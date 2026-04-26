@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/color", "crates/raster"]
+
+[workspace.dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+smallvec = { version = "1", features = ["union"] }
+bitflags = { version = "2" }
+proptest = { version = "1" }

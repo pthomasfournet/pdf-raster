@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock is committed for binaries, not for libs — keep for now
+# Cargo.lock
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.DS_Store
+
+# Test / benchmark artifacts
+criterion/
+flamegraph.svg
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+
+# Temp files
+*.tmp
+*.bak
+*.orig
+
+# Binaries produced by tests
+/tmp/
+
+# OS
+Thumbs.db
