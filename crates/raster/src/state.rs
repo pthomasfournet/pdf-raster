@@ -405,14 +405,20 @@ mod tests {
     #[test]
     fn default_matrix_is_identity() {
         let s = GraphicsState::new(100, 100, false);
-        assert_eq!(s.matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // These values are set by assignment from a literal, so exact equality is correct.
+        assert!(
+            s.matrix
+                .iter()
+                .zip([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
     fn default_alpha_is_one() {
         let s = GraphicsState::new(100, 100, false);
-        assert_eq!(s.stroke_alpha, 1.0);
-        assert_eq!(s.fill_alpha, 1.0);
+        assert!((s.stroke_alpha - 1.0).abs() < f64::EPSILON);
+        assert!((s.fill_alpha - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -450,7 +456,7 @@ mod tests {
 
         assert!(stack.restore());
         assert_eq!(stack.depth(), 1);
-        assert_eq!(stack.current().line_width, 1.0); // restored to default
+        assert!((stack.current().line_width - 1.0).abs() < f64::EPSILON); // restored to default
     }
 
     #[test]
@@ -465,7 +471,7 @@ mod tests {
     fn set_transfer_derives_cmyk() {
         let mut s = GraphicsState::new(100, 100, false);
         // Inversion LUT: i → 255-i
-        let inv: [u8; 256] = std::array::from_fn(|i| 255 - i as u8);
+        let inv: [u8; 256] = std::array::from_fn(|i| u8::try_from(255 - i).expect("i < 256"));
         s.set_transfer(&inv, &inv, &inv, &inv);
         // CMYK C = 255 - R[255-i] (before overwrite of R); with identity R:
         // R[255-i] = 255-i, so C[i] = 255-(255-i) = i → identity

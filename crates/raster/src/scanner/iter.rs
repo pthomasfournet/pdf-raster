@@ -114,8 +114,7 @@ mod tests {
     fn out_of_range_y_empty() {
         let xpath = rect_xpath(0.0, 0.0, 4.0, 4.0);
         let scanner = XPathScanner::new(&xpath, false, 0, 10);
-        let spans: Vec<_> = ScanIterator::new(&scanner, 100).collect();
-        assert!(spans.is_empty());
+        assert!(ScanIterator::new(&scanner, 100).next().is_none());
     }
 
     #[test]

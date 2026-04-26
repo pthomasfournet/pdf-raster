@@ -396,7 +396,7 @@ mod tests {
         let pa = a.build();
 
         let mut b_path = pa.clone();
-        let mut other = pa.clone();
+        let mut other = pa;
         other.hints.push(StrokeAdjustHint {
             ctrl0: 0,
             ctrl1: 1,

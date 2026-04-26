@@ -69,9 +69,9 @@ pub struct XPath {
 }
 
 impl XPath {
-    /// Create an empty XPath (for tests and internal use).
+    /// Create an empty `XPath` (for tests and internal use).
     #[cfg(test)]
-    pub(crate) fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             segs: Vec::new(),
             curve_data: None,
@@ -321,8 +321,8 @@ mod tests {
         let s = &xpath.segs[0];
         assert!(s.flags.contains(XPathFlags::HORIZ));
         assert!(!s.flags.contains(XPathFlags::FLIPPED));
-        assert_eq!(s.y0, 5.0);
-        assert_eq!(s.y1, 5.0);
+        assert!((s.y0 - 5.0).abs() < f64::EPSILON);
+        assert!((s.y1 - 5.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         xpath.add_segment(5.0, 0.0, 5.0, 10.0);
         let s = &xpath.segs[0];
         assert!(s.flags.contains(XPathFlags::VERT));
-        assert_eq!(s.dxdy, 0.0);
+        assert!(s.dxdy.abs() < f64::EPSILON);
     }
 
     #[test]

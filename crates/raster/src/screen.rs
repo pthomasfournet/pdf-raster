@@ -156,9 +156,17 @@ fn build_clustered(mat: &mut [u8], size: usize) {
             let dx = f64::from(u32::try_from(x).unwrap_or(u32::MAX)) - cx;
             let dy = f64::from(u32::try_from(y).unwrap_or(u32::MAX)) - cy;
             let dist = dx.mul_add(dx, dy * dy);
-            let val = (1.0 - dist / max_dist).mul_add(254.0, 0.5);
-            // val is in [0.5, 254.5] after clamping; safe to convert via unsafe.
-            let v: u8 = unsafe { val.clamp(0.5, 254.5).to_int_unchecked() };
+            // Known false-positive: value is clamped to [0.5, 254.5] so
+            // truncation to u8 is safe. #[expect] errors if clippy ever fixes
+            // the false-positive (github.com/rust-lang/rust-clippy/issues/7486).
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "value clamped to [0.5, 254.5] before cast; fits in u8"
+            )]
+            let v = (1.0_f64 - dist / max_dist)
+                .mul_add(254.0, 0.5)
+                .clamp(0.5, 254.5) as u8;
             mat[y * size + x] = v.max(1);
         }
     }
