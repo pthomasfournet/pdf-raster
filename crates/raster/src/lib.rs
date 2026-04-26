@@ -28,6 +28,7 @@ pub mod pipe;
 pub mod scanner;
 pub mod screen;
 pub mod state;
+pub mod stroke;
 pub mod types;
 pub mod xpath;
 
@@ -40,5 +41,6 @@ pub use scanner::iter::ScanIterator;
 pub use scanner::{Intersect, XPathScanner};
 pub use screen::HalftoneScreen;
 pub use state::{GraphicsState, StateStack, TransferSet};
+pub use stroke::{StrokeParams, flatten_path, make_dashed_path, make_stroke_path, stroke, stroke_narrow, stroke_wide};
 pub use types::*;
 pub use xpath::{XPath, XPathFlags, XPathSeg};

@@ -459,6 +459,15 @@ impl PathBuilder {
         });
     }
 
+    /// Returns the number of points accumulated in the builder so far.
+    ///
+    /// This is a read-only view used by callers that need to record point
+    /// indices for stroke-adjustment hints (e.g. `raster::stroke::make_stroke_path`).
+    #[must_use]
+    pub const fn pts_len(&self) -> usize {
+        self.path.pts.len()
+    }
+
     /// Translate every point accumulated so far by `(dx, dy)`.
     pub fn offset(&mut self, dx: f64, dy: f64) {
         self.path.offset(dx, dy);
