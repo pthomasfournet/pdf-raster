@@ -9,17 +9,22 @@
 //! # Regenerating references
 //!
 //! Run `tests/golden/generate.sh` from the workspace root.  That script
-//! renders the same fixtures with `pdftoppm` and writes the results into
-//! `tests/golden/ref/`.  Commit the updated PPMs.
+//! renders the same fixtures with the release `pdf-raster` binary and writes
+//! the results into `tests/golden/ref/`.  Commit the updated PPMs.
 //!
 //! # Environment
 //!
 //! The binary path is resolved at compile time via `CARGO_BIN_EXE_pdf-raster`.
+//! During `cargo test` this is the *debug* build.  References are generated
+//! with the release build; minor rendering differences between build profiles
+//! are not expected, but regenerate references with debug if tests fail
+//! consistently only in CI.
+//!
 //! The workspace root is derived from `CARGO_MANIFEST_DIR` (this crate's
 //! manifest lives at `crates/cli/`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
@@ -44,14 +49,17 @@ struct Case {
     /// Prefix used when naming reference files in `tests/golden/ref/`.
     ///
     /// Reference files are named `<prefix>-<page>.ppm` where `<page>` is
-    /// the 1-based page number, zero-padded to match pdftoppm's convention
+    /// the 1-based page number, zero-padded to match `pdf-raster`'s convention
     /// for the document's total page count.
     ref_prefix: &'static str,
     /// First page to test, 1-based.
     first: u32,
     /// Last page to test, 1-based.
     last: u32,
-    /// Total page count of the PDF — determines pdftoppm's zero-pad width.
+    /// Total page count of the PDF — determines the zero-pad width.
+    ///
+    /// Must match the actual page count of the fixture so that the file names
+    /// produced by `pdf-raster` align with the reference files.
     total_pages: u32,
 }
 
@@ -59,33 +67,37 @@ struct Case {
 ///
 /// Keep these small — a few pages each — so `cargo test` completes quickly.
 /// Large-page-count fixtures belong in the benchmark suite, not here.
+///
+/// **Ordering matters**: the test entry points reference cases by index.
+/// Add new cases at the end and add a corresponding `#[test]` fn.
 const CASES: &[Case] = &[
     Case {
         pdf: "cryptic-rite.pdf",
         ref_prefix: "cryptic-rite-72",
         first: 1,
         last: 3,
-        total_pages: 7,   // 7 pages → pdftoppm uses 1-digit padding
+        total_pages: 7,   // 7 pages → 1-digit padding (e.g. page-1.ppm)
     },
     Case {
         pdf: "ritual-14th.pdf",
         ref_prefix: "ritual-14th-72",
         first: 1,
         last: 3,
-        total_pages: 41,  // 41 pages → pdftoppm uses 2-digit padding
+        total_pages: 41,  // 41 pages → 2-digit padding (e.g. page-01.ppm)
     },
 ];
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── path helpers ──────────────────────────────────────────────────────────────
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is `<workspace>/crates/cli`; walk up two levels.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
+    let crates = manifest
         .parent()
-        .expect("crates/ dir")
+        .unwrap_or_else(|| panic!("expected crates/ parent of {}", manifest.display()));
+    crates
         .parent()
-        .expect("workspace root")
+        .unwrap_or_else(|| panic!("expected workspace root parent of {}", crates.display()))
         .to_owned()
 }
 
@@ -97,58 +109,63 @@ fn ref_dir() -> PathBuf {
     workspace_root().join("tests/golden/ref")
 }
 
+// ── PPM parsing ───────────────────────────────────────────────────────────────
+
+/// Skip ASCII whitespace and `#`-comment lines, advancing `pos` in `buf`.
+fn skip_whitespace_and_comments(buf: &[u8], pos: &mut usize) {
+    loop {
+        while *pos < buf.len()
+            && matches!(buf[*pos], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            *pos += 1;
+        }
+        if *pos < buf.len() && buf[*pos] == b'#' {
+            while *pos < buf.len() && buf[*pos] != b'\n' {
+                *pos += 1;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// Read the next whitespace-delimited token from `buf`, advancing `pos`.
+fn read_token(buf: &[u8], pos: &mut usize) -> String {
+    skip_whitespace_and_comments(buf, pos);
+    let start = *pos;
+    while *pos < buf.len() && !matches!(buf[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+    String::from_utf8_lossy(&buf[start..*pos]).into_owned()
+}
+
 /// Parse a binary P6 PPM file.  Returns `(width, height, pixels_rgb)`.
 ///
 /// Panics with a clear message on any parse failure so test output is readable.
 fn parse_ppm(path: &Path) -> (u32, u32, Vec<u8>) {
     let data = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e));
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
-    // PPM header: "P6\n<w> <h>\n255\n" then raw RGB bytes.
-    // Skip comment lines starting with '#'.
     let mut pos = 0usize;
 
-    let consume_whitespace_and_comments = |p: &mut usize, buf: &[u8]| {
-        loop {
-            while *p < buf.len() && (buf[*p] == b' ' || buf[*p] == b'\t' || buf[*p] == b'\n' || buf[*p] == b'\r') {
-                *p += 1;
-            }
-            if *p < buf.len() && buf[*p] == b'#' {
-                while *p < buf.len() && buf[*p] != b'\n' {
-                    *p += 1;
-                }
-            } else {
-                break;
-            }
-        }
-    };
-
-    // Magic
+    // Magic — must be "P6".
     assert!(
         data.get(pos..pos + 2) == Some(b"P6"),
-        "not a P6 PPM file: {}",
-        path.display()
+        "not a P6 PPM file: {} (got {:?})",
+        path.display(),
+        data.get(..4).map(|b| String::from_utf8_lossy(b).into_owned())
     );
     pos += 2;
 
-    let read_token = |p: &mut usize, buf: &[u8]| -> String {
-        consume_whitespace_and_comments(p, buf);
-        let start = *p;
-        while *p < buf.len() && !matches!(buf[*p], b' ' | b'\t' | b'\n' | b'\r') {
-            *p += 1;
-        }
-        String::from_utf8_lossy(&buf[start..*p]).into_owned()
-    };
-
-    let w: u32 = read_token(&mut pos, &data)
+    let w: u32 = read_token(&data, &mut pos)
         .parse()
-        .unwrap_or_else(|_| panic!("bad width in {}", path.display()));
-    let h: u32 = read_token(&mut pos, &data)
+        .unwrap_or_else(|e| panic!("bad width in {}: {e}", path.display()));
+    let h: u32 = read_token(&data, &mut pos)
         .parse()
-        .unwrap_or_else(|_| panic!("bad height in {}", path.display()));
-    let maxval: u32 = read_token(&mut pos, &data)
+        .unwrap_or_else(|e| panic!("bad height in {}: {e}", path.display()));
+    let maxval: u32 = read_token(&data, &mut pos)
         .parse()
-        .unwrap_or_else(|_| panic!("bad maxval in {}", path.display()));
+        .unwrap_or_else(|e| panic!("bad maxval in {}: {e}", path.display()));
 
     assert!(
         maxval == 255,
@@ -156,23 +173,36 @@ fn parse_ppm(path: &Path) -> (u32, u32, Vec<u8>) {
         path.display()
     );
 
-    // One whitespace byte separates header from pixel data.
-    pos += 1;
+    // PPM spec: exactly one whitespace character separates the header from the
+    // pixel data.  We must consume exactly one byte here regardless of whether
+    // it is '\n', '\r\n', etc., so that CRLF files do not corrupt pixel reads.
+    assert!(
+        pos < data.len(),
+        "PPM file truncated before pixel data: {}",
+        path.display()
+    );
+    pos += 1; // consume exactly the one mandatory separator byte
 
-    let expected = (w * h * 3) as usize;
-    let pixels = data[pos..].to_vec();
+    let n_pixels = w as usize * h as usize; // safe: usize arithmetic, no u32 overflow
+    let expected = n_pixels * 3;
+    let remaining = data.len().saturating_sub(pos);
     assert_eq!(
-        pixels.len(),
+        remaining,
         expected,
-        "pixel data length mismatch in {}: expected {expected}, got {}",
-        path.display(),
-        pixels.len()
+        "pixel data length mismatch in {}: expected {expected} bytes ({w}×{h}×3), got {remaining}",
+        path.display()
     );
 
-    (w, h, pixels)
+    assert!(
+        n_pixels > 0,
+        "zero-size image in {}: {w}×{h}",
+        path.display()
+    );
+
+    (w, h, data[pos..].to_vec())
 }
 
-/// Zero-pad a number to `width` decimal digits.
+/// Zero-pad `n` to `width` decimal digits.
 fn zero_pad(n: u32, width: usize) -> String {
     format!("{n:0>width$}")
 }
@@ -184,34 +214,43 @@ fn run_case(case: &Case) {
     let pdf_path = fixtures_dir().join(case.pdf);
     let ref_dir = ref_dir();
 
-    // pdftoppm zero-pads page numbers to the width needed for total_pages.
-    // e.g. 7-page doc → 1 digit; 41-page doc → 2 digits; 100-page doc → 3 digits.
+    assert!(
+        pdf_path.exists(),
+        "fixture PDF missing: {}\n  Add it to tests/fixtures/ and re-run generate.sh.",
+        pdf_path.display()
+    );
+
+    // Pad width matches pdf-raster's digit_width(total_pages) in naming.rs.
     let pad_width = case.total_pages.to_string().len();
 
     // Render into a temp directory.
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = tempfile::tempdir().expect("failed to create tempdir for golden test");
     let out_prefix = tmp.path().join("page");
 
-    let status = Command::new(binary)
-        .args([
-            "-r",
-            &DPI.to_string(),
-            "-f",
-            &case.first.to_string(),
-            "-l",
-            &case.last.to_string(),
-            pdf_path.to_str().expect("pdf path is valid UTF-8"),
-            out_prefix.to_str().expect("tmp path is valid UTF-8"),
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn pdf-raster: {e}"));
+    let dpi_str = DPI.to_string();
+    let first_str = case.first.to_string();
+    let last_str = case.last.to_string();
 
-    assert!(
-        status.success(),
-        "pdf-raster exited with {} for {}",
-        status,
-        case.pdf
-    );
+    let output = Command::new(binary)
+        .args([
+            "-r", &dpi_str,
+            "-f", &first_str,
+            "-l", &last_str,
+            pdf_path.to_str().expect("pdf path must be valid UTF-8"),
+            out_prefix.to_str().expect("tempdir path must be valid UTF-8"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn pdf-raster ({binary}): {e}"));
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "pdf-raster exited with {} for {}:\n{stderr}",
+            output.status, case.pdf
+        );
+    }
 
     let mut page_failures: Vec<String> = Vec::new();
 
@@ -219,16 +258,16 @@ fn run_case(case: &Case) {
         let page_str = zero_pad(page, pad_width);
 
         let out_file = tmp.path().join(format!("page-{page_str}.ppm"));
-        let ref_file = ref_dir.join(format!("{}-{}.ppm", case.ref_prefix, page_str));
+        let ref_file = ref_dir.join(format!("{}-{page_str}.ppm", case.ref_prefix));
 
         assert!(
             ref_file.exists(),
-            "reference file missing: {}\n  Run tests/golden/generate.sh to create it.",
+            "reference file missing: {}\n  Run: bash tests/golden/generate.sh",
             ref_file.display()
         );
         assert!(
             out_file.exists(),
-            "pdf-raster did not produce page {page} for {}: expected {}",
+            "pdf-raster did not produce page {page} for {} (expected {})",
             case.pdf,
             out_file.display()
         );
@@ -237,9 +276,7 @@ fn run_case(case: &Case) {
         let (out_w, out_h, out_px) = parse_ppm(&out_file);
 
         // Allow ±1px dimension difference from independent rounding.
-        let w_ok = ref_w.abs_diff(out_w) <= 1;
-        let h_ok = ref_h.abs_diff(out_h) <= 1;
-        if !w_ok || !h_ok {
+        if ref_w.abs_diff(out_w) > 1 || ref_h.abs_diff(out_h) > 1 {
             page_failures.push(format!(
                 "  page {page}: dimension mismatch — ref {ref_w}×{ref_h}, got {out_w}×{out_h}"
             ));
@@ -249,6 +286,11 @@ fn run_case(case: &Case) {
         // Compare over the overlapping region to handle the ±1px cases.
         let cmp_w = ref_w.min(out_w) as usize;
         let cmp_h = ref_h.min(out_h) as usize;
+
+        // n_samples cannot be 0 here: parse_ppm already asserts n_pixels > 0
+        // and the dimension check above gates cmp_w/cmp_h to be ≥ ref-1.
+        debug_assert!(cmp_w > 0 && cmp_h > 0, "comparison region is empty");
+
         let ref_stride = ref_w as usize * 3;
         let out_stride = out_w as usize * 3;
 
@@ -258,10 +300,11 @@ fn run_case(case: &Case) {
             let r = &ref_px[row * ref_stride..row * ref_stride + cmp_w * 3];
             let o = &out_px[row * out_stride..row * out_stride + cmp_w * 3];
             for (&a, &b) in r.iter().zip(o.iter()) {
-                sum_diff += a.abs_diff(b) as u64;
+                sum_diff += u64::from(a.abs_diff(b));
                 n_samples += 1;
             }
         }
+
         let page_mae = sum_diff as f64 / n_samples as f64;
 
         if page_mae > MAE_LIMIT {
