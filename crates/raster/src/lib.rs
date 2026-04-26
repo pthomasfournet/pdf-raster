@@ -32,6 +32,7 @@ pub mod screen;
 pub mod shading;
 pub mod state;
 pub mod stroke;
+pub mod transparency;
 pub mod types;
 pub mod xpath;
 

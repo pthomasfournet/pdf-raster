@@ -55,6 +55,7 @@ pub trait Pattern: Send + Sync {
 ///
 /// `'bmp` borrows slices out of the destination bitmap's alpha plane and the
 /// current graphics state's transfer tables.
+#[derive(Copy, Clone, Debug)]
 pub struct PipeState<'bmp> {
     /// Compositing blend mode.
     pub blend_mode: BlendMode,

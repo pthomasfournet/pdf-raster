@@ -449,6 +449,7 @@ impl GraphicsState {
 ///
 /// Constructed via [`GraphicsState::transfer_set`] and stored in [`PipeState`].
 /// Avoids cloning the tables for each paint operation.
+#[derive(Copy, Clone, Debug)]
 pub struct TransferSet<'a> {
     /// RGB transfer tables: `[R, G, B]`, each 256 bytes.
     pub rgb: [&'a [u8; 256]; 3],

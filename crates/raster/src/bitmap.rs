@@ -214,6 +214,21 @@ impl<P: Pixel> Bitmap<P> {
         self.alpha.is_some()
     }
 
+    /// Read-only access to the full alpha plane (`width × height` bytes).
+    ///
+    /// Returns `None` if this bitmap was created without an alpha plane.
+    #[must_use]
+    pub fn alpha_plane(&self) -> Option<&[u8]> {
+        self.alpha.as_deref()
+    }
+
+    /// Mutable access to the full alpha plane (`width × height` bytes).
+    ///
+    /// Returns `None` if this bitmap was created without an alpha plane.
+    pub fn alpha_plane_mut(&mut self) -> Option<&mut [u8]> {
+        self.alpha.as_deref_mut()
+    }
+
     /// Simultaneous mutable access to the pixel row and the alpha row.
     ///
     /// Returns `(pixel_row_bytes, Some(alpha_row))` or `(pixel_row_bytes, None)`.
