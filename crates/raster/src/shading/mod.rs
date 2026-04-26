@@ -1,0 +1,141 @@
+//! Shaded fills — gradient patterns and Gouraud-shaded triangles.
+//!
+//! Replaces `Splash::shadedFill` and `Splash::gouraudTriangleShadedFill`.
+//!
+//! # Module layout
+//! - [`axial`]    — [`AxialPattern`]: linear gradient along an axis vector
+//! - [`radial`]   — [`RadialPattern`]: gradient between two circles
+//! - [`function`] — [`FunctionPattern`]: PDF function sampled per pixel
+//! - [`gouraud`]  — [`gouraud_triangle_fill`]: vertex-coloured triangle scan
+//!
+//! # Entry point
+//!
+//! [`shaded_fill`] is a thin wrapper around [`fill::fill`] / [`fill::eo_fill`]
+//! that passes the pattern as a [`PipeSrc::Pattern`].  The gradient patterns
+//! implement [`Pattern`] and are injected by the caller (typically `pdf_bridge`).
+
+pub mod axial;
+pub mod function;
+pub mod gouraud;
+pub mod radial;
+
+use crate::bitmap::Bitmap;
+use crate::clip::Clip;
+use crate::fill;
+use crate::path::Path;
+use crate::pipe::{Pattern, PipeSrc, PipeState};
+use color::Pixel;
+
+/// Fill `path` using a shading pattern as the colour source.
+///
+/// Equivalent to `Splash::shadedFill`.  The path defines the shading's bounding
+/// shape; `pattern` supplies per-pixel colour.  `eo` selects even-odd vs. non-zero
+/// winding.  `clip_to_stroke` selects stroke alpha (not currently wired — caller
+/// sets `pipe.a_input` directly).
+#[expect(clippy::too_many_arguments, reason = "mirrors shadedFill signature")]
+pub fn shaded_fill<P: Pixel>(
+    bitmap: &mut Bitmap<P>,
+    clip: &Clip,
+    path: &Path,
+    pipe: &PipeState<'_>,
+    pattern: &dyn Pattern,
+    matrix: &[f64; 6],
+    flatness: f64,
+    vector_antialias: bool,
+    eo: bool,
+) {
+    let src = PipeSrc::Pattern(pattern);
+    if eo {
+        fill::eo_fill::<P>(bitmap, clip, path, pipe, &src, matrix, flatness, vector_antialias);
+    } else {
+        fill::fill::<P>(bitmap, clip, path, pipe, &src, matrix, flatness, vector_antialias);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitmap::Bitmap;
+    use crate::clip::Clip;
+    use crate::path::PathBuilder;
+    use crate::pipe::PipeState;
+    use crate::shading::axial::AxialPattern;
+    use crate::state::TransferSet;
+    use crate::types::BlendMode;
+    use color::Rgb8;
+
+    fn identity_matrix() -> [f64; 6] {
+        [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    }
+
+    fn simple_pipe() -> PipeState<'static> {
+        PipeState {
+            blend_mode: BlendMode::Normal,
+            a_input: 255,
+            overprint_mask: 0xFFFF_FFFF,
+            overprint_additive: false,
+            transfer: TransferSet::identity_rgb(),
+            soft_mask: None,
+            alpha0: None,
+            knockout: false,
+            knockout_opacity: 255,
+            non_isolated_group: false,
+        }
+    }
+
+    fn rect_path(x0: f64, y0: f64, x1: f64, y1: f64) -> Path {
+        let mut b = PathBuilder::new();
+        b.move_to(x0, y0).unwrap();
+        b.line_to(x1, y0).unwrap();
+        b.line_to(x1, y1).unwrap();
+        b.line_to(x0, y1).unwrap();
+        b.close(true).unwrap();
+        b.build()
+    }
+
+    #[test]
+    fn shaded_fill_axial_paints_interior() {
+        // 8×8 bitmap; fill (1,1)→(6,6) with a left→right gradient black→white.
+        let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 4, false);
+        let clip = Clip::new(0.0, 0.0, 7.999, 7.999, false);
+        let pipe = simple_pipe();
+        let path = rect_path(1.0, 1.0, 6.0, 6.0);
+
+        // Horizontal axial gradient: x=1→black, x=6→white.
+        let pattern = AxialPattern::new(
+            [0u8, 0, 0],
+            [255u8, 255, 255],
+            1.0, 3.5,  // p0_x, p0_y
+            6.0, 3.5,  // p1_x, p1_y
+            0.0, 1.0,  // t0, t1 (full range)
+            false, false, // extend_start, extend_end
+        );
+
+        shaded_fill::<Rgb8>(
+            &mut bmp, &clip, &path, &pipe, &pattern,
+            &identity_matrix(), 1.0, false, false,
+        );
+
+        // The interior should be painted — check that the fill happened.
+        // Row 3, column 1 should be near-black; column 5 should be near-white.
+        let r3 = bmp.row(3);
+        assert!(r3[1].r < 60,  "x=1 should be near-black (got {})", r3[1].r);
+        assert!(r3[5].r > 180, "x=5 should be near-white (got {})", r3[5].r);
+    }
+
+    #[test]
+    fn shaded_fill_empty_path_is_noop() {
+        let mut bmp: Bitmap<Rgb8> = Bitmap::new(8, 8, 4, false);
+        let clip = Clip::new(0.0, 0.0, 7.999, 7.999, false);
+        let pipe = simple_pipe();
+        let path = PathBuilder::new().build();
+        let pattern = AxialPattern::new(
+            [255u8, 0, 0], [0u8, 255, 0],
+            0.0, 0.0, 8.0, 0.0,
+            0.0, 1.0, false, false,
+        );
+        shaded_fill::<Rgb8>(&mut bmp, &clip, &path, &pipe, &pattern,
+            &identity_matrix(), 1.0, false, false);
+        assert_eq!(bmp.row(4)[4].r, 0, "empty path must not paint");
+    }
+}
