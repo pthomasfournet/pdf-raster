@@ -14,9 +14,10 @@
 #   -l PAGE         Last page rendered per run (default: 5, keeps runs short)
 #   -w N            Hyperfine warmup runs per benchmark (default: 1)
 #   -n N            Hyperfine measurement runs per benchmark (default: 5)
-#   -o FILE         Write JSON results to FILE (default: bench-results.json)
+#   -o FILE         Write JSON results to FILE (default: bench/bench-results.json)
+#   -d              Dry run: print hyperfine commands without executing them
 #
-# Requires: hyperfine, pdftoppm, pdf-raster (release build)
+# Requires: hyperfine, pdftoppm, pdf-raster (release build), python3
 
 set -euo pipefail
 
@@ -33,8 +34,14 @@ LAST_PAGE=5
 WARMUP=1
 RUNS=5
 JSON_OUT="${SCRIPT_DIR}/bench-results.json"
+DRY_RUN=false
 
-while getopts ":r:f:p:l:w:n:o:h" opt; do
+usage() {
+    grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
+    exit 0
+}
+
+while getopts ":r:f:p:l:w:n:o:dh" opt; do
     case $opt in
         r) DPI_LIST="$OPTARG" ;;
         f) FIXTURES_DIR="$OPTARG" ;;
@@ -43,14 +50,15 @@ while getopts ":r:f:p:l:w:n:o:h" opt; do
         w) WARMUP="$OPTARG" ;;
         n) RUNS="$OPTARG" ;;
         o) JSON_OUT="$OPTARG" ;;
-        h) sed -n 's/^# \{0,2\}//p' "$0" | sed '1d; /^!/d'; exit 0 ;;
-        :) echo "Option -$OPTARG requires an argument." >&2; exit 1 ;;
-        \?) echo "Unknown option: -$OPTARG" >&2; exit 1 ;;
+        d) DRY_RUN=true ;;
+        h) usage ;;
+        :) echo "Error: option -$OPTARG requires an argument." >&2; exit 1 ;;
+       \?) echo "Error: unknown option -$OPTARG." >&2; exit 1 ;;
     esac
 done
 
 # ── dependency check ──────────────────────────────────────────────────────────
-for cmd in hyperfine pdftoppm; do
+for cmd in hyperfine pdftoppm python3; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found in PATH" >&2; exit 1; }
 done
 [[ -x "$RASTER_BIN" ]] || {
@@ -72,12 +80,33 @@ else
     [[ ${#pdf_files[@]} -gt 0 ]] || { echo "Error: no PDFs in $FIXTURES_DIR" >&2; exit 1; }
 fi
 
-# Output temp dir for rendered files (discarded after each run).
+# ── dry-run ───────────────────────────────────────────────────────────────────
+if $DRY_RUN; then
+    echo "DRY RUN — hyperfine commands that would be executed:"
+    echo ""
+    IFS=',' read -ra dpis <<< "$DPI_LIST"
+    for pdf in "${pdf_files[@]}"; do
+        pdf_name="$(basename "$pdf")"
+        echo "  ── ${pdf_name} ──"
+        for dpi in "${dpis[@]}"; do
+            ref_cmd="pdftoppm -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} <TMP>/ref/pg"
+            new_cmd="${RASTER_BIN} -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} <TMP>/new/pg"
+            frag="<TMP>/frag_${pdf_name//[^a-zA-Z0-9]/_}_${dpi}.json"
+            echo "  hyperfine --warmup ${WARMUP} --runs ${RUNS} --export-json ${frag} \\"
+            echo "    --command-name 'pdftoppm  @${dpi}dpi' '${ref_cmd}' \\"
+            echo "    --command-name 'pdf-raster@${dpi}dpi' '${new_cmd}'"
+            echo ""
+        done
+    done
+    echo "  JSON output → ${JSON_OUT}"
+    exit 0
+fi
+
+# ── temp dir for rendered pages (discarded between runs) ──────────────────────
 OUT_DIR="$(mktemp -d)"
 trap 'rm -rf "$OUT_DIR"' EXIT
 
 # ── aggregate JSON output ─────────────────────────────────────────────────────
-# We collect one JSON fragment per (pdf, dpi) pair and wrap them at the end.
 json_fragments=()
 
 echo "══════════════════════════════════════════════════════════════════════════"
@@ -105,8 +134,6 @@ for pdf in "${pdf_files[@]}"; do
 
         ref_cmd="pdftoppm -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} ${ref_out}/pg"
         new_cmd="${RASTER_BIN} -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} ${new_out}/pg"
-
-        # hyperfine JSON fragment for this run pair
         frag_file="${OUT_DIR}/frag_${pdf_name//[^a-zA-Z0-9]/_}_${dpi}.json"
 
         hyperfine \
@@ -118,14 +145,13 @@ for pdf in "${pdf_files[@]}"; do
 
         json_fragments+=("$frag_file")
 
-        # Clean up rendered output between runs so disk doesn't fill up.
+        # Clean up rendered pages so disk doesn't fill up on large fixtures.
         rm -f "${ref_out}"/pg-*.ppm "${new_out}"/pg-*.ppm
     done
 done
 
 echo ""
 echo "── Writing combined results → ${JSON_OUT} ───────────────────────────────"
-# Merge all fragment JSON arrays into one object.
 python3 - "${json_fragments[@]}" "$JSON_OUT" <<'PYEOF'
 import json, sys
 
@@ -157,7 +183,6 @@ last_page = int(sys.argv[2])
 print(f"  {'Command':<30} {'Mean (s)':>9} {'Pages/s':>10} {'vs ref':>8}")
 print(f"  {'-'*30} {'-'*9} {'-'*10} {'-'*8}")
 
-# Group pairs by DPI label extracted from command name.
 ref_times = {}
 for r in data["results"]:
     name = r["command"]
