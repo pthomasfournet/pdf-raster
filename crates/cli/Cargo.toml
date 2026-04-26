@@ -16,6 +16,9 @@ clap       = { version = "4", features = ["derive"] }
 rayon      = "1"
 anyhow     = "1"
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints.rust]
 # cli binary: unsafe_code only allowed in pdf_bridge (the FFI crate)
 unsafe_code    = "deny"

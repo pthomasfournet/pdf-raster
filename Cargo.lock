@@ -589,6 +589,7 @@ dependencies = [
  "pdf_bridge",
  "raster",
  "rayon",
+ "tempfile",
 ]
 
 [[package]]
