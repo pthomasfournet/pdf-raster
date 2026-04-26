@@ -140,7 +140,8 @@ impl GpuCtx {
         let _ = builder.arg(&mut d_dst);
         let _ = builder.arg(&n_u32);
         // SAFETY: kernel arguments match the PTX signature; n_u32 bounds are verified above.
-        unsafe { builder.launch(cfg) }?;
+        // launch returns Option<timing events> on success; we don't need timing, so discard it.
+        let _ = unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
         stream.memcpy_dtoh(&d_dst, dst)?;
@@ -166,7 +167,8 @@ impl GpuCtx {
         let _ = builder.arg(&d_mask);
         let _ = builder.arg(&n_u32);
         // SAFETY: kernel arguments match the PTX signature; n_u32 bounds are verified above.
-        unsafe { builder.launch(cfg) }?;
+        // launch returns Option<timing events> on success; we don't need timing, so discard it.
+        let _ = unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
         stream.memcpy_dtoh(&d_pixels, pixels)?;
@@ -208,6 +210,7 @@ pub fn composite_rgba8_cpu(src: &[u8], dst: &mut [u8]) {
                 (u32::from(s[c]) * a_src + u32::from(d[c]) * a_dst * inv / 255 + a_out / 2) / a_out;
             d[c] = blended.min(255) as u8;
         }
+        // a_out = a_src + (a_dst * inv + 127) / 255 ≤ 255 + 255 = 510, so min(255) is needed.
         d[3] = a_out.min(255) as u8;
     }
 }

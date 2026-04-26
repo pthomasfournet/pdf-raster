@@ -1,5 +1,4 @@
 //! Build script: compiles CUDA kernels to PTX via nvcc and places them in `OUT_DIR`.
-#![allow(missing_docs)]
 
 use std::env;
 use std::path::PathBuf;
@@ -9,11 +8,12 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let kernels_dir = PathBuf::from("kernels");
 
-    // Tell cargo to rerun if kernels change.
+    // Tell cargo to rerun if kernels or CUDA_ARCH env changes.
     println!("cargo:rerun-if-changed=kernels/");
+    println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
 
     let nvcc = env::var("NVCC").unwrap_or_else(|_| {
-        // Try standard CUDA install paths.
         for path in ["/usr/local/cuda-12.8/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
             if PathBuf::from(path).exists() {
                 return path.to_owned();
@@ -22,6 +22,10 @@ fn main() {
         "nvcc".to_owned()
     });
 
+    // Allow overriding the PTX target arch (e.g. CUDA_ARCH=sm_86 for Ampere).
+    // Default is sm_80 which runs on Ampere, Ada, Hopper, and Blackwell.
+    let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_owned());
+
     for kernel in ["composite_rgba8", "apply_soft_mask"] {
         let src = kernels_dir.join(format!("{kernel}.cu"));
         let ptx = out_dir.join(format!("{kernel}.ptx"));
@@ -29,16 +33,16 @@ fn main() {
         let status = Command::new(&nvcc)
             .args([
                 "--ptx",
-                "-arch=sm_120", // Blackwell / sm_120 (RTX 5070)
+                &format!("-arch={arch}"),
                 "-O3",
                 "--use_fast_math",
                 "-o",
-                ptx.to_str().unwrap(),
-                src.to_str().unwrap(),
+                ptx.to_str().expect("OUT_DIR path contains non-UTF-8"),
+                src.to_str().expect("kernel source path contains non-UTF-8"),
             ])
             .status()
-            .unwrap_or_else(|e| panic!("failed to run nvcc: {e}"));
+            .unwrap_or_else(|e| panic!("failed to run nvcc ({nvcc}): {e}"));
 
-        assert!(status.success(), "nvcc failed for {kernel}.cu");
+        assert!(status.success(), "nvcc failed for {kernel}.cu (arch={arch})");
     }
 }
