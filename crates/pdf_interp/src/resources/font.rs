@@ -76,10 +76,6 @@ impl CidEncoding {
     pub fn width_for_cid(&self, cid: u32) -> i32 {
         for (first, ws) in &self.widths {
             if cid >= *first {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "index bounded by W segment length, which is always < usize::MAX"
-                )]
                 let idx = (cid - first) as usize;
                 if idx < ws.len() {
                     return ws[idx];

@@ -17,6 +17,7 @@ pub(crate) mod dict_ext;
 pub mod font;
 pub mod image;
 pub mod shading;
+pub mod tiling;
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
@@ -205,6 +206,15 @@ impl<'doc> PageResources<'doc> {
         self.doc
     }
 
+    /// The object ID of the current resource context (page or form stream).
+    ///
+    /// Used by tiling-pattern rendering to inherit the parent context when the
+    /// pattern stream carries no own `Resources` dict.
+    #[must_use]
+    pub const fn resource_context_id(&self) -> ObjectId {
+        self.resource_context_id
+    }
+
     /// Resolve the font dictionary for the named resource (e.g. `b"F1"`).
     ///
     /// Returns `None` if the resource name is not present in the resource dict.
@@ -286,6 +296,17 @@ impl<'doc> PageResources<'doc> {
             resources_id: stream_id,
             has_own_resources,
         })
+    }
+
+    /// Resolve the named `Pattern` resource as a tiling descriptor.
+    ///
+    /// Returns `None` if the name is absent, the pattern is not `PatternType 1`
+    /// (tiling), or any required key is missing.  A debug message is logged for
+    /// PatternType 2 (shading patterns referenced via `scn`).
+    #[must_use]
+    pub fn tiling_pattern(&self, name: &[u8]) -> Option<tiling::TilingDescriptor> {
+        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        tiling::resolve_tiling(self.doc, ctx_dict, name)
     }
 
     /// Resolve the named `Shading` resource and return a [`raster::pipe::Pattern`]

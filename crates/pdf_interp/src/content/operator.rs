@@ -4,8 +4,8 @@
 //! [`Operator`] value ready for dispatch to the renderer.
 
 use super::operands::{
-    drain_numbers, pop_f64, pop_i32, pop_matrix, pop_name, pop_number_array, pop_string, pop2,
-    pop3, pop4,
+    ScnOperands, pop_f64, pop_i32, pop_matrix, pop_name, pop_number_array, pop_scn, pop_string,
+    pop2, pop3, pop4,
 };
 use super::tokenizer::Token;
 
@@ -150,6 +150,23 @@ pub enum Operator {
     SetFillColor(Vec<f64>),
     /// `SC` / `SCN` — set stroke colour (components in current stroke space).
     SetStrokeColor(Vec<f64>),
+    /// `scn /Name [c1…cn]` — activate a named Pattern as the fill source.
+    ///
+    /// `components` carries optional tint values for uncoloured (PaintType 2)
+    /// patterns; it is empty for coloured (PaintType 1) patterns.
+    SetFillPattern {
+        /// Key into the page `Pattern` resource dictionary.
+        name: Vec<u8>,
+        /// Tint components for PaintType 2 patterns (may be empty).
+        components: Vec<f64>,
+    },
+    /// `SCN /Name [c1…cn]` — activate a named Pattern as the stroke source.
+    SetStrokePattern {
+        /// Key into the page `Pattern` resource dictionary.
+        name: Vec<u8>,
+        /// Tint components for PaintType 2 patterns (may be empty).
+        components: Vec<f64>,
+    },
     /// `g` — set fill colour to gray level (`DeviceGray` shorthand).
     SetFillGray(f64),
     /// `G` — set stroke colour to gray level (`DeviceGray` shorthand).
@@ -326,8 +343,18 @@ pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
         // ── Colour ────────────────────────────────────────────────────────────
         b"cs" => Operator::SetFillColorSpace(pop_name(operands)),
         b"CS" => Operator::SetStrokeColorSpace(pop_name(operands)),
-        b"sc" | b"scn" => Operator::SetFillColor(drain_numbers(operands)),
-        b"SC" | b"SCN" => Operator::SetStrokeColor(drain_numbers(operands)),
+        b"sc" | b"scn" => match pop_scn(operands) {
+            ScnOperands::Components(c) => Operator::SetFillColor(c),
+            ScnOperands::Pattern { name, components } => {
+                Operator::SetFillPattern { name, components }
+            }
+        },
+        b"SC" | b"SCN" => match pop_scn(operands) {
+            ScnOperands::Components(c) => Operator::SetStrokeColor(c),
+            ScnOperands::Pattern { name, components } => {
+                Operator::SetStrokePattern { name, components }
+            }
+        },
         b"g" => Operator::SetFillGray(pop_f64(operands)),
         b"G" => Operator::SetStrokeGray(pop_f64(operands)),
         b"rg" => {

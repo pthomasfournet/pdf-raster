@@ -66,6 +66,53 @@ pub fn drain_numbers(stack: &mut Vec<Token<'_>>) -> Vec<f64> {
         .collect()
 }
 
+/// Result of parsing `scn` / `SCN` operands: either a pattern name or numeric
+/// colour components.
+///
+/// PDF §8.6.8: `scn` operands are zero or more numbers followed by an optional
+/// name.  When the last token is a name the colour space is Pattern and the name
+/// selects the pattern resource.  For all other colour spaces only numbers appear.
+pub enum ScnOperands {
+    /// `/PatternName [c1 … cn]` — Pattern colour space; name is the resource key,
+    /// components are the underlying non-Pattern colour (may be empty for
+    /// PaintType 1 / coloured patterns).
+    Pattern {
+        /// Pattern resource name (key into the page `Pattern` resource dict).
+        name: Vec<u8>,
+        /// Optional tint components for uncoloured (PaintType 2) patterns.
+        components: Vec<f64>,
+    },
+    /// Plain numeric components for non-pattern colour spaces.
+    Components(Vec<f64>),
+}
+
+/// Parse the operand stack for `scn` / `SCN`.
+///
+/// The PDF grammar is `c1 … cn name?`, where the optional trailing `name` selects
+/// a Pattern resource.  Numbers are consumed left-to-right; if the topmost token
+/// is a Name the result is `ScnOperands::Pattern`.
+pub fn pop_scn(stack: &mut Vec<Token<'_>>) -> ScnOperands {
+    // Check whether the top token is a name — if so it is the pattern key.
+    let name = match stack.last() {
+        Some(Token::Name(_)) => {
+            if let Some(Token::Name(n)) = stack.pop() {
+                Some(n.to_vec())
+            } else {
+                unreachable!()
+            }
+        }
+        _ => None,
+    };
+    let components = drain_numbers(stack);
+    match name {
+        Some(n) => ScnOperands::Pattern {
+            name: n,
+            components,
+        },
+        None => ScnOperands::Components(components),
+    }
+}
+
 /// Pop the topmost token as a flat array of numbers.
 ///
 /// If the top is a `Token::Array`, extract numbers from it.

@@ -33,6 +33,7 @@ pub mod shading;
 pub mod simd;
 pub mod state;
 pub mod stroke;
+pub mod tiling;
 pub mod transparency;
 pub mod types;
 pub mod xpath;
@@ -68,5 +69,6 @@ pub use stroke::{
     StrokeParams, flatten_path, make_dashed_path, make_stroke_path, stroke, stroke_narrow,
     stroke_wide,
 };
+pub use tiling::TiledPattern;
 pub use types::*;
 pub use xpath::{XPath, XPathFlags, XPathSeg};

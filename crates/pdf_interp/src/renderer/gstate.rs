@@ -107,6 +107,20 @@ pub struct InterpGState {
     pub dash: (Vec<f64>, f64),
     /// Text state (font, size, spacing, matrices).
     pub text: TextState,
+    /// Active fill pattern name (key into the page `Pattern` resource dict).
+    ///
+    /// Set by `scn /Name`; cleared when any other fill-colour operator fires.
+    /// `None` means use `fill_color` as a solid colour.
+    pub fill_pattern: Option<Vec<u8>>,
+    /// Tint components for an uncoloured fill pattern (PaintType 2).
+    pub fill_pattern_components: Vec<f64>,
+    /// Active stroke pattern name (key into the page `Pattern` resource dict).
+    ///
+    /// Set by `SCN /Name`; cleared when any other stroke-colour operator fires.
+    /// `None` means use `stroke_color` as a solid colour.
+    pub stroke_pattern: Option<Vec<u8>>,
+    /// Tint components for an uncoloured stroke pattern (PaintType 2).
+    pub stroke_pattern_components: Vec<f64>,
 }
 
 impl Clone for InterpGState {
@@ -126,6 +140,10 @@ impl Clone for InterpGState {
             flatness: self.flatness,
             dash: self.dash.clone(),
             text: self.text.clone(),
+            fill_pattern: self.fill_pattern.clone(),
+            fill_pattern_components: self.fill_pattern_components.clone(),
+            stroke_pattern: self.stroke_pattern.clone(),
+            stroke_pattern_components: self.stroke_pattern_components.clone(),
         }
     }
 }
@@ -149,6 +167,10 @@ impl InterpGState {
             flatness: 0.0,
             dash: (Vec::new(), 0.0),
             text: TextState::default(),
+            fill_pattern: None,
+            fill_pattern_components: Vec::new(),
+            stroke_pattern: None,
+            stroke_pattern_components: Vec::new(),
         }
     }
 }

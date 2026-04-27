@@ -42,10 +42,10 @@ use font::{
     engine::{FontEngine, SharedEngine},
 };
 use raster::{
-    Bitmap, eo_fill, fill,
+    Bitmap, TiledPattern, eo_fill, fill,
     glyph::{GlyphBitmap, fill_glyph},
     path::PathBuilder,
-    pipe::{PipeSrc, PipeState},
+    pipe::{Pattern, PipeSrc, PipeState},
     shading::shaded_fill,
     state::TransferSet,
     stroke::{StrokeParams, stroke},
@@ -253,7 +253,15 @@ impl<'doc> PageRenderer<'doc> {
             Operator::SetFillRgb(r, g, b) => self.set_fill(RasterColor::rgb(*r, *g, *b)),
             Operator::SetFillCmyk(c, m, y, k) => self.set_fill(RasterColor::cmyk(*c, *m, *y, *k)),
             Operator::SetFillColor(comps) => self.set_fill(components_to_color(comps)),
-            Operator::SetFillColorSpace(_) => {}
+            Operator::SetFillColorSpace(_) => {
+                // Switching colour space clears any active pattern.
+                self.gstate.current_mut().fill_pattern = None;
+            }
+            Operator::SetFillPattern { name, components } => {
+                let gs = self.gstate.current_mut();
+                gs.fill_pattern = Some(name.clone());
+                gs.fill_pattern_components = components.clone();
+            }
 
             Operator::SetStrokeGray(g) => self.set_stroke(RasterColor::gray(*g)),
             Operator::SetStrokeRgb(r, g, b) => self.set_stroke(RasterColor::rgb(*r, *g, *b)),
@@ -261,7 +269,15 @@ impl<'doc> PageRenderer<'doc> {
                 self.set_stroke(RasterColor::cmyk(*c, *m, *y, *k));
             }
             Operator::SetStrokeColor(comps) => self.set_stroke(components_to_color(comps)),
-            Operator::SetStrokeColorSpace(_) => {}
+            Operator::SetStrokeColorSpace(_) => {
+                // Switching colour space clears any active pattern.
+                self.gstate.current_mut().stroke_pattern = None;
+            }
+            Operator::SetStrokePattern { name, components } => {
+                let gs = self.gstate.current_mut();
+                gs.stroke_pattern = Some(name.clone());
+                gs.stroke_pattern_components = components.clone();
+            }
 
             // ── Path construction ─────────────────────────────────────────────
             Operator::MoveTo(x, y) => {
@@ -623,11 +639,15 @@ impl<'doc> PageRenderer<'doc> {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn set_fill(&mut self, c: RasterColor) {
-        self.gstate.current_mut().fill_color = c;
+        let gs = self.gstate.current_mut();
+        gs.fill_color = c;
+        gs.fill_pattern = None;
     }
 
     fn set_stroke(&mut self, c: RasterColor) {
-        self.gstate.current_mut().stroke_color = c;
+        let gs = self.gstate.current_mut();
+        gs.stroke_color = c;
+        gs.stroke_pattern = None;
     }
 
     fn path_builder(&mut self) -> &mut PathBuilder {
@@ -723,15 +743,31 @@ impl<'doc> PageRenderer<'doc> {
         self.stroke_path(&path);
     }
 
-    /// Fill `path` using the current fill colour.  Shared by `do_fill` and
-    /// `do_fill_then_stroke`.
+    /// Fill `path` using the current fill colour or pattern.  Shared by `do_fill`
+    /// and `do_fill_then_stroke`.
     fn fill_path(&mut self, path: &raster::path::Path, even_odd: bool) {
         let gs = self.gstate.current();
-        let color = gs.fill_color.as_slice().to_vec();
         let clip = gs.clip.clone_shared();
         let flatness = gs.flatness.max(0.1);
         let pipe = Self::make_pipe(gs.fill_alpha, gs.blend_mode);
-        let src = PipeSrc::Solid(&color);
+
+        // Resolve the fill source — pattern or solid colour.
+        let pat_name = gs.fill_pattern.clone();
+        let solid_color = gs.fill_color.as_slice().to_vec();
+        let _ = gs; // end immutable borrow before the mutable resolve_fill_pattern call
+
+        let tiled: Option<TiledPattern>;
+        let src = if let Some(ref name) = pat_name {
+            tiled = self.resolve_fill_pattern(name);
+            match tiled.as_ref() {
+                Some(p) => PipeSrc::Pattern(p as &dyn Pattern),
+                None => PipeSrc::Solid(&solid_color),
+            }
+        } else {
+            tiled = None;
+            PipeSrc::Solid(&solid_color)
+        };
+
         if even_odd {
             eo_fill(
                 &mut self.bitmap,
@@ -755,25 +791,50 @@ impl<'doc> PageRenderer<'doc> {
                 true,
             );
         }
+        drop(tiled);
     }
 
     fn stroke_path(&mut self, path: &raster::path::Path) {
+        // Clone all graphics state data before any mutable borrow.
         let gs = self.gstate.current();
-        let color = gs.stroke_color.as_slice().to_vec();
         let clip = gs.clip.clone_shared();
         let pipe = Self::make_pipe(gs.stroke_alpha, gs.blend_mode);
-        let src = PipeSrc::Solid(&color);
+        let line_width = gs.line_width;
+        let line_cap = gs.line_cap;
+        let line_join = gs.line_join;
+        let miter_limit = gs.miter_limit;
+        let flatness = gs.flatness.max(0.1);
+        let line_dash = gs.dash.0.clone();
+        let line_dash_phase = gs.dash.1;
+        let pat_name = gs.stroke_pattern.clone();
+        let solid_color = gs.stroke_color.as_slice().to_vec();
+        // gs immutable borrow ends here.
+
         let params = StrokeParams {
-            line_width: gs.line_width,
-            line_cap: gs.line_cap,
-            line_join: gs.line_join,
-            miter_limit: gs.miter_limit,
-            flatness: gs.flatness.max(0.1),
-            line_dash: &gs.dash.0,
-            line_dash_phase: gs.dash.1,
+            line_width,
+            line_cap,
+            line_join,
+            miter_limit,
+            flatness,
+            line_dash: &line_dash,
+            line_dash_phase,
             stroke_adjust: false,
             vector_antialias: true,
         };
+
+        // Resolve the stroke source — pattern or solid colour.
+        let tiled: Option<TiledPattern>;
+        let src = if let Some(ref name) = pat_name {
+            tiled = self.resolve_fill_pattern(name);
+            match tiled.as_ref() {
+                Some(p) => PipeSrc::Pattern(p as &dyn Pattern),
+                None => PipeSrc::Solid(&solid_color),
+            }
+        } else {
+            tiled = None;
+            PipeSrc::Solid(&solid_color)
+        };
+
         stroke(
             &mut self.bitmap,
             &clip,
@@ -783,6 +844,114 @@ impl<'doc> PageRenderer<'doc> {
             &DEVICE_MATRIX,
             &params,
         );
+        drop(tiled);
+    }
+
+    // ── Tiling pattern rasterisation ──────────────────────────────────────────
+
+    /// Rasterise the named tiling pattern resource into a [`TiledPattern`] ready
+    /// for use as a [`PipeSrc::Pattern`].
+    ///
+    /// The tile is rendered into a small bitmap by recursively invoking
+    /// `PageRenderer` on the pattern's content stream.  The tile dimensions are
+    /// derived from the pattern's `XStep` / `YStep` values scaled by the
+    /// combined CTM.  The pattern origin (phase) is the CTM translation component
+    /// of the pattern matrix composed with the current CTM.
+    ///
+    /// Returns `None` if the resource is missing, the tile would be degenerate
+    /// (zero or negative pixel size), or rasterisation fails.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "tile dimensions are capped at 4096 and clamped to positive; phase coords are page-bounded; safe casts"
+    )]
+    fn resolve_fill_pattern(&mut self, name: &[u8]) -> Option<TiledPattern> {
+        let desc = self.resources.tiling_pattern(name)?;
+
+        // Compose pattern matrix with current CTM to get pattern-space → device-space.
+        let ctm = self.gstate.current().ctm;
+        let pat_ctm = ctm_multiply(&desc.matrix, &ctm);
+
+        // Tile size in device pixels — scale the XStep/YStep by the linear scale
+        // of the combined transform.  We use the L2 norm of each column vector to
+        // account for rotations.
+        let sx = (pat_ctm[0].hypot(pat_ctm[1])).abs();
+        let sy = (pat_ctm[2].hypot(pat_ctm[3])).abs();
+
+        if sx < 0.5 || sy < 0.5 {
+            log::debug!(
+                "pdf_interp: Pattern /{} tile scale ({sx:.2}, {sy:.2}) too small — skipping",
+                String::from_utf8_lossy(name)
+            );
+            return None;
+        }
+
+        // Cap the tile to a sane maximum to avoid huge allocations from malformed PDFs.
+        const MAX_TILE_PX: f64 = 4096.0;
+        let tile_w = (desc.x_step.abs() * sx).min(MAX_TILE_PX).ceil() as u32;
+        let tile_h = (desc.y_step.abs() * sy).min(MAX_TILE_PX).ceil() as u32;
+
+        if tile_w == 0 || tile_h == 0 {
+            log::debug!(
+                "pdf_interp: Pattern /{} produced zero-size tile ({tile_w}×{tile_h}) — skipping",
+                String::from_utf8_lossy(name)
+            );
+            return None;
+        }
+
+        // Build the CTM for the tile renderer: pattern space → tile device space.
+        // Translation is handled by phase below, so we zero it here.
+        let tile_ctm = [pat_ctm[0], pat_ctm[1], pat_ctm[2], pat_ctm[3], 0.0, 0.0];
+
+        // Rasterise the tile.
+        let tile_bitmap = self.render_pattern_tile(&desc, tile_w, tile_h, &tile_ctm)?;
+
+        // Phase = where the pattern origin lands in device space (after y-flip).
+        let page_h = f64::from(self.height);
+        let (ox, oy_pdf) = ctm_transform(&pat_ctm, 0.0, 0.0);
+        let oy = page_h - oy_pdf;
+
+        let phase_x = ox.round() as i32;
+        let phase_y = oy.round() as i32;
+
+        let pixels = tile_bitmap.data().to_vec();
+        Some(TiledPattern::new(
+            pixels,
+            tile_w as i32,
+            tile_h as i32,
+            phase_x,
+            phase_y,
+        ))
+    }
+
+    /// Render a pattern content stream into a tile bitmap.
+    ///
+    /// Creates a child `PageRenderer` scoped to the pattern's resource context and
+    /// executes the pattern's content stream.  The tile bitmap is `tile_w ×
+    /// tile_h` pixels with a white background.
+    fn render_pattern_tile(
+        &self,
+        desc: &crate::resources::tiling::TilingDescriptor,
+        tile_w: u32,
+        tile_h: u32,
+        tile_ctm: &[f64; 6],
+    ) -> Option<Bitmap<Rgb8>> {
+        // Build a temporary child renderer sharing the same document / font engine.
+        let doc = self.resources.doc();
+        let mut tile_renderer = PageRenderer::new(tile_w, tile_h, doc, desc.stream_id);
+
+        // Override the CTM to map pattern space → tile device space.
+        tile_renderer.gstate.current_mut().ctm = *tile_ctm;
+
+        // If the pattern has no own resources, point it at the parent context.
+        if !desc.has_own_resources {
+            tile_renderer.resources = PageResources::new(doc, self.resources.resource_context_id());
+        }
+
+        let ops = crate::content::parse(&desc.content);
+        tile_renderer.execute(&ops);
+        Some(tile_renderer.finish())
     }
 
     // ── XObject rendering ─────────────────────────────────────────────────────
