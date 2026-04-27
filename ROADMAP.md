@@ -42,7 +42,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 - [ ] **Text render modes 4–7** — text-as-clip (glyph outlines → XPath intersection); rare in practice but used in some graphics-heavy docs
 - [ ] **Type 0 / CIDFont composite fonts** — needed for CJK and other multi-byte encodings
-- [ ] **Tiling patterns** — `scn` with pattern colour space; used for hatching, textures
+- [x] **Tiling patterns** — `scn`/`SCN` with Pattern colour space; `PatternType` 1 tiles rasterised via child `PageRenderer` and tiled with `rem_euclid`; PaintType 2 (uncoloured) falls through to solid fill
 
 ### Phase 1 parking lot (post-shipping coverage work)
 

@@ -22,10 +22,13 @@
 //!   embedded stream CMaps and `Identity-H`/`V`), `CIDToGIDMap`, `DW`/`W`
 //!   advance widths, and multi-byte character code iteration
 //!
+//! - Text render modes 4–7 — fill/stroke painting combined with text-as-clip
+//!   (`glyph_path` outlines accumulated into the clip region per PDF §9.3.6)
+//! - `PatternType` 1 tiling patterns via `scn`/`SCN`
+//!
 //! # Not yet implemented
 //!
 //! - Image `XObjects`: `JBIG2Decode` filter
-//! - Shading (`sh`) — requires shading resource lookup
 //! - `ExtGState` blend mode (`BM`) — only `Normal` is currently mapped
 //! - Type 0 named CMaps other than `Identity-H`/`V` (e.g. `/GB-EUC-H`)
 //! - Type 3 paint-procedure fonts
@@ -70,6 +73,13 @@ const DEVICE_MATRIX: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// Prevents unbounded recursion from self-referencing or mutually-referencing
 /// form streams in malformed documents.
 const MAX_FORM_DEPTH: u32 = 32;
+
+/// Maximum tiling pattern tile dimension in device pixels.
+///
+/// A malformed PDF could specify `XStep`/`YStep` values large enough to OOM
+/// the process.  This cap limits the tile to a manageable size regardless of
+/// the pattern parameters.
+const MAX_TILE_PX: f64 = 4096.0;
 
 /// Renders a decoded operator sequence onto a `Bitmap<Rgb8>`.
 pub struct PageRenderer<'doc> {
@@ -470,14 +480,18 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
 
-        // PDF render modes 0–2 paint (fill/stroke/both); mode 3 is invisible.
-        // Modes 4–7 repeat 0–3 and additionally accumulate text outlines into
-        // the clip path (text-as-clip, PDF §9.3.6 Table 106).  Text-as-clip
-        // requires converting glyph outlines to XPaths and intersecting them
-        // into the clip — not yet implemented.  We skip modes ≥ 3 entirely,
-        // which is conservative: invisible/clip-only text is not rendered, but
-        // also not used as a clip mask.
-        if self.gstate.current().text.render_mode >= 3 {
+        // PDF render modes (PDF §9.3.6 Table 106):
+        //   0 fill, 1 stroke, 2 fill+stroke, 3 invisible
+        //   4 fill+clip, 5 stroke+clip, 6 fill+stroke+clip, 7 clip only
+        //
+        // For modes 4–6 we paint AND add glyph outlines to the clip path.
+        // Mode 3 and 7 skip painting; mode 7 still adds outlines to the clip.
+        let render_mode = self.gstate.current().text.render_mode;
+        let do_paint = render_mode != 3 && render_mode != 7;
+        let do_clip = render_mode >= 4;
+
+        // Mode 3 (invisible) with no clip — nothing to do.
+        if !do_paint && !do_clip {
             return;
         }
 
@@ -509,10 +523,18 @@ impl<'doc> PageRenderer<'doc> {
             return;
         };
 
-        // Phase 1: rasterize all glyphs.
-        // We collect (pen_x, pen_y, GlyphBitmap data) as owned Vecs so that the
-        // `font_cache` borrow is released before we touch `self.bitmap`.
+        // Phase 1: rasterize glyphs and optionally collect outlines for clip.
+        //
+        // Two-phase design: borrow `font_cache` here (read-only after load), then
+        // release it before touching `self.bitmap` or `self.gstate` in phase 2.
         let mut records: Vec<GlyphRecord> = Vec::with_capacity(bytes.len());
+        // Glyph outline paths in device space — populated only when `do_clip`.
+        // One entry per character code; `None` when the glyph has no outline.
+        let mut clip_paths: Vec<Option<raster::path::Path>> = if do_clip {
+            Vec::with_capacity(bytes.len())
+        } else {
+            Vec::new()
+        };
 
         {
             // Trm[2×2] = font_size × Tm[2×2] × CTM[2×2] — the text rendering
@@ -532,9 +554,12 @@ impl<'doc> PageRenderer<'doc> {
             // Type 0 composite fonts use 1–4 bytes determined by the Encoding CMap.
             let cid_enc = descriptor.cid_encoding.as_ref();
 
-            // Shared helper: push a rasterized glyph into `records` if visible.
-            let mut push_glyph = |gid: u32, pen_x: i32, pen_y: i32| {
-                if let Some(bmp) = face.make_glyph(gid, 0) {
+            // Shared helper: push a rasterized glyph into `records` (when painting)
+            // and collect its outline path into `clip_paths` (when clipping).
+            // `char_code_for_path` is the char-code argument for `glyph_path`
+            // (same convention as `make_glyph` — the face resolves GID internally).
+            let mut push_glyph = |char_code_for_path: u32, gid: u32, pen_x: i32, pen_y: i32| {
+                if do_paint && let Some(bmp) = face.make_glyph(gid, 0) {
                     records.push(GlyphRecord {
                         pen_x,
                         pen_y,
@@ -545,6 +570,24 @@ impl<'doc> PageRenderer<'doc> {
                         aa: bmp.aa,
                         data: bmp.data,
                     });
+                }
+                if do_clip {
+                    // Collect the glyph outline in device space.
+                    // `glyph_path` returns coordinates in text space, where the
+                    // FreeType transform (Trm) has already been applied.  The
+                    // origin (0, 0) maps to the pen position; Y is positive-up
+                    // (FreeType convention).  To get device space: translate by
+                    // (pen_x, pen_y) and flip Y (device Y is positive-down).
+                    let path = face.glyph_path(char_code_for_path).map(|mut p| {
+                        let px = f64::from(pen_x);
+                        let py = f64::from(pen_y);
+                        for pt in &mut p.pts {
+                            pt.x += px;
+                            pt.y = py - pt.y;
+                        }
+                        p
+                    });
+                    clip_paths.push(path);
                 }
             };
 
@@ -571,7 +614,7 @@ impl<'doc> PageRenderer<'doc> {
                     let gid = enc.code_to_gid(char_code);
 
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
-                    push_glyph(gid, pen_x, pen_y);
+                    push_glyph(char_code, gid, pen_x, pen_y);
 
                     // CID width lookup uses the CID, not the raw char code.
                     // Advance formula: w/1000 * font_size (PDF §9.7.4.3).
@@ -586,7 +629,7 @@ impl<'doc> PageRenderer<'doc> {
                 // Simple font: one byte per character code.
                 for &byte in bytes {
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
-                    push_glyph(u32::from(byte), pen_x, pen_y);
+                    push_glyph(u32::from(byte), u32::from(byte), pen_x, pen_y);
 
                     // Advance regardless of whether the glyph rendered — PDF §9.4.4
                     // requires the pen to advance even for missing/invisible glyphs.
@@ -599,37 +642,58 @@ impl<'doc> PageRenderer<'doc> {
             }
         } // font_cache borrow released here
 
-        // Phase 2: blit rasterized glyphs — mutable borrow of bitmap only.
-        let fill_bytes = self.gstate.current().fill_color.as_slice().to_vec();
-        let clip = self.gstate.current().clip.clone_shared();
-        let pipe = Self::make_pipe(
-            self.gstate.current().fill_alpha,
-            self.gstate.current().blend_mode,
-        );
-        let src = PipeSrc::Solid(&fill_bytes);
-
-        for rec in &records {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "glyph dimensions are always small (sub-pixel-sized); cannot exceed i32::MAX"
-            )]
-            let glyph = GlyphBitmap {
-                data: &rec.data,
-                x: rec.x_off,
-                y: rec.y_off,
-                w: rec.width as i32,
-                h: rec.height as i32,
-                aa: rec.aa,
-            };
-            fill_glyph::<Rgb8>(
-                &mut self.bitmap,
-                &clip,
-                &pipe,
-                &src,
-                rec.pen_x,
-                rec.pen_y,
-                &glyph,
+        // Phase 2: blit rasterized glyphs (skipped for modes 3 and 7).
+        if do_paint {
+            let fill_bytes = self.gstate.current().fill_color.as_slice().to_vec();
+            let clip = self.gstate.current().clip.clone_shared();
+            let pipe = Self::make_pipe(
+                self.gstate.current().fill_alpha,
+                self.gstate.current().blend_mode,
             );
+            let src = PipeSrc::Solid(&fill_bytes);
+
+            for rec in &records {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "glyph dimensions are always small (sub-pixel-sized); cannot exceed i32::MAX"
+                )]
+                let glyph = GlyphBitmap {
+                    data: &rec.data,
+                    x: rec.x_off,
+                    y: rec.y_off,
+                    w: rec.width as i32,
+                    h: rec.height as i32,
+                    aa: rec.aa,
+                };
+                fill_glyph::<Rgb8>(
+                    &mut self.bitmap,
+                    &clip,
+                    &pipe,
+                    &src,
+                    rec.pen_x,
+                    rec.pen_y,
+                    &glyph,
+                );
+            }
+        }
+
+        // Phase 3: intersect glyph outlines into the clip path (modes 4–7).
+        //
+        // PDF §9.3.6: glyph outlines from a single text-showing operator are
+        // unioned together first, then the union is intersected with the clip.
+        // We build a single accumulated path from all glyphs and call
+        // `clip_to_path` once with `even_odd = false` (non-zero winding), which
+        // matches Acrobat's behaviour for composite glyph clip paths.
+        if do_clip {
+            let mut glyph_outline = raster::path::Path::new();
+            for p in clip_paths.into_iter().flatten() {
+                if !p.pts.is_empty() {
+                    glyph_outline.append(&p);
+                }
+            }
+            if !glyph_outline.pts.is_empty() {
+                self.clip_path_into_gstate(&glyph_outline, false);
+            }
         }
 
         // Write updated text matrix back.
@@ -756,17 +820,12 @@ impl<'doc> PageRenderer<'doc> {
         let solid_color = gs.fill_color.as_slice().to_vec();
         let _ = gs; // end immutable borrow before the mutable resolve_fill_pattern call
 
-        let tiled: Option<TiledPattern>;
-        let src = if let Some(ref name) = pat_name {
-            tiled = self.resolve_fill_pattern(name);
-            match tiled.as_ref() {
-                Some(p) => PipeSrc::Pattern(p as &dyn Pattern),
-                None => PipeSrc::Solid(&solid_color),
-            }
-        } else {
-            tiled = None;
-            PipeSrc::Solid(&solid_color)
-        };
+        let tiled = pat_name
+            .as_deref()
+            .and_then(|name| self.resolve_fill_pattern(name));
+        let src = tiled.as_ref().map_or(PipeSrc::Solid(&solid_color), |p| {
+            PipeSrc::Pattern(p as &dyn Pattern)
+        });
 
         if even_odd {
             eo_fill(
@@ -823,17 +882,12 @@ impl<'doc> PageRenderer<'doc> {
         };
 
         // Resolve the stroke source — pattern or solid colour.
-        let tiled: Option<TiledPattern>;
-        let src = if let Some(ref name) = pat_name {
-            tiled = self.resolve_fill_pattern(name);
-            match tiled.as_ref() {
-                Some(p) => PipeSrc::Pattern(p as &dyn Pattern),
-                None => PipeSrc::Solid(&solid_color),
-            }
-        } else {
-            tiled = None;
-            PipeSrc::Solid(&solid_color)
-        };
+        let tiled = pat_name
+            .as_deref()
+            .and_then(|name| self.resolve_fill_pattern(name));
+        let src = tiled.as_ref().map_or(PipeSrc::Solid(&solid_color), |p| {
+            PipeSrc::Pattern(p as &dyn Pattern)
+        });
 
         stroke(
             &mut self.bitmap,
@@ -866,7 +920,7 @@ impl<'doc> PageRenderer<'doc> {
         clippy::cast_possible_wrap,
         reason = "tile dimensions are capped at 4096 and clamped to positive; phase coords are page-bounded; safe casts"
     )]
-    fn resolve_fill_pattern(&mut self, name: &[u8]) -> Option<TiledPattern> {
+    fn resolve_fill_pattern(&self, name: &[u8]) -> Option<TiledPattern> {
         let desc = self.resources.tiling_pattern(name)?;
 
         // Compose pattern matrix with current CTM to get pattern-space → device-space.
@@ -887,8 +941,7 @@ impl<'doc> PageRenderer<'doc> {
             return None;
         }
 
-        // Cap the tile to a sane maximum to avoid huge allocations from malformed PDFs.
-        const MAX_TILE_PX: f64 = 4096.0;
+        // Cap the tile to MAX_TILE_PX to avoid huge allocations from malformed PDFs.
         let tile_w = (desc.x_step.abs() * sx).min(MAX_TILE_PX).ceil() as u32;
         let tile_h = (desc.y_step.abs() * sy).min(MAX_TILE_PX).ceil() as u32;
 
@@ -905,7 +958,7 @@ impl<'doc> PageRenderer<'doc> {
         let tile_ctm = [pat_ctm[0], pat_ctm[1], pat_ctm[2], pat_ctm[3], 0.0, 0.0];
 
         // Rasterise the tile.
-        let tile_bitmap = self.render_pattern_tile(&desc, tile_w, tile_h, &tile_ctm)?;
+        let tile_bitmap = self.render_pattern_tile(&desc, tile_w, tile_h, &tile_ctm);
 
         // Phase = where the pattern origin lands in device space (after y-flip).
         let page_h = f64::from(self.height);
@@ -936,7 +989,7 @@ impl<'doc> PageRenderer<'doc> {
         tile_w: u32,
         tile_h: u32,
         tile_ctm: &[f64; 6],
-    ) -> Option<Bitmap<Rgb8>> {
+    ) -> Bitmap<Rgb8> {
         // Build a temporary child renderer sharing the same document / font engine.
         let doc = self.resources.doc();
         let mut tile_renderer = PageRenderer::new(tile_w, tile_h, doc, desc.stream_id);
@@ -951,7 +1004,7 @@ impl<'doc> PageRenderer<'doc> {
 
         let ops = crate::content::parse(&desc.content);
         tile_renderer.execute(&ops);
-        Some(tile_renderer.finish())
+        tile_renderer.finish()
     }
 
     // ── XObject rendering ─────────────────────────────────────────────────────
