@@ -9,11 +9,8 @@ use clap::Parser;
 use rayon::prelude::*;
 
 use args::Args;
-use pdf_bridge::{Document as PopplerDoc, install_log_callback};
 
 fn main() {
-    // Silence poppler's stderr before opening any document.  Must come first.
-    install_log_callback();
     // try_init so tests and embedders that already called init() don't panic.
     let _ = env_logger::try_init();
 
@@ -25,96 +22,57 @@ fn main() {
         .build()
         .expect("failed to build thread pool");
 
-    // ── Document opening ──────────────────────────────────────────────────────
-
-    if args.native {
-        let doc = pdf_interp::open(&args.input).unwrap_or_else(|e| {
-            eprintln!("pdf-raster: failed to open PDF: {e}");
-            std::process::exit(1);
-        });
-
-        let n = pdf_interp::page_count(&doc);
-        if n == 0 {
-            eprintln!("pdf-raster: document has no pages");
-            std::process::exit(1);
-        }
-        let total = i32::try_from(n).unwrap_or_else(|_| {
-            eprintln!("pdf-raster: document has too many pages ({n} > i32::MAX)");
-            std::process::exit(1);
-        });
-
-        if args.gray || args.mono {
-            eprintln!(
-                "pdf-raster: warning: --gray/--mono are not yet supported by the native \
-                 renderer and will be ignored"
-            );
-        }
-
-        let pages = build_page_list(total, &args);
-
-        let n_pages = pages.len();
-        let done = AtomicU32::new(0);
-        let start = Instant::now();
-
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "total validated ≥ 1 via i32::try_from above"
-        )]
-        let total_u32 = total as u32;
-
-        let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
-            pages
-                .par_iter()
-                .filter_map(|&page_num| {
-                    #[expect(
-                        clippy::cast_sign_loss,
-                        reason = "page_num ≥ 1, enforced by build_page_list"
-                    )]
-                    let page_u32 = page_num as u32;
-                    let result = render::render_page_native(&doc, page_u32, total_u32, &args);
-                    report_progress(&args, &done, n_pages, &start, page_num);
-                    result.err().map(|e| (page_num, e))
-                })
-                .collect()
-        });
-
-        report_errors(errors);
-    } else {
-        let doc = PopplerDoc::from_file(
-            &args.input,
-            args.owner_password.as_deref(),
-            args.user_password.as_deref(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("pdf-raster: failed to open PDF: {e}");
-            std::process::exit(1);
-        });
-
-        let total = doc.page_count();
-        if total <= 0 {
-            eprintln!("pdf-raster: document has no pages");
-            std::process::exit(1);
-        }
-
-        let pages = build_page_list(total, &args);
-
-        let n_pages = pages.len();
-        let done = AtomicU32::new(0);
-        let start = Instant::now();
-
-        let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
-            pages
-                .par_iter()
-                .filter_map(|&page_num| {
-                    let result = render::render_page_poppler(&doc, page_num, total, &args);
-                    report_progress(&args, &done, n_pages, &start, page_num);
-                    result.err().map(|e| (page_num, e))
-                })
-                .collect()
-        });
-
-        report_errors(errors);
+    if args.gray || args.mono {
+        eprintln!(
+            "pdf-raster: warning: --gray/--mono are not yet supported by the native \
+             renderer and will be ignored"
+        );
     }
+
+    let doc = pdf_interp::open(&args.input).unwrap_or_else(|e| {
+        eprintln!("pdf-raster: failed to open PDF: {e}");
+        std::process::exit(1);
+    });
+
+    let n = pdf_interp::page_count(&doc);
+    if n == 0 {
+        eprintln!("pdf-raster: document has no pages");
+        std::process::exit(1);
+    }
+    let total = i32::try_from(n).unwrap_or_else(|_| {
+        eprintln!("pdf-raster: document has too many pages ({n} > i32::MAX)");
+        std::process::exit(1);
+    });
+
+    let pages = build_page_list(total, &args);
+
+    let n_pages = pages.len();
+    let done = AtomicU32::new(0);
+    let start = Instant::now();
+
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "total validated ≥ 1 via i32::try_from above"
+    )]
+    let total_u32 = total as u32;
+
+    let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
+        pages
+            .par_iter()
+            .filter_map(|&page_num| {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "page_num ≥ 1, enforced by build_page_list"
+                )]
+                let page_u32 = page_num as u32;
+                let result = render::render_page_native(&doc, page_u32, total_u32, &args);
+                report_progress(&args, &done, n_pages, &start, page_num);
+                result.err().map(|e| (page_num, e))
+            })
+            .collect()
+    });
+
+    report_errors(errors);
 }
 
 /// Build the filtered, clamped list of 1-based page numbers to render.

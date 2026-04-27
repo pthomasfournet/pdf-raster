@@ -36,7 +36,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 - [x] **CCITTFaxDecode Group 3 (K=0)** — 1D T.4 supported via fax::decoder::decode_g3; K>0 (mixed 2D) stub
 - [x] **Inline images (`BI ID EI`)** — decode_inline_image: abbreviated key/name expansion, FlateDecode/DCT/CCITT/RL/raw dispatch, wired to blit_image
 - [x] **Shading (`sh`)** — Types 2 (axial) and 3 (radial) resolved; Function Types 2 (Exponential) and 3 (Stitching) evaluated; wired to shaded_fill
-- [ ] **Wire CLI by default** — remove `--native` flag; make native the only path; delete `pdf_bridge`
+- [x] **Wire CLI by default** — `--native` flag removed; native is the only path; pdf_bridge dep removed from cli (crate retained for reference)
 
 ### Nice-to-have before default (won't block, but improve coverage)
 

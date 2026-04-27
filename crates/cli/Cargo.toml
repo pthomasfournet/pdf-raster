@@ -8,7 +8,6 @@ name = "pdf-raster"
 path = "src/main.rs"
 
 [dependencies]
-pdf_bridge  = { path = "../pdf_bridge" }
 pdf_interp  = { path = "../pdf_interp" }
 lopdf       = "0.40"
 encode      = { path = "../encode" }
@@ -16,7 +15,6 @@ color       = { path = "../color" }
 raster      = { path = "../raster" }
 clap        = { version = "4", features = ["derive"] }
 rayon       = "1"
-anyhow      = "1"
 log         = { workspace = true }
 env_logger  = { workspace = true }
 
