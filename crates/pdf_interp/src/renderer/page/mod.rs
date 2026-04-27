@@ -1131,12 +1131,19 @@ impl<'doc> PageRenderer<'doc> {
             PipeSrc::Pattern(p as &dyn Pattern)
         });
 
-        // GPU AA path: delegate to the warp-ballot 64-sample kernel when a
-        // context is available, the fill area is above the dispatch threshold,
-        // and the source is a solid colour (patterns are not yet GPU-accelerated).
-        // Arc::clone releases the shared reference before the mutable borrow in
-        // try_gpu_aa_fill; the nested ifs are intentionally separate to keep
-        // the tiled.is_none() guard on patterns distinct from the GPU-dispatch guard.
+        // GPU fill dispatch — only for solid-colour fills (patterns not yet
+        // GPU-accelerated).  Arc::clone releases the borrow before the mutable
+        // self borrow inside the try_* helpers.
+        //
+        // Dispatch order:
+        //   1. Tile-parallel analytical fill (GPU_TILE_FILL_THRESHOLD) — exact
+        //      analytical coverage, best for large solid fills.
+        //   2. Warp-ballot 64-sample AA (GPU_AA_FILL_THRESHOLD) — stochastic
+        //      but faster for medium-sized fills.
+        //   3. CPU scanline AA (always available as final fallback).
+        //
+        // The nested ifs keep the pattern guard (tiled.is_none()) separate from
+        // the GPU-availability guard to make each condition readable.
         #[cfg(feature = "gpu-aa")]
         #[expect(
             clippy::collapsible_if,
@@ -1145,6 +1152,9 @@ impl<'doc> PageRenderer<'doc> {
         )]
         if tiled.is_none() {
             if let Some(ctx) = self.gpu_ctx.clone() {
+                if self.try_gpu_tile_fill(path, even_odd, &pipe, &src, &ctx) {
+                    return;
+                }
                 if self.try_gpu_aa_fill(path, even_odd, &pipe, &src, &ctx) {
                     return;
                 }
@@ -1177,40 +1187,28 @@ impl<'doc> PageRenderer<'doc> {
         drop(tiled);
     }
 
-    /// Attempt to rasterise `path` with the GPU 64-sample AA kernel.
+    /// Shared preamble for GPU fill paths: flatten path, compute clamped bbox,
+    /// convert segments to packed f32.
     ///
-    /// Returns `true` if the GPU path was taken (caller should skip the CPU
-    /// fill).  Returns `false` if the fill area is below the threshold, the
-    /// segment list is empty, or any bounding-box coordinate is non-finite.
+    /// Returns `None` if the path is empty, produces no segments, or the bbox
+    /// is degenerate/non-finite.  Otherwise returns `(segs_f32, bx, by, bw, bh)`.
     #[cfg(feature = "gpu-aa")]
     #[expect(
-        clippy::too_many_lines,
-        reason = "self-contained rasterisation path; splitting into helpers would require passing many parameters"
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bbox clamped to bitmap dims (derived from u32); value is finite, non-negative, ≤ u32::MAX"
     )]
-    fn try_gpu_aa_fill(
-        &mut self,
-        path: &raster::path::Path,
-        even_odd: bool,
-        pipe: &raster::pipe::PipeState<'_>,
-        src: &raster::pipe::PipeSrc<'_>,
-        ctx: &gpu::GpuCtx,
-    ) -> bool {
-        use gpu::GPU_AA_FILL_THRESHOLD;
-        use raster::clip::ClipResult;
-        use raster::pipe;
-
+    fn gpu_fill_segs(&self, path: &raster::path::Path) -> Option<(Vec<f32>, u32, u32, u32, u32)> {
         if path.pts.is_empty() {
-            return false;
+            return None;
         }
 
-        // Build device-space segment list (no AA scaling — kernel works in
-        // the same coordinate space as the bitmap pixels).
         let xpath = XPath::new(path, &DEVICE_MATRIX, 0.1, true);
         if xpath.segs.is_empty() {
-            return false;
+            return None;
         }
 
-        // Compute pixel bbox of the fill from the segment coordinates.
+        // Pixel bbox from segment endpoints.
         let mut x_min_f = f64::INFINITY;
         let mut y_min_f = f64::INFINITY;
         let mut x_max_f = f64::NEG_INFINITY;
@@ -1221,143 +1219,113 @@ impl<'doc> PageRenderer<'doc> {
             x_max_f = x_max_f.max(seg.x0).max(seg.x1);
             y_max_f = y_max_f.max(seg.y0).max(seg.y1);
         }
-
         if !x_min_f.is_finite()
             || !y_min_f.is_finite()
             || !x_max_f.is_finite()
             || !y_max_f.is_finite()
         {
-            return false;
+            return None;
         }
 
-        // Clamp bbox to bitmap dimensions.
+        // Clamp to bitmap dimensions.
         let bmp_w = f64::from(self.bitmap.width);
         let bmp_h = f64::from(self.bitmap.height);
         x_min_f = x_min_f.max(0.0).floor();
         y_min_f = y_min_f.max(0.0).floor();
         x_max_f = x_max_f.min(bmp_w).ceil();
         y_max_f = y_max_f.min(bmp_h).ceil();
-
         if x_max_f <= x_min_f || y_max_f <= y_min_f {
-            return false;
+            return None;
         }
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "clamped to [0, bmp_w/bmp_h] which are derived from u32; value is finite, non-negative, ≤ u32::MAX"
-        )]
-        let (bx, by, bw, bh) = (
-            x_min_f as u32,
-            y_min_f as u32,
-            (x_max_f - x_min_f) as u32,
-            (y_max_f - y_min_f) as u32,
-        );
+        let bx = x_min_f as u32;
+        let by = y_min_f as u32;
+        let bw = (x_max_f - x_min_f) as u32;
+        let bh = (y_max_f - y_min_f) as u32;
 
-        let area = bw as usize * bh as usize;
-        if area < GPU_AA_FILL_THRESHOLD {
-            return false;
-        }
-
-        // Convert segment list to packed f32 [x0,y0,x1,y1].
-        // f64→f32 truncation is intentional: GPU kernel operates in f32;
-        // at typical DPI (≤ 32768 px) the precision loss is sub-pixel.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "f64→f32 for GPU kernel; sub-pixel precision loss at realistic page sizes"
-        )]
+        // Pack segments as flat f32 [x0,y0,x1,y1]; f64→f32 precision loss is
+        // sub-pixel at any realistic PDF rasterisation DPI (≤ 32768 px wide).
         let segs_f32: Vec<f32> = xpath
             .segs
             .iter()
             .flat_map(|seg| [seg.x0 as f32, seg.y0 as f32, seg.x1 as f32, seg.y1 as f32])
             .collect();
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "x_min_f/y_min_f are clamped to [0, u32::MAX], finite; f64→f32 precision loss is sub-pixel"
-        )]
-        let coverage =
-            match ctx.aa_fill(&segs_f32, x_min_f as f32, y_min_f as f32, bw, bh, even_odd) {
-                Ok(cov) => cov,
-                Err(e) => {
-                    log::warn!("GPU AA fill failed, falling back to CPU: {e}");
-                    return false;
-                }
-            };
+        Some((segs_f32, bx, by, bw, bh))
+    }
 
-        // Apply per-pixel coverage to the bitmap row by row.
+    /// Paint a GPU-produced per-pixel coverage buffer `coverage` (`bw × bh` bytes,
+    /// origin at `(bx, by)`) into `self.bitmap` using `pipe` and `src`.
+    ///
+    /// Scans each row for contiguous non-zero spans, clips them to the current
+    /// clip region and bitmap bounds, then calls `pipe::render_span`.
+    #[cfg(feature = "gpu-aa")]
+    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "all coordinates bounded by bitmap dims which are derived from u32; realistic pages are far below i32::MAX"
+    )]
+    fn gpu_coverage_to_bitmap(
+        &mut self,
+        coverage: &[u8],
+        bx: u32,
+        by: u32,
+        bw: u32,
+        bh: u32,
+        pipe: &raster::pipe::PipeState<'_>,
+        src: &raster::pipe::PipeSrc<'_>,
+    ) {
+        use raster::clip::ClipResult;
+        use raster::pipe;
+
         let clip = self.gstate.current().clip.clone_shared();
+        let bmp_w_i = self.bitmap.width as i32;
 
         for row in 0..bh {
             let y = by + row;
             if y >= self.bitmap.height {
                 break;
             }
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "y ≤ bitmap.height ≤ u32::MAX; realistic page heights are far below i32::MAX"
-            )]
             let y_i = y as i32;
 
             let row_start = row as usize * bw as usize;
             let row_cov = &coverage[row_start..row_start + bw as usize];
 
-            // Emit contiguous non-zero coverage spans as render_span calls.
+            // Walk the row, collecting contiguous non-zero spans and emitting them.
             let mut span_start: Option<usize> = None;
             for col in 0..=bw as usize {
                 let is_covered = col < bw as usize && row_cov[col] > 0;
                 if is_covered {
-                    if span_start.is_none() {
-                        span_start = Some(col);
-                    }
+                    span_start.get_or_insert(col);
                 } else if let Some(start) = span_start.take() {
-                    #[expect(
-                        clippy::cast_possible_wrap,
-                        clippy::cast_possible_truncation,
-                        reason = "bx, start, col all bounded by bitmap dimensions; realistic pages are well within i32"
-                    )]
-                    let (x0, x1) = (bx as i32 + start as i32, bx as i32 + col as i32 - 1);
+                    let x0 = bx as i32 + start as i32;
+                    let x1 = bx as i32 + col as i32 - 1;
 
-                    let clip_res = clip.test_span(x0, x1, y_i);
-                    if clip_res == ClipResult::AllOutside {
+                    if clip.test_span(x0, x1, y_i) == ClipResult::AllOutside {
                         continue;
                     }
 
                     let shape_slice = &row_cov[start..col];
 
-                    // Clamp to bitmap width.
-                    #[expect(
-                        clippy::cast_possible_wrap,
-                        reason = "bitmap.width ≤ u32::MAX; realistic pages are well within i32"
-                    )]
-                    let bmp_w_i = self.bitmap.width as i32;
+                    // Clamp to bitmap width and trim the shape slice to match.
                     let sx0 = x0.max(0);
                     let sx1 = x1.min(bmp_w_i - 1);
                     if sx0 > sx1 {
                         continue;
                     }
-
-                    // sx0 ≥ x0 and sx1 ≤ x1, both ≥ 0 because of the max(0)/min clamps.
-                    #[expect(
-                        clippy::cast_sign_loss,
-                        reason = "sx0 - x0 ≥ 0 (sx0 = x0.max(0) ≥ x0); x1 - sx1 ≥ 0 (sx1 ≤ x1)"
-                    )]
-                    let (trim_left, trim_right) = ((sx0 - x0) as usize, (x1 - sx1) as usize);
+                    let trim_left = (sx0 - x0) as usize;
+                    let trim_right = (x1 - sx1) as usize;
                     let trimmed_shape = &shape_slice[trim_left..shape_slice.len() - trim_right];
                     if trimmed_shape.is_empty() {
                         continue;
                     }
 
                     let (row_pixels, alpha_row) = self.bitmap.row_and_alpha_mut(y);
-                    #[expect(
-                        clippy::cast_sign_loss,
-                        reason = "sx0 >= 0 (clamped above); sx1 >= sx0 >= 0"
-                    )]
-                    let (byte_off, byte_end, alpha_range) = (
-                        sx0 as usize * <color::Rgb8 as Pixel>::BYTES,
-                        (sx1 as usize + 1) * <color::Rgb8 as Pixel>::BYTES,
-                        sx0 as usize..=sx1 as usize,
-                    );
+                    let byte_off = sx0 as usize * <color::Rgb8 as Pixel>::BYTES;
+                    let byte_end = (sx1 as usize + 1) * <color::Rgb8 as Pixel>::BYTES;
+                    let alpha_range = sx0 as usize..=sx1 as usize;
                     let dst_pixels = &mut row_pixels[byte_off..byte_end];
                     let dst_alpha = alpha_row.map(|a| &mut a[alpha_range]);
 
@@ -1374,7 +1342,96 @@ impl<'doc> PageRenderer<'doc> {
                 }
             }
         }
+    }
 
+    /// Attempt to rasterise `path` with the GPU 64-sample AA kernel.
+    ///
+    /// Returns `true` if the GPU path was taken (caller skips the CPU fill).
+    /// Returns `false` if the area is below the dispatch threshold, the segment
+    /// list is empty, the bbox is non-finite, or the GPU call fails (warning
+    /// logged; CPU fill used as fallback).
+    #[cfg(feature = "gpu-aa")]
+    fn try_gpu_aa_fill(
+        &mut self,
+        path: &raster::path::Path,
+        even_odd: bool,
+        pipe: &raster::pipe::PipeState<'_>,
+        src: &raster::pipe::PipeSrc<'_>,
+        ctx: &gpu::GpuCtx,
+    ) -> bool {
+        use gpu::GPU_AA_FILL_THRESHOLD;
+
+        let Some((segs_f32, bx, by, bw, bh)) = self.gpu_fill_segs(path) else {
+            return false;
+        };
+        if (bw as usize * bh as usize) < GPU_AA_FILL_THRESHOLD {
+            return false;
+        }
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "bx/by are u32 from bitmap coords; f64→f32 is sub-pixel at realistic DPIs"
+        )]
+        let coverage = match ctx.aa_fill(&segs_f32, bx as f32, by as f32, bw, bh, even_odd) {
+            Ok(cov) => cov,
+            Err(e) => {
+                log::warn!("GPU AA fill failed, falling back to CPU: {e}");
+                return false;
+            }
+        };
+
+        self.gpu_coverage_to_bitmap(&coverage, bx, by, bw, bh, pipe, src);
+        true
+    }
+
+    /// Attempt to rasterise `path` with the GPU tile-parallel analytical fill kernel.
+    ///
+    /// Returns `true` if the GPU path was taken (caller skips the CPU fill).
+    /// Returns `false` if the area is below the dispatch threshold, the segment
+    /// list is empty, the bbox is non-finite, or the GPU call fails (warning
+    /// logged; caller falls through to AA or CPU fill).
+    #[cfg(feature = "gpu-aa")]
+    fn try_gpu_tile_fill(
+        &mut self,
+        path: &raster::path::Path,
+        even_odd: bool,
+        pipe: &raster::pipe::PipeState<'_>,
+        src: &raster::pipe::PipeSrc<'_>,
+        ctx: &gpu::GpuCtx,
+    ) -> bool {
+        use gpu::{GPU_TILE_FILL_THRESHOLD, build_tile_records};
+
+        let Some((segs_f32, bx, by, bw, bh)) = self.gpu_fill_segs(path) else {
+            return false;
+        };
+        if (bw as usize * bh as usize) < GPU_TILE_FILL_THRESHOLD {
+            return false;
+        }
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "bx/by are u32 from bitmap coords; f32 precision is sub-pixel at realistic DPIs"
+        )]
+        let (records, tile_starts, tile_counts, grid_w) =
+            build_tile_records(&segs_f32, bx as f32, by as f32, bw, bh);
+
+        let coverage = match ctx.tile_fill(
+            &records,
+            &tile_starts,
+            &tile_counts,
+            grid_w,
+            bw,
+            bh,
+            even_odd,
+        ) {
+            Ok(cov) => cov,
+            Err(e) => {
+                log::warn!("GPU tile fill failed, falling back to AA fill: {e}");
+                return false;
+            }
+        };
+
+        self.gpu_coverage_to_bitmap(&coverage, bx, by, bw, bh, pipe, src);
         true
     }
 
