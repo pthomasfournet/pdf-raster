@@ -9,20 +9,20 @@
 //!
 //! # What is implemented
 //!
-//! - Graphics state: `q Q cm w J j M d ri i`
+//! - Graphics state: `q Q cm w J j M d ri i gs`
 //! - Path construction: `m l c v y h re`
 //! - Path painting: `S s f F f* B B* b b* n`
+//! - Clip paths: `W W*` (winding and even-odd; intersected into the current `Clip`)
 //! - Colour: `g G rg RG k K sc scn SC SCN cs CS`
 //! - Text objects + state: `BT ET Tf Tc Tw Tz TL Ts Tr Td TD Tm T*`
 //! - Text showing: `Tj TJ ' "` (via `FreeType` through font crate)
+//! - Font encoding `Differences` array — resolved via Adobe Glyph List
 //!
 //! # Not yet implemented
 //!
-//! - Image `XObjects`: `JBIG2Decode`
+//! - Image `XObjects`: `JBIG2Decode` filter
 //! - Shading (`sh`) — requires shading resource lookup
 //! - `ExtGState` blend mode (`BM`) — only `Normal` is currently mapped
-//! - Clip paths (W W*) — stub; page-rect clip used as fallback
-//! - Char-to-glyph Differences encoding (phase 2)
 //! - Type 0 / `CIDFont` composite fonts (phase 2)
 //! - Type 3 paint-procedure fonts (phase 2)
 
@@ -38,13 +38,14 @@ use font::{
     engine::{FontEngine, SharedEngine},
 };
 use raster::{
-    Bitmap, Clip, eo_fill, fill,
+    Bitmap, eo_fill, fill,
     glyph::{GlyphBitmap, fill_glyph},
     path::PathBuilder,
     pipe::{PipeSrc, PipeState},
     state::TransferSet,
     stroke::{StrokeParams, stroke},
     types::{BlendMode, LineCap, LineJoin},
+    xpath::XPath,
 };
 
 use super::color::RasterColor;
@@ -117,7 +118,7 @@ impl<'doc> PageRenderer<'doc> {
         let mut bitmap = Bitmap::<Rgb8>::new(width, height, 1, false);
         bitmap.data_mut().fill(255u8); // white background
 
-        let mut gstate = GStateStack::new();
+        let mut gstate = GStateStack::new(width, height);
         if (scale - 1.0).abs() > f64::EPSILON {
             gstate.current_mut().ctm = [scale, 0.0, 0.0, scale, 0.0, 0.0];
         }
@@ -289,11 +290,9 @@ impl<'doc> PageRenderer<'doc> {
                 self.path = None;
             }
 
-            // ── Clipping (stub — page-rect clip used until path-clip is wired) ─
-            Operator::Clip | Operator::ClipEvenOdd => {
-                // TODO(phase2): build a path-based clip from self.path.
-                self.path = None;
-            }
+            // ── Clipping ──────────────────────────────────────────────────────
+            Operator::Clip => self.do_clip(false),
+            Operator::ClipEvenOdd => self.do_clip(true),
 
             // ── Text objects ──────────────────────────────────────────────────
             Operator::BeginText => self.gstate.current_mut().text.begin_text(),
@@ -486,7 +485,7 @@ impl<'doc> PageRenderer<'doc> {
 
         // Phase 2: blit rasterized glyphs — mutable borrow of bitmap only.
         let fill_bytes = self.gstate.current().fill_color.as_slice().to_vec();
-        let clip = self.page_clip();
+        let clip = self.gstate.current().clip.clone_shared();
         let pipe = Self::make_pipe_with_alpha(self.gstate.current().fill_alpha);
         let src = PipeSrc::Solid(&fill_bytes);
 
@@ -540,14 +539,18 @@ impl<'doc> PageRenderer<'doc> {
         (dx, f64::from(self.height) - dy)
     }
 
-    fn page_clip(&self) -> Clip {
-        Clip::new(
-            0.0,
-            0.0,
-            f64::from(self.width),
-            f64::from(self.height),
-            false,
-        )
+    /// Apply the current path as a clip region (`W` / `W*` operators).
+    ///
+    /// PDF §8.5.4: the clipping path is intersected with the current path using
+    /// the specified fill rule.  The current path is then discarded (not painted).
+    /// The new clip takes effect starting with the *next* painting operator.
+    fn do_clip(&mut self, even_odd: bool) {
+        if let Some(builder) = self.path.take() {
+            let path = builder.build();
+            let flatness = self.gstate.current().flatness.max(0.1);
+            let xpath = XPath::new(&path, &DEVICE_MATRIX, flatness, true);
+            self.gstate.current_mut().clip.clip_to_path(&xpath, even_odd);
+        }
     }
 
     /// Build a [`PipeState`] for Normal-blend rendering with the given opacity.
@@ -594,7 +597,7 @@ impl<'doc> PageRenderer<'doc> {
     fn fill_path(&mut self, path: &raster::path::Path, even_odd: bool) {
         let gs = self.gstate.current();
         let color = gs.fill_color.as_slice().to_vec();
-        let clip = self.page_clip();
+        let clip = gs.clip.clone_shared();
         let flatness = gs.flatness.max(0.1);
         let pipe = Self::make_pipe_with_alpha(gs.fill_alpha);
         let src = PipeSrc::Solid(&color);
@@ -626,7 +629,7 @@ impl<'doc> PageRenderer<'doc> {
     fn stroke_path(&mut self, path: &raster::path::Path) {
         let gs = self.gstate.current();
         let color = gs.stroke_color.as_slice().to_vec();
-        let clip = self.page_clip();
+        let clip = gs.clip.clone_shared();
         let pipe = Self::make_pipe_with_alpha(gs.stroke_alpha);
         let src = PipeSrc::Solid(&color);
         let params = StrokeParams {

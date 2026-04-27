@@ -7,6 +7,7 @@
 //!
 //! The save/restore stack is a plain `Vec`; `q` pushes a clone, `Q` pops.
 
+use raster::Clip;
 use raster::types::{LineCap, LineJoin};
 
 use super::color::RasterColor;
@@ -70,10 +71,14 @@ pub fn ctm_transform(ctm: &Ctm, x: f64, y: f64) -> (f64, f64) {
 ///
 /// One instance lives per save/restore level; the stack is managed by
 /// [`GStateStack`].
-#[derive(Debug, Clone)]
+///
+/// `Clone` is implemented manually so that `clip` uses `clone_shared`
+/// (Arc-sharing scanners) rather than a deep copy.
 pub struct InterpGState {
     /// Current transformation matrix.
     pub ctm: Ctm,
+    /// Current clip region (page rect at init; narrowed by `W`/`W*` operators).
+    pub clip: Clip,
     /// Current fill colour.
     pub fill_color: RasterColor,
     /// Current stroke colour.
@@ -98,21 +103,43 @@ pub struct InterpGState {
     pub text: TextState,
 }
 
-impl Default for InterpGState {
-    /// PDF initial graphics state (§8.4.4 Table 52).
-    fn default() -> Self {
+impl Clone for InterpGState {
+    fn clone(&self) -> Self {
+        Self {
+            ctm: self.ctm,
+            clip: self.clip.clone_shared(),
+            fill_color: self.fill_color.clone(),
+            stroke_color: self.stroke_color.clone(),
+            fill_alpha: self.fill_alpha,
+            stroke_alpha: self.stroke_alpha,
+            line_width: self.line_width,
+            line_cap: self.line_cap,
+            line_join: self.line_join,
+            miter_limit: self.miter_limit,
+            flatness: self.flatness,
+            dash: self.dash.clone(),
+            text: self.text.clone(),
+        }
+    }
+}
+
+impl InterpGState {
+    /// Create the initial graphics state for a page of `width × height` device pixels.
+    #[must_use]
+    pub fn initial(width: u32, height: u32) -> Self {
         Self {
             ctm: CTM_IDENTITY,
-            fill_color: RasterColor::default(),   // black
-            stroke_color: RasterColor::default(), // black
-            fill_alpha: 255,   // fully opaque
-            stroke_alpha: 255, // fully opaque
+            clip: Clip::new(0.0, 0.0, f64::from(width), f64::from(height), false),
+            fill_color: RasterColor::default(),
+            stroke_color: RasterColor::default(),
+            fill_alpha: 255,
+            stroke_alpha: 255,
             line_width: 1.0,
             line_cap: LineCap::Butt,
             line_join: LineJoin::Miter,
             miter_limit: 10.0,
             flatness: 0.0,
-            dash: (Vec::new(), 0.0), // solid line
+            dash: (Vec::new(), 0.0),
             text: TextState::default(),
         }
     }
@@ -122,18 +149,18 @@ impl Default for InterpGState {
 ///
 /// `q` pushes a clone; `Q` pops. Unmatched `Q` operators are silently ignored
 /// to be lenient with real-world PDFs that have mismatched save/restore counts.
-#[derive(Debug, Default)]
 pub struct GStateStack {
     /// Index 0 = bottom (page-level) state; last = current.
     stack: Vec<InterpGState>,
 }
 
 impl GStateStack {
-    /// Create a new stack with the initial PDF graphics state at the bottom.
+    /// Create a new stack with the initial PDF graphics state for a page of
+    /// `width × height` device pixels.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(width: u32, height: u32) -> Self {
         Self {
-            stack: vec![InterpGState::default()],
+            stack: vec![InterpGState::initial(width, height)],
         }
     }
 
@@ -198,7 +225,7 @@ mod tests {
 
     #[test]
     fn save_restore_roundtrip() {
-        let mut stack = GStateStack::new();
+        let mut stack = GStateStack::new(100, 100);
         stack.current_mut().line_width = 5.0;
         stack.save();
         stack.current_mut().line_width = 10.0;
@@ -209,7 +236,7 @@ mod tests {
 
     #[test]
     fn restore_unmatched_is_silent() {
-        let mut stack = GStateStack::new();
+        let mut stack = GStateStack::new(100, 100);
         stack.restore(); // should not panic
         stack.restore(); // still should not panic
     }
