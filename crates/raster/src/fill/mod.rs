@@ -191,9 +191,12 @@ pub(super) fn fill_impl<P: Pixel>(
             }
         }
     } else {
+        if bitmap.width == 0 {
+            return;
+        }
         #[expect(
             clippy::cast_possible_wrap,
-            reason = "bitmap.width ≤ i32::MAX in practice"
+            reason = "bitmap.width ≤ i32::MAX in practice; zero checked above"
         )]
         let width_i = bitmap.width as i32;
 

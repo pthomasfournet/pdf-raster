@@ -146,7 +146,7 @@ impl XPathScanner {
             }
             let sy_min = seg.y0.min(seg.y1);
             let sy_max = seg.y0.max(seg.y1);
-            if sy_min >= f64::from(clip_y_max + 1) || sy_max < f64::from(clip_y_min) {
+            if sy_min >= f64::from(clip_y_max) + 1.0 || sy_max < f64::from(clip_y_min) {
                 continue;
             }
             x_min_fp = x_min_fp.min(seg.x0).min(seg.x1);
@@ -168,7 +168,8 @@ impl XPathScanner {
             return Self::empty(eo);
         }
 
-        let n_rows = usize::try_from(y_max - y_min + 1).expect("y_max >= y_min");
+        let n_rows = usize::try_from(i64::from(y_max) - i64::from(y_min) + 1)
+            .expect("n_rows overflows usize; page height is impossibly large");
 
         // ── Two-pass construction: count → prefix-sum → fill → finalise ──────
         //
@@ -261,7 +262,7 @@ impl XPathScanner {
     /// True when the scanner covers no scanlines.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.x_min > self.x_max
+        self.x_min > self.x_max || self.y_min > self.y_max
     }
 
     /// Iterate over only the scanlines that have at least one intersection.
@@ -279,8 +280,9 @@ impl XPathScanner {
             .windows(2)
             .enumerate()
             .filter(|(_, w)| w[0] < w[1])
-            // i < n_rows ≤ i32::MAX for any real page
-            .map(|(i, _)| self.y_min + i32::try_from(i).unwrap_or(i32::MAX))
+            // i < n_rows ≤ i32::MAX (enforced by n_rows construction); saturating_add
+            // is a no-cost guard against logic errors in debug builds.
+            .map(|(i, _)| self.y_min.saturating_add(i32::try_from(i).unwrap_or(i32::MAX)))
     }
 
     /// The intersections for scanline `y`, sorted by `x0`.
@@ -355,12 +357,12 @@ impl XPathScanner {
         let eo_mask = if self.eo { 1i32 } else { !0i32 };
         let mut count = 0i32;
         let mut i = 0;
-        let mut xx1 = x0 - 1;
+        let mut xx1 = x0.saturating_sub(1);
         while xx1 < x1 {
             if i >= row.len() {
                 return false;
             }
-            if row[i].x0 > xx1 + 1 && (count & eo_mask) == 0 {
+            if row[i].x0 > xx1.saturating_add(1) && (count & eo_mask) == 0 {
                 return false;
             }
             if row[i].x1 > xx1 {
@@ -566,7 +568,7 @@ fn fill_intersections(
             // Initialised from f64 to preserve accuracy at the first row, then
             // stepped by `dxdy_fp` (integer add) per scanline — no f64 arithmetic
             // inside the hot loop.
-            let mut xx1_fp = fp_from_f64(f64::from(row_y0 + 1).mul_add(seg.dxdy, x_base));
+            let mut xx1_fp = fp_from_f64((f64::from(row_y0) + 1.0).mul_add(seg.dxdy, x_base));
 
             for row in row_y0..=row_y1 {
                 let xx1_fp_clamped = xx1_fp.clamp(fp_clamp_min, fp_clamp_max);
@@ -615,7 +617,7 @@ fn write_intersect(
     if cur > 0 {
         // Check the last written entry in this row for adjacency/overlap.
         let last = &mut intersects[base + cur - 1];
-        if last.x1 + 1 >= entry.x0 && last.x0 <= entry.x1 + 1 {
+        if last.x1.saturating_add(1) >= entry.x0 && last.x0 <= entry.x1.saturating_add(1) {
             // Merge: expand span and accumulate count.
             last.count = last.count.wrapping_add(entry.count);
             last.x0 = last.x0.min(entry.x0);
@@ -660,7 +662,7 @@ fn add_intersection(row: &mut Vec<Intersect>, x0: i32, x1: i32, count: i32, _is_
         return;
     }
     let last = row.last_mut().unwrap();
-    if last.x1 + 1 < entry.x0 || last.x0 > entry.x1 + 1 {
+    if last.x1.saturating_add(1) < entry.x0 || last.x0 > entry.x1.saturating_add(1) {
         row.push(entry);
     } else {
         last.count = last.count.wrapping_add(entry.count);

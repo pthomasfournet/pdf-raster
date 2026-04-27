@@ -202,14 +202,15 @@ fn fill_band<P: Pixel>(
     scanner: &XPathScanner,
     clip_res: ClipResult,
 ) {
+    // bands_mut guarantees y_start + height ≤ bitmap.height ≤ i32::MAX.
     #[expect(
         clippy::cast_possible_wrap,
-        reason = "y_start fits in i32 for valid PDF coordinates"
+        reason = "band.y_start ≤ bitmap.height ≤ i32::MAX; enforced by bands_mut"
     )]
     let y_band_min = band.y_start as i32;
     #[expect(
         clippy::cast_possible_wrap,
-        reason = "y_start + height fits in i32 for valid PDF coordinates"
+        reason = "band.y_start + band.height - 1 ≤ bitmap.height - 1 ≤ i32::MAX; enforced by bands_mut"
     )]
     let y_band_max = (band.y_start + band.height - 1) as i32;
 
@@ -221,9 +222,12 @@ fn fill_band<P: Pixel>(
         return;
     }
 
+    if band.width == 0 {
+        return;
+    }
     #[expect(
         clippy::cast_possible_wrap,
-        reason = "band.width ≤ i32::MAX in practice"
+        reason = "band.width ≤ bitmap.width ≤ i32::MAX; zero checked above"
     )]
     let width_i = band.width as i32;
 
