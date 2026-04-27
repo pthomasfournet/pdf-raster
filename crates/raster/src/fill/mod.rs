@@ -29,8 +29,7 @@ mod parallel;
 #[cfg(feature = "rayon")]
 pub use parallel::{PARALLEL_FILL_MIN_HEIGHT, eo_fill_parallel, fill_parallel};
 
-use crate::bitmap::AaBuf;
-use crate::bitmap::Bitmap;
+use crate::bitmap::{AaBuf, Bitmap, BitmapBand};
 use crate::clip::{Clip, ClipResult};
 use crate::path::Path;
 use crate::pipe::{self, PipeSrc, PipeState};
@@ -225,18 +224,52 @@ pub(super) fn fill_impl<P: Pixel>(
                 }
 
                 if inner_clip {
-                    draw_span::<P>(bitmap, pipe, src, sx0, sx1, y);
+                    draw_span::<P, _>(bitmap, pipe, src, sx0, sx1, y);
                 } else {
-                    draw_span_clipped::<P>(bitmap, clip, pipe, src, sx0, sx1, y);
+                    draw_span_clipped::<P, _>(bitmap, clip, pipe, src, sx0, sx1, y);
                 }
             }
         }
     }
 }
 
-/// Emit a solid span that is fully inside the clip — no per-pixel clip test.
-fn draw_span<P: Pixel>(
-    bitmap: &mut Bitmap<P>,
+// ── RowSink — shared abstraction over Bitmap and BitmapBand ──────────────────
+
+/// A target that can vend a mutable pixel row and an optional alpha row.
+///
+/// Implemented by [`Bitmap`] and [`BitmapBand`], letting `draw_span` and
+/// `draw_span_clipped` work without duplication across the sequential and
+/// parallel fill paths.
+pub(super) trait RowSink<P: Pixel> {
+    /// Return mutable access to the raw pixel bytes and the optional alpha
+    /// plane for absolute row `y`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y` is out of range for the sink (matches the behaviour of
+    /// `Bitmap::row_and_alpha_mut` and `BitmapBand::row_and_alpha_mut`).
+    fn row_and_alpha_mut(&mut self, y: u32) -> (&mut [u8], Option<&mut [u8]>);
+}
+
+impl<P: Pixel> RowSink<P> for Bitmap<P> {
+    #[inline]
+    fn row_and_alpha_mut(&mut self, y: u32) -> (&mut [u8], Option<&mut [u8]>) {
+        self.row_and_alpha_mut(y)
+    }
+}
+
+impl<P: Pixel> RowSink<P> for BitmapBand<'_, P> {
+    #[inline]
+    fn row_and_alpha_mut(&mut self, y: u32) -> (&mut [u8], Option<&mut [u8]>) {
+        self.row_and_alpha_mut(y)
+    }
+}
+
+// ── Span drawing helpers ──────────────────────────────────────────────────────
+
+/// Emit a solid span into `sink` that is fully inside the clip — no per-pixel test.
+pub(super) fn draw_span<P: Pixel, S: RowSink<P>>(
+    sink: &mut S,
     pipe: &PipeState<'_>,
     src: &PipeSrc<'_>,
     x0: i32,
@@ -254,7 +287,7 @@ fn draw_span<P: Pixel>(
     #[expect(clippy::cast_sign_loss, reason = "x0 >= 0, x1 >= x0")]
     let alpha_range = x0 as usize..=x1 as usize;
 
-    let (row, alpha) = bitmap.row_and_alpha_mut(y_u);
+    let (row, alpha) = sink.row_and_alpha_mut(y_u);
     let dst_pixels = &mut row[byte_off..byte_end];
     let dst_alpha = alpha.map(|a| &mut a[alpha_range]);
 
@@ -262,8 +295,8 @@ fn draw_span<P: Pixel>(
 }
 
 /// Emit a span with per-pixel clip test (partial clip region).
-fn draw_span_clipped<P: Pixel>(
-    bitmap: &mut Bitmap<P>,
+pub(super) fn draw_span_clipped<P: Pixel, S: RowSink<P>>(
+    sink: &mut S,
     clip: &Clip,
     pipe: &PipeState<'_>,
     src: &PipeSrc<'_>,
@@ -281,11 +314,11 @@ fn draw_span_clipped<P: Pixel>(
                 run_start = Some(x);
             }
         } else if let Some(rs) = run_start.take() {
-            draw_span::<P>(bitmap, pipe, src, rs, x - 1, y);
+            draw_span::<P, S>(sink, pipe, src, rs, x - 1, y);
         }
     }
     if let Some(rs) = run_start {
-        draw_span::<P>(bitmap, pipe, src, rs, x1, y);
+        draw_span::<P, S>(sink, pipe, src, rs, x1, y);
     }
 }
 

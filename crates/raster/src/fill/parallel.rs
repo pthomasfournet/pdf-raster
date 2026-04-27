@@ -7,14 +7,14 @@
 use crate::bitmap::{Bitmap, BitmapBand};
 use crate::clip::{Clip, ClipResult};
 use crate::path::Path;
-use crate::pipe::{self, PipeSrc, PipeState};
+use crate::pipe::{PipeSrc, PipeState};
 use crate::scanner::XPathScanner;
 use crate::scanner::iter::ScanIterator;
 use crate::types::AA_SIZE;
 use crate::xpath::XPath;
 use color::Pixel;
 
-use super::fill_impl;
+use super::{RowSink, draw_span, draw_span_clipped, fill_impl};
 
 /// Minimum fill height (in output pixel rows) for which the parallel path is
 /// activated.  Below this threshold the thread-spawn overhead dominates and
@@ -253,62 +253,10 @@ fn fill_band<P: Pixel>(
             }
 
             if inner_clip {
-                draw_span_band::<P>(band, pipe, src, sx0, sx1, y);
+                draw_span::<P, _>(band, pipe, src, sx0, sx1, y);
             } else {
-                draw_span_band_clipped::<P>(band, clip, pipe, src, sx0, sx1, y);
+                draw_span_clipped::<P, _>(band, clip, pipe, src, sx0, sx1, y);
             }
         }
-    }
-}
-
-/// Emit a solid span into a band row that is fully inside the clip.
-fn draw_span_band<P: Pixel>(
-    band: &mut BitmapBand<'_, P>,
-    pipe: &PipeState<'_>,
-    src: &PipeSrc<'_>,
-    x0: i32,
-    x1: i32,
-    y: i32,
-) {
-    debug_assert!(x0 <= x1);
-    debug_assert!(y >= 0);
-    #[expect(clippy::cast_sign_loss, reason = "y >= 0")]
-    let y_u = y as u32;
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0 after clip clamping")]
-    let byte_off = x0 as usize * P::BYTES;
-    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0")]
-    let byte_end = (x1 as usize + 1) * P::BYTES;
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0, x1 >= x0")]
-    let alpha_range = x0 as usize..=x1 as usize;
-
-    let (row, alpha) = band.row_and_alpha_mut(y_u);
-    let dst_pixels = &mut row[byte_off..byte_end];
-    let dst_alpha = alpha.map(|a| &mut a[alpha_range]);
-
-    pipe::render_span::<P>(pipe, src, dst_pixels, dst_alpha, None, x0, x1, y);
-}
-
-/// Emit a span with per-pixel clip test into a band row.
-fn draw_span_band_clipped<P: Pixel>(
-    band: &mut BitmapBand<'_, P>,
-    clip: &Clip,
-    pipe: &PipeState<'_>,
-    src: &PipeSrc<'_>,
-    x0: i32,
-    x1: i32,
-    y: i32,
-) {
-    let mut run_start: Option<i32> = None;
-    for x in x0..=x1 {
-        if clip.test(x, y) {
-            if run_start.is_none() {
-                run_start = Some(x);
-            }
-        } else if let Some(rs) = run_start.take() {
-            draw_span_band::<P>(band, pipe, src, rs, x - 1, y);
-        }
-    }
-    if let Some(rs) = run_start {
-        draw_span_band::<P>(band, pipe, src, rs, x1, y);
     }
 }
