@@ -131,7 +131,6 @@ pub(super) fn aa_coverage_span_scalar(rows: [&[u8]; 4], x0: usize, shape: &mut [
                 "aa_coverage_span_scalar: byte_idx={byte_idx} out of bounds (row.len={})",
                 row.len()
             );
-            // SAFETY: byte_idx < row.len() asserted above.
             let byte = row[byte_idx];
             let nibble = if is_odd { byte & 0x0f } else { byte >> 4 };
             count += NIBBLE_POP[nibble as usize];
@@ -194,13 +193,13 @@ unsafe fn aa_coverage_span_avx512(rows: [&[u8]; 4], x0: usize, shape: &mut [u8])
         let mut acc_lo = _mm512_set1_epi8(0);
 
         for row in rows {
-            debug_assert!(
+            assert!(
                 byte_off + 64 <= row.len(),
-                "aa_coverage_span_avx512: byte_off+64={} out of bounds (row.len={})",
+                "aa_coverage_span: row slice too short: need {} bytes at offset {byte_off}, have {}",
                 byte_off + 64,
                 row.len()
             );
-            // SAFETY: byte_off + 64 ≤ row.len() asserted above; unaligned load is always valid.
+            // SAFETY: byte_off + 64 ≤ row.len() asserted immediately above.
             let v = unsafe { _mm512_loadu_si512(row[byte_off..].as_ptr().cast()) };
             // High nibble → bits 3–0 via >>4, then mask to kill carry from adjacent lane.
             let hi_bits = _mm512_and_si512(_mm512_srli_epi16(v, 4), mask_lo);
@@ -264,9 +263,19 @@ pub fn popcnt_aa_row(row: &[u8]) -> u32 {
 
 /// Fill `shape[i]` with the AA coverage count (0..=16) for output pixel `x0 + i`.
 ///
-/// `rows` are the four AA sub-row byte slices (one per `AA_SIZE` row), each of
-/// length `row_bytes = (bitmap_width * 4 + 7) / 8`.  `x0` must be non-negative
-/// and `x0 + shape.len()` must not exceed `bitmap_width`.
+/// `rows` are the four `AaBuf` sub-row byte slices (one per AA sub-row), each of
+/// length `(bitmap_width * AA_SIZE + 7) / 8`.
+///
+/// # Preconditions
+///
+/// - `x0 + shape.len() <= bitmap_width` — the span must not exceed the row width.
+/// - `x0` must be **even** for the AVX-512 BITALG tier to be used; an odd `x0`
+///   silently falls back to the scalar tier (correct but slower).
+///
+/// # Panics
+///
+/// Panics if `x0 + shape.len() > bitmap_width` (detected in the AVX-512 tier via
+/// bounds checking on the row slices; detected in the scalar tier via slice indexing).
 ///
 /// Selects the best available SIMD tier at runtime.
 pub fn aa_coverage_span(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {

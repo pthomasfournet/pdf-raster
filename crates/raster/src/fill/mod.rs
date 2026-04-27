@@ -345,32 +345,33 @@ fn draw_aa_line<P: Pixel>(
     x1: i32,
     y: i32,
 ) {
-    debug_assert!(x0 <= x1);
-    debug_assert!(y >= 0);
+    debug_assert!(x0 >= 0, "draw_aa_line: x0={x0} is negative");
+    debug_assert!(x0 <= x1, "draw_aa_line: x0={x0} > x1={x1}");
+    debug_assert!(y >= 0, "draw_aa_line: y={y} is negative");
 
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0 after clip clamping")]
+    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0: asserted above")]
     let x0_usize = x0 as usize;
     #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0")]
     let count = (x1 - x0 + 1) as usize;
 
-    // Gather raw coverage counts (0..=16) for each output pixel via the best
-    // available SIMD tier (AVX-512 BITALG → scalar NIBBLE_POP).
+    // Gather raw coverage counts (0..=16) into shape[], then gamma-map in place.
+    // Single allocation: aa_coverage_span writes raw counts; we overwrite with
+    // AA_GAMMA[t] in the same buffer (0 stays 0; non-zero gets the LUT value).
     let rows = [
         aa_buf.row_slice(0),
         aa_buf.row_slice(1),
         aa_buf.row_slice(2),
         aa_buf.row_slice(3),
     ];
-    let mut raw_counts = vec![0u8; count];
-    simd::aa_coverage_span(rows, x0_usize, &mut raw_counts);
-
-    // Apply gamma LUT: raw count 0 → shape 0 (skip), 1..=16 → AA_GAMMA[t].
     let mut shape = vec![0u8; count];
+    simd::aa_coverage_span(rows, x0_usize, &mut shape);
+
+    // Gamma-map in place: 0 → 0 (skip), 1..=16 → AA_GAMMA[t].
     let mut any_nonzero = false;
-    for (raw, out) in raw_counts.iter().zip(shape.iter_mut()) {
-        let t = *raw as usize;
+    for s in &mut shape {
+        let t = *s as usize;
         if t > 0 {
-            *out = AA_GAMMA[t];
+            *s = AA_GAMMA[t];
             any_nonzero = true;
         }
     }
