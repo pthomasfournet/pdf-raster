@@ -54,16 +54,18 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 ---
 
-## Phase 2 — Raster performance
+## Phase 2 — Raster performance ✓ COMPLETE
 
-Do not start until the native CLI path is the default (pdf_bridge deleted). The raster crate is not yet in the hot path — optimising it now is optimising the wrong thing.
-
-**Hardware context (Ryzen 9 9900X3D):** 128 MiB 3D V-Cache means edge tables and scanline sweep structures for most real-world documents fit in L3. Algorithms that are cache-bound on a normal CPU are compute-bound here — this shifts the priority order vs. generic advice. Sparse tile rasterisation has an outsized benefit because it maximises L3 utilisation. AVX-512 (F/BW/VL/VNNI/BF16/VPOPCNTDQ) is fully available; target `avx512f,avx512bw,avx512vl` with `-C target-cpu=native`.
+**Hardware context (Ryzen 9 9900X3D):** 128 MiB 3D V-Cache means edge tables and scanline sweep structures for most real-world documents fit in L3. The scanline sweep is therefore compute-bound, not memory-bound — algorithms that improve cache utilisation (sparse tiles) give less uplift here than on a normal CPU. AVX-512 (F/BW/VL/VNNI/BF16/VPOPCNTDQ) is fully available; target `avx512f,avx512bw,avx512vl` with `-C target-cpu=native`.
 
 - [x] **Eliminate per-span heap allocations** — `PipeSrc::Solid` and pattern scratch bufs use thread-local grow-never-shrink `PAT_BUF`; zero allocation per span
 - [x] **u16×16 compositing inner loop** — `composite_aa_rgb8_opaque` processes 16 pixels/iter as `[u16; 16]`, `div255_u16 = (v+255)>>8`; LLVM auto-vectorizes to AVX2/AVX-512
 - [x] **Fixed-point edge stepping (FDot16)** — `XPathSeg::dxdy_fp: i32` (16.16) added; scanner inner loop does `xx1_fp += dxdy_fp` (integer add) instead of `f64` accumulation
-- [ ] **Sparse tile rasterisation** — replace flat SoA edge table + per-scanline sweep with tile records sorted by (y, x); only non-empty tiles touched; reference: vello_cpu sparse_strips/. Especially high value with 3D V-Cache.
+- [x] **Sparse nonempty-row iteration** — `XPathScanner::nonempty_rows()` uses the existing `row_start` sentinel array as a free sparsity index; fill loops skip empty rows with zero overhead
+
+**Decision: CPU sparse tile rasterisation is deferred.** The original item (replace flat SoA with tile records sorted by (y,x)) was motivated by cache-miss reduction. On the 9900X3D the working set fits in L3, so the scanline sweep is already compute-bound and the win would be marginal. Tile records become high-value as the **GPU dispatch format** (Phase 4), where they map directly to warp-parallel execution. Implementing them twice — once for CPU, once for GPU — is redundant; Phase 4 will do it once, correctly, for the right target.
+
+**AA quality note:** the current 4× scanline supersampling (`render_aa_line`) is an approximation. Analytical sub-pixel coverage (vello-style trapezoid integrals) is strictly better in quality and would be faster on the GPU. This is addressed in Phase 4.
 
 ---
 
@@ -80,18 +82,74 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 
 ## Phase 4 — GPU acceleration (cudarc)
 
-Unblocked by Phase 1 completion (poppler must be gone first).
+Unblocked by Phase 1 completion (poppler must be gone first). **Phase 1 is complete — Phase 4 is now unblocked.**
 
 **Hardware context (RTX 5070, CC 12.0 Blackwell, 12 GB GDDR7):** cudarc 0.19 is already wired in `crates/gpu` with two kernels (Porter-Duff composite, soft mask) and CPU fallbacks. Target `sm_120` PTX. The GPU dispatch threshold is currently 500k pixels — validate this against actual transfer latency on this machine once the native path is hot. Do **not** use wgpu/Vello's GPU backend — CUDA is strictly better for a batch server pipeline on NVIDIA hardware.
 
-**Corpus note:** if the workload is predominantly scanned pages (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), image decoding throughput will dominate wall-clock time, not rasterisation. Profile first — nvJPEG may be the highest-value GPU target, not tile rasterisation.
+**Do not use DLSS, MSAA, CSAA, or TAA.** These are real-time game rendering features (temporal, triangle-mesh, depth-buffer dependent) and have no applicability to batch PDF rasterisation.
+
+### Priority order
+
+**1. nvJPEG image decoding — highest value, implement first**
+
+For scan-heavy corpora (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), image decoding dominates wall-clock time. nvJPEG decodes at ~10 GB/s on the RTX 5070; the CPU JPEG path (libjpeg via DCTDecode) is 10–20× slower. No rasterizer changes required — wire nvJPEG into the existing `blit_image` path behind a feature flag.
+
+- [ ] `nvjpeg` crate or raw FFI bindings to `libnvjpeg.so`
+- [ ] DCTDecode dispatch: if image area > threshold and GPU available → nvJPEG, else CPU
+- [ ] nvJPEG2000 for JPXDecode (JPEG 2000); lower priority than baseline JPEG
+
+**2. GPU supersampled AA — replaces CPU 4× scanline AA**
+
+The current `render_aa_line` + nibble-popcount AA is the weakest part of the CPU pipeline. Replace it with a CUDA kernel doing **jittered supersampling** at 64 samples/pixel using warp-level ballot reduction:
+
+```cuda
+// One warp (32 threads) per output pixel
+bool inside = winding_test(segs, n_segs, jittered_sample(px, py, threadIdx.x));
+int coverage = __popc(__ballot_sync(0xFFFFFFFF, inside));
+output[py * width + px] = (uint8_t)((coverage * 255) / 32);
+```
+
+`__ballot_sync` + `__popc` gives 32-sample coverage in a single warp cycle. With 2 warps/pixel: 64 samples. Quality far exceeds the CPU 4×4 grid; cost is lower because the 4352 CUDA cores run all pixels in parallel. The CPU AA path remains as fallback below the dispatch threshold.
+
+- [ ] CUDA kernel: jittered 64-sample winding test per pixel
+- [ ] Warp-ballot reduction: `__ballot_sync` + `__popc` for coverage count
+- [ ] Wire into `render_aa_line` dispatch: if fill area > threshold → GPU kernel
+- [ ] Validate quality vs CPU AA on pixel-diff benchmark
+
+**3. Tile-parallel fill rasterisation — GPU path only**
+
+Tile records (sorted by (y, x)) are the natural GPU work unit. One thread block per tile strip, independent coverage accumulation per tile, no warp divergence. The sort is done on the GPU via CUB radix sort (ships with CUDA toolkit).
+
+This is the correct implementation of the ROADMAP's original "sparse tile rasterisation" item — done once, for the GPU, where it actually matters. The CPU scanline scanner is retained unchanged for fills below the dispatch threshold (large solid fills are already near-memset speed on the CPU via AVX-512 `render_span`).
+
+- [ ] Tile record format: `{x: u16, y: u16, packed: u32}` (8 bytes, matches vello_common layout)
+- [ ] GPU segment upload: XPath edge list → device buffer via cudarc
+- [ ] CUB radix sort: sort tile records by (y << 16 | x) on device
+- [ ] Fill kernel: one thread block per strip, analytical trapezoid coverage (vello algorithm)
+- [ ] Winding kernel: accumulate integer winding across tile rows using prefix sum
+- [ ] Integrate with `fill_impl_parallel` dispatch: if `vector_antialias && area > threshold` → GPU
+
+**4. ICC colour transforms (cuBLAS / custom kernel)**
+
+ICC profile evaluation is a per-pixel matrix multiply. For DeviceCMYK → DeviceRGB conversion on large images, a CUDA kernel with cuBLAS GEMM can saturate memory bandwidth. Medium priority — only visible on CMYK-heavy documents.
+
+- [ ] Kernel: 4→3 channel matrix multiply per pixel, fused with image decode
+- [ ] Unblocked by: Phase 1 colour spaces (complete)
+
+**5. OptiX BVH for complex paths — low priority, evaluate later**
+
+RT cores on Blackwell provide hardware BVH traversal. For pages with thousands of path segments, an OptiX any-hit kernel computing winding numbers via ray casting would be faster than the tile rasteriser for very complex geometry. In practice, most PDF pages have O(100) path segments, not O(10000), so this is unlikely to be the bottleneck. Evaluate only after profiling shows complex path rasterisation in the flamegraph.
+
+### GPU dispatch table
 
 | Target | Value | Unblocked by |
 |---|---|---|
-| Tile-parallel rasterisation | High | Phase 2 sparse tiles |
-| Image decoding (nvJPEG / cuvid) | High if scan-heavy corpus | Phase 1 image pipeline |
-| ICC colour transforms | Medium | Phase 1 colour spaces |
-| Blend / composite | Low | Phase 2 perf work |
+| nvJPEG image decoding | **Highest** — scan-heavy corpora | Phase 1 image pipeline ✓ |
+| GPU supersampled AA (warp ballot) | High — quality + speed | GPU segment upload |
+| Tile-parallel fill rasterisation | High — sparse/complex paths | GPU segment upload |
+| ICC colour transforms | Medium — CMYK docs | Phase 1 colour spaces ✓ |
+| OptiX BVH winding test | Low — only extreme geometry | Tile rasteriser |
+| Blend / composite | Low — already fast on CPU | Phase 2 perf work ✓ |
 
 FreeType text rendering is **not** a GPU target — hinting is sequential per glyph. A GPU text path requires a GPU-resident rasteriser (SDF atlas or Slug algorithm) and is a separate major project.
 
@@ -114,6 +172,9 @@ CARGO_PROFILE_RELEASE_DEBUG=true flamegraph -o /tmp/flame.svg \
 
 # Fill microbenchmark (raster crate only)
 RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --stars 200
+
+# GPU AA benchmark (once Phase 4 item 2 lands)
+RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --stars 200 --aa gpu
 ```
 
 Current pixel diff vs poppler (--native, 150 dpi):
