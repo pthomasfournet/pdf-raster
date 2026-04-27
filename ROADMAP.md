@@ -108,9 +108,15 @@ Unblocked by Phase 1 completion (poppler must be gone first). **Phase 1 is compl
 
 For scan-heavy corpora (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), image decoding dominates wall-clock time. nvJPEG decodes at ~10 GB/s on the RTX 5070; the CPU JPEG path (libjpeg via DCTDecode) is 10–20× slower. No rasterizer changes required — wire nvJPEG into the existing `blit_image` path behind a feature flag.
 
-- [x] `gpu::nvjpeg` module: minimal raw FFI surface (no bindgen); NvJpeg context + NvJpegDecoder safe wrapper; decode_sync handles cuStreamSynchronize
-- [x] DCTDecode dispatch: image area ≥ GPU_JPEG_THRESHOLD_PX (512×512) → nvJPEG; else CPU zune-jpeg; CMYK JPEG falls through to CPU
-- [x] Feature flags: `gpu/nvjpeg` + `pdf_interp/nvjpeg`; zero-cost when disabled; pdf_interp maintains unsafe_code = "deny"
+- [x] `gpu::nvjpeg` module: minimal raw FFI surface (no bindgen); `NvJpeg` (pub(crate)) + `NvJpegDecoder` (pub) safe wrapper; `decode_sync` blocks on `cuStreamSynchronize` after GPU DMA completes
+- [x] DCTDecode dispatch: image area ≥ `GPU_JPEG_THRESHOLD_PX` (512×512) → nvJPEG; else CPU zune-jpeg; CMYK JPEG falls through to CPU
+- [x] Feature flags: `gpu/nvjpeg` + `pdf_interp/nvjpeg`; zero-cost when disabled; pdf_interp maintains `unsafe_code = "deny"`
+- [x] `NVJPEG_BACKEND_HARDWARE` (on-die engine, RTX 5070/Turing+) with automatic fallback to `NVJPEG_BACKEND_DEFAULT` on `NVJPEG_STATUS_JPEG_NOT_SUPPORTED` (progressive JPEGs); fallback is one-shot per decoder instance
+- [x] Output buffer is `PinnedBuf` via `cuMemAllocHost_v2` — declare the `_v2` symbol explicitly via `#[link_name]`; calling the old `cuMemAllocHost` symbol returns `CUDA_ERROR_INVALID_CONTEXT=201`; plain `Vec<u8>` segfaults on DMA
+- [x] Pure raw CUDA driver API in `NvJpegDecoder` (no cudarc at runtime): `cuInit → cuDeviceGet → cuDevicePrimaryCtxRetain → cuCtxSetCurrent → cuStreamCreate → nvjpegCreate`; mixing cudarc's primary context with nvJPEG's internal context causes `CUDA_ERROR_INVALID_CONTEXT=201` on every `cuStreamSynchronize`
+- [x] `NvJpegDecoder::dec` is `ManuallyDrop<NvJpeg>` so Drop explicitly calls nvjpegDestroy *before* `cuDevicePrimaryCtxRelease`; Rust's field-drop order would otherwise release the context while nvJPEG handles are still live
+- [x] `cuStreamSynchronize` called on error path from `nvjpegDecode` before dropping `PinnedBuf` — GPU may have enqueued partial work that would write into freed memory
+- [x] Minimum JPEG size: nvJPEG GPU kernels require ≥ one full 8×8 MCU block; 1×1 JPEGs crash inside the driver (test fixture is 16×16)
 - [ ] nvJPEG2000 for JPXDecode (JPEG 2000); lower priority than baseline JPEG
 
 **2. GPU supersampled AA — replaces CPU 4× scanline AA**
