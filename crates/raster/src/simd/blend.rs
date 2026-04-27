@@ -214,14 +214,15 @@ unsafe fn blend_solid_rgb8_movdir64b(dst: &mut [u8], color: [u8; 3], count: usiz
     #[repr(align(64))]
     struct Tile([u8; 192]);
 
+    // count * 3 cannot overflow: caller asserts dst.len() >= count * 3,
+    // and dst.len() is bounded by isize::MAX.
+    let byte_count = count * 3;
     debug_assert!(
-        dst.len() >= count * 3,
+        dst.len() >= byte_count,
         "dst too short for movdir64b RGB fill: {} < {}",
         dst.len(),
-        count * 3,
+        byte_count,
     );
-
-    let byte_count = count * 3;
     let dst_ptr = dst.as_mut_ptr();
 
     // ── Preamble ──────────────────────────────────────────────────────────────

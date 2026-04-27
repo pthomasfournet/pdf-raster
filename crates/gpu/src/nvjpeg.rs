@@ -97,8 +97,7 @@ const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 type nvjpegBackend_t = i32;
 
 /// Auto-select the best available backend (typically `HYBRID`).
-/// Used in `create_handle` when the HARDWARE backend is unavailable, passed
-/// to `nvjpegCreateEx` explicitly rather than through `nvjpegCreateSimple`.
+/// Used as the fallback when `NVJPEG_BACKEND_HARDWARE` is unavailable.
 const NVJPEG_BACKEND_DEFAULT: nvjpegBackend_t = 0;
 /// Hardware JPEG decode engine — fastest for baseline JPEGs on Turing+/Blackwell.
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;

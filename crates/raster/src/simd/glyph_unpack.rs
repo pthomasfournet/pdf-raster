@@ -14,6 +14,7 @@
 #[inline]
 pub(super) fn unpack_mono_row_scalar(packed: &[u8], width: usize, out: &mut [u8]) {
     debug_assert!(out.len() >= width);
+    debug_assert!(packed.len() >= width.div_ceil(8));
     for px in 0..width {
         let byte = packed[px / 8];
         let bit = 7 - (px % 8);
