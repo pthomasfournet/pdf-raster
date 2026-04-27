@@ -50,7 +50,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 - [x] JBIG2Decode image filter
 - [x] Optional content groups (layers / OCG)
 - [x] Annotation rendering
-- [ ] Non-axis-aligned image transforms (currently bounding-box nearest-neighbour approximation)
+- [x] Non-axis-aligned image transforms (currently bounding-box nearest-neighbour approximation)
 
 ---
 
