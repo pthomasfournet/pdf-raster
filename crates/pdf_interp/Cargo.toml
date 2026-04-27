@@ -20,7 +20,8 @@ log    = { workspace = true }
 fax = "0.2.6"
 zune-jpeg = "0.5.15"
 zune-core = "0.5.1"
-jpeg2k = { version = "0.10.1", default-features = false, features = ["image", "openjpeg-sys"] }
+jpeg2k      = { version = "0.10.1", default-features = false, features = ["image", "openjpeg-sys"] }
+hayro-jbig2 = { version = "0.3.0", default-features = false }
 
 [dev-dependencies]
 env_logger = { workspace = true }

@@ -14,7 +14,7 @@
 //! | none (raw) | yes/no | yes |
 //! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`, or GPU nvJPEG) |
 //! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`) |
-//! | `JBIG2Decode` | — | stub |
+//! | `JBIG2Decode` | yes/no | yes (via `hayro-jbig2`) |
 //! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | — | stub |
 //!
 //! # Pixel layout in `ImageDescriptor::data`
@@ -34,6 +34,7 @@
 
 use std::borrow::Cow;
 
+use hayro_jbig2::Decoder as Jbig2Decoder;
 use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
@@ -151,8 +152,8 @@ pub fn resolve_image(
         }
         Some("JPXDecode") => decode_jpx(stream.content.as_slice(), w, h),
         Some("JBIG2Decode") => {
-            log::debug!("image: filter \"JBIG2Decode\" not yet implemented");
-            None
+            let parms = stream.dict.get(b"DecodeParms").ok();
+            decode_jbig2(doc, stream.content.as_slice(), w, h, is_mask, parms)
         }
         Some(other) => {
             log::warn!("image: unknown filter {other:?}");
@@ -237,8 +238,8 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
         }
         Some("JPXDecode") => decode_jpx(data, w, h),
         Some("JBIG2Decode") => {
-            log::debug!("inline image: JBIG2Decode not yet implemented");
-            None
+            // Inline images cannot reference a JBIG2Globals stream (no object identity).
+            decode_jbig2(doc, data, w, h, is_mask, None)
         }
         Some("RunLengthDecode") => {
             let raw = decode_run_length(data);
@@ -476,8 +477,14 @@ fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<
                 .collect()
         }
         Some("JBIG2Decode") => {
-            log::debug!("image: SMask filter \"JBIG2Decode\" not yet supported");
-            return None;
+            let parms = stream.dict.get(b"DecodeParms").ok();
+            let sm_desc = decode_jbig2(doc, stream.content.as_slice(), sm_w, sm_h, true, parms)?;
+            // Mask-space polarity: 0x00 = fill (opaque in alpha) ↔ 0xFF = skip (transparent).
+            sm_desc
+                .data
+                .iter()
+                .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
+                .collect()
         }
         Some(other) => {
             log::debug!("image: SMask filter {other:?} not yet supported");
@@ -1445,6 +1452,121 @@ const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
     }
 }
 
+// ── JBIG2Decode ──────────────────────────────────────────────────────────────
+
+/// Decode a `JBIG2Decode` stream via `hayro-jbig2`.
+///
+/// PDF JBIG2 uses the "embedded organisation" (Annex D.3 of T.88): the stream
+/// contains page segments only; global segments live in a separate
+/// `JBIG2Globals` stream referenced from `DecodeParms`.
+///
+/// The decoder produces one byte per pixel: 0x00 = black, 0xFF = white (for
+/// grayscale images) or 0x00 = paint, 0xFF = transparent (for `ImageMask`).
+/// JBIG2 convention is 0 = white, 1 = black; we invert to match the rest of
+/// the image pipeline.
+fn decode_jbig2(
+    doc: &Document,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    is_mask: bool,
+    parms: Option<&Object>,
+) -> Option<ImageDescriptor> {
+    // Resolve optional JBIG2Globals stream from DecodeParms.
+    let globals_bytes: Option<Vec<u8>> = parms
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|d| d.get(b"JBIG2Globals").ok())
+        .and_then(|o| match o {
+            Object::Reference(id) => {
+                let g_obj = doc.get_object(*id).ok()?;
+                let g_stream = g_obj.as_stream().ok()?;
+                // JBIG2Globals streams are typically not compressed, but
+                // decompressed_content handles both cases transparently.
+                g_stream.decompressed_content().ok()
+            }
+            _ => None,
+        });
+
+    // Parse the embedded JBIG2 image (page segments + optional globals).
+    let img = hayro_jbig2::Image::new_embedded(
+        data,
+        globals_bytes.as_deref(),
+    )
+    .map_err(|e| log::warn!("image: JBIG2Decode parse error: {e}"))
+    .ok()?;
+
+    let jw = img.width();
+    let jh = img.height();
+
+    // Validate decoded dimensions against the PDF image dict.
+    if jw != width || jh != height {
+        log::warn!(
+            "image: JBIG2Decode dimension mismatch: image dict says {width}×{height}, JBIG2 stream says {jw}×{jh} — using stream dimensions"
+        );
+    }
+
+    let n_pixels = (jw as usize).checked_mul(jh as usize)?;
+    let mut collector = Jbig2Collector {
+        data: Vec::with_capacity(n_pixels),
+        is_mask,
+    };
+
+    img.decode(&mut collector)
+        .map_err(|e| log::warn!("image: JBIG2Decode decode error: {e}"))
+        .ok()?;
+
+    if collector.data.len() != n_pixels {
+        log::warn!(
+            "image: JBIG2Decode produced {} pixels, expected {n_pixels} — skipping",
+            collector.data.len()
+        );
+        return None;
+    }
+
+    let cs = if is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: jw,
+        height: jh,
+        color_space: cs,
+        data: collector.data,
+        smask: None,
+    })
+}
+
+/// Pixel collector for `hayro_jbig2::Decoder`.
+///
+/// JBIG2 convention: 0 = white, 1 = black.
+/// `ImageColorSpace::Gray` convention: 0x00 = black, 0xFF = white.
+/// `ImageColorSpace::Mask` convention: 0x00 = paint (== JBIG2 black), 0xFF = transparent.
+///
+/// Both output conventions share the same polarity flip: JBIG2 black (1) → 0x00,
+/// JBIG2 white (0) → 0xFF.
+struct Jbig2Collector {
+    data: Vec<u8>,
+    is_mask: bool,
+}
+
+impl Jbig2Decoder for Jbig2Collector {
+    fn push_pixel(&mut self, black: bool) {
+        self.data.push(if black { 0x00 } else { 0xFF });
+    }
+
+    fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+        let byte = if black { 0x00 } else { 0xFF };
+        let n = chunk_count as usize * 8;
+        self.data.extend(std::iter::repeat_n(byte, n));
+    }
+
+    fn next_line(&mut self) {
+        // Row boundary — nothing to do; pixels are already stored flat.
+        let _ = self.is_mask; // used at construction; suppress dead-code lint
+    }
+}
+
 // ── Color space helpers ───────────────────────────────────────────────────────
 
 /// Internal resolved colour space — what the decode path will actually produce.
@@ -1987,5 +2109,33 @@ mod tests {
         let params = b"/CS /G /BPC 8";
         let doc = lopdf::Document::new();
         assert!(decode_inline_image(&doc, params, &[0u8; 4]).is_none());
+    }
+
+    // ── JBIG2 collector unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn jbig2_collector_push_pixel_grayscale() {
+        // JBIG2: black=true → Gray 0x00, black=false → Gray 0xFF.
+        let mut c = Jbig2Collector { data: Vec::new(), is_mask: false };
+        Jbig2Decoder::push_pixel(&mut c, true);
+        Jbig2Decoder::push_pixel(&mut c, false);
+        assert_eq!(c.data, [0x00, 0xFF]);
+    }
+
+    #[test]
+    fn jbig2_collector_push_pixel_chunk() {
+        let mut c = Jbig2Collector { data: Vec::new(), is_mask: false };
+        // chunk_count=2 → 16 pixels of white (0xFF each).
+        Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
+        assert_eq!(c.data.len(), 16);
+        assert!(c.data.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn jbig2_decode_invalid_data_returns_none() {
+        // Corrupt/empty JBIG2 data must not panic — it must return None.
+        let doc = lopdf::Document::new();
+        let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
+        assert!(result.is_none());
     }
 }
