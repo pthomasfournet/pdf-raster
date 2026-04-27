@@ -147,6 +147,7 @@ pub fn render_page_native(
     let mut renderer =
         pdf_interp::renderer::PageRenderer::new_scaled(w_px, h_px, scale, doc, page_id);
     renderer.execute(&ops);
+    renderer.render_annotations(page_id);
     let bitmap: Bitmap<color::Rgb8> = renderer.finish();
 
     #[expect(

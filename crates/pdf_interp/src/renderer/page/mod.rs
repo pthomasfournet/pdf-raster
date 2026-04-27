@@ -29,10 +29,10 @@
 //!
 //! - Optional Content Groups (OCG / layers) — `BDC /OC` respects `OCProperties/D`
 //!   default state; inactive groups are skipped at operator level
+//! - Annotation rendering — `AP/N` normal appearance streams blitted after page content
 //!
 //! # Not yet implemented
 //!
-//! - Image `XObjects`: `JBIG2Decode` filter
 //! - `ExtGState` blend mode (`BM`) — only `Normal` is currently mapped
 //! - Type 0 named `CMaps` other than `Identity-H`/`V` (e.g. `/GB-EUC-H`)
 
@@ -40,7 +40,7 @@ mod text_ops;
 
 use self::text_ops::{GlyphRecord, text_to_device};
 
-use lopdf::{Document, ObjectId};
+use lopdf::{Document, Object, ObjectId};
 
 use color::Rgb8;
 use font::{
@@ -206,6 +206,113 @@ impl<'doc> PageRenderer<'doc> {
         for op in ops {
             self.execute_one(op);
         }
+    }
+
+    /// Render all annotations on the page (PDF §12.5).
+    ///
+    /// Each annotation with an `AP/N` (normal appearance) stream is rendered
+    /// after the page content stream.  Only the `/N` entry is used; rollover
+    /// (`/R`) and down (`/D`) appearances are ignored (this is a rasterizer,
+    /// not an interactive viewer).
+    ///
+    /// Annotations with no appearance stream are silently skipped — many
+    /// annotation types (e.g. `Link`) have no visible appearance by default.
+    ///
+    /// Call this after [`execute`](Self::execute) and before [`finish`](Self::finish).
+    pub fn render_annotations(&mut self, page_id: ObjectId) {
+        let doc = self.resources.doc();
+        let Ok(page_dict) = doc.get_dictionary(page_id) else { return };
+
+        // Collect annotation refs to avoid borrow conflict.
+        let annot_ids: Vec<ObjectId> = {
+            let arr = match page_dict.get(b"Annots") {
+                Ok(Object::Array(a)) => a.clone(),
+                Ok(Object::Reference(id)) => {
+                    match doc.get_object(*id).ok().and_then(|o| o.as_array().ok().cloned()) {
+                        Some(a) => a,
+                        None => return,
+                    }
+                }
+                _ => return,
+            };
+            arr.iter()
+                .filter_map(|o| if let Object::Reference(id) = o { Some(*id) } else { None })
+                .collect()
+        };
+
+        for annot_id in annot_ids {
+            self.render_one_annotation(annot_id);
+        }
+    }
+
+    fn render_one_annotation(&mut self, annot_id: ObjectId) {
+        let doc = self.resources.doc();
+
+        let Ok(annot_dict) = doc.get_dictionary(annot_id) else { return };
+
+        // Annotation rect in page user space: [llx, lly, urx, ury].
+        let Some(rect) = read_rect(annot_dict) else { return };
+
+        // Resolve AP/N appearance stream.
+        let Some(ap_dict) = annot_dict.get(b"AP").ok().and_then(|o| match o {
+            Object::Dictionary(d) => Some(d),
+            Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            _ => None,
+        }) else { return };
+
+        // N can be a stream reference or a sub-dict (state-keyed appearances).
+        let stream_id: ObjectId = {
+            let Ok(n_obj) = ap_dict.get(b"N") else { return };
+            match n_obj {
+                Object::Reference(id) => *id,
+                Object::Dictionary(_) => {
+                    // State-keyed: look up the current appearance state (AS).
+                    let state = annot_dict
+                        .get(b"AS")
+                        .ok()
+                        .and_then(|o| o.as_name().ok());
+                    let Some(state_key) = state else { return };
+                    match n_obj.as_dict().ok().and_then(|d| d.get(state_key).ok()) {
+                        Some(Object::Reference(id)) => *id,
+                        _ => return,
+                    }
+                }
+                _ => return,
+            }
+        };
+
+        // Build the FormXObject from the appearance stream.
+        let Some(mut form) = self.resources.form_from_stream_id(stream_id) else { return };
+
+        // Compute the BBox→Rect mapping and compose with the stream's own Matrix.
+        // The appearance stream's Matrix maps form coords → a space where Rect is
+        // the clip/position area (PDF §12.5.5).
+        let bbox = {
+            let doc = self.resources.doc();
+            let Ok(obj) = doc.get_object(stream_id) else { return };
+            let Ok(stream) = obj.as_stream() else { return };
+            let Some(r) = read_rect(&stream.dict) else { return };
+            r
+        };
+
+        let [llx, lly, urx, ury] = rect;
+        let [bx0, by0, bx1, by1] = bbox;
+        let bw = bx1 - bx0;
+        let bh = by1 - by0;
+        if bw.abs() < f64::EPSILON || bh.abs() < f64::EPSILON {
+            return;
+        }
+
+        let sx = (urx - llx) / bw;
+        let sy = (ury - lly) / bh;
+        let tx = bx0.mul_add(-sx, llx);
+        let ty = by0.mul_add(-sy, lly);
+        let bbox_to_rect: [f64; 6] = [sx, 0.0, 0.0, sy, tx, ty];
+
+        // Composed rendering matrix: stream.Matrix × bbox_to_rect.
+        form.matrix = ctm_multiply(&form.matrix, &bbox_to_rect);
+
+        self.do_form_xobject(&form);
     }
 
     #[expect(clippy::too_many_lines, reason = "operator dispatch table")]
@@ -1485,4 +1592,34 @@ const fn int_to_join(v: i32) -> LineJoin {
         2 => LineJoin::Bevel,
         _ => LineJoin::Miter,
     }
+}
+
+/// Read a 4-element rect `[llx, lly, urx, ury]` from a PDF dictionary.
+///
+/// Returns `None` if the `Rect` key is absent or has fewer than 4 numeric entries.
+fn read_rect(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+    let arr = dict.get(b"Rect").ok()?.as_array().ok()?;
+    if arr.len() < 4 {
+        return None;
+    }
+    let mut r = [0.0f64; 4];
+    for (i, obj) in arr.iter().take(4).enumerate() {
+        r[i] = match obj {
+            Object::Real(v) => f64::from(*v),
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "PDF rect coords are always well within f64 precision range"
+            )]
+            Object::Integer(v) => *v as f64,
+            _ => return None,
+        };
+    }
+    // Normalise so llx ≤ urx and lly ≤ ury.
+    if r[0] > r[2] {
+        r.swap(0, 2);
+    }
+    if r[1] > r[3] {
+        r.swap(1, 3);
+    }
+    Some(r)
 }

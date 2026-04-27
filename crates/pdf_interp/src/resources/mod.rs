@@ -298,6 +298,25 @@ impl<'doc> PageResources<'doc> {
         })
     }
 
+    /// Build a [`FormXObject`] directly from a stream object ID.
+    ///
+    /// Used for annotation appearance streams, which are referenced by object ID
+    /// rather than through the page `Resources/XObject` dict.
+    #[must_use]
+    pub fn form_from_stream_id(&self, stream_id: ObjectId) -> Option<FormXObject> {
+        let obj = self.doc.get_object(stream_id).ok()?;
+        let stream = obj.as_stream().ok()?;
+        let content = stream.decompressed_content().ok()?;
+        let matrix = read_matrix(&stream.dict).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let has_own_resources = stream.dict.get(b"Resources").is_ok();
+        Some(FormXObject {
+            content,
+            matrix,
+            resources_id: stream_id,
+            has_own_resources,
+        })
+    }
+
     /// Resolve the named `Pattern` resource as a tiling descriptor.
     ///
     /// Returns `None` if the name is absent, the pattern is not `PatternType 1`
