@@ -46,7 +46,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 ### Phase 1 parking lot (post-shipping coverage work)
 
-- [ ] Type 3 paint-procedure fonts
+- [x] Type 3 paint-procedure fonts
 - [ ] JBIG2Decode image filter
 - [ ] Optional content groups (layers / OCG)
 - [ ] Annotation rendering

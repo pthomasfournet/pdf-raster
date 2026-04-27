@@ -112,14 +112,14 @@ pub struct InterpGState {
     /// Set by `scn /Name`; cleared when any other fill-colour operator fires.
     /// `None` means use `fill_color` as a solid colour.
     pub fill_pattern: Option<Vec<u8>>,
-    /// Tint components for an uncoloured fill pattern (PaintType 2).
+    /// Tint components for an uncoloured fill pattern (`PaintType` 2).
     pub fill_pattern_components: Vec<f64>,
     /// Active stroke pattern name (key into the page `Pattern` resource dict).
     ///
     /// Set by `SCN /Name`; cleared when any other stroke-colour operator fires.
     /// `None` means use `stroke_color` as a solid colour.
     pub stroke_pattern: Option<Vec<u8>>,
-    /// Tint components for an uncoloured stroke pattern (PaintType 2).
+    /// Tint components for an uncoloured stroke pattern (`PaintType` 2).
     pub stroke_pattern_components: Vec<f64>,
 }
 

@@ -13,7 +13,7 @@
 //!   MMType1 → Multiple Master (treated as Type 1)
 //!   TrueType → TrueType / OpenType-TT
 //!   Type0   → CIDFont composite (descendant font carries the actual bytes)
-//!   Type3   → paint-procedure glyph (not yet supported)
+//!   Type3   → paint-procedure glyph (content streams, no FreeType face)
 //!   CIDFontType0 / CIDFontType2 → only appear as DescendantFonts entries
 //! ```
 //!
@@ -44,20 +44,20 @@ pub enum PdfFontKind {
 /// CID encoding information for Type 0 composite fonts.
 ///
 /// Type 0 fonts encode character codes as 1–4 byte sequences.  The `Encoding`
-/// CMap maps byte sequences to CIDs; the `CIDToGIDMap` (or identity) then maps
-/// CIDs to FreeType GIDs.
+/// `CMap` maps byte sequences to CIDs; the `CIDToGIDMap` (or identity) then maps
+/// CIDs to `FreeType` GIDs.
 #[derive(Debug)]
 pub struct CidEncoding {
-    /// Decoded `Encoding` CMap — maps char codes to CIDs.
+    /// Decoded `Encoding` `CMap` — maps char codes to CIDs.
     ///
-    /// `None` when no CMap stream could be parsed (Identity-H/V or missing);
+    /// `None` when no `CMap` stream could be parsed (`Identity-H`/V or missing);
     /// in that case charcode == CID (identity mapping).
     pub encoding_cmap: Option<CMap>,
 
     /// Precomputed CID → GID lookup from `CIDToGIDMap`.
     ///
     /// `None` means Identity (CID == GID, the common case for OpenType-CFF and
-    /// TrueType CIDFonts).
+    /// TrueType `CIDFonts`).
     pub cid_to_gid: Option<Vec<u32>>,
 
     /// Default advance width in thousandths of a text-space unit (`DW` key).
@@ -73,6 +73,7 @@ impl CidEncoding {
     /// Return the advance width for `cid` in thousandths of a text-space unit.
     ///
     /// Searches the explicit `W` table first; falls back to `default_width`.
+    #[must_use]
     pub fn width_for_cid(&self, cid: u32) -> i32 {
         for (first, ws) in &self.widths {
             if cid >= *first {
@@ -89,22 +90,53 @@ impl CidEncoding {
     /// `cid_to_gid`.
     ///
     /// Returns 0 (`.notdef`) when the code is absent from either map.
+    #[must_use]
     pub fn code_to_gid(&self, char_code: u32) -> u32 {
-        // Step 1: char code → CID.
-        let cid = match &self.encoding_cmap {
-            Some(cmap) => cmap.map.get(&char_code).copied().unwrap_or(0),
-            None => char_code, // Identity-H/V or no CMap.
-        };
+        // Step 1: char code → CID via encoding CMap (identity if absent).
+        let cid = self
+            .encoding_cmap
+            .as_ref()
+            .map_or(char_code, |cmap| cmap.map.get(&char_code).copied().unwrap_or(0));
 
-        // Step 2: CID → GID via table, or identity if no CIDToGIDMap.
-        match &self.cid_to_gid {
-            Some(table) => {
-                // CIDs are 16-bit values (PDF spec §9.7.4); usize is always ≥ 16 bits.
-                let idx = cid as usize;
-                table.get(idx).copied().unwrap_or(0)
-            }
-            None => cid,
-        }
+        // Step 2: CID → GID via table (identity if absent).
+        // CIDs are 16-bit values (PDF spec §9.7.4); usize is always ≥ 16 bits.
+        self.cid_to_gid
+            .as_ref()
+            .map_or(cid, |table| table.get(cid as usize).copied().unwrap_or(0))
+    }
+}
+
+/// Decoded `CharProc` entry for a single Type 3 glyph.
+#[derive(Debug, Clone)]
+pub struct Type3Glyph {
+    /// Decompressed content stream bytes for this glyph's paint procedure.
+    pub content: Vec<u8>,
+    /// Advance width in thousandths of a text-space unit, from the `Widths` array.
+    /// `None` when absent (fall back to 0).
+    pub width_units: i32,
+}
+
+/// All data extracted from a Type 3 font dictionary.
+///
+/// Unlike FreeType-backed fonts, Type 3 glyphs are PDF content streams that
+/// must be executed by a child renderer.  Each `CharProc` stream begins with a
+/// `d0` (colorless) or `d1` (self-colored) operator that declares the glyph
+/// advance width.
+#[derive(Debug, Clone)]
+pub struct Type3Data {
+    /// Resolved glyph content keyed by char code (0–255).
+    /// Missing entries mean `.notdef`; the caller renders nothing for them.
+    pub glyphs: Vec<Option<Type3Glyph>>,
+    /// 6-element `FontMatrix` (user-space → glyph-space transform).
+    /// Default is `[0.001, 0, 0, 0.001, 0, 0]` per PDF spec §9.6.5.
+    pub font_matrix: [f64; 6],
+}
+
+impl Type3Data {
+    /// Return the content and nominal width for `char_code`, if any `CharProc` exists.
+    #[must_use]
+    pub fn glyph(&self, char_code: u8) -> Option<&Type3Glyph> {
+        self.glyphs.get(usize::from(char_code))?.as_ref()
     }
 }
 
@@ -130,8 +162,12 @@ pub struct FontDescriptor {
     /// active charmap at face-load time.
     pub differences: Box<[Option<Box<str>>; 256]>,
     /// CID encoding for Type 0 composite fonts.  `Some` when `Subtype` is
-    /// `Type0`; `None` for all simple fonts (Type1, TrueType, MMType1).
+    /// `Type0`; `None` for all simple fonts (Type1, TrueType, `MMType1`).
     pub cid_encoding: Option<CidEncoding>,
+    /// Type 3 glyph data.  `Some` only when `Subtype` is `Type3`; `None` for
+    /// all FreeType-backed fonts.  When `Some`, `bytes` is `None` and `kind`
+    /// is `Other` (Type 3 has no font program; glyphs are content streams).
+    pub type3: Option<Type3Data>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -147,6 +183,9 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     if matches!(subtype, b"Type0") {
         return resolve_type0_font(doc, dict);
     }
+    if matches!(subtype, b"Type3") {
+        return resolve_type3_font(doc, dict);
+    }
 
     let kind = classify_kind(dict);
     let bytes = extract_bytes(doc, dict);
@@ -161,6 +200,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         code_to_gid,
         differences,
         cid_encoding: None,
+        type3: None,
     }
 }
 
@@ -349,14 +389,12 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     // 5. CIDFont metrics: DW and W.
     let (default_width, widths) = descendant
         .as_ref()
-        .map(|d| extract_cid_widths(d))
-        .unwrap_or((1000, vec![]));
+        .map_or((1000, vec![]), |d| extract_cid_widths(d));
 
     // 6. Determine font kind from CIDFont Subtype.
     let kind = descendant
         .as_ref()
-        .map(|d| classify_kind(d))
-        .unwrap_or(PdfFontKind::Other);
+        .map_or(PdfFontKind::Other, |d| classify_kind(d));
 
     FontDescriptor {
         kind,
@@ -371,12 +409,148 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
             default_width,
             widths,
         }),
+        type3: None,
     }
+}
+
+// ── Type 3 font extraction ────────────────────────────────────────────────────
+
+/// Maximum decompressed size for a single Type 3 `CharProc` stream (4 MiB).
+///
+/// Real Type 3 glyphs are tiny path/image sequences; 4 MiB is a generous cap.
+const MAX_CHARPROC_BYTES: usize = 4 * 1024 * 1024;
+
+/// Extract [`FontDescriptor`] for a Type 3 font.
+///
+/// Type 3 fonts have no embedded font program — each glyph is a PDF content
+/// stream in the `CharProcs` dictionary.  The `Widths` array and `FirstChar`
+/// key give nominal advance widths (supplemented by the `d0`/`d1` operators
+/// inside each `CharProc`, which are authoritative).
+fn resolve_type3_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
+    let (first_char, widths) = extract_widths(dict);
+
+    // FontMatrix transforms glyph space to text space.
+    // PDF default is [0.001 0 0 0.001 0 0] (i.e. 1000 units = 1 text-space unit).
+    let font_matrix =
+        extract_matrix(dict, b"FontMatrix").unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
+
+    // Resolve CharProcs: maps glyph name → stream object.
+    let charprocs_obj = dict.get(b"CharProcs").ok();
+    let charprocs_dict: Option<&Dictionary> = charprocs_obj.and_then(|o| match o {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    });
+
+    // Resolve Encoding/Differences to get char_code → glyph_name mapping.
+    let differences = extract_encoding(doc, dict, PdfFontKind::Other).1;
+
+    // Build the glyphs table: 256 entries, one per possible char code.
+    let mut glyphs: Vec<Option<Type3Glyph>> = (0..256).map(|_| None).collect();
+
+    if let Some(cp) = charprocs_dict {
+        for code in 0u8..=255 {
+            // Determine the glyph name for this char code.
+            // Priority: Differences table overrides (if set), then treat the
+            // char code as a single-byte Latin-1 name (rare fallback).
+            let Some(glyph_name) = differences
+                .get(usize::from(code))
+                .and_then(|x| x.as_deref())
+            else {
+                continue; // No mapping → no glyph for this code.
+            };
+            let glyph_name = glyph_name.as_bytes();
+
+            // Look up the CharProc stream.
+            let Some(stream_obj) = cp.get(glyph_name).ok() else {
+                continue;
+            };
+            let stream_obj_deref;
+            let stream = match stream_obj {
+                Object::Stream(s) => s,
+                Object::Reference(id) => {
+                    stream_obj_deref = doc.get_object(*id).ok().and_then(|o| {
+                        if let Object::Stream(s) = o {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    match stream_obj_deref.as_ref() {
+                        Some(s) => s,
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            let content = match stream.decompressed_content() {
+                Ok(b) if b.len() <= MAX_CHARPROC_BYTES => b,
+                Ok(b) => {
+                    log::warn!(
+                        "font/type3: CharProc for code {code} is {} bytes (limit {}), skipping",
+                        b.len(),
+                        MAX_CHARPROC_BYTES
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("font/type3: failed to decompress CharProc for code {code}: {e}");
+                    continue;
+                }
+            };
+
+            let width_idx = usize::from(code).saturating_sub(first_char as usize);
+            let width_units = widths.get(width_idx).copied().unwrap_or(0);
+
+            glyphs[usize::from(code)] = Some(Type3Glyph {
+                content,
+                width_units,
+            });
+        }
+    } else {
+        log::warn!("font/type3: CharProcs dict missing or unresolvable — no glyphs");
+    }
+
+    FontDescriptor {
+        kind: PdfFontKind::Other,
+        bytes: None,
+        widths,
+        first_char,
+        code_to_gid: vec![],
+        differences,
+        cid_encoding: None,
+        type3: Some(Type3Data {
+            glyphs,
+            font_matrix,
+        }),
+    }
+}
+
+/// Read a 6-element matrix from `dict[key]`.  Returns `None` if missing or malformed.
+fn extract_matrix(dict: &Dictionary, key: &[u8]) -> Option<[f64; 6]> {
+    let arr = dict.get(key).ok()?.as_array().ok()?;
+    if arr.len() < 6 {
+        return None;
+    }
+    let mut m = [0.0f64; 6];
+    for (i, obj) in arr.iter().enumerate().take(6) {
+        m[i] = match obj {
+            Object::Real(r) => f64::from(*r),
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "PDF matrix values are small integers"
+            )]
+            Object::Integer(n) => *n as f64,
+            _ => return None,
+        };
+    }
+    Some(m)
 }
 
 /// Parse the `Encoding` entry of a Type 0 font into a [`CMap`].
 ///
-/// Identity-H and Identity-V are predefined CMaps where char code == CID.
+/// `Identity-H` and `Identity-V` are predefined `CMaps` where char code == CID.
 /// We represent these as `None` (identity).  Any stream reference is parsed.
 fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap> {
     let enc = dict.get(b"Encoding").ok()?;
@@ -416,12 +590,9 @@ fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap
 /// The PDF spec requires exactly one descendant; we take the first and warn if
 /// the array is absent or empty.
 fn extract_descendant<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a Dictionary> {
-    let arr_obj = match dict.get(b"DescendantFonts") {
-        Ok(o) => o,
-        Err(_) => {
-            log::warn!("font: Type0 font has no DescendantFonts — cannot load face");
-            return None;
-        }
+    let Ok(arr_obj) = dict.get(b"DescendantFonts") else {
+        log::warn!("font: Type0 font has no DescendantFonts — cannot load face");
+        return None;
     };
     let arr = match arr_obj {
         Object::Array(a) => a,
@@ -453,7 +624,7 @@ fn resolve_obj_to_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dic
     }
 }
 
-/// Extract embedded font bytes from the `FontDescriptor` of a CIDFont dict.
+/// Extract embedded font bytes from the `FontDescriptor` of a `CIDFont` dict.
 fn extract_bytes_from_descendant(doc: &Document, descendant: &Dictionary) -> Option<Vec<u8>> {
     // CIDFont kind determines file key priority.
     let kind = classify_kind(descendant);
@@ -479,15 +650,14 @@ fn extract_bytes_with_kind(
     None
 }
 
-/// Parse the `CIDToGIDMap` stream from a CIDFontType2 (TrueType) descendant.
+/// Parse the `CIDToGIDMap` stream from a `CIDFontType2` (TrueType) descendant.
 ///
 /// The map is a byte array of 2-byte big-endian GIDs indexed by CID.
 /// `/Identity` (or absent) means CID == GID; we represent that as `None`.
+const MAX_CID_TO_GID_BYTES: usize = 65536 * 2;
 fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32>> {
     let obj = descendant.get(b"CIDToGIDMap").ok()?;
     match obj {
-        Object::Name(n) if n == b"Identity" => None,
-        Object::Name(_) => None,
         Object::Reference(id) => {
             let stream_obj = doc.get_object(*id).ok()?;
             let stream = stream_obj.as_stream().ok()?;
@@ -495,7 +665,6 @@ fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32
 
             // A CIDToGIDMap covers CIDs 0..65535 at most → max 65536 × 2 = 131072 bytes.
             // Reject oversized maps to prevent memory exhaustion from malicious PDFs.
-            const MAX_CID_TO_GID_BYTES: usize = 65536 * 2;
             if bytes.len() > MAX_CID_TO_GID_BYTES {
                 log::warn!(
                     "font: CIDToGIDMap stream is {} bytes — exceeds {MAX_CID_TO_GID_BYTES} limit, ignoring",
@@ -522,7 +691,7 @@ fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32
     }
 }
 
-/// Parse `DW` and `W` from a CIDFont dictionary.
+/// Parse `DW` and `W` from a `CIDFont` dictionary.
 ///
 /// Returns `(default_width, segments)` where segments match the PDF `W` format:
 /// `[first_cid, [w0, w1, …]]` (the `c [w...]` variant only; the `c1 c2 w`

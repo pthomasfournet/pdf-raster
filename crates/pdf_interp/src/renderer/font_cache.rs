@@ -222,6 +222,10 @@ fn resolve_differences_to_gid(face: &FontFace, differences: &[Option<Box<str>>; 
 /// hundreds of MiB of working memory per codegen unit in debug mode, which
 /// caused the build to OOM on this machine.  A `static` array is pure data —
 /// zero LLVM IR generated, O(log n) lookup.
+#[expect(
+    clippy::too_many_lines,
+    reason = "static lookup table — 345 AGL entries, all data and no logic"
+)]
 fn adobe_glyph_to_unicode(name: &str) -> Option<u32> {
     // Fast path: names like "uni0041" or "u0041" encode the codepoint directly.
     if let Some(hex) = name.strip_prefix("uni").filter(|s| s.len() == 4) {
@@ -235,6 +239,10 @@ fn adobe_glyph_to_unicode(name: &str) -> Option<u32> {
     }
 
     // Sorted by glyph name so binary_search_by_key works.
+    #[expect(
+        clippy::items_after_statements,
+        reason = "static table placed after fast-path returns to keep it close to its only use"
+    )]
     static AGL: &[(&str, u32)] = &[
         ("A", 0x0041),
         ("AE", 0x00C6),

@@ -302,7 +302,7 @@ impl<'doc> PageResources<'doc> {
     ///
     /// Returns `None` if the name is absent, the pattern is not `PatternType 1`
     /// (tiling), or any required key is missing.  A debug message is logged for
-    /// PatternType 2 (shading patterns referenced via `scn`).
+    /// `PatternType` 2 (shading patterns referenced via `scn`).
     #[must_use]
     pub fn tiling_pattern(&self, name: &[u8]) -> Option<tiling::TilingDescriptor> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;

@@ -152,19 +152,19 @@ pub enum Operator {
     SetStrokeColor(Vec<f64>),
     /// `scn /Name [c1…cn]` — activate a named Pattern as the fill source.
     ///
-    /// `components` carries optional tint values for uncoloured (PaintType 2)
-    /// patterns; it is empty for coloured (PaintType 1) patterns.
+    /// `components` carries optional tint values for uncoloured (`PaintType` 2)
+    /// patterns; it is empty for coloured (`PaintType` 1) patterns.
     SetFillPattern {
         /// Key into the page `Pattern` resource dictionary.
         name: Vec<u8>,
-        /// Tint components for PaintType 2 patterns (may be empty).
+        /// Tint components for `PaintType` 2 patterns (may be empty).
         components: Vec<f64>,
     },
     /// `SCN /Name [c1…cn]` — activate a named Pattern as the stroke source.
     SetStrokePattern {
         /// Key into the page `Pattern` resource dictionary.
         name: Vec<u8>,
-        /// Tint components for PaintType 2 patterns (may be empty).
+        /// Tint components for `PaintType` 2 patterns (may be empty).
         components: Vec<f64>,
     },
     /// `g` — set fill colour to gray level (`DeviceGray` shorthand).
@@ -194,6 +194,18 @@ pub enum Operator {
     // ── Shading ───────────────────────────────────────────────────────────────
     /// `sh name` — paint a shading pattern.
     PaintShading(Vec<u8>),
+
+    // ── Type 3 glyph metrics ──────────────────────────────────────────────────
+    /// `wx wy d0` — Type 3 colorless glyph: declares advance width (wx, wy).
+    ///
+    /// Must be the first operator in a Type 3 `CharProc`.  The glyph is rendered
+    /// using the current graphics state fill/stroke colour from the parent.
+    Type3GlyphWidth(f64, f64),
+    /// `wx wy llx lly urx ury d1` — Type 3 self-colored glyph with `BBox`.
+    ///
+    /// Must be the first operator in a Type 3 `CharProc`.  The glyph provides its
+    /// own colour; the `BBox` is a hint to the renderer for caching and clipping.
+    Type3GlyphWidthBBox(f64, f64, f64, f64, f64, f64),
 
     // ── Marked content (no rendering effect) ─────────────────────────────────
     /// `BMC` / `BDC` / `EMC` / `MP` / `DP` — marked-content operators.
@@ -379,6 +391,22 @@ pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
 
         // ── Shading ───────────────────────────────────────────────────────────
         b"sh" => Operator::PaintShading(pop_name(operands)),
+
+        // ── Type 3 glyph metrics ──────────────────────────────────────────────
+        b"d0" => {
+            let (wx, wy) = pop2(operands);
+            Operator::Type3GlyphWidth(wx, wy)
+        }
+        b"d1" => {
+            // Stream order: wx wy llx lly urx ury d1
+            let ury = pop_f64(operands);
+            let urx = pop_f64(operands);
+            let lly = pop_f64(operands);
+            let llx = pop_f64(operands);
+            let wy = pop_f64(operands);
+            let wx = pop_f64(operands);
+            Operator::Type3GlyphWidthBBox(wx, wy, llx, lly, urx, ury)
+        }
 
         // ── Marked content (no rendering effect) ─────────────────────────────
         b"BMC" | b"BDC" | b"EMC" | b"MP" | b"DP" => Operator::MarkedContent,

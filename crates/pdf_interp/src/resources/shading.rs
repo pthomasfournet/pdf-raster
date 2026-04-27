@@ -76,12 +76,10 @@ pub fn resolve_shading(
     // Try stream first (stream has a dict too), then fall back to plain dict.
     let (sh_dict, stream_data): (&Dictionary, Option<Vec<u8>>) = match sh_obj {
         Object::Stream(s) => (&s.dict, stream_content(s)),
-        Object::Reference(id) => {
-            match doc.get_object(*id).ok()? {
-                Object::Stream(s) => (&s.dict, stream_content(s)),
-                obj => (super::image::resolve_dict(doc, obj)?, None),
-            }
-        }
+        Object::Reference(id) => match doc.get_object(*id).ok()? {
+            Object::Stream(s) => (&s.dict, stream_content(s)),
+            obj => (super::image::resolve_dict(doc, obj)?, None),
+        },
         obj => (super::image::resolve_dict(doc, obj)?, None),
     };
 
@@ -274,7 +272,10 @@ impl<'a> BitReader<'a> {
     /// Returns `None` when the stream is exhausted before `n` bits are available.
     /// Callers must not pass `n == 0` (asserted in debug builds; release returns 0).
     fn read_bits(&mut self, n: u8) -> Option<u32> {
-        debug_assert!((1..=32).contains(&n), "read_bits: n={n} out of range 1..=32");
+        debug_assert!(
+            (1..=32).contains(&n),
+            "read_bits: n={n} out of range 1..=32"
+        );
         if n == 0 || n > 32 {
             return Some(0);
         }
@@ -302,11 +303,16 @@ const VALID_BITS: &[u8] = &[1, 2, 4, 8, 12, 16, 24, 32];
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
     let v = sh.get_i64(b"BitsPerCoordinate")?;
-    #[expect(clippy::option_if_let_else, reason = "else branch has a side-effect (log::warn); map_or_else would be less clear")]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
+    )]
     if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
         Some(bits)
     } else {
-        log::warn!("shading/{tag}: BitsPerCoordinate={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
+        log::warn!(
+            "shading/{tag}: BitsPerCoordinate={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping"
+        );
         None
     }
 }
@@ -317,11 +323,16 @@ fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 fn parse_bits_per_comp(sh: &Dictionary, tag: &str) -> Option<u8> {
     let v = sh.get_i64(b"BitsPerComponent")?;
-    #[expect(clippy::option_if_let_else, reason = "else branch has a side-effect (log::warn); map_or_else would be less clear")]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
+    )]
     if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
         Some(bits)
     } else {
-        log::warn!("shading/{tag}: BitsPerComponent={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
+        log::warn!(
+            "shading/{tag}: BitsPerComponent={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping"
+        );
         None
     }
 }
@@ -343,8 +354,12 @@ fn decode_type4_mesh(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Vec<[GouraudVertex; 3]> {
-    let Some(bpc) = parse_bits_per_coord(sh, "type4") else { return vec![] };
-    let Some(bpcomp) = parse_bits_per_comp(sh, "type4") else { return vec![] };
+    let Some(bpc) = parse_bits_per_coord(sh, "type4") else {
+        return vec![];
+    };
+    let Some(bpcomp) = parse_bits_per_comp(sh, "type4") else {
+        return vec![];
+    };
     let decode = read_decode_array(sh, n_channels);
 
     let mut reader = BitReader::new(data);
@@ -353,20 +368,33 @@ fn decode_type4_mesh(
     let mut prev: Option<[GouraudVertex; 3]> = None;
 
     // Flag is 8 bits; read_bits(8) guarantees value ≤ 255.
-    #[expect(clippy::cast_possible_truncation, reason = "read_bits(8) returns at most 255")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read_bits(8) returns at most 255"
+    )]
     while let Some(flag_raw) = reader.read_bits(8) {
         let flag = flag_raw as u8;
 
         let n_new: usize = if flag == 0 { 3 } else { 1 };
 
         // Read new vertices; bail out of the entire mesh on any truncation.
-        let mut new_verts = [GouraudVertex { x: 0.0, y: 0.0, color: [0; 3] }; 3];
+        let mut new_verts = [GouraudVertex {
+            x: 0.0,
+            y: 0.0,
+            color: [0; 3],
+        }; 3];
         for slot in new_verts.iter_mut().take(n_new) {
-            let Some(raw_x) = reader.read_bits(bpc) else { return triangles };
-            let Some(raw_y) = reader.read_bits(bpc) else { return triangles };
+            let Some(raw_x) = reader.read_bits(bpc) else {
+                return triangles;
+            };
+            let Some(raw_y) = reader.read_bits(bpc) else {
+                return triangles;
+            };
             let mut channels = [0u32; 4]; // max 4 channels (CMYK)
             for ch in channels.iter_mut().take(n_channels) {
-                let Some(raw_c) = reader.read_bits(bpcomp) else { return triangles };
+                let Some(raw_c) = reader.read_bits(bpcomp) else {
+                    return triangles;
+                };
                 *ch = raw_c;
             }
             *slot = decode_vertex(
@@ -423,8 +451,12 @@ fn decode_type5_mesh(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Vec<[GouraudVertex; 3]> {
-    let Some(bpc) = parse_bits_per_coord(sh, "type5") else { return vec![] };
-    let Some(bpcomp) = parse_bits_per_comp(sh, "type5") else { return vec![] };
+    let Some(bpc) = parse_bits_per_coord(sh, "type5") else {
+        return vec![];
+    };
+    let Some(bpcomp) = parse_bits_per_comp(sh, "type5") else {
+        return vec![];
+    };
     let Some(verts_per_row) = sh.get_i64(b"VerticesPerRow") else {
         log::warn!("shading/type5: missing VerticesPerRow — skipping");
         return vec![];
@@ -447,11 +479,17 @@ fn decode_type5_mesh(
     'rows: loop {
         let mut row = Vec::with_capacity(vpr);
         for _ in 0..vpr {
-            let Some(raw_x) = reader.read_bits(bpc) else { break 'rows };
-            let Some(raw_y) = reader.read_bits(bpc) else { break 'rows };
+            let Some(raw_x) = reader.read_bits(bpc) else {
+                break 'rows;
+            };
+            let Some(raw_y) = reader.read_bits(bpc) else {
+                break 'rows;
+            };
             let mut channels = [0u32; 4];
             for ch in channels.iter_mut().take(n_channels) {
-                let Some(raw_c) = reader.read_bits(bpcomp) else { break 'rows };
+                let Some(raw_c) = reader.read_bits(bpcomp) else {
+                    break 'rows;
+                };
                 *ch = raw_c;
             }
             row.push(decode_vertex(
@@ -535,18 +573,17 @@ const fn mid2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
 fn mid_color(a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
     // lerp_u8(a, b, 128) = round((a + b) / 2) — matches poppler's bilinear interp.
     use color::convert::lerp_u8;
-    [lerp_u8(a[0], b[0], 128), lerp_u8(a[1], b[1], 128), lerp_u8(a[2], b[2], 128)]
+    [
+        lerp_u8(a[0], b[0], 128),
+        lerp_u8(a[1], b[1], 128),
+        lerp_u8(a[2], b[2], 128),
+    ]
 }
 
 /// Maximum per-component colour difference across all 4 corner pairs of the patch.
 /// Used as the subdivision-stop criterion.
 fn color_delta(p: &Patch) -> f64 {
-    let corners = [
-        p.color[0][0],
-        p.color[0][1],
-        p.color[1][0],
-        p.color[1][1],
-    ];
+    let corners = [p.color[0][0], p.color[0][1], p.color[1][0], p.color[1][1]];
     let mut max_d = 0.0_f64;
     for i in 0..4 {
         for j in (i + 1)..4 {
@@ -698,7 +735,10 @@ fn read_patch_points(
     page_h: f64,
 ) -> Option<Vec<[f64; 2]>> {
     // bpc ∈ VALID_BITS ⊆ [1,32]; u64 fits the shift; cast to f64 is exact (≤ 2^32−1 < 2^53).
-    #[expect(clippy::cast_precision_loss, reason = "max_coord ≤ 2^32−1; f64 mantissa is 52 bits")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "max_coord ≤ 2^32−1; f64 mantissa is 52 bits"
+    )]
     let max_coord = ((1u64 << bpc) - 1) as f64;
     let x_min = decode.first().copied().unwrap_or(0.0);
     let x_max = decode.get(1).copied().unwrap_or(1.0);
@@ -729,7 +769,10 @@ fn read_patch_colors(
     cs: ImageColorSpace,
 ) -> Option<Vec<[u8; 3]>> {
     // bpcomp ∈ VALID_BITS ⊆ [1,32]; cast to f64 exact for u32-range values.
-    #[expect(clippy::cast_precision_loss, reason = "max_comp ≤ 2^32−1; f64 mantissa is 52 bits")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "max_comp ≤ 2^32−1; f64 mantissa is 52 bits"
+    )]
     let max_comp = ((1u64 << bpcomp) - 1) as f64;
     let mut colors = Vec::with_capacity(n_colors);
     for _ in 0..n_colors {
@@ -755,7 +798,10 @@ fn read_patch_colors(
 /// Validate and extract `BitsPerFlag` from a patch mesh shading dictionary.
 fn parse_bits_per_flag(sh: &Dictionary, tag: &str) -> Option<u8> {
     let v = sh.get_i64(b"BitsPerFlag")?;
-    #[expect(clippy::option_if_let_else, reason = "else branch has a side-effect (log::warn); map_or_else would be less clear")]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
+    )]
     if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_FLAG_BITS.contains(b)) {
         Some(bits)
     } else {
@@ -780,10 +826,18 @@ fn build_patch_type6(pts: &[[f64; 2]], colors: &[[u8; 3]]) -> Patch {
     let mut p = Patch::zero();
 
     // Boundary point assignment (PDF §8.7.4.5.6 Table 87, flag=0).
-    p.xy[0][0] = pts[0];  p.xy[0][1] = pts[1];  p.xy[0][2] = pts[2];  p.xy[0][3] = pts[3];
-    p.xy[1][3] = pts[4];  p.xy[2][3] = pts[5];
-    p.xy[3][3] = pts[6];  p.xy[3][2] = pts[7];  p.xy[3][1] = pts[8];  p.xy[3][0] = pts[9];
-    p.xy[2][0] = pts[10]; p.xy[1][0] = pts[11];
+    p.xy[0][0] = pts[0];
+    p.xy[0][1] = pts[1];
+    p.xy[0][2] = pts[2];
+    p.xy[0][3] = pts[3];
+    p.xy[1][3] = pts[4];
+    p.xy[2][3] = pts[5];
+    p.xy[3][3] = pts[6];
+    p.xy[3][2] = pts[7];
+    p.xy[3][1] = pts[8];
+    p.xy[3][0] = pts[9];
+    p.xy[2][0] = pts[10];
+    p.xy[1][0] = pts[11];
 
     // Corner colours: [0][0]=c0, [0][1]=c1, [1][1]=c2, [1][0]=c3.
     p.color[0][0] = colors[0];
@@ -803,15 +857,31 @@ fn fill_type6_interior(p: &mut Patch) {
     for k in 0..2usize {
         // Snapshot boundary values before writing interior — avoids borrow conflict.
         let [p00, p01, p02, p03] = [p.xy[0][0][k], p.xy[0][1][k], p.xy[0][2][k], p.xy[0][3][k]];
-        let [p10, p13]            = [p.xy[1][0][k], p.xy[1][3][k]];
-        let [p20, p23]            = [p.xy[2][0][k], p.xy[2][3][k]];
+        let [p10, p13] = [p.xy[1][0][k], p.xy[1][3][k]];
+        let [p20, p23] = [p.xy[2][0][k], p.xy[2][3][k]];
         let [p30, p31, p32, p33] = [p.xy[3][0][k], p.xy[3][1][k], p.xy[3][2][k], p.xy[3][3][k]];
         // Coons formula: (-4a + 6(b+c) - 2(d+e) + 3(f+g) - h) / 9
         // Written with mul_add to minimise rounding error.
-        p.xy[1][1][k] = ((-4.0f64).mul_add(p00, 6.0*(p01+p10)).mul_add(1.0, (-2.0f64).mul_add(p03+p30, 3.0*(p31+p13))) - p33) / 9.0;
-        p.xy[1][2][k] = ((-4.0f64).mul_add(p03, 6.0*(p02+p13)).mul_add(1.0, (-2.0f64).mul_add(p00+p33, 3.0*(p32+p10))) - p30) / 9.0;
-        p.xy[2][1][k] = ((-4.0f64).mul_add(p30, 6.0*(p31+p20)).mul_add(1.0, (-2.0f64).mul_add(p33+p00, 3.0*(p01+p23))) - p03) / 9.0;
-        p.xy[2][2][k] = ((-4.0f64).mul_add(p33, 6.0*(p32+p23)).mul_add(1.0, (-2.0f64).mul_add(p30+p03, 3.0*(p02+p20))) - p00) / 9.0;
+        p.xy[1][1][k] = ((-4.0f64)
+            .mul_add(p00, 6.0 * (p01 + p10))
+            .mul_add(1.0, (-2.0f64).mul_add(p03 + p30, 3.0 * (p31 + p13)))
+            - p33)
+            / 9.0;
+        p.xy[1][2][k] = ((-4.0f64)
+            .mul_add(p03, 6.0 * (p02 + p13))
+            .mul_add(1.0, (-2.0f64).mul_add(p00 + p33, 3.0 * (p32 + p10)))
+            - p30)
+            / 9.0;
+        p.xy[2][1][k] = ((-4.0f64)
+            .mul_add(p30, 6.0 * (p31 + p20))
+            .mul_add(1.0, (-2.0f64).mul_add(p33 + p00, 3.0 * (p01 + p23)))
+            - p03)
+            / 9.0;
+        p.xy[2][2][k] = ((-4.0f64)
+            .mul_add(p33, 6.0 * (p32 + p23))
+            .mul_add(1.0, (-2.0f64).mul_add(p30 + p03, 3.0 * (p02 + p20)))
+            - p00)
+            / 9.0;
     }
 }
 
@@ -828,37 +898,58 @@ fn apply_flag_type6(flag: u8, prev: &Patch, pts: &[[f64; 2]], colors: &[[u8; 3]]
     match flag {
         1 => {
             // Shared: prev right edge → new left edge (col 0 of new patch = col 3 of prev).
-            for row in 0..4 { p.xy[row][0] = prev.xy[row][3]; }
+            for row in 0..4 {
+                p.xy[row][0] = prev.xy[row][3];
+            }
             p.color[0][0] = prev.color[0][1];
             p.color[1][0] = prev.color[1][1];
             // New boundary: right edge (col 3), then bottom (row 3) and top (row 0) partial.
-            p.xy[0][1] = pts[0]; p.xy[0][2] = pts[1]; p.xy[0][3] = pts[2];
-            p.xy[1][3] = pts[3]; p.xy[2][3] = pts[4];
-            p.xy[3][3] = pts[5]; p.xy[3][2] = pts[6]; p.xy[3][1] = pts[7];
+            p.xy[0][1] = pts[0];
+            p.xy[0][2] = pts[1];
+            p.xy[0][3] = pts[2];
+            p.xy[1][3] = pts[3];
+            p.xy[2][3] = pts[4];
+            p.xy[3][3] = pts[5];
+            p.xy[3][2] = pts[6];
+            p.xy[3][1] = pts[7];
             p.color[0][1] = colors[0];
             p.color[1][1] = colors[1];
         }
         2 => {
             // Shared: prev bottom edge → new top edge (row 0 of new = row 3 of prev).
-            for col in 0..4 { p.xy[0][col] = prev.xy[3][col]; }
+            for col in 0..4 {
+                p.xy[0][col] = prev.xy[3][col];
+            }
             p.color[0][0] = prev.color[1][0];
             p.color[0][1] = prev.color[1][1];
             // New boundary.
-            p.xy[1][3] = pts[0]; p.xy[2][3] = pts[1];
-            p.xy[3][3] = pts[2]; p.xy[3][2] = pts[3]; p.xy[3][1] = pts[4]; p.xy[3][0] = pts[5];
-            p.xy[2][0] = pts[6]; p.xy[1][0] = pts[7];
+            p.xy[1][3] = pts[0];
+            p.xy[2][3] = pts[1];
+            p.xy[3][3] = pts[2];
+            p.xy[3][2] = pts[3];
+            p.xy[3][1] = pts[4];
+            p.xy[3][0] = pts[5];
+            p.xy[2][0] = pts[6];
+            p.xy[1][0] = pts[7];
             p.color[1][1] = colors[0];
             p.color[1][0] = colors[1];
         }
         3 => {
             // Shared: prev left edge → new right edge (col 3 of new = col 0 of prev).
-            for row in 0..4 { p.xy[row][3] = prev.xy[row][0]; }
+            for row in 0..4 {
+                p.xy[row][3] = prev.xy[row][0];
+            }
             p.color[0][1] = prev.color[0][0];
             p.color[1][1] = prev.color[1][0];
             // New boundary: left edge (col 0), then top (row 0) and bottom (row 3) partial.
-            p.xy[3][2] = pts[0]; p.xy[3][1] = pts[1]; p.xy[3][0] = pts[2];
-            p.xy[2][0] = pts[3]; p.xy[1][0] = pts[4];
-            p.xy[0][0] = pts[5]; p.xy[0][1] = pts[6]; p.xy[0][2] = pts[7];
+            p.xy[3][2] = pts[0];
+            p.xy[3][1] = pts[1];
+            p.xy[3][0] = pts[2];
+            p.xy[2][0] = pts[3];
+            p.xy[1][0] = pts[4];
+            p.xy[0][0] = pts[5];
+            p.xy[0][1] = pts[6];
+            p.xy[0][2] = pts[7];
             p.color[0][0] = colors[0];
             p.color[1][0] = colors[1];
         }
@@ -882,14 +973,24 @@ fn build_patch_type7(pts: &[[f64; 2]], colors: &[[u8; 3]]) -> Patch {
     let mut p = Patch::zero();
 
     // Boundary (same layout as Type 6).
-    p.xy[0][0] = pts[0];  p.xy[0][1] = pts[1];  p.xy[0][2] = pts[2];  p.xy[0][3] = pts[3];
-    p.xy[1][3] = pts[4];  p.xy[2][3] = pts[5];
-    p.xy[3][3] = pts[6];  p.xy[3][2] = pts[7];  p.xy[3][1] = pts[8];  p.xy[3][0] = pts[9];
-    p.xy[2][0] = pts[10]; p.xy[1][0] = pts[11];
+    p.xy[0][0] = pts[0];
+    p.xy[0][1] = pts[1];
+    p.xy[0][2] = pts[2];
+    p.xy[0][3] = pts[3];
+    p.xy[1][3] = pts[4];
+    p.xy[2][3] = pts[5];
+    p.xy[3][3] = pts[6];
+    p.xy[3][2] = pts[7];
+    p.xy[3][1] = pts[8];
+    p.xy[3][0] = pts[9];
+    p.xy[2][0] = pts[10];
+    p.xy[1][0] = pts[11];
 
     // Interior points (PDF §8.7.4.5.7 Table 89, flag=0, pts 12–15).
-    p.xy[1][1] = pts[12]; p.xy[1][2] = pts[13];
-    p.xy[2][2] = pts[14]; p.xy[2][1] = pts[15];
+    p.xy[1][1] = pts[12];
+    p.xy[1][2] = pts[13];
+    p.xy[2][2] = pts[14];
+    p.xy[2][1] = pts[15];
 
     // Corner colours.
     p.color[0][0] = colors[0];
@@ -911,38 +1012,68 @@ fn apply_flag_type7(flag: u8, prev: &Patch, pts: &[[f64; 2]], colors: &[[u8; 3]]
     match flag {
         1 => {
             // Shared: prev right edge → new left edge.
-            for row in 0..4 { p.xy[row][0] = prev.xy[row][3]; }
+            for row in 0..4 {
+                p.xy[row][0] = prev.xy[row][3];
+            }
             p.color[0][0] = prev.color[0][1];
             p.color[1][0] = prev.color[1][1];
             // 8 new boundary points + 4 interior.
-            p.xy[0][1] = pts[0]; p.xy[0][2] = pts[1]; p.xy[0][3] = pts[2];
-            p.xy[1][3] = pts[3]; p.xy[2][3] = pts[4];
-            p.xy[3][3] = pts[5]; p.xy[3][2] = pts[6]; p.xy[3][1] = pts[7];
-            p.xy[1][1] = pts[8]; p.xy[1][2] = pts[9]; p.xy[2][2] = pts[10]; p.xy[2][1] = pts[11];
+            p.xy[0][1] = pts[0];
+            p.xy[0][2] = pts[1];
+            p.xy[0][3] = pts[2];
+            p.xy[1][3] = pts[3];
+            p.xy[2][3] = pts[4];
+            p.xy[3][3] = pts[5];
+            p.xy[3][2] = pts[6];
+            p.xy[3][1] = pts[7];
+            p.xy[1][1] = pts[8];
+            p.xy[1][2] = pts[9];
+            p.xy[2][2] = pts[10];
+            p.xy[2][1] = pts[11];
             p.color[0][1] = colors[0];
             p.color[1][1] = colors[1];
         }
         2 => {
             // Shared: prev bottom edge → new top edge.
-            for col in 0..4 { p.xy[0][col] = prev.xy[3][col]; }
+            for col in 0..4 {
+                p.xy[0][col] = prev.xy[3][col];
+            }
             p.color[0][0] = prev.color[1][0];
             p.color[0][1] = prev.color[1][1];
-            p.xy[1][3] = pts[0]; p.xy[2][3] = pts[1];
-            p.xy[3][3] = pts[2]; p.xy[3][2] = pts[3]; p.xy[3][1] = pts[4]; p.xy[3][0] = pts[5];
-            p.xy[2][0] = pts[6]; p.xy[1][0] = pts[7];
-            p.xy[1][1] = pts[8]; p.xy[1][2] = pts[9]; p.xy[2][2] = pts[10]; p.xy[2][1] = pts[11];
+            p.xy[1][3] = pts[0];
+            p.xy[2][3] = pts[1];
+            p.xy[3][3] = pts[2];
+            p.xy[3][2] = pts[3];
+            p.xy[3][1] = pts[4];
+            p.xy[3][0] = pts[5];
+            p.xy[2][0] = pts[6];
+            p.xy[1][0] = pts[7];
+            p.xy[1][1] = pts[8];
+            p.xy[1][2] = pts[9];
+            p.xy[2][2] = pts[10];
+            p.xy[2][1] = pts[11];
             p.color[1][1] = colors[0];
             p.color[1][0] = colors[1];
         }
         3 => {
             // Shared: prev left edge → new right edge.
-            for row in 0..4 { p.xy[row][3] = prev.xy[row][0]; }
+            for row in 0..4 {
+                p.xy[row][3] = prev.xy[row][0];
+            }
             p.color[0][1] = prev.color[0][0];
             p.color[1][1] = prev.color[1][0];
-            p.xy[3][2] = pts[0]; p.xy[3][1] = pts[1]; p.xy[3][0] = pts[2];
-            p.xy[2][0] = pts[3]; p.xy[1][0] = pts[4];
-            p.xy[0][0] = pts[5]; p.xy[0][1] = pts[6]; p.xy[0][2] = pts[7];
-            p.xy[1][1] = pts[8]; p.xy[1][2] = pts[9]; p.xy[2][2] = pts[10]; p.xy[2][1] = pts[11];
+            p.xy[3][2] = pts[0];
+            p.xy[3][1] = pts[1];
+            p.xy[3][0] = pts[2];
+            p.xy[2][0] = pts[3];
+            p.xy[1][0] = pts[4];
+            p.xy[0][0] = pts[5];
+            p.xy[0][1] = pts[6];
+            p.xy[0][2] = pts[7];
+            p.xy[1][1] = pts[8];
+            p.xy[1][2] = pts[9];
+            p.xy[2][2] = pts[10];
+            p.xy[2][1] = pts[11];
             p.color[0][0] = colors[0];
             p.color[1][0] = colors[1];
         }
@@ -968,25 +1099,38 @@ fn decode_type6_mesh(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Vec<[GouraudVertex; 3]> {
-    let Some(bpc) = parse_bits_per_coord(sh, "type6") else { return vec![] };
-    let Some(bpcomp) = parse_bits_per_comp(sh, "type6") else { return vec![] };
-    let Some(bpf) = parse_bits_per_flag(sh, "type6") else { return vec![] };
+    let Some(bpc) = parse_bits_per_coord(sh, "type6") else {
+        return vec![];
+    };
+    let Some(bpcomp) = parse_bits_per_comp(sh, "type6") else {
+        return vec![];
+    };
+    let Some(bpf) = parse_bits_per_flag(sh, "type6") else {
+        return vec![];
+    };
     let decode = read_decode_array(sh, n_channels);
 
     let mut reader = BitReader::new(data);
     let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
     let mut prev: Option<Patch> = None;
 
-    #[expect(clippy::cast_possible_truncation, reason = "bpf ∈ {2,4,8}; value fits u8")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bpf ∈ {2,4,8}; value fits u8"
+    )]
     while let Some(flag_raw) = reader.read_bits(bpf) {
         let flag = flag_raw as u8;
 
         let (n_pts, n_colors): (usize, usize) = if flag == 0 { (12, 4) } else { (8, 2) };
 
-        let Some(pts) = read_patch_points(&mut reader, n_pts, bpc, &decode, ctm, page_h)
-        else { break };
-        let Some(colors) = read_patch_colors(&mut reader, n_colors, n_channels, bpcomp, &decode, cs)
-        else { break };
+        let Some(pts) = read_patch_points(&mut reader, n_pts, bpc, &decode, ctm, page_h) else {
+            break;
+        };
+        let Some(colors) =
+            read_patch_colors(&mut reader, n_colors, n_channels, bpcomp, &decode, cs)
+        else {
+            break;
+        };
 
         let patch = match (flag, &prev) {
             (0, _) => build_patch_type6(&pts, &colors),
@@ -1021,25 +1165,38 @@ fn decode_type7_mesh(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Vec<[GouraudVertex; 3]> {
-    let Some(bpc) = parse_bits_per_coord(sh, "type7") else { return vec![] };
-    let Some(bpcomp) = parse_bits_per_comp(sh, "type7") else { return vec![] };
-    let Some(bpf) = parse_bits_per_flag(sh, "type7") else { return vec![] };
+    let Some(bpc) = parse_bits_per_coord(sh, "type7") else {
+        return vec![];
+    };
+    let Some(bpcomp) = parse_bits_per_comp(sh, "type7") else {
+        return vec![];
+    };
+    let Some(bpf) = parse_bits_per_flag(sh, "type7") else {
+        return vec![];
+    };
     let decode = read_decode_array(sh, n_channels);
 
     let mut reader = BitReader::new(data);
     let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
     let mut prev: Option<Patch> = None;
 
-    #[expect(clippy::cast_possible_truncation, reason = "bpf ∈ {2,4,8}; value fits u8")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bpf ∈ {2,4,8}; value fits u8"
+    )]
     while let Some(flag_raw) = reader.read_bits(bpf) {
         let flag = flag_raw as u8;
 
         let (n_pts, n_colors): (usize, usize) = if flag == 0 { (16, 4) } else { (12, 2) };
 
-        let Some(pts) = read_patch_points(&mut reader, n_pts, bpc, &decode, ctm, page_h)
-        else { break };
-        let Some(colors) = read_patch_colors(&mut reader, n_colors, n_channels, bpcomp, &decode, cs)
-        else { break };
+        let Some(pts) = read_patch_points(&mut reader, n_pts, bpc, &decode, ctm, page_h) else {
+            break;
+        };
+        let Some(colors) =
+            read_patch_colors(&mut reader, n_colors, n_channels, bpcomp, &decode, cs)
+        else {
+            break;
+        };
 
         let patch = match (flag, &prev) {
             (0, _) => build_patch_type7(&pts, &colors),
@@ -1130,10 +1287,16 @@ fn decode_vertex(
 ) -> GouraudVertex {
     // bits_per_coord/comp ∈ VALID_BITS ⊆ [1,32]; shift is safe.
     // Cast from u64 to f64: max_coord ≤ 2^32−1 < 2^53, so conversion is exact.
-    #[expect(clippy::cast_precision_loss, reason = "max_coord ≤ 2^32−1; f64 mantissa is 52 bits")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "max_coord ≤ 2^32−1; f64 mantissa is 52 bits"
+    )]
     let max_coord = ((1u64 << bits_per_coord) - 1) as f64;
-    #[expect(clippy::cast_precision_loss, reason = "max_comp ≤ 2^32−1; f64 mantissa is 52 bits")]
-    let max_comp  = ((1u64 << bits_per_comp)  - 1) as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "max_comp ≤ 2^32−1; f64 mantissa is 52 bits"
+    )]
+    let max_comp = ((1u64 << bits_per_comp) - 1) as f64;
 
     let x_min = decode.first().copied().unwrap_or(0.0);
     let x_max = decode.get(1).copied().unwrap_or(1.0);
@@ -1157,7 +1320,11 @@ fn decode_vertex(
     let color = cs_to_rgb(cs, &channels);
     let (dx, dy) = transform_point(ctm, ux, uy, page_h);
 
-    GouraudVertex { x: dx, y: dy, color }
+    GouraudVertex {
+        x: dx,
+        y: dy,
+        color,
+    }
 }
 
 // ── PDF Function evaluation ───────────────────────────────────────────────────
@@ -1603,7 +1770,16 @@ mod tests {
 
     // ── Patch subdivision tests ───────────────────────────────────────────────
 
-    fn flat_patch(x0: f64, y0: f64, x1: f64, y1: f64, c00: [u8;3], c01: [u8;3], c10: [u8;3], c11: [u8;3]) -> super::Patch {
+    fn flat_patch(
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        c00: [u8; 3],
+        c01: [u8; 3],
+        c10: [u8; 3],
+        c11: [u8; 3],
+    ) -> super::Patch {
         // Bilinear interpolation of control points across the 4×4 grid.
         let mut p = super::Patch::zero();
         for r in 0..4usize {
@@ -1614,37 +1790,65 @@ mod tests {
                 p.xy[r][c][1] = y0 + (y1 - y0) * tr;
             }
         }
-        p.color[0][0] = c00; p.color[0][1] = c01;
-        p.color[1][0] = c10; p.color[1][1] = c11;
+        p.color[0][0] = c00;
+        p.color[0][1] = c01;
+        p.color[1][0] = c10;
+        p.color[1][1] = c11;
         p
     }
 
     #[test]
     fn split_patch_u_flat_corners_unchanged() {
-        let p = flat_patch(0.0, 0.0, 6.0, 4.0,
-            [0,0,0], [255,0,0], [0,255,0], [0,0,255]);
+        let p = flat_patch(
+            0.0,
+            0.0,
+            6.0,
+            4.0,
+            [0, 0, 0],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+        );
         let (left, right) = super::split_patch_u(&p);
         // Top-left corner should be exactly preserved in both halves.
         assert_eq!(left.xy[0][0], p.xy[0][0]);
         assert_eq!(right.xy[3][0], p.xy[3][0]);
         // Split point on left side should be at midpoint in y.
         let mid_y = (p.xy[0][0][1] + p.xy[3][0][1]) / 2.0;
-        assert!((left.xy[3][0][1] - mid_y).abs() < 1e-9,
-            "left bottom y={} expected={}", left.xy[3][0][1], mid_y);
-        assert!((right.xy[0][0][1] - mid_y).abs() < 1e-9,
-            "right top y={} expected={}", right.xy[0][0][1], mid_y);
+        assert!(
+            (left.xy[3][0][1] - mid_y).abs() < 1e-9,
+            "left bottom y={} expected={}",
+            left.xy[3][0][1],
+            mid_y
+        );
+        assert!(
+            (right.xy[0][0][1] - mid_y).abs() < 1e-9,
+            "right top y={} expected={}",
+            right.xy[0][0][1],
+            mid_y
+        );
         // Colors: left's u=1 edge should be midpoint of original u edges.
         for ch in 0..3 {
             let expected = ((p.color[0][0][ch] as u16 + p.color[1][0][ch] as u16) / 2) as u8;
-            assert!((left.color[1][0][ch] as i16 - expected as i16).abs() <= 1,
-                "color mismatch ch={ch}");
+            assert!(
+                (left.color[1][0][ch] as i16 - expected as i16).abs() <= 1,
+                "color mismatch ch={ch}"
+            );
         }
     }
 
     #[test]
     fn split_patch_v_flat_corners_unchanged() {
-        let p = flat_patch(0.0, 0.0, 8.0, 6.0,
-            [10,20,30], [200,100,50], [30,60,90], [180,90,45]);
+        let p = flat_patch(
+            0.0,
+            0.0,
+            8.0,
+            6.0,
+            [10, 20, 30],
+            [200, 100, 50],
+            [30, 60, 90],
+            [180, 90, 45],
+        );
         let (left, right) = super::split_patch_v(&p);
         assert_eq!(left.xy[0][0], p.xy[0][0]);
         assert_eq!(right.xy[0][3], p.xy[0][3]);
@@ -1657,15 +1861,20 @@ mod tests {
     fn color_delta_uniform_is_zero() {
         let mut p = super::Patch::zero();
         let c = [128u8, 64, 32];
-        p.color[0][0] = c; p.color[0][1] = c; p.color[1][0] = c; p.color[1][1] = c;
+        p.color[0][0] = c;
+        p.color[0][1] = c;
+        p.color[1][0] = c;
+        p.color[1][1] = c;
         assert_eq!(super::color_delta(&p), 0.0);
     }
 
     #[test]
     fn color_delta_max_diff_is_one() {
         let mut p = super::Patch::zero();
-        p.color[0][0] = [0,0,0]; p.color[0][1] = [255,0,0];
-        p.color[1][0] = [0,0,0]; p.color[1][1] = [0,0,0];
+        p.color[0][0] = [0, 0, 0];
+        p.color[0][1] = [255, 0, 0];
+        p.color[1][0] = [0, 0, 0];
+        p.color[1][1] = [0, 0, 0];
         let d = super::color_delta(&p);
         assert!((d - 1.0).abs() < 1e-9, "expected 1.0, got {d}");
     }
@@ -1673,11 +1882,23 @@ mod tests {
     #[test]
     fn tessellate_patch_uniform_emits_two_triangles() {
         // A patch where all corners have the same colour → depth=0 leaf immediately.
-        let p = flat_patch(0.0, 0.0, 1.0, 1.0,
-            [128,128,128], [128,128,128], [128,128,128], [128,128,128]);
+        let p = flat_patch(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            [128, 128, 128],
+            [128, 128, 128],
+            [128, 128, 128],
+            [128, 128, 128],
+        );
         let mut out = Vec::new();
         super::tessellate_patch(p, &mut out);
-        assert_eq!(out.len(), 2, "expected exactly 2 triangles for uniform-colour patch");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected exactly 2 triangles for uniform-colour patch"
+        );
     }
 
     #[test]
@@ -1690,17 +1911,33 @@ mod tests {
         //
         // For a uniform-spaced rectilinear grid the Coons interior formula collapses to
         // simple bilinear: p[1][1]=(1,1), p[1][2]=(2,1), p[2][1]=(1,2), p[2][2]=(2,2).
-        let pts: Vec<[f64;2]> = vec![
-            [0.0,0.0],[1.0,0.0],[2.0,0.0],[3.0,0.0], // p[0][0..3]
-            [3.0,1.0],[3.0,2.0],                      // p[1][3], p[2][3]
-            [3.0,3.0],[2.0,3.0],[1.0,3.0],[0.0,3.0], // p[3][3..0]
-            [0.0,2.0],[0.0,1.0],                       // p[2][0], p[1][0]
+        let pts: Vec<[f64; 2]> = vec![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0], // p[0][0..3]
+            [3.0, 1.0],
+            [3.0, 2.0], // p[1][3], p[2][3]
+            [3.0, 3.0],
+            [2.0, 3.0],
+            [1.0, 3.0],
+            [0.0, 3.0], // p[3][3..0]
+            [0.0, 2.0],
+            [0.0, 1.0], // p[2][0], p[1][0]
         ];
-        let colors: Vec<[u8;3]> = vec![[0,0,0],[255,0,0],[0,255,0],[0,0,255]];
+        let colors: Vec<[u8; 3]> = vec![[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]];
         let p = super::build_patch_type6(&pts, &colors);
-        for (r, c, ex, ey) in [(1,1,1.0,1.0),(1,2,2.0,1.0),(2,1,1.0,2.0),(2,2,2.0,2.0)] {
-            assert!((p.xy[r][c][0]-ex).abs() < 1e-9 && (p.xy[r][c][1]-ey).abs() < 1e-9,
-                "interior[{r}][{c}] = {:?} expected ({ex},{ey})", p.xy[r][c]);
+        for (r, c, ex, ey) in [
+            (1, 1, 1.0, 1.0),
+            (1, 2, 2.0, 1.0),
+            (2, 1, 1.0, 2.0),
+            (2, 2, 2.0, 2.0),
+        ] {
+            assert!(
+                (p.xy[r][c][0] - ex).abs() < 1e-9 && (p.xy[r][c][1] - ey).abs() < 1e-9,
+                "interior[{r}][{c}] = {:?} expected ({ex},{ey})",
+                p.xy[r][c]
+            );
         }
     }
 }

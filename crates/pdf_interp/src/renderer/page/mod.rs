@@ -18,20 +18,20 @@
 //! - Text showing: `Tj TJ ' "` (via `FreeType` through font crate)
 //! - Font encoding `Differences` array — resolved via Adobe Glyph List
 //!
-//! - Type 0 / `CIDFont` composite fonts — `Encoding` CMap (including
-//!   embedded stream CMaps and `Identity-H`/`V`), `CIDToGIDMap`, `DW`/`W`
+//! - Type 0 / `CIDFont` composite fonts — `Encoding` `CMap` (including
+//!   embedded stream `CMaps` and `Identity-H`/`V`), `CIDToGIDMap`, `DW`/`W`
 //!   advance widths, and multi-byte character code iteration
 //!
 //! - Text render modes 4–7 — fill/stroke painting combined with text-as-clip
 //!   (`glyph_path` outlines accumulated into the clip region per PDF §9.3.6)
 //! - `PatternType` 1 tiling patterns via `scn`/`SCN`
+//! - Type 3 paint-procedure fonts — `CharProc` content streams, `d0`/`d1` metrics
 //!
 //! # Not yet implemented
 //!
 //! - Image `XObjects`: `JBIG2Decode` filter
 //! - `ExtGState` blend mode (`BM`) — only `Normal` is currently mapped
-//! - Type 0 named CMaps other than `Identity-H`/`V` (e.g. `/GB-EUC-H`)
-//! - Type 3 paint-procedure fonts
+//! - Type 0 named `CMaps` other than `Identity-H`/`V` (e.g. `/GB-EUC-H`)
 
 mod text_ops;
 
@@ -59,6 +59,7 @@ use raster::{
 use super::color::RasterColor;
 use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
+use super::text::TextState;
 use crate::content::{Operator, TextArrayElement};
 use crate::resources::{ImageColorSpace, PageResources, image::decode_inline_image};
 #[cfg(feature = "nvjpeg")]
@@ -270,7 +271,7 @@ impl<'doc> PageRenderer<'doc> {
             Operator::SetFillPattern { name, components } => {
                 let gs = self.gstate.current_mut();
                 gs.fill_pattern = Some(name.clone());
-                gs.fill_pattern_components = components.clone();
+                gs.fill_pattern_components.clone_from(components);
             }
 
             Operator::SetStrokeGray(g) => self.set_stroke(RasterColor::gray(*g)),
@@ -286,7 +287,7 @@ impl<'doc> PageRenderer<'doc> {
             Operator::SetStrokePattern { name, components } => {
                 let gs = self.gstate.current_mut();
                 gs.stroke_pattern = Some(name.clone());
-                gs.stroke_pattern_components = components.clone();
+                gs.stroke_pattern_components.clone_from(components);
             }
 
             // ── Path construction ─────────────────────────────────────────────
@@ -448,6 +449,13 @@ impl<'doc> PageRenderer<'doc> {
                 self.do_shading(name);
             }
 
+            // ── Type 3 glyph metrics ──────────────────────────────────────────
+            // `d0`/`d1` declare the glyph advance width and (for `d1`) a bounding
+            // box.  Width is sourced from the font's `Widths` array at call time;
+            // the BBox is informational.  Both operators are no-ops in the renderer
+            // — the CharProc's subsequent path/colour operators do the actual work.
+            Operator::Type3GlyphWidth(..) | Operator::Type3GlyphWidthBBox(..) => {}
+
             // ── No-ops ────────────────────────────────────────────────────────
             Operator::MarkedContent | Operator::CompatibilitySection => {}
 
@@ -475,6 +483,10 @@ impl<'doc> PageRenderer<'doc> {
     /// 1. Rasterize all glyphs while holding the `font_cache` borrow (no bitmap access).
     /// 2. Blit the pre-rasterized bitmaps, using `bitmap` mutably (no `font_cache` access).
     #[expect(clippy::many_single_char_names, reason = "PDF matrix components")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-phase glyph render (rasterize then blit) inherently interleaves font, matrix, and clip logic that cannot be cleanly split without adding costly intermediate allocations"
+    )]
     fn show_text(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -522,6 +534,26 @@ impl<'doc> PageRenderer<'doc> {
             );
             return;
         };
+
+        // ── Type 3 fast path ──────────────────────────────────────────────────
+        // Type 3 glyphs are PDF content streams executed at the current pen
+        // position.  They paint directly into the page bitmap, so there is no
+        // two-phase rasterise-then-blit loop — each CharProc runs inline.
+        if let Some(t3) = descriptor.type3.clone() {
+            self.show_text_type3(
+                bytes,
+                &t3,
+                font_size,
+                ctm,
+                tm,
+                char_spacing,
+                word_spacing,
+                horiz_scaling,
+                rise,
+                do_paint,
+            );
+            return;
+        }
 
         // Phase 1: rasterize glyphs and optionally collect outlines for clip.
         //
@@ -694,6 +726,103 @@ impl<'doc> PageRenderer<'doc> {
             if !glyph_outline.pts.is_empty() {
                 self.clip_path_into_gstate(&glyph_outline, false);
             }
+        }
+
+        // Write updated text matrix back.
+        self.gstate.current_mut().text.text_matrix = tm;
+    }
+
+    // ── Type 3 font rendering ─────────────────────────────────────────────────
+
+    /// Execute Type 3 `CharProcs` for all character codes in `bytes`.
+    ///
+    /// Each `CharProc` is a PDF content stream that paints the glyph using the
+    /// full graphics pipeline.  This method sets up the CTM for each glyph
+    /// position and executes the stream, then advances the text matrix.
+    ///
+    /// The `CharProc` coordinate system (glyph space) maps to device space via:
+    /// `charproc_ctm = CTM × Tm_at_glyph × scale(font_size) × FontMatrix`
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors show_text() parameter set; all values are needed for glyph placement"
+    )]
+    #[expect(clippy::many_single_char_names, reason = "PDF matrix components a–f")]
+    fn show_text_type3(
+        &mut self,
+        bytes: &[u8],
+        t3: &crate::resources::font::Type3Data,
+        font_size: f64,
+        ctm: [f64; 6],
+        mut tm: [f64; 6],
+        char_spacing: f64,
+        word_spacing: f64,
+        horiz_scaling: f64,
+        rise: f64,
+        do_paint: bool,
+    ) {
+        for &byte in bytes {
+            let Some(glyph) = t3.glyph(byte) else {
+                // No CharProc for this code — advance by zero width, continue.
+                let [a, b_m, c, d, e, f] = tm;
+                let tx_adv = char_spacing * horiz_scaling;
+                tm = [a, b_m, c, d, tx_adv.mul_add(a, e), tx_adv.mul_add(b_m, f)];
+                continue;
+            };
+
+            if do_paint && self.form_depth < MAX_FORM_DEPTH {
+                // Build the CharProc CTM:
+                //   Tm_rise = Tm with rise shift applied (PDF §9.4.4)
+                //   TRM     = [fs·fm[0], fs·fm[1], fs·fm[2], fs·fm[3], tx, ty]
+                //             where [tx, ty] = Tm_rise × CTM translation
+                //   charproc_ctm = TRM × CTM_current
+                //
+                // Concretely: we insert `(font_size × FontMatrix) × Tm` as the
+                // new CTM component so that the charproc's user space maps
+                // correctly to device pixels.
+                let fm = t3.font_matrix;
+                // font_size × FontMatrix (2×2 + translation)
+                let fs_fm = [
+                    font_size * fm[0],
+                    font_size * fm[1],
+                    font_size * fm[2],
+                    font_size * fm[3],
+                    fm[4],
+                    fm[5],
+                ];
+                // Apply rise to text matrix (vertical shift in text space).
+                let tm_rise = if rise.abs() > f64::EPSILON {
+                    let [a, b_m, c, d, e, f] = tm;
+                    [a, b_m, c, d, rise.mul_add(c, e), rise.mul_add(d, f)]
+                } else {
+                    tm
+                };
+                // TRM = fs_fm × tm_rise
+                let trm = ctm_multiply(&fs_fm, &tm_rise);
+                // charproc_ctm = trm × CTM
+                let charproc_ctm = ctm_multiply(&trm, &ctm);
+
+                self.gstate.save();
+                self.form_depth += 1;
+                self.gstate.current_mut().ctm = charproc_ctm;
+                // Reset text state inside charproc (PDF §9.6.5 — charproc is a
+                // fresh graphics state, not a text object).
+                self.gstate.current_mut().text = TextState::default();
+
+                let ops = crate::content::parse(&glyph.content);
+                self.execute(&ops);
+
+                self.form_depth -= 1;
+                self.gstate.restore();
+            }
+
+            // Advance the text matrix by the glyph width (PDF §9.4.4).
+            // width_units are in glyph space; scale by FontMatrix[0] × font_size.
+            let glyph_advance = f64::from(glyph.width_units) * t3.font_matrix[0];
+            let extra = if byte == b' ' { word_spacing } else { 0.0 };
+            let tx_adv =
+                (glyph_advance.mul_add(font_size, char_spacing) + extra) * horiz_scaling;
+            let [a, b_m, c, d, e, f] = tm;
+            tm = [a, b_m, c, d, tx_adv.mul_add(a, e), tx_adv.mul_add(b_m, f)];
         }
 
         // Write updated text matrix back.
@@ -1088,12 +1217,7 @@ impl<'doc> PageRenderer<'doc> {
             }
             ShadingResult::Mesh(triangles) => {
                 for tri in triangles {
-                    gouraud_triangle_fill::<color::Rgb8>(
-                        &mut self.bitmap,
-                        &clip,
-                        &pipe,
-                        tri,
-                    );
+                    gouraud_triangle_fill::<color::Rgb8>(&mut self.bitmap, &clip, &pipe, tri);
                 }
             }
         }
@@ -1147,6 +1271,11 @@ impl<'doc> PageRenderer<'doc> {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "device pixel coords are always in page bounds after clamping; safe casts"
+    )]
+    #[expect(clippy::many_single_char_names, reason = "PDF CTM components a–f are standard")]
+    #[expect(
+        clippy::similar_names,
+        reason = "dx_rel / dy_rel are the standard names for the per-axis deltas in the inverse CTM formula"
     )]
     fn blit_image(&mut self, img: &crate::resources::ImageDescriptor) {
         // Degenerate image — nothing to blit.
@@ -1218,7 +1347,7 @@ impl<'doc> PageRenderer<'doc> {
         //
         // This is exact for any invertible CTM (axis-aligned or rotated/sheared).
         let [a, b, c, d, e, f] = ctm;
-        let det = a * d - b * c;
+        let det = a.mul_add(d, -(b * c));
         // det is guaranteed non-zero: we already checked all corners are finite,
         // and a singular CTM would produce a degenerate bounding box caught above.
         let inv_det = if det.abs() < 1e-12 {
@@ -1243,8 +1372,8 @@ impl<'doc> PageRenderer<'doc> {
             for dx in bx0..bx1 {
                 let dx_rel = f64::from(dx) - e;
                 // Image-space coordinates ∈ [0, 1]; clamp to guard edges.
-                let u = (d * dx_rel * inv_det + u_row).clamp(0.0, 1.0);
-                let v = ((-b) * dx_rel * inv_det + v_row).clamp(0.0, 1.0);
+                let u = (d * dx_rel).mul_add(inv_det, u_row).clamp(0.0, 1.0);
+                let v = ((-b) * dx_rel).mul_add(inv_det, v_row).clamp(0.0, 1.0);
 
                 // Nearest-neighbour sample.  Clamp so ix < img.width, iy < img.height.
                 // u maps to image column (left→right);

@@ -1,15 +1,15 @@
-//! PDF CMap parser — character code → CID/GID and ToUnicode mappings.
+//! PDF `CMap` parser — character code → `CID`/`GID` and `ToUnicode` mappings.
 //!
-//! # PDF CMap primer
+//! # PDF `CMap` primer
 //!
 //! A Type 0 composite font maps *character codes* (1–4 bytes each) to *CIDs*
-//! (Character IDs) via a `Encoding` CMap stream, then maps CIDs to *GIDs*
+//! (Character IDs) via a `Encoding` `CMap` stream, then maps CIDs to *GIDs*
 //! (glyph indices in the descendant font) via the `CIDToGIDMap` stream or
-//! identity mapping.  A separate `ToUnicode` CMap maps character codes to
+//! identity mapping.  A separate `ToUnicode` `CMap` maps character codes to
 //! Unicode for text extraction (not needed for rendering, but used to resolve
 //! GIDs via the Unicode charmap when no `CIDToGIDMap` is present).
 //!
-//! # CMap stream syntax (subset implemented here)
+//! # `CMap` stream syntax (subset implemented here)
 //!
 //! ```text
 //! begincodespacerange
@@ -38,9 +38,9 @@
 //!
 //! The code-space range entries determine the byte width used to read character
 //! codes from a content-stream string.  We take the width of the *first*
-//! codespace entry.  Real CMaps are consistent across all entries, or they use
+//! codespace entry.  Real `CMaps` are consistent across all entries, or they use
 //! a code-space that spans both 1- and 2-byte ranges (e.g. GB-EUC).  For the
-//! common case (all-2-byte or all-1-byte), this is exact.  For mixed-width CMaps
+//! common case (all-2-byte or all-1-byte), this is exact.  For mixed-width `CMaps`
 //! we take the conservative minimum, which may produce wrong results for the
 //! mixed-width codes — correct mixed-width parsing requires a trie/state machine
 //! and is deferred.
@@ -49,10 +49,10 @@ use std::collections::HashMap;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// A resolved CMap: maps character codes (as `u32`) to CIDs or Unicode
+/// A resolved `CMap`: maps character codes (as `u32`) to CIDs or Unicode
 /// codepoints.
 ///
-/// For CIDFont encoding CMaps the values are CIDs.  For ToUnicode CMaps the
+/// For `CIDFont` encoding `CMaps` the values are CIDs.  For `ToUnicode` `CMaps` the
 /// values are Unicode codepoints.
 #[derive(Debug, Clone)]
 pub struct CMap {
@@ -67,7 +67,8 @@ impl CMap {
     ///
     /// Reads `self.code_bytes` bytes at a time.  Codes absent from the map
     /// are yielded with `mapped_value = 0` (maps to GID 0 = `.notdef`).
-    pub fn iter_codes<'a>(&'a self, bytes: &'a [u8]) -> CMapIter<'a> {
+    #[must_use]
+    pub const fn iter_codes<'a>(&'a self, bytes: &'a [u8]) -> CMapIter<'a> {
         CMapIter {
             cmap: self,
             bytes,
@@ -104,10 +105,10 @@ impl Iterator for CMapIter<'_> {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
-/// Parse a PDF CMap byte stream into a [`CMap`].
+/// Parse a PDF `CMap` byte stream into a [`CMap`].
 ///
-/// Handles both encoding CMaps (`begincidchar` / `begincidrange`) and
-/// ToUnicode CMaps (`beginbfchar` / `beginbfrange`).  Both map char codes to
+/// Handles both encoding `CMaps` (`begincidchar` / `begincidrange`) and
+/// `ToUnicode` `CMaps` (`beginbfchar` / `beginbfrange`).  Both map char codes to
 /// integer values (CIDs or Unicode codepoints respectively).
 ///
 /// Returns `None` if the stream contains no recognised directives.  In that
@@ -186,7 +187,7 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                                 map.insert(code, base.saturating_add(offset as u32));
                             }
                         } else {
-                            log::warn!("cmap: ignoring degenerate range {:04X}–{:04X}", lo, hi);
+                            log::warn!("cmap: ignoring degenerate range {lo:04X}–{hi:04X}");
                         }
                         i += 3;
                     } else {
@@ -213,11 +214,11 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
 
 // ── Tokeniser ─────────────────────────────────────────────────────────────────
 
-/// Split a CMap stream into tokens.
+/// Split a `CMap` stream into tokens.
 ///
 /// Tokens are: keyword strings, `<hexstring>` literals, decimal integers, and
 /// PostScript string literals `(...)`.  Comments (`%` to end of line) are
-/// stripped.  This is a minimal subset sufficient for the CMap syntax above.
+/// stripped.  This is a minimal subset sufficient for the `CMap` syntax above.
 fn tokenise(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut tokens: Vec<&str> = Vec::with_capacity(256);
@@ -335,11 +336,11 @@ fn parse_hex_string(tok: Option<&str>) -> Option<Vec<u8>> {
     if hex.is_empty() {
         return None;
     }
-    // Pad to even length.
-    let hex = if hex.len() % 2 != 0 {
-        format!("0{hex}")
-    } else {
+    // Pad to even length (hex strings must have an even number of nibbles).
+    let hex = if hex.len().is_multiple_of(2) {
         hex
+    } else {
+        format!("0{hex}")
     };
     let bytes: Option<Vec<u8>> = hex
         .as_bytes()

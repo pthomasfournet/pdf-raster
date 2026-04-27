@@ -1938,7 +1938,10 @@ mod tests {
         // 20 × 128 = 2560 bytes would be decoded without cap.
         let out = decode_run_length_capped(&data, CAP);
         assert!(out.len() <= CAP, "output {} exceeded cap {CAP}", out.len());
-        assert!(!out.is_empty(), "should have decoded something before truncation");
+        assert!(
+            !out.is_empty(),
+            "should have decoded something before truncation"
+        );
         assert!(out.iter().all(|&b| b == 0xAB), "all bytes should be 0xAB");
     }
 

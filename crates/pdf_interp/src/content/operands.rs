@@ -75,11 +75,11 @@ pub fn drain_numbers(stack: &mut Vec<Token<'_>>) -> Vec<f64> {
 pub enum ScnOperands {
     /// `/PatternName [c1 … cn]` — Pattern colour space; name is the resource key,
     /// components are the underlying non-Pattern colour (may be empty for
-    /// PaintType 1 / coloured patterns).
+    /// `PaintType` 1 / coloured patterns).
     Pattern {
         /// Pattern resource name (key into the page `Pattern` resource dict).
         name: Vec<u8>,
-        /// Optional tint components for uncoloured (PaintType 2) patterns.
+        /// Optional tint components for uncoloured (`PaintType` 2) patterns.
         components: Vec<f64>,
     },
     /// Plain numeric components for non-pattern colour spaces.
