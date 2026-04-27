@@ -95,6 +95,18 @@ const MAX_FORM_DEPTH: u32 = 32;
 /// the pattern parameters.
 const MAX_TILE_PX: f64 = 4096.0;
 
+/// Clamped pixel-space bounding box for a GPU fill operation.
+///
+/// All fields are in device-pixel coordinates, clipped to the bitmap bounds.
+/// `x` / `y` are the top-left corner; `w` / `h` are the extent.
+#[cfg(feature = "gpu-aa")]
+struct GpuBbox {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
 /// Renders a decoded operator sequence onto a `Bitmap<Rgb8>`.
 pub struct PageRenderer<'doc> {
     /// Target pixel buffer.
@@ -1191,14 +1203,15 @@ impl<'doc> PageRenderer<'doc> {
     /// convert segments to packed f32.
     ///
     /// Returns `None` if the path is empty, produces no segments, or the bbox
-    /// is degenerate/non-finite.  Otherwise returns `(segs_f32, bx, by, bw, bh)`.
+    /// is degenerate/non-finite.  Otherwise returns `(segs_f32, bbox)`.
     #[cfg(feature = "gpu-aa")]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "bbox clamped to bitmap dims (derived from u32); value is finite, non-negative, ≤ u32::MAX"
+        reason = "bbox is clamped to [0, bitmap.width/height] before cast; all values are \
+                  finite, non-negative, and ≤ u32::MAX"
     )]
-    fn gpu_fill_segs(&self, path: &raster::path::Path) -> Option<(Vec<f32>, u32, u32, u32, u32)> {
+    fn gpu_fill_segs(&self, path: &raster::path::Path) -> Option<(Vec<f32>, GpuBbox)> {
         if path.pts.is_empty() {
             return None;
         }
@@ -1219,15 +1232,20 @@ impl<'doc> PageRenderer<'doc> {
             x_max_f = x_max_f.max(seg.x0).max(seg.x1);
             y_max_f = y_max_f.max(seg.y0).max(seg.y1);
         }
+        // Segment coords should always be finite; NaN/Inf would indicate a bug
+        // in the path construction or CTM, so we log and bail rather than panic.
         if !x_min_f.is_finite()
             || !y_min_f.is_finite()
             || !x_max_f.is_finite()
             || !y_max_f.is_finite()
         {
+            log::warn!(
+                "gpu_fill_segs: non-finite segment bbox ({x_min_f}, {y_min_f}, {x_max_f}, {y_max_f}); skipping GPU path"
+            );
             return None;
         }
 
-        // Clamp to bitmap dimensions.
+        // Clamp to bitmap dimensions and quantise to integer pixels.
         let bmp_w = f64::from(self.bitmap.width);
         let bmp_h = f64::from(self.bitmap.height);
         x_min_f = x_min_f.max(0.0).floor();
@@ -1238,56 +1256,84 @@ impl<'doc> PageRenderer<'doc> {
             return None;
         }
 
-        let bx = x_min_f as u32;
-        let by = y_min_f as u32;
-        let bw = (x_max_f - x_min_f) as u32;
-        let bh = (y_max_f - y_min_f) as u32;
+        let bbox = GpuBbox {
+            x: x_min_f as u32,
+            y: y_min_f as u32,
+            w: (x_max_f - x_min_f) as u32,
+            h: (y_max_f - y_min_f) as u32,
+        };
 
-        // Pack segments as flat f32 [x0,y0,x1,y1]; f64→f32 precision loss is
-        // sub-pixel at any realistic PDF rasterisation DPI (≤ 32768 px wide).
+        // Pack segments as flat f32 [x0,y0,x1,y1].  The f64→f32 cast is
+        // intentional: GPU kernels operate in f32, and precision loss is
+        // sub-pixel at realistic PDF rasterisation DPIs.
         let segs_f32: Vec<f32> = xpath
             .segs
             .iter()
             .flat_map(|seg| [seg.x0 as f32, seg.y0 as f32, seg.x1 as f32, seg.y1 as f32])
             .collect();
 
-        Some((segs_f32, bx, by, bw, bh))
+        Some((segs_f32, bbox))
     }
 
-    /// Paint a GPU-produced per-pixel coverage buffer `coverage` (`bw × bh` bytes,
-    /// origin at `(bx, by)`) into `self.bitmap` using `pipe` and `src`.
+    /// Paint a GPU-produced per-pixel coverage buffer into `self.bitmap`.
     ///
-    /// Scans each row for contiguous non-zero spans, clips them to the current
+    /// `coverage` must be exactly `bbox.w × bbox.h` bytes (one byte per pixel,
+    /// 0 = outside, 255 = inside), with `bbox` giving the top-left corner and
+    /// extent in device-pixel coordinates (already clamped to bitmap bounds).
+    ///
+    /// Scans each row for contiguous non-zero spans, clips them to the active
     /// clip region and bitmap bounds, then calls `pipe::render_span`.
     #[cfg(feature = "gpu-aa")]
-    #[allow(clippy::too_many_arguments)]
     #[expect(
         clippy::cast_possible_wrap,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "all coordinates bounded by bitmap dims which are derived from u32; realistic pages are far below i32::MAX"
+        reason = "all coordinates bounded by bitmap dims which are derived from u32; \
+                  realistic pages are far below i32::MAX"
     )]
     fn gpu_coverage_to_bitmap(
         &mut self,
         coverage: &[u8],
-        bx: u32,
-        by: u32,
-        bw: u32,
-        bh: u32,
+        bbox: &GpuBbox,
         pipe: &raster::pipe::PipeState<'_>,
         src: &raster::pipe::PipeSrc<'_>,
     ) {
         use raster::clip::ClipResult;
         use raster::pipe;
 
+        let GpuBbox {
+            x: bx,
+            y: by,
+            w: bw,
+            h: bh,
+        } = *bbox;
+
+        // The caller guarantees coverage.len() == bw * bh.  A mismatch would
+        // mean a bug in the GPU dispatch layer — catch it in debug builds.
+        debug_assert_eq!(
+            coverage.len(),
+            bw as usize * bh as usize,
+            "coverage buffer length mismatch: expected {}×{}={}, got {}",
+            bw,
+            bh,
+            bw as usize * bh as usize,
+            coverage.len()
+        );
+        // bbox was clamped to bitmap dims in gpu_fill_segs; bx+bw ≤ bitmap.width,
+        // by+bh ≤ bitmap.height.  Assert in debug builds.
+        debug_assert!(
+            bx.saturating_add(bw) <= self.bitmap.width
+                && by.saturating_add(bh) <= self.bitmap.height,
+            "GPU bbox ({bx},{by} {bw}×{bh}) extends outside bitmap ({}×{})",
+            self.bitmap.width,
+            self.bitmap.height
+        );
+
         let clip = self.gstate.current().clip.clone_shared();
         let bmp_w_i = self.bitmap.width as i32;
 
         for row in 0..bh {
-            let y = by + row;
-            if y >= self.bitmap.height {
-                break;
-            }
+            let y = by + row; // cannot exceed bitmap.height (clamped in gpu_fill_segs)
             let y_i = y as i32;
 
             let row_start = row as usize * bw as usize;
@@ -1307,14 +1353,18 @@ impl<'doc> PageRenderer<'doc> {
                         continue;
                     }
 
-                    let shape_slice = &row_cov[start..col];
-
-                    // Clamp to bitmap width and trim the shape slice to match.
+                    // Clamp to bitmap width and trim the coverage slice to match.
                     let sx0 = x0.max(0);
                     let sx1 = x1.min(bmp_w_i - 1);
                     if sx0 > sx1 {
                         continue;
                     }
+
+                    // trim_left = sx0 - x0 ≥ 0 (sx0 = x0.max(0)).
+                    // trim_right = x1 - sx1 ≥ 0 (sx1 = x1.min(bmp_w_i-1)).
+                    // trim_left + trim_right = (sx0-x0) + (x1-sx1) ≤ (x1-x0) = col-start-1
+                    // which is < shape_slice.len() = col-start.  So the subtraction is safe.
+                    let shape_slice = &row_cov[start..col];
                     let trim_left = (sx0 - x0) as usize;
                     let trim_right = (x1 - sx1) as usize;
                     let trimmed_shape = &shape_slice[trim_left..shape_slice.len() - trim_right];
@@ -1361,18 +1411,25 @@ impl<'doc> PageRenderer<'doc> {
     ) -> bool {
         use gpu::GPU_AA_FILL_THRESHOLD;
 
-        let Some((segs_f32, bx, by, bw, bh)) = self.gpu_fill_segs(path) else {
+        let Some((segs_f32, bbox)) = self.gpu_fill_segs(path) else {
             return false;
         };
-        if (bw as usize * bh as usize) < GPU_AA_FILL_THRESHOLD {
+        if (bbox.w as usize * bbox.h as usize) < GPU_AA_FILL_THRESHOLD {
             return false;
         }
 
         #[expect(
             clippy::cast_precision_loss,
-            reason = "bx/by are u32 from bitmap coords; f64→f32 is sub-pixel at realistic DPIs"
+            reason = "bbox.x/y are u32 bitmap coords; f32 precision is sub-pixel at realistic DPIs"
         )]
-        let coverage = match ctx.aa_fill(&segs_f32, bx as f32, by as f32, bw, bh, even_odd) {
+        let coverage = match ctx.aa_fill(
+            &segs_f32,
+            bbox.x as f32,
+            bbox.y as f32,
+            bbox.w,
+            bbox.h,
+            even_odd,
+        ) {
             Ok(cov) => cov,
             Err(e) => {
                 log::warn!("GPU AA fill failed, falling back to CPU: {e}");
@@ -1380,7 +1437,7 @@ impl<'doc> PageRenderer<'doc> {
             }
         };
 
-        self.gpu_coverage_to_bitmap(&coverage, bx, by, bw, bh, pipe, src);
+        self.gpu_coverage_to_bitmap(&coverage, &bbox, pipe, src);
         true
     }
 
@@ -1401,27 +1458,27 @@ impl<'doc> PageRenderer<'doc> {
     ) -> bool {
         use gpu::{GPU_TILE_FILL_THRESHOLD, build_tile_records};
 
-        let Some((segs_f32, bx, by, bw, bh)) = self.gpu_fill_segs(path) else {
+        let Some((segs_f32, bbox)) = self.gpu_fill_segs(path) else {
             return false;
         };
-        if (bw as usize * bh as usize) < GPU_TILE_FILL_THRESHOLD {
+        if (bbox.w as usize * bbox.h as usize) < GPU_TILE_FILL_THRESHOLD {
             return false;
         }
 
         #[expect(
             clippy::cast_precision_loss,
-            reason = "bx/by are u32 from bitmap coords; f32 precision is sub-pixel at realistic DPIs"
+            reason = "bbox.x/y are u32 bitmap coords; f32 precision is sub-pixel at realistic DPIs"
         )]
         let (records, tile_starts, tile_counts, grid_w) =
-            build_tile_records(&segs_f32, bx as f32, by as f32, bw, bh);
+            build_tile_records(&segs_f32, bbox.x as f32, bbox.y as f32, bbox.w, bbox.h);
 
         let coverage = match ctx.tile_fill(
             &records,
             &tile_starts,
             &tile_counts,
             grid_w,
-            bw,
-            bh,
+            bbox.w,
+            bbox.h,
             even_odd,
         ) {
             Ok(cov) => cov,
@@ -1431,7 +1488,7 @@ impl<'doc> PageRenderer<'doc> {
             }
         };
 
-        self.gpu_coverage_to_bitmap(&coverage, bx, by, bw, bh, pipe, src);
+        self.gpu_coverage_to_bitmap(&coverage, &bbox, pipe, src);
         true
     }
 
