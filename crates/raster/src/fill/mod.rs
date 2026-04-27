@@ -128,7 +128,15 @@ pub(super) fn fill_impl<P: Pixel>(
     // Clip y bounds in scanner coordinates (AA or normal).
     let (y_min_clip, y_max_clip) = if vector_antialias {
         xpath.aa_scale();
-        (clip.y_min_i * AA_SIZE, (clip.y_max_i + 1) * AA_SIZE - 1)
+        let y_min = clip.y_min_i
+            .checked_mul(AA_SIZE)
+            .expect("AA y_lo overflows i32: clip.y_min_i is unreasonably large");
+        let y_max = clip.y_max_i
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(AA_SIZE))
+            .map(|v| v - 1)
+            .expect("AA y_hi overflows i32: clip.y_max_i is unreasonably large");
+        (y_min, y_max)
     } else {
         (clip.y_min_i, clip.y_max_i)
     };
@@ -136,6 +144,10 @@ pub(super) fn fill_impl<P: Pixel>(
     let scanner = XPathScanner::new(&xpath, eo, y_min_clip, y_max_clip);
 
     if scanner.is_empty() {
+        return;
+    }
+
+    if bitmap.width == 0 {
         return;
     }
 
@@ -190,12 +202,9 @@ pub(super) fn fill_impl<P: Pixel>(
             }
         }
     } else {
-        if bitmap.width == 0 {
-            return;
-        }
         #[expect(
             clippy::cast_possible_wrap,
-            reason = "bitmap.width ≤ i32::MAX in practice; zero checked above"
+            reason = "bitmap.width ≤ i32::MAX in practice; zero checked above scanner.is_empty()"
         )]
         let width_i = bitmap.width as i32;
 
@@ -276,15 +285,16 @@ pub(super) fn draw_span<P: Pixel, S: RowSink<P>>(
     x1: i32,
     y: i32,
 ) {
-    debug_assert!(x0 <= x1);
-    debug_assert!(y >= 0);
-    #[expect(clippy::cast_sign_loss, reason = "y >= 0 checked above")]
+    debug_assert!(x0 <= x1, "draw_span: x0={x0} > x1={x1}");
+    debug_assert!(x0 >= 0, "draw_span: x0={x0} is negative (caller must clamp before calling)");
+    debug_assert!(y >= 0, "draw_span: y={y} is negative");
+    #[expect(clippy::cast_sign_loss, reason = "y >= 0 asserted above")]
     let y_u = y as u32;
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0 after clip clamping")]
+    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0 asserted above")]
     let byte_off = x0 as usize * P::BYTES;
-    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0")]
+    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0 asserted above")]
     let byte_end = (x1 as usize + 1) * P::BYTES;
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0, x1 >= x0")]
+    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0, x1 >= x0 asserted above")]
     let alpha_range = x0 as usize..=x1 as usize;
 
     let (row, alpha) = sink.row_and_alpha_mut(y_u);
@@ -314,11 +324,11 @@ pub(super) fn draw_span_clipped<P: Pixel, S: RowSink<P>>(
                 run_start = Some(x);
             }
         } else if let Some(rs) = run_start.take() {
-            draw_span::<P, S>(sink, pipe, src, rs, x - 1, y);
+            draw_span(sink, pipe, src, rs, x - 1, y);
         }
     }
     if let Some(rs) = run_start {
-        draw_span::<P, S>(sink, pipe, src, rs, x1, y);
+        draw_span(sink, pipe, src, rs, x1, y);
     }
 }
 

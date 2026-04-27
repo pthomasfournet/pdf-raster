@@ -112,6 +112,14 @@ fn fill_impl_parallel<P: Pixel + Send>(
         return;
     }
 
+    // Bitmap height must fit in i32 so band y-coordinates can be compared with
+    // scanner coordinates (which are i32). Any real PDF page is far below 2^31 px.
+    assert!(
+        bitmap.height <= i32::MAX as u32,
+        "bitmap height {} exceeds i32::MAX; cannot compute band y-coordinates",
+        bitmap.height,
+    );
+
     // Fall back to sequential for trivially small fills or single-band requests.
     if n_bands <= 1 || bitmap.height < PARALLEL_FILL_MIN_HEIGHT {
         fill_impl::<P>(
@@ -133,7 +141,15 @@ fn fill_impl_parallel<P: Pixel + Send>(
 
     let (y_min_clip, y_max_clip) = if vector_antialias {
         xpath.aa_scale();
-        (clip.y_min_i * AA_SIZE, (clip.y_max_i + 1) * AA_SIZE - 1)
+        let y_min = clip.y_min_i
+            .checked_mul(AA_SIZE)
+            .expect("AA y_lo overflows i32: clip.y_min_i is unreasonably large");
+        let y_max = clip.y_max_i
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(AA_SIZE))
+            .map(|v| v - 1)
+            .expect("AA y_hi overflows i32: clip.y_max_i is unreasonably large");
+        (y_min, y_max)
     } else {
         (clip.y_min_i, clip.y_max_i)
     };
@@ -202,15 +218,16 @@ fn fill_band<P: Pixel>(
     scanner: &XPathScanner,
     clip_res: ClipResult,
 ) {
-    // bands_mut guarantees y_start + height ≤ bitmap.height ≤ i32::MAX.
+    // bitmap.height ≤ i32::MAX is asserted in fill_impl_parallel before bands_mut;
+    // band.y_start and band.y_start + band.height - 1 are both ≤ bitmap.height.
     #[expect(
         clippy::cast_possible_wrap,
-        reason = "band.y_start ≤ bitmap.height ≤ i32::MAX; enforced by bands_mut"
+        reason = "band.y_start ≤ bitmap.height ≤ i32::MAX; asserted in fill_impl_parallel"
     )]
     let y_band_min = band.y_start as i32;
     #[expect(
         clippy::cast_possible_wrap,
-        reason = "band.y_start + band.height - 1 ≤ bitmap.height - 1 ≤ i32::MAX; enforced by bands_mut"
+        reason = "band.y_start + band.height - 1 ≤ bitmap.height - 1 ≤ i32::MAX; asserted in fill_impl_parallel"
     )]
     let y_band_max = (band.y_start + band.height - 1) as i32;
 
