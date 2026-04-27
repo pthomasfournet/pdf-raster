@@ -93,7 +93,7 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 
 - [x] Coons patch / tensor mesh shading (Type 4–7)
 - [x] Non-axis-aligned image transforms — exact inverse-CTM nearest-neighbour sampling for arbitrary rotated/sheared images; row-constant hoisting eliminates redundant multiplies per inner loop
-- [ ] Halftone screens for CMYK separation output
+- [~] Halftone screens for CMYK separation output — out of scope for a screen rasterizer; PDF viewers intentionally ignore `HT` and render continuous tone; only relevant to print RIPs
 - [x] PDF transparency groups (isolated / non-isolated / knockout) at the page level
 
 ---
