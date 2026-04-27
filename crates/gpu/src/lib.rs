@@ -1242,125 +1242,150 @@ mod tests {
 
     // ── GPU vs CPU AA fill parity ─────────────────────────────────────────────
     //
-    // These tests run the same segments through both aa_fill_cpu and the GPU
-    // kernel and assert byte-identical results.  They require a CUDA device and
-    // are gated on the `gpu-validation` feature so CI without a GPU can skip
-    // them via `cargo test --lib` (no feature flag).
+    // Assert byte-identical coverage output between aa_fill_cpu and the CUDA
+    // aa_fill kernel.  Requires a CUDA device; gated on `gpu-validation` so
+    // CI without a GPU skips them automatically.
     //
-    // Run on the dev machine with:
-    //   cargo test -p gpu --lib --features gpu-validation -- aa_fill_gpu_vs_cpu
+    //   cargo test -p gpu --lib --features gpu-validation -- gpu_vs_cpu
 
     #[cfg(feature = "gpu-validation")]
     mod gpu_vs_cpu {
+        use std::sync::OnceLock;
+
         use super::super::{GpuCtx, aa_fill_cpu};
 
+        // Initialise GpuCtx once for the whole test module.  Each test calls
+        // `gpu()` rather than `GpuCtx::init()` directly so that:
+        //   (a) the CUDA context is created only once, not once per test, and
+        //   (b) a missing GPU produces a single clear message, not six separate
+        //       panics with redundant stack traces.
+        static GPU: OnceLock<GpuCtx> = OnceLock::new();
+
+        fn gpu() -> &'static GpuCtx {
+            GPU.get_or_init(|| {
+                GpuCtx::init().expect(
+                    "gpu-validation tests require a CUDA device — \
+                     run with a machine that has an NVIDIA GPU",
+                )
+            })
+        }
+
+        // Closed CCW rectangle as four directed segments: top, right, bottom, left.
+        // rustfmt::skip keeps the 4-floats-per-segment grouping readable.
+        #[rustfmt::skip]
         fn rect_segs(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<f32> {
             vec![
-                x0, y0, x1, y0, x1, y0, x1, y1, x1, y1, x0, y1, x0, y1, x0, y0,
+                x0, y0,  x1, y0,   // top edge    (left → right)
+                x1, y0,  x1, y1,   // right edge  (top  → bottom)
+                x1, y1,  x0, y1,   // bottom edge (right → left)
+                x0, y1,  x0, y0,   // left edge   (bottom → top)
             ]
         }
 
-        fn gpu() -> GpuCtx {
-            GpuCtx::init().expect("CUDA device required for gpu-validation tests")
+        // Run both CPU and GPU paths on `segs` over a 1×1 output at (`xmin`,`ymin`).
+        // Returns `(cpu_byte, gpu_byte)`.  Panics loudly if the GPU call fails.
+        fn both_1x1(segs: &[f32], x_min: f32, y_min: f32, eo: bool) -> (u8, u8) {
+            let cpu = aa_fill_cpu(segs, x_min, y_min, 1, 1, eo);
+            // aa_fill_gpu bypasses the dispatch threshold so we always hit the kernel,
+            // even for single-pixel regions that would normally fall back to CPU.
+            let gpu_cov = gpu()
+                .aa_fill_gpu(segs, x_min, y_min, 1, 1, eo)
+                .unwrap_or_else(|e| panic!("GPU aa_fill failed: {e}"));
+            (cpu[0], gpu_cov[0])
         }
 
         #[test]
-        fn aa_fill_gpu_vs_cpu_fully_covered() {
-            // Large rect completely surrounds the 1×1 output pixel.
+        fn fully_covered() {
+            // Large rect encloses the 1×1 query window entirely.
             let segs = rect_segs(-100.0, -100.0, 100.0, 100.0);
-            let cpu = aa_fill_cpu(&segs, 0.0, 0.0, 1, 1, false);
-            // Force GPU path by using a large enough region (bypass threshold).
-            // Single pixel is below threshold; use aa_fill_gpu directly.
-            let gpu_cov = gpu()
-                .aa_fill_gpu(&segs, 0.0, 0.0, 1, 1, false)
-                .expect("GPU aa_fill failed");
-            assert_eq!(
-                cpu, gpu_cov,
-                "fully-covered pixel: CPU={cpu:?} GPU={gpu_cov:?}"
-            );
-            assert_eq!(cpu[0], 255);
+            let (cpu, gpu) = both_1x1(&segs, 0.0, 0.0, false);
+            assert_eq!(cpu, gpu, "CPU={cpu} GPU={gpu}");
+            assert_eq!(cpu, 255, "fully enclosed pixel must be 255");
         }
 
         #[test]
-        fn aa_fill_gpu_vs_cpu_fully_outside() {
+        fn fully_outside() {
+            // Rect at origin; query window is 200 px away.
             let segs = rect_segs(0.0, 0.0, 10.0, 10.0);
-            let cpu = aa_fill_cpu(&segs, 200.0, 200.0, 1, 1, false);
-            let gpu_cov = gpu()
-                .aa_fill_gpu(&segs, 200.0, 200.0, 1, 1, false)
-                .expect("GPU aa_fill failed");
-            assert_eq!(cpu, gpu_cov, "outside pixel: CPU={cpu:?} GPU={gpu_cov:?}");
-            assert_eq!(cpu[0], 0);
+            let (cpu, gpu) = both_1x1(&segs, 200.0, 200.0, false);
+            assert_eq!(cpu, gpu, "CPU={cpu} GPU={gpu}");
+            assert_eq!(cpu, 0, "pixel outside path must be 0");
         }
 
         #[test]
-        fn aa_fill_gpu_vs_cpu_eo_donut_centre() {
-            // EO donut: outer 20×20, inner 10×10 — centre pixel winds twice → outside.
-            let outer = rect_segs(-10.0, -10.0, 10.0, 10.0);
-            let inner = rect_segs(-5.0, -5.0, 5.0, 5.0);
-            let segs: Vec<f32> = outer.iter().chain(inner.iter()).copied().collect();
-            let cpu = aa_fill_cpu(&segs, -0.5, -0.5, 1, 1, true);
-            let gpu_cov = gpu()
-                .aa_fill_gpu(&segs, -0.5, -0.5, 1, 1, true)
-                .expect("GPU aa_fill failed");
-            assert_eq!(cpu, gpu_cov, "EO donut centre: CPU={cpu:?} GPU={gpu_cov:?}");
-            assert_eq!(cpu[0], 0);
+        fn eo_donut_centre() {
+            // EO donut: outer 20×20, inner 10×10, same winding direction.
+            // Centre pixel has winding=2 → even → outside under EO rule.
+            let segs: Vec<f32> = rect_segs(-10.0, -10.0, 10.0, 10.0)
+                .into_iter()
+                .chain(rect_segs(-5.0, -5.0, 5.0, 5.0))
+                .collect();
+            let (cpu, gpu) = both_1x1(&segs, -0.5, -0.5, true);
+            assert_eq!(cpu, gpu, "CPU={cpu} GPU={gpu}");
+            assert_eq!(cpu, 0, "EO donut centre must be 0");
         }
 
         #[test]
-        fn aa_fill_gpu_vs_cpu_partial_edge() {
-            // Rect covering the right half of a pixel: x ∈ [0.0, 0.5), y ∈ [-1, 1).
-            // Roughly half the Halton samples land inside → partial coverage.
-            let segs = rect_segs(0.0, -1.0, 0.5, 1.0);
-            // Pixel centred at (0.0 + 0 + 0.5, 0.0 + 0 + 0.5) = (0.5, 0.5); query at x_min=0,y_min=0.
-            let cpu = aa_fill_cpu(&segs, 0.0, 0.0, 1, 1, false);
-            let gpu_cov = gpu()
-                .aa_fill_gpu(&segs, 0.0, 0.0, 1, 1, false)
-                .expect("GPU aa_fill failed");
-            assert_eq!(
-                cpu, gpu_cov,
-                "partial-edge pixel: CPU={} GPU={}",
-                cpu[0], gpu_cov[0]
-            );
-            // Sanity: neither fully covered nor empty.
+        fn nz_donut_centre() {
+            // Same two-rect donut as above but NZ rule.
+            // Winding=2 ≠ 0 → inside.
+            let segs: Vec<f32> = rect_segs(-10.0, -10.0, 10.0, 10.0)
+                .into_iter()
+                .chain(rect_segs(-5.0, -5.0, 5.0, 5.0))
+                .collect();
+            let (cpu, gpu) = both_1x1(&segs, -0.5, -0.5, false);
+            assert_eq!(cpu, gpu, "CPU={cpu} GPU={gpu}");
+            assert_eq!(cpu, 255, "NZ donut centre (winding=2) must be 255");
+        }
+
+        #[test]
+        fn partial_edge() {
+            // Rect whose right edge bisects the pixel exactly at x=0.5.
+            // Pixel centre is (0.5, 0.5); sub-pixel samples at cx + H2[s] - 0.5 = H2[s].
+            // Samples with H2[s] < 0.5 are inside the rect; ~half the 64 Halton(2)
+            // samples satisfy this, giving partial coverage strictly in (0, 255).
+            let segs = rect_segs(-100.0, -100.0, 0.5, 100.0);
+            let (cpu, gpu) = both_1x1(&segs, 0.0, 0.0, false);
+            assert_eq!(cpu, gpu, "CPU={cpu} GPU={gpu}");
             assert!(
-                cpu[0] > 0 && cpu[0] < 255,
-                "expected partial coverage, got {}",
-                cpu[0]
+                cpu > 0 && cpu < 255,
+                "half-covered pixel must be partial (got {cpu})"
             );
         }
 
         #[test]
-        fn aa_fill_gpu_vs_cpu_multi_pixel_region() {
-            // 8×8 region with a diagonal rect covering the upper-left triangle.
-            let segs = vec![0.0, 0.0, 8.0, 0.0, 8.0, 0.0, 0.0, 8.0, 0.0, 8.0, 0.0, 0.0];
+        fn multi_pixel_region() {
+            // Closed right-triangle: vertices (0,0), (8,0), (0,8).
+            // Pixels in the upper-left corner should be covered; bottom-right corner outside.
+            #[rustfmt::skip]
+            let segs: Vec<f32> = vec![
+                0.0, 0.0,  8.0, 0.0,   // hypotenuse top
+                8.0, 0.0,  0.0, 8.0,   // hypotenuse diagonal
+                0.0, 8.0,  0.0, 0.0,   // left edge back to origin
+            ];
             let cpu = aa_fill_cpu(&segs, 0.0, 0.0, 8, 8, false);
             let gpu_cov = gpu()
                 .aa_fill_gpu(&segs, 0.0, 0.0, 8, 8, false)
-                .expect("GPU aa_fill failed");
-            assert_eq!(
-                cpu,
-                gpu_cov,
-                "multi-pixel region mismatch — first diff at byte {}",
-                cpu.iter()
-                    .zip(gpu_cov.iter())
-                    .position(|(a, b)| a != b)
-                    .unwrap_or(usize::MAX)
-            );
-        }
+                .unwrap_or_else(|e| panic!("GPU aa_fill failed: {e}"));
 
-        #[test]
-        fn aa_fill_gpu_vs_cpu_nz_winding() {
-            // Non-zero rule: two concentric CCW rects → winding=2 inside inner → covered.
-            let outer = rect_segs(-10.0, -10.0, 10.0, 10.0);
-            let inner = rect_segs(-5.0, -5.0, 5.0, 5.0);
-            let segs: Vec<f32> = outer.iter().chain(inner.iter()).copied().collect();
-            let cpu = aa_fill_cpu(&segs, -0.5, -0.5, 1, 1, false);
-            let gpu_cov = gpu()
-                .aa_fill_gpu(&segs, -0.5, -0.5, 1, 1, false)
-                .expect("GPU aa_fill failed");
-            assert_eq!(cpu, gpu_cov, "NZ donut centre: CPU={cpu:?} GPU={gpu_cov:?}");
-            // NZ: winding=2 ≠ 0 → inside → should be 255.
-            assert_eq!(cpu[0], 255, "NZ centre should be fully covered");
+            // Find the first mismatch position for a clear failure message.
+            let first_diff = cpu
+                .iter()
+                .zip(gpu_cov.iter())
+                .enumerate()
+                .find(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| format!("byte {i}: CPU={a} GPU={b}"));
+
+            assert!(
+                first_diff.is_none(),
+                "multi-pixel region mismatch at {}",
+                first_diff.as_deref().unwrap_or("(none)")
+            );
+
+            // Structural sanity: top-left pixel (0,0) must be inside the triangle.
+            assert_eq!(cpu[0], 255, "pixel (0,0) must be fully inside triangle");
+            // Bottom-right pixel (7,7) must be outside.
+            assert_eq!(cpu[63], 0, "pixel (7,7) must be fully outside triangle");
         }
     }
 }
