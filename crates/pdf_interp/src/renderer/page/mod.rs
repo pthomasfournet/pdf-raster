@@ -76,6 +76,13 @@ pub struct PageRenderer<'doc> {
     gstate: GStateStack,
     /// Current path under construction, if any.
     path: Option<PathBuilder>,
+    /// Pending clip rule set by `W`/`W*` (PDF §8.5.4).
+    ///
+    /// `W`/`W*` do NOT consume the path — they set this flag so the next
+    /// painting or `n` operator intersects the current path into the clip
+    /// region before (or instead of) painting.  `false` = non-zero winding,
+    /// `true` = even-odd.  Cleared by every path-terminating operator.
+    pending_clip: Option<bool>,
     /// Font face cache for this page.
     font_cache: FontCache,
     /// Resource accessor for the current page or innermost form.
@@ -135,6 +142,7 @@ impl<'doc> PageRenderer<'doc> {
             height,
             gstate,
             path: None,
+            pending_clip: None,
             font_cache,
             resources,
             form_depth: 0,
@@ -230,15 +238,13 @@ impl<'doc> PageRenderer<'doc> {
             }
             Operator::CurveToV(x2, y2, x3, y3) => {
                 // `v`: first control point = current point.
-                let cp = self.path_builder().cur_pt().map(|p| (p.x, p.y));
-                if cp.is_none() {
+                let Some(cp) = self.path_builder().cur_pt() else {
                     log::debug!("pdf_interp: CurveToV with no current point — operator ignored");
                     return;
-                }
-                let (cpx, cpy) = cp.expect("checked above");
+                };
                 let (dx2, dy2) = self.to_device(*x2, *y2);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
-                let _ = self.path_builder().curve_to(cpx, cpy, dx2, dy2, dx3, dy3);
+                let _ = self.path_builder().curve_to(cp.x, cp.y, dx2, dy2, dx3, dy3);
             }
             Operator::CurveToY(x1, y1, x3, y3) => {
                 // `y`: second control point = endpoint.
@@ -287,12 +293,16 @@ impl<'doc> PageRenderer<'doc> {
             Operator::FillStroke => self.do_fill_then_stroke(false),
             Operator::FillStrokeEvenOdd => self.do_fill_then_stroke(true),
             Operator::EndPath => {
+                self.apply_pending_clip();
                 self.path = None;
             }
 
             // ── Clipping ──────────────────────────────────────────────────────
-            Operator::Clip => self.do_clip(false),
-            Operator::ClipEvenOdd => self.do_clip(true),
+            // W/W* set a pending flag; the clip is applied by the *next*
+            // path-terminating operator (PDF §8.5.4).  The path is NOT
+            // consumed here — it may still be painted by e.g. "W f".
+            Operator::Clip => self.pending_clip = Some(false),
+            Operator::ClipEvenOdd => self.pending_clip = Some(true),
 
             // ── Text objects ──────────────────────────────────────────────────
             Operator::BeginText => self.gstate.current_mut().text.begin_text(),
@@ -401,11 +411,13 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
 
-        // PDF render modes 0–2 paint (fill/stroke/both); mode 3 is invisible;
-        // modes 4–7 are the same as 0–3 but also add to the clip path.
-        // We skip all modes ≥ 3 here — modes 4–6 would normally still paint,
-        // but since clip accumulation is not yet implemented, skipping them is
-        // the conservative choice (text is not drawn but also not used as clip).
+        // PDF render modes 0–2 paint (fill/stroke/both); mode 3 is invisible.
+        // Modes 4–7 repeat 0–3 and additionally accumulate text outlines into
+        // the clip path (text-as-clip, PDF §9.3.6 Table 106).  Text-as-clip
+        // requires converting glyph outlines to XPaths and intersecting them
+        // into the clip — not yet implemented.  We skip modes ≥ 3 entirely,
+        // which is conservative: invisible/clip-only text is not rendered, but
+        // also not used as a clip mask.
         if self.gstate.current().text.render_mode >= 3 {
             return;
         }
@@ -539,18 +551,35 @@ impl<'doc> PageRenderer<'doc> {
         (dx, f64::from(self.height) - dy)
     }
 
-    /// Apply the current path as a clip region (`W` / `W*` operators).
+    /// Apply a pending `W`/`W*` clip using the current path, then discard the path.
     ///
-    /// PDF §8.5.4: the clipping path is intersected with the current path using
-    /// the specified fill rule.  The current path is then discarded (not painted).
-    /// The new clip takes effect starting with the *next* painting operator.
-    fn do_clip(&mut self, even_odd: bool) {
-        if let Some(builder) = self.path.take() {
-            let path = builder.build();
-            let flatness = self.gstate.current().flatness.max(0.1);
-            let xpath = XPath::new(&path, &DEVICE_MATRIX, flatness, true);
-            self.gstate.current_mut().clip.clip_to_path(&xpath, even_odd);
+    /// Called by `EndPath` (`n`) when no painting follows.
+    fn apply_pending_clip(&mut self) {
+        if let Some(even_odd) = self.pending_clip.take() {
+            if let Some(builder) = self.path.take() {
+                self.clip_path_into_gstate(&builder.build(), even_odd);
+            } else {
+                log::debug!("pdf_interp: W/W* with no current path — clip unchanged");
+            }
         }
+    }
+
+    /// Apply a pending `W`/`W*` clip using an already-built path.
+    ///
+    /// Called by paint helpers (`do_fill`, `do_stroke`, `do_fill_then_stroke`)
+    /// when a `W`/`W*` preceded the painting operator.  The same path is used
+    /// for both clipping and painting (PDF §8.5.4).
+    fn apply_pending_clip_with(&mut self, path: &raster::path::Path) {
+        if let Some(even_odd) = self.pending_clip.take() {
+            self.clip_path_into_gstate(path, even_odd);
+        }
+    }
+
+    /// Intersect `path` into the current graphics-state clip region.
+    fn clip_path_into_gstate(&mut self, path: &raster::path::Path, even_odd: bool) {
+        let flatness = self.gstate.current().flatness.max(0.1);
+        let xpath = XPath::new(path, &DEVICE_MATRIX, flatness, true);
+        self.gstate.current_mut().clip.clip_to_path(&xpath, even_odd);
     }
 
     /// Build a [`PipeState`] for Normal-blend rendering with the given opacity.
@@ -571,23 +600,31 @@ impl<'doc> PageRenderer<'doc> {
 
     fn do_fill(&mut self, even_odd: bool) {
         let Some(builder) = self.path.take() else {
+            self.pending_clip = None;
             return;
         };
-        self.fill_path(&builder.build(), even_odd);
+        let path = builder.build();
+        self.apply_pending_clip_with(&path);
+        self.fill_path(&path, even_odd);
     }
 
     fn do_stroke(&mut self) {
         let Some(builder) = self.path.take() else {
+            self.pending_clip = None;
             return;
         };
-        self.stroke_path(&builder.build());
+        let path = builder.build();
+        self.apply_pending_clip_with(&path);
+        self.stroke_path(&path);
     }
 
     fn do_fill_then_stroke(&mut self, even_odd: bool) {
         let Some(builder) = self.path.take() else {
+            self.pending_clip = None;
             return;
         };
         let path = builder.build();
+        self.apply_pending_clip_with(&path);
         self.fill_path(&path, even_odd);
         self.stroke_path(&path);
     }

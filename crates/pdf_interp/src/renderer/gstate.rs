@@ -78,6 +78,10 @@ pub struct InterpGState {
     /// Current transformation matrix.
     pub ctm: Ctm,
     /// Current clip region (page rect at init; narrowed by `W`/`W*` operators).
+    ///
+    /// Constructed with `antialias: true` so path-clip scanners are built in
+    /// AA-scaled coordinates, matching the `vector_antialias = true` mode used
+    /// by fill and stroke.
     pub clip: Clip,
     /// Current fill colour.
     pub fill_color: RasterColor,
@@ -129,7 +133,7 @@ impl InterpGState {
     pub fn initial(width: u32, height: u32) -> Self {
         Self {
             ctm: CTM_IDENTITY,
-            clip: Clip::new(0.0, 0.0, f64::from(width), f64::from(height), false),
+            clip: Clip::new(0.0, 0.0, f64::from(width), f64::from(height), true),
             fill_color: RasterColor::default(),
             stroke_color: RasterColor::default(),
             fill_alpha: 255,
@@ -275,5 +279,43 @@ mod tests {
         assert!((r[1] - 0.0).abs() < 1e-12);
         assert!((r[2] - 0.0).abs() < 1e-12);
         assert!((r[3] - (-1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn initial_clip_covers_page() {
+        let stack = GStateStack::new(200, 100);
+        let clip = &stack.current().clip;
+        // Initial clip rect should span the full page in device pixels.
+        assert!(clip.x_min < 1.0);
+        assert!(clip.y_min < 1.0);
+        assert!(clip.x_max > 199.0);
+        assert!(clip.y_max > 99.0);
+    }
+
+    #[test]
+    fn initial_clip_uses_antialias() {
+        // Clip must be created with antialias=true so path-clip scanners are
+        // built in AA-scaled coordinates, matching vector_antialias=true in fill/stroke.
+        let stack = GStateStack::new(100, 100);
+        assert!(stack.current().clip.antialias);
+    }
+
+    #[test]
+    fn clip_narrows_on_save_restore() {
+        let mut stack = GStateStack::new(100, 100);
+        let original_xmax = stack.current().clip.x_max;
+
+        // Narrow the clip in the current state.
+        stack.current_mut().clip.clip_to_rect(0.0, 0.0, 50.0, 50.0);
+        assert!(stack.current().clip.x_max <= 50.0);
+
+        // Save, narrow further, then restore — should return to the 50-wide clip.
+        stack.save();
+        stack.current_mut().clip.clip_to_rect(0.0, 0.0, 10.0, 10.0);
+        assert!(stack.current().clip.x_max <= 10.0);
+        stack.restore();
+        // After restore: should be back to the 50-wide clip, not the original page rect.
+        assert!(stack.current().clip.x_max <= 50.0 + 1.0);
+        assert!(stack.current().clip.x_max < original_xmax);
     }
 }
