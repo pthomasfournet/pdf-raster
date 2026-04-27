@@ -11,7 +11,11 @@ nvjpeg = ["gpu/nvjpeg"]
 # Enable GPU supersampled AA fill (64-sample warp-ballot kernel).
 # Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU 4× scanline AA when
 # the fill area is below the dispatch threshold or no GPU is available.
-gpu-aa = ["dep:gpu"]
+gpu-aa  = ["dep:gpu"]
+# Enable GPU-accelerated CMYK→RGB colour transform for image decode.
+# Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU subtractive complement
+# when no GPU context is set or the image is below the dispatch threshold.
+gpu-icc = ["dep:gpu"]
 
 [dependencies]
 raster = { path = "../raster" }

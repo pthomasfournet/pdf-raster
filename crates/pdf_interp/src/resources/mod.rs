@@ -253,6 +253,7 @@ impl<'doc> PageResources<'doc> {
         &self,
         name: &[u8],
         #[cfg(feature = "nvjpeg")] gpu: Option<&mut gpu::nvjpeg::NvJpegDecoder>,
+        #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
     ) -> Option<image::ImageDescriptor> {
         let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
         image::resolve_image(
@@ -261,6 +262,8 @@ impl<'doc> PageResources<'doc> {
             name,
             #[cfg(feature = "nvjpeg")]
             gpu,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
         )
     }
 

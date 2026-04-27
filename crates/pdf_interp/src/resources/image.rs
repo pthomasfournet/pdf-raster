@@ -49,6 +49,11 @@ use zune_jpeg::JpegDecoder;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
 
+// ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
+
+#[cfg(feature = "gpu-icc")]
+use gpu::GpuCtx;
+
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
 /// Below this threshold `PCIe` transfer overhead dominates and CPU `zune-jpeg`
@@ -106,6 +111,7 @@ pub fn resolve_image(
     page_dict: &Dictionary,
     name: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
     let stream_id = xobject_id(doc, page_dict, name)?;
     let obj = doc.get_object(stream_id).ok()?;
@@ -128,9 +134,9 @@ pub fn resolve_image(
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
 
     let mut img = match filter.as_deref() {
-        None => decode_raw(doc, stream.content.as_slice(), w, h, is_mask, &stream.dict),
+        None => decode_raw(doc, stream.content.as_slice(), w, h, is_mask, &stream.dict, #[cfg(feature = "gpu-icc")] gpu_ctx),
         Some("FlateDecode") => match stream.decompressed_content() {
-            Ok(data) => decode_raw(doc, &data, w, h, is_mask, &stream.dict),
+            Ok(data) => decode_raw(doc, &data, w, h, is_mask, &stream.dict, #[cfg(feature = "gpu-icc")] gpu_ctx),
             Err(e) => {
                 log::warn!("image: FlateDecode decompression failed: {e}");
                 None
@@ -141,11 +147,19 @@ pub fn resolve_image(
             decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
         }
         Some("DCTDecode") => {
-            #[cfg(feature = "nvjpeg")]
+            #[cfg(all(feature = "nvjpeg", feature = "gpu-icc"))]
+            {
+                decode_dct(stream.content.as_slice(), w, h, gpu, gpu_ctx)
+            }
+            #[cfg(all(feature = "nvjpeg", not(feature = "gpu-icc")))]
             {
                 decode_dct(stream.content.as_slice(), w, h, gpu)
             }
-            #[cfg(not(feature = "nvjpeg"))]
+            #[cfg(all(not(feature = "nvjpeg"), feature = "gpu-icc"))]
+            {
+                decode_dct(stream.content.as_slice(), w, h, gpu_ctx)
+            }
+            #[cfg(all(not(feature = "nvjpeg"), not(feature = "gpu-icc")))]
             {
                 decode_dct(stream.content.as_slice(), w, h)
             }
@@ -677,6 +691,7 @@ fn decode_raw(
     height: u32,
     is_mask: bool,
     dict: &Dictionary,
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
     let bpc = dict.get_i64(b"BitsPerComponent").unwrap_or(8);
 
@@ -746,7 +761,7 @@ fn decode_raw(
                 smask: None,
             })
         }
-        8 => decode_raw_8bpp(data, width, height, resolved),
+        8 => decode_raw_8bpp(data, width, height, resolved, #[cfg(feature = "gpu-icc")] gpu_ctx),
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
             None
@@ -762,6 +777,7 @@ fn decode_raw_8bpp(
     width: u32,
     height: u32,
     resolved: ResolvedCs,
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
     let components = resolved.components();
     let npixels = (width as usize).checked_mul(height as usize)?;
@@ -779,14 +795,7 @@ fn decode_raw_8bpp(
 
     if resolved == ResolvedCs::Cmyk {
         // Raw PDF CMYK: 255 = full ink, 0 = no ink.
-        let rgb_cap = npixels.checked_mul(3)?;
-        let mut rgb = Vec::with_capacity(rgb_cap);
-        for chunk in raw.chunks_exact(4) {
-            let (r, g, b) = cmyk_raw_to_rgb_triple(chunk[0], chunk[1], chunk[2], chunk[3]);
-            rgb.push(r);
-            rgb.push(g);
-            rgb.push(b);
-        }
+        let rgb = cmyk_raw_to_rgb(raw, #[cfg(feature = "gpu-icc")] gpu_ctx)?;
         Some(ImageDescriptor {
             width,
             height,
@@ -1121,6 +1130,7 @@ fn decode_dct(
     pdf_w: u32,
     pdf_h: u32,
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
     // ── GPU fast path (nvjpeg feature, large images, 1- or 3-component only) ──
     #[cfg(feature = "nvjpeg")]
@@ -1197,7 +1207,19 @@ fn decode_dct(
             data: pixels,
             smask: None,
         }),
-        ZColorSpace::CMYK => cmyk_to_rgb(&pixels, jw, jh),
+        ZColorSpace::CMYK => {
+            // zune-jpeg returns JPEG CMYK with inverted convention (0=full ink, 255=no ink).
+            // Complement to direct convention (255=full ink, 0=no ink) before dispatch.
+            let direct: Vec<u8> = pixels.iter().map(|&b| 255 - b).collect();
+            let rgb = cmyk_raw_to_rgb(&direct, #[cfg(feature = "gpu-icc")] gpu_ctx)?;
+            Some(ImageDescriptor {
+                width: jw,
+                height: jh,
+                color_space: ImageColorSpace::Rgb,
+                data: rgb,
+                smask: None,
+            })
+        }
         // out_cs is always Luma, RGB, or CMYK — set from the components match above.
         _ => unreachable!("DCTDecode: unexpected out_cs variant"),
     }
@@ -1256,68 +1278,38 @@ fn decode_dct_gpu(
 /// Convert a flat CMYK byte buffer (inverted ink densities, 4 bytes/pixel) to
 /// an RGB byte buffer (3 bytes/pixel).
 ///
-/// PDF JPEG CMYK stores inverted ink densities: 0 = full ink, 255 = no ink.
-/// `zune-jpeg` returns bytes in this same inverted form.  We complement each
-/// byte to get the direct ink density, then apply the simplified CMYK→RGB formula:
+/// Convert a raw CMYK pixel buffer to RGB, dispatching to GPU when available.
 ///
-/// ```text
-/// R = 255 - saturating(C_ink + K_ink)
-/// ```
+/// Input convention (raw images / `decode_raw_8bpp`): 0 = no ink, 255 = full ink.
+/// This matches the `GpuCtx::icc_cmyk_to_rgb` matrix kernel directly.
 ///
-/// `saturating_sub` clamps the result to [0, 255], making the `as u8` cast lossless.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "CMYK and RGB are conventional single-letter colour channel names"
-)]
-fn cmyk_to_rgb(pixels: &[u8], width: u32, height: u32) -> Option<ImageDescriptor> {
-    let npixels = (width as usize).checked_mul(height as usize)?;
-
-    let expected_len = npixels.checked_mul(4)?;
-    if pixels.len() != expected_len {
-        log::warn!(
-            "image: DCTDecode: CMYK buffer is {} bytes, expected {expected_len} for {width}×{height}",
-            pixels.len(),
-        );
-        return None;
+/// Returns `None` only on arithmetic overflow (degenerate image size).
+fn cmyk_raw_to_rgb(
+    pixels: &[u8],
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+) -> Option<Vec<u8>> {
+    // GPU path: delegate to GpuCtx which handles threshold + CPU fallback internally.
+    #[cfg(feature = "gpu-icc")]
+    if let Some(ctx) = gpu_ctx {
+        match ctx.icc_cmyk_to_rgb(pixels, None) {
+            Ok(rgb) => return Some(rgb),
+            Err(e) => {
+                log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}");
+            }
+        }
     }
 
-    let rgb_cap = npixels.checked_mul(3)?;
-    let mut rgb = Vec::with_capacity(rgb_cap);
-
+    // CPU path (also used below threshold by GpuCtx itself, but we land here
+    // when the feature is disabled or no GpuCtx is provided).
+    let npixels = pixels.len() / 4;
+    let mut rgb = Vec::with_capacity(npixels.checked_mul(3)?);
     for chunk in pixels.chunks_exact(4) {
-        // Inverted ink densities (0=full ink, 255=none) — complement to get ink density.
-        let c = u16::from(255 - chunk[0]);
-        let m = u16::from(255 - chunk[1]);
-        let y = u16::from(255 - chunk[2]);
-        let k = u16::from(255 - chunk[3]);
-        // saturating_sub clamps to [0, 255]; the result fits in u8 without truncation.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "saturating_sub result ≤ 255"
-        )]
-        let r = 255u16.saturating_sub(c + k) as u8;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "saturating_sub result ≤ 255"
-        )]
-        let g = 255u16.saturating_sub(m + k) as u8;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "saturating_sub result ≤ 255"
-        )]
-        let b = 255u16.saturating_sub(y + k) as u8;
+        let (r, g, b) = cmyk_raw_to_rgb_triple(chunk[0], chunk[1], chunk[2], chunk[3]);
         rgb.push(r);
         rgb.push(g);
         rgb.push(b);
     }
-
-    Some(ImageDescriptor {
-        width,
-        height,
-        color_space: ImageColorSpace::Rgb,
-        data: rgb,
-        smask: None,
-    })
+    Some(rgb)
 }
 
 // ── JPXDecode (JPEG 2000) ─────────────────────────────────────────────────────

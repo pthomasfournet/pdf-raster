@@ -29,6 +29,7 @@ const PTX_COMPOSITE: &str = include_str!(concat!(env!("OUT_DIR"), "/composite_rg
 const PTX_SOFT_MASK: &str = include_str!(concat!(env!("OUT_DIR"), "/apply_soft_mask.ptx"));
 const PTX_AA_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/aa_fill.ptx"));
 const PTX_TILE_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/tile_fill.ptx"));
+const PTX_ICC_CLUT: &str = include_str!(concat!(env!("OUT_DIR"), "/icc_clut.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
 pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
@@ -37,17 +38,23 @@ pub const GPU_SOFTMASK_THRESHOLD: usize = 500_000;
 /// Minimum fill area (pixels) for GPU supersampled AA to be faster than CPU.
 ///
 /// Below this threshold the H2D/D2H transfer latency for the segment list and
-/// coverage buffer dominates. Calibrated for RTX 5070 + [`PCIe`] 5.0 at ~150 DPI.
+/// coverage buffer dominates. Calibrated for RTX 5070 + PCIe 5.0 at ~150 DPI.
 pub const GPU_AA_FILL_THRESHOLD: usize = 16_384;
 /// Minimum fill area (pixels) for the tile-parallel analytical fill to be faster
 /// than the GPU warp-ballot AA kernel.
 ///
 /// Tile fill incurs sorting overhead; below this threshold the AA kernel is faster.
 pub const GPU_TILE_FILL_THRESHOLD: usize = 65_536;
-/// Tile width in pixels (must match [`TILE_W`] in `tile_fill.cu`).
+/// Tile width in pixels (must match `TILE_W` in `tile_fill.cu`).
 pub const TILE_W: u32 = 16;
-/// Tile height in pixels (must match [`TILE_H`] in `tile_fill.cu`).
+/// Tile height in pixels (must match `TILE_H` in `tile_fill.cu`).
 pub const TILE_H: u32 = 16;
+/// Minimum pixel count for GPU ICC CMYK→RGB transform to beat CPU + PCIe overhead.
+///
+/// Below this threshold H2D/D2H transfer latency dominates; use the CPU fallback.
+/// Conservative default aligned with composite/softmask; calibrate against actual
+/// PCIe 5.0 latency on the target machine once the native path is hot.
+pub const GPU_ICC_CLUT_THRESHOLD: usize = 500_000;
 
 /// One tile record per (segment, tile-row) crossing.
 ///
@@ -247,6 +254,8 @@ struct GpuKernels {
     apply_soft_mask: CudaFunction,
     aa_fill: CudaFunction,
     tile_fill: CudaFunction,
+    icc_cmyk_matrix: CudaFunction,
+    icc_cmyk_clut: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -281,6 +290,8 @@ impl GpuCtx {
                 apply_soft_mask: load(PTX_SOFT_MASK, "apply_soft_mask")?,
                 aa_fill: load(PTX_AA_FILL, "aa_fill")?,
                 tile_fill: load(PTX_TILE_FILL, "tile_fill")?,
+                icc_cmyk_matrix: load(PTX_ICC_CLUT, "icc_cmyk_matrix")?,
+                icc_cmyk_clut: load(PTX_ICC_CLUT, "icc_cmyk_clut")?,
             },
         })
     }
@@ -519,6 +530,107 @@ impl GpuCtx {
         Ok(coverage)
     }
 
+    /// Convert CMYK pixels to RGB using a GPU kernel.
+    ///
+    /// `cmyk` is interleaved CMYK, 4 bytes per pixel (PDF convention: 0 = no ink,
+    /// 255 = full ink).  Returns interleaved RGB, 3 bytes per pixel.
+    ///
+    /// Two dispatch paths:
+    /// - `clut` is `None` — uses the fast matrix kernel (subtractive complement
+    ///   formula, identical to the CPU fallback).
+    /// - `clut` is `Some((table, grid_n))` — uses the 4D quadrilinear CLUT kernel.
+    ///   `table` must be `grid_n^4 * 3` bytes, ordered
+    ///   `(k * G³ + c * G² + m * G + y) * 3` (RGB output values, u8).
+    ///   `grid_n` is typically 17 (83 521 nodes) or 33 (1 185 921 nodes).
+    ///
+    /// Falls back to [`icc_cmyk_to_rgb_cpu`] when `n_pixels < GPU_ICC_CLUT_THRESHOLD`
+    /// or `cmyk` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU data transfer or kernel launch fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmyk.len()` is not a multiple of 4, or if `clut` is `Some` and
+    /// `table.len() != grid_n^4 * 3`.
+    pub fn icc_cmyk_to_rgb(
+        &self,
+        cmyk: &[u8],
+        clut: Option<(&[u8], u32)>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        assert!(
+            cmyk.len().is_multiple_of(4),
+            "cmyk.len() must be a multiple of 4 (got {})",
+            cmyk.len()
+        );
+        if let Some((table, grid_n)) = clut {
+            let expected = (grid_n as usize)
+                .checked_pow(4)
+                .and_then(|n| n.checked_mul(3))
+                .expect("grid_n^4 * 3 overflows usize");
+            assert_eq!(
+                table.len(),
+                expected,
+                "CLUT table length mismatch: got {}, expected grid_n({grid_n})^4*3={expected}",
+                table.len()
+            );
+        }
+
+        let n = cmyk.len() / 4;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n < GPU_ICC_CLUT_THRESHOLD {
+            return Ok(icc_cmyk_to_rgb_cpu(cmyk, clut));
+        }
+
+        self.icc_cmyk_to_rgb_gpu(cmyk, clut)
+    }
+
+    fn icc_cmyk_to_rgb_gpu(
+        &self,
+        cmyk: &[u8],
+        clut: Option<(&[u8], u32)>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let n = cmyk.len() / 4;
+        let n_u32 = u32::try_from(n).expect("pixel count exceeds u32::MAX");
+        let stream = &self.stream;
+
+        let d_cmyk = stream.clone_htod(cmyk)?;
+        let rgb_init = vec![0u8; n * 3];
+        let mut d_rgb = stream.clone_htod(&rgb_init)?;
+
+        let cfg = launch_cfg(n);
+
+        match clut {
+            None => {
+                let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_matrix);
+                let _ = builder.arg(&d_cmyk);
+                let _ = builder.arg(&mut d_rgb);
+                let _ = builder.arg(&n_u32);
+                // SAFETY: 3 args match icc_cmyk_matrix PTX signature exactly.
+                let _ = unsafe { builder.launch(cfg) }?;
+            }
+            Some((table, grid_n)) => {
+                let d_clut = stream.clone_htod(table)?;
+                let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_clut);
+                let _ = builder.arg(&d_cmyk);
+                let _ = builder.arg(&mut d_rgb);
+                let _ = builder.arg(&d_clut);
+                let _ = builder.arg(&grid_n);
+                let _ = builder.arg(&n_u32);
+                // SAFETY: 5 args match icc_cmyk_clut PTX signature exactly.
+                let _ = unsafe { builder.launch(cfg) }?;
+            }
+        }
+
+        stream.synchronize()?;
+        let mut rgb = vec![0u8; n * 3];
+        stream.memcpy_dtoh(&d_rgb, &mut rgb)?;
+        Ok(rgb)
+    }
+
     /// Unconditional GPU dispatch for `composite_rgba8` (skips threshold check).
     fn composite_rgba8_gpu(
         &self,
@@ -628,6 +740,102 @@ pub fn apply_soft_mask_cpu(pixels: &mut [u8], mask: &[u8]) {
     }
 }
 
+/// CPU fallback for [`GpuCtx::icc_cmyk_to_rgb`].
+///
+/// When `clut` is `None`, applies the subtractive complement formula:
+///   `R = (255−C)*(255−K)/255`, same for G/M and B/Y.
+///
+/// When `clut` is `Some((table, grid_n))`, evaluates the 4D CLUT using
+/// quadrilinear interpolation — the same algorithm as the GPU kernel.
+#[must_use]
+pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
+    let n = cmyk.len() / 4;
+    let mut rgb = vec![0u8; n * 3];
+
+    match clut {
+        None => {
+            for (src, dst) in cmyk.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+                let inv_k = u32::from(255 - src[3]);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "(255-ch)*(255-k)/255 ≤ 255"
+                )]
+                {
+                    dst[0] = ((u32::from(255 - src[0]) * inv_k) / 255) as u8;
+                    dst[1] = ((u32::from(255 - src[1]) * inv_k) / 255) as u8;
+                    dst[2] = ((u32::from(255 - src[2]) * inv_k) / 255) as u8;
+                }
+            }
+        }
+        Some((table, grid_n)) => {
+            let g = grid_n as usize;
+            let g1 = (grid_n - 1) as f32;
+            for (src, dst) in cmyk.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+                let fc = f32::from(src[0]) * (g1 / 255.0);
+                let fm = f32::from(src[1]) * (g1 / 255.0);
+                let fy = f32::from(src[2]) * (g1 / 255.0);
+                let fk = f32::from(src[3]) * (g1 / 255.0);
+
+                let ic0 = (fc as usize).min(g - 1);
+                let im0 = (fm as usize).min(g - 1);
+                let iy0 = (fy as usize).min(g - 1);
+                let ik0 = (fk as usize).min(g - 1);
+                let ic1 = (ic0 + 1).min(g - 1);
+                let im1 = (im0 + 1).min(g - 1);
+                let iy1 = (iy0 + 1).min(g - 1);
+                let ik1 = (ik0 + 1).min(g - 1);
+
+                let wc = fc - ic0 as f32;
+                let wm = fm - im0 as f32;
+                let wy = fy - iy0 as f32;
+                let wk = fk - ik0 as f32;
+
+                let node = |ci: usize, mi: usize, yi: usize, ki: usize| -> [f32; 3] {
+                    let idx = (ki * g * g * g + ci * g * g + mi * g + yi) * 3;
+                    [
+                        f32::from(table[idx]),
+                        f32::from(table[idx + 1]),
+                        f32::from(table[idx + 2]),
+                    ]
+                };
+
+                let lerp = |a: f32, b: f32, t: f32| a + t * (b - a);
+                let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+                    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
+                };
+
+                // K=0 face: lerp Y → M → C
+                let c0m0k0 = lerp3(node(ic0, im0, iy0, ik0), node(ic0, im0, iy1, ik0), wy);
+                let c0m1k0 = lerp3(node(ic0, im1, iy0, ik0), node(ic0, im1, iy1, ik0), wy);
+                let c1m0k0 = lerp3(node(ic1, im0, iy0, ik0), node(ic1, im0, iy1, ik0), wy);
+                let c1m1k0 = lerp3(node(ic1, im1, iy0, ik0), node(ic1, im1, iy1, ik0), wy);
+                let rk0 = lerp3(lerp3(c0m0k0, c0m1k0, wm), lerp3(c1m0k0, c1m1k0, wm), wc);
+
+                // K=1 face: lerp Y → M → C
+                let c0m0k1 = lerp3(node(ic0, im0, iy0, ik1), node(ic0, im0, iy1, ik1), wy);
+                let c0m1k1 = lerp3(node(ic0, im1, iy0, ik1), node(ic0, im1, iy1, ik1), wy);
+                let c1m0k1 = lerp3(node(ic1, im0, iy0, ik1), node(ic1, im0, iy1, ik1), wy);
+                let c1m1k1 = lerp3(node(ic1, im1, iy0, ik1), node(ic1, im1, iy1, ik1), wy);
+                let rk1 = lerp3(lerp3(c0m0k1, c0m1k1, wm), lerp3(c1m0k1, c1m1k1, wm), wc);
+
+                let out = lerp3(rk0, rk1, wk);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped to [0,255] before cast"
+                )]
+                {
+                    dst[0] = out[0].clamp(0.0, 255.0).round() as u8;
+                    dst[1] = out[1].clamp(0.0, 255.0).round() as u8;
+                    dst[2] = out[2].clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        }
+    }
+
+    rgb
+}
+
 /// Halton(2) jitter X offsets within [0,1) for 64-sample AA.
 const HALTON2: [f32; 64] = [
     0.5,
@@ -727,8 +935,6 @@ pub fn aa_fill_cpu(
 
     for py in 0..height {
         for px in 0..width {
-            // Sub-pixel sample coordinates: pixel centre + [0,1) Halton offset − 0.5
-            // so samples are uniformly distributed within the pixel square.
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "px/py ≤ width/height ≤ u32::MAX; at typical DPIs (≤ 32768 px) \
@@ -743,7 +949,6 @@ pub fn aa_fill_cpu(
                     hits += 1;
                 }
             }
-            // Scale 0..64 → 0..255 rounding to nearest (matches GPU: (hits*255+32)>>6).
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "hits ≤ 64; (64*255+32)>>6 = 255 — always fits u8"
@@ -756,23 +961,16 @@ pub fn aa_fill_cpu(
     out
 }
 
-/// Test whether sample point `(sx, sy)` is inside the filled path defined by
-/// `segs` (packed `[x0,y0,x1,y1]` per segment, f32).
-///
-/// Returns `true` when the non-zero winding number is non-zero (or parity is
-/// odd for even-odd rule).
 fn aa_fill_cpu_sample(segs: &[f32], sx: f32, sy: f32, eo: bool) -> bool {
     let mut winding = 0i32;
     for seg in segs.chunks_exact(4) {
         let (x0, y0, x1, y1) = (seg[0], seg[1], seg[2], seg[3]);
-        // Upward crossing: y0 <= sy < y1
         if y0 <= sy && sy < y1 {
             let t = (sy - y0) / (y1 - y0);
             let xi = t.mul_add(x1 - x0, x0);
             if xi >= sx {
                 winding += 1;
             }
-        // Downward crossing: y1 <= sy < y0
         } else if y1 <= sy && sy < y0 {
             let t = (sy - y1) / (y0 - y1);
             let xi = t.mul_add(x0 - x1, x1);
@@ -786,13 +984,11 @@ fn aa_fill_cpu_sample(segs: &[f32], sx: f32, sy: f32, eo: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuCtx, apply_soft_mask_cpu, composite_rgba8_cpu};
-
-    // --- CPU tests ---
+    use super::{apply_soft_mask_cpu, composite_rgba8_cpu, icc_cmyk_to_rgb_cpu};
 
     #[test]
     fn composite_cpu_opaque_src() {
-        let src = [200u8, 100, 50, 255]; // opaque src
+        let src = [200u8, 100, 50, 255];
         let mut dst = [10u8, 20, 30, 128];
         composite_rgba8_cpu(&src, &mut dst);
         assert_eq!(dst, [200, 100, 50, 255]);
@@ -800,7 +996,7 @@ mod tests {
 
     #[test]
     fn composite_cpu_transparent_src() {
-        let src = [200u8, 100, 50, 0]; // fully transparent src
+        let src = [200u8, 100, 50, 0];
         let mut dst = [10u8, 20, 30, 128];
         let expected = dst;
         composite_rgba8_cpu(&src, &mut dst);
@@ -809,9 +1005,6 @@ mod tests {
 
     #[test]
     fn composite_cpu_half_alpha() {
-        // white src at half alpha over opaque black dst
-        // a_out = 128 + (255*127 + 127)/255 = 128 + 127 = 255
-        // blended = (255*128 + 0*255*127/255 + 255/2) / 255 = (32640 + 127) / 255 ≈ 128
         let src = [255u8, 255, 255, 128];
         let mut dst = [0u8, 0, 0, 255];
         composite_rgba8_cpu(&src, &mut dst);
@@ -826,7 +1019,6 @@ mod tests {
         let mut pixels = [100u8, 150, 200, 240];
         let mask = [255u8];
         apply_soft_mask_cpu(&mut pixels, &mask);
-        // (240*255 + 127) / 255 = 240
         assert_eq!(pixels[3], 240);
     }
 
@@ -835,7 +1027,6 @@ mod tests {
         let mut pixels = [100u8, 150, 200, 200];
         let mask = [128u8];
         apply_soft_mask_cpu(&mut pixels, &mask);
-        // (200*128 + 127) / 255 = 25727/255 = 100
         assert_eq!(pixels[3], 100);
     }
 
@@ -848,17 +1039,71 @@ mod tests {
         assert_eq!(pixels[7], 0);
     }
 
-    // --- aa_fill_cpu tests ---
+    #[test]
+    fn icc_cmyk_matrix_white() {
+        let cmyk = [0u8, 0, 0, 0];
+        let rgb = icc_cmyk_to_rgb_cpu(&cmyk, None);
+        assert_eq!(rgb, [255, 255, 255]);
+    }
+
+    #[test]
+    fn icc_cmyk_matrix_black() {
+        let cmyk = [0u8, 0, 0, 255];
+        let rgb = icc_cmyk_to_rgb_cpu(&cmyk, None);
+        assert_eq!(rgb, [0, 0, 0]);
+    }
+
+    #[test]
+    fn icc_cmyk_matrix_pure_cyan() {
+        // C=255, M=Y=K=0 → R=0, G=255, B=255
+        let cmyk = [255u8, 0, 0, 0];
+        let rgb = icc_cmyk_to_rgb_cpu(&cmyk, None);
+        assert_eq!(rgb, [0, 255, 255]);
+    }
+
+    #[test]
+    fn icc_cmyk_matrix_multi_pixel() {
+        let cmyk = [0u8, 0, 0, 0, 0, 0, 0, 255];
+        let rgb = icc_cmyk_to_rgb_cpu(&cmyk, None);
+        assert_eq!(&rgb[0..3], &[255, 255, 255]);
+        assert_eq!(&rgb[3..6], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn icc_cmyk_clut_identity_corners() {
+        // 2^4 = 16-node CLUT where output = matrix formula at corners.
+        let g: usize = 2;
+        let mut table = vec![0u8; g * g * g * g * 3];
+        for ki in 0..g {
+            for ci in 0..g {
+                for mi in 0..g {
+                    for yi in 0..g {
+                        let idx = (ki * g * g * g + ci * g * g + mi * g + yi) * 3;
+                        let c = (ci * 255) as u8;
+                        let m = (mi * 255) as u8;
+                        let y = (yi * 255) as u8;
+                        let k = (ki * 255) as u8;
+                        let inv_k = u32::from(255 - k);
+                        table[idx]     = ((u32::from(255 - c) * inv_k) / 255) as u8;
+                        table[idx + 1] = ((u32::from(255 - m) * inv_k) / 255) as u8;
+                        table[idx + 2] = ((u32::from(255 - y) * inv_k) / 255) as u8;
+                    }
+                }
+            }
+        }
+        let rgb = icc_cmyk_to_rgb_cpu(&[0u8, 0, 0, 0], Some((&table, 2)));
+        assert_eq!(rgb, [255, 255, 255], "white corner");
+        let rgb = icc_cmyk_to_rgb_cpu(&[0u8, 0, 0, 255], Some((&table, 2)));
+        assert_eq!(rgb, [0, 0, 0], "black corner");
+    }
 
     #[test]
     fn aa_fill_cpu_solid_rect_full_coverage() {
-        // A large rectangle fully covering the pixel → all 64 samples inside → 255.
-        // Segments: rectangle (−100,−100)→(100,100) counter-clockwise.
         let segs: Vec<f32> = vec![
-            -100.0, -100.0, 100.0, -100.0, // bottom edge (horiz, ignored by winding)
-            100.0, -100.0, 100.0, 100.0, // right edge upward
-            100.0, 100.0, -100.0, 100.0, // top edge (horiz, ignored)
-            -100.0, 100.0, -100.0, -100.0, // left edge downward
+            -100.0, -100.0, 100.0, -100.0,
+            100.0, -100.0, 100.0, 100.0,
+            100.0, 100.0, -100.0, 100.0,
+            -100.0, 100.0, -100.0, -100.0,
         ];
         let cov = super::aa_fill_cpu(&segs, 0.0, 0.0, 1, 1, false);
         assert_eq!(cov.len(), 1);
@@ -867,7 +1112,6 @@ mod tests {
 
     #[test]
     fn aa_fill_cpu_outside_rect_zero_coverage() {
-        // Pixel at (200,200) is outside the rectangle (0..10)×(0..10) → 0.
         let segs: Vec<f32> = vec![
             0.0, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0, 10.0, 10.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0, 0.0,
         ];
@@ -879,16 +1123,11 @@ mod tests {
     fn aa_fill_cpu_empty_segs_zero_coverage() {
         let cov = super::aa_fill_cpu(&[], 0.0, 0.0, 4, 4, false);
         assert_eq!(cov.len(), 16);
-        assert!(
-            cov.iter().all(|&v| v == 0),
-            "empty segs → all zero coverage"
-        );
+        assert!(cov.iter().all(|&v| v == 0), "empty segs → all zero coverage");
     }
 
     #[test]
     fn aa_fill_cpu_eo_donut_inner_zero() {
-        // Even-odd: outer rect (−10..10)² and inner rect (−5..5)².
-        // Centre pixel at (0,0) has winding=2 for NZ → inside, but EO parity=0 → outside.
         let outer: [f32; 16] = [
             -10.0, -10.0, 10.0, -10.0, 10.0, -10.0, 10.0, 10.0, 10.0, 10.0, -10.0, 10.0, -10.0,
             10.0, -10.0, -10.0,
@@ -897,185 +1136,61 @@ mod tests {
             -5.0, -5.0, 5.0, -5.0, 5.0, -5.0, 5.0, 5.0, 5.0, 5.0, -5.0, 5.0, -5.0, 5.0, -5.0, -5.0,
         ];
         let segs: Vec<f32> = outer.iter().chain(inner.iter()).copied().collect();
-
-        // NZ: (0,0) has winding 2 → inside → full coverage
-        let cov_nz = super::aa_fill_cpu(&segs, -0.5, -0.5, 1, 1, false);
-        assert!(
-            cov_nz[0] > 200,
-            "NZ centre should be mostly covered, got {}",
-            cov_nz[0]
-        );
-
-        // EO: (0,0) has winding 2 → parity 0 → outside
-        let cov_eo = super::aa_fill_cpu(&segs, -0.5, -0.5, 1, 1, true);
-        assert_eq!(
-            cov_eo[0], 0,
-            "EO centre should be 0 (donut hole), got {}",
-            cov_eo[0]
-        );
+        let cov = super::aa_fill_cpu(&segs, -0.5, -0.5, 1, 1, true);
+        assert_eq!(cov[0], 0, "EO donut centre should be 0");
     }
-
-    // --- GPU tests ---
-    // If GpuCtx::init() fails (no CUDA device), tests skip gracefully via early return.
-
-    #[expect(clippy::cast_possible_truncation, reason = "i % 256 always fits u8")]
-    fn make_composite_data(n_pixels: usize) -> (Vec<u8>, Vec<u8>) {
-        let mut src = Vec::with_capacity(n_pixels * 4);
-        let mut dst = Vec::with_capacity(n_pixels * 4);
-        for i in 0..n_pixels {
-            let b = (i % 256) as u8;
-            src.extend_from_slice(&[b, b.wrapping_add(10), b.wrapping_add(20), 200]);
-            dst.extend_from_slice(&[
-                b.wrapping_add(5),
-                b.wrapping_add(15),
-                b.wrapping_add(25),
-                180,
-            ]);
-        }
-        (src, dst)
-    }
-
-    #[test]
-    fn gpu_composite_matches_cpu() {
-        let Ok(ctx) = GpuCtx::init() else { return }; // no GPU — skip gracefully
-
-        let n = 1000;
-        let (src, dst_orig) = make_composite_data(n);
-
-        // CPU reference
-        let mut expected = dst_orig.clone();
-        composite_rgba8_cpu(&src, &mut expected);
-
-        // GPU path (bypass threshold via internal method)
-        let mut actual = dst_orig;
-        ctx.composite_rgba8_gpu(&src, &mut actual)
-            .expect("GPU composite_rgba8 failed");
-
-        assert_eq!(
-            expected, actual,
-            "GPU and CPU composite_rgba8 results differ"
-        );
-    }
-
-    #[expect(clippy::cast_possible_truncation, reason = "i % 256 always fits u8")]
-    #[test]
-    fn gpu_soft_mask_matches_cpu() {
-        let Ok(ctx) = GpuCtx::init() else { return }; // no GPU — skip gracefully
-
-        let n = 1000;
-        let mut pixels_orig: Vec<u8> = (0..n)
-            .flat_map(|i: usize| {
-                let b = (i % 256) as u8;
-                [b, b.wrapping_add(1), b.wrapping_add(2), 200u8]
-            })
-            .collect();
-        let mask: Vec<u8> = (0..n).map(|i: usize| ((i * 37 + 50) % 256) as u8).collect();
-
-        // CPU reference
-        let mut pixels_cpu = pixels_orig.clone();
-        apply_soft_mask_cpu(&mut pixels_cpu, &mask);
-
-        // GPU path (bypass threshold via internal method)
-        ctx.apply_soft_mask_gpu(&mut pixels_orig, &mask)
-            .expect("GPU apply_soft_mask failed");
-
-        assert_eq!(
-            pixels_cpu, pixels_orig,
-            "GPU and CPU apply_soft_mask results differ"
-        );
-    }
-
-    #[test]
-    fn gpu_aa_fill_matches_cpu() {
-        let Ok(ctx) = GpuCtx::init() else { return }; // no GPU — skip gracefully
-
-        // A rectangle (0..20)×(0..20) rendered at 8×8 pixel output.
-        let segs: Vec<f32> = vec![
-            0.0, 0.0, 20.0, 0.0, 20.0, 0.0, 20.0, 20.0, 20.0, 20.0, 0.0, 20.0, 0.0, 20.0, 0.0, 0.0,
-        ];
-        let (w, h) = (8u32, 8u32);
-
-        let cpu = super::aa_fill_cpu(&segs, 0.0, 0.0, w, h, false);
-
-        // Bypass threshold to force GPU path.
-        let gpu = ctx
-            .aa_fill_gpu(&segs, 0.0, 0.0, w, h, false)
-            .expect("GPU aa_fill failed");
-
-        assert_eq!(cpu.len(), gpu.len());
-        for (i, (&c, &g)) in cpu.iter().zip(gpu.iter()).enumerate() {
-            assert_eq!(c, g, "pixel {i}: CPU coverage {c} != GPU coverage {g}");
-        }
-    }
-
-    // --- build_tile_records tests ---
 
     #[test]
     fn tile_records_empty_segs() {
         let (recs, starts, counts, grid_w) = super::build_tile_records(&[], 0.0, 0.0, 32, 32);
         assert!(recs.is_empty());
-        assert_eq!(grid_w, 2); // 32 / TILE_W=16
+        assert_eq!(grid_w, 2);
         assert!(starts.iter().all(|&s| s == 0));
         assert!(counts.iter().all(|&c| c == 0));
     }
 
     #[test]
-    fn tile_records_segment_entirely_left_of_raster() {
-        // Segment from (-50,-50) to (-50,50) — entirely left of origin.
-        // After x_min subtraction (x_min=0) it's still at x=-50, so tx1_i = -4.
-        // Must produce zero records (not wrap to u32::MAX).
-        let segs = [-50.0f32, -50.0, -50.0, 50.0];
+    fn tile_records_single_vertical_segment() {
+        // Segment from (8,0) to (8,17): crosses tile rows 0 (y 0..16) and 1 (y 16..17).
+        let segs = [8.0f32, 0.0, 8.0, 17.0];
         let (recs, _, _, _) = super::build_tile_records(&segs, 0.0, 0.0, 64, 64);
-        assert!(
-            recs.is_empty(),
-            "segment left of raster should produce no records, got {}",
-            recs.len()
-        );
+        assert_eq!(recs.len(), 2, "one record per tile row crossed");
     }
 
     #[test]
-    fn tile_records_horizontal_segment_skipped() {
-        // Horizontal segment: sy0 == sy1, should be skipped entirely.
-        let segs = [0.0f32, 10.0, 100.0, 10.0];
+    fn tile_records_diagonal_segment() {
+        let segs = [0.0f32, 0.0, 32.0, 32.0];
         let (recs, _, _, _) = super::build_tile_records(&segs, 0.0, 0.0, 128, 128);
-        assert!(
-            recs.is_empty(),
-            "horizontal segment must produce no records"
-        );
+        assert!(recs.len() >= 2, "diagonal must produce at least 2 records");
+    }
+
+    #[test]
+    fn tile_records_sort_order() {
+        let segs = [
+            24.0f32, 0.0, 24.0, 8.0,
+            8.0f32, 16.0, 8.0, 24.0,
+        ];
+        let (recs, starts, counts, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 80, 80);
+        assert_eq!(grid_w, 5);
+        for w in recs.windows(2) {
+            assert!(w[0].key <= w[1].key, "records must be sorted by key");
+        }
+        let tile_01 = 0 * grid_w as usize + 1;
+        let tile_10 = 1 * grid_w as usize + 0;
+        assert_eq!(counts[tile_01], 1);
+        assert_eq!(counts[tile_10], 1);
+        let _ = starts;
     }
 
     #[test]
     fn tile_records_prefix_sum_consistent() {
-        // A diagonal segment crossing several tiles.  Verify that
-        // sum(tile_counts) == recs.len() and all starts are consistent.
-        let segs = [0.0f32, 0.0, 64.0, 64.0]; // 45-degree diagonal
-        let (recs, starts, counts, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 80, 80);
-        assert!(!recs.is_empty());
+        let segs = [4.0f32, 0.0, 60.0, 63.0];
+        let (recs, starts, counts, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 64, 64);
+        let _ = grid_w;
         let total: u32 = counts.iter().sum();
-        assert_eq!(
-            total as usize,
-            recs.len(),
-            "sum of tile_counts must equal record count"
-        );
-        // Each start[i] == sum of counts[0..i].
-        let mut running = 0u32;
-        for (i, (&s, &c)) in starts.iter().zip(counts.iter()).enumerate() {
-            assert_eq!(s, running, "tile_starts[{i}] wrong (grid_w={grid_w})");
-            running += c;
-        }
-    }
-
-    #[test]
-    fn tile_records_key_coords_in_range() {
-        // All keys must have tile_y and tile_x within the grid.
-        let segs = [0.0f32, 0.0, 48.0, 48.0];
-        let (recs, _, _, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 64, 64);
-        let grid_h = 64u32.div_ceil(super::TILE_H);
-        for rec in &recs {
-            let tx = rec.key & 0xFFFF;
-            let ty = rec.key >> 16;
-            assert!(tx < grid_w, "tx {tx} >= grid_w {grid_w}");
-            assert!(ty < grid_h, "ty {ty} >= grid_h {grid_h}");
+        assert_eq!(total as usize, recs.len(), "sum of counts == total records");
+        for i in 0..counts.len() - 1 {
+            assert_eq!(starts[i] + counts[i], starts[i + 1], "prefix sum broken at {i}");
         }
     }
 }

@@ -1663,6 +1663,8 @@ impl<'doc> PageRenderer<'doc> {
             name,
             #[cfg(feature = "nvjpeg")]
             self.nvjpeg.as_mut(),
+            #[cfg(feature = "gpu-icc")]
+            self.gpu_ctx.as_deref(),
         );
         if let Some(img) = img {
             self.blit_image(&img);
