@@ -86,7 +86,7 @@ const NVJPEG_OUTPUT_Y: nvjpegOutputFormat_t = 2;
 /// `NVJPEG_OUTPUT_RGBI` — interleaved RGB output to `channel[0]`, 3 bytes per pixel.
 const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 
-/// Backend selection for `nvjpegCreate`.
+/// Backend selection for `nvjpegCreateEx`.
 ///
 /// `NVJPEG_BACKEND_HARDWARE` uses the on-die JPEG engine present on Turing+
 /// GPUs (including Blackwell RTX 5070).  It only supports baseline single-scan
@@ -97,8 +97,8 @@ const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 type nvjpegBackend_t = i32;
 
 /// Auto-select the best available backend (typically `HYBRID`).
-/// Not referenced in code — `nvjpegCreateSimple` selects it implicitly.
-#[expect(dead_code, reason = "documents the numeric value; nvjpegCreateSimple selects DEFAULT implicitly")]
+/// Used in `create_handle` when the HARDWARE backend is unavailable, passed
+/// to `nvjpegCreateEx` explicitly rather than through `nvjpegCreateSimple`.
 const NVJPEG_BACKEND_DEFAULT: nvjpegBackend_t = 0;
 /// Hardware JPEG decode engine — fastest for baseline JPEGs on Turing+/Blackwell.
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;
@@ -169,14 +169,21 @@ unsafe extern "C" {
 
 // NVJPEGAPI on Linux is the default calling convention — no special attribute.
 unsafe extern "C" {
-    /// Create a library handle selecting a specific backend.
-    /// Pass `NULL` for both allocator parameters to use the default CUDA allocators.
-    fn nvjpegCreate(
+    /// Create a library handle with explicit backend and custom allocator support.
+    ///
+    /// Prefer this over the deprecated `nvjpegCreate`.  Pass `NULL` for both
+    /// allocator parameters to use the default CUDA allocators (`cudaMalloc` /
+    /// `cudaFreeHost`).  `flags` must be 0.
+    ///
+    /// Signature (nvjpeg.h, CUDA 12.8):
+    /// `nvjpegCreateEx(backend, dev_allocator, pinned_allocator, flags, handle)`
+    fn nvjpegCreateEx(
         backend: nvjpegBackend_t,
         dev_allocator: *mut std::ffi::c_void,
+        pinned_allocator: *mut std::ffi::c_void,
+        flags: u32,
         handle: *mut nvjpegHandle_t,
     ) -> nvjpegStatus_t;
-    fn nvjpegCreateSimple(handle: *mut nvjpegHandle_t) -> nvjpegStatus_t;
     fn nvjpegDestroy(handle: nvjpegHandle_t) -> nvjpegStatus_t;
     fn nvjpegJpegStateCreate(
         handle: nvjpegHandle_t,
@@ -271,6 +278,7 @@ impl std::fmt::Display for NvJpegError {
             }
             Self::Overflow => write!(f, "pixel buffer size overflow (image too large)"),
             Self::CudaError(code) => {
+                // Codes from cuda.h (CUDA 12.8); confirmed against installed headers.
                 let name = match *code {
                     1   => "CUDA_ERROR_INVALID_VALUE",
                     2   => "CUDA_ERROR_OUT_OF_MEMORY",
@@ -280,7 +288,11 @@ impl std::fmt::Display for NvJpegError {
                     101 => "CUDA_ERROR_INVALID_DEVICE",
                     200 => "CUDA_ERROR_INVALID_IMAGE",
                     201 => "CUDA_ERROR_INVALID_CONTEXT",
-                    209 => "CUDA_ERROR_MAP_FAILED",
+                    205 => "CUDA_ERROR_MAP_FAILED",
+                    209 => "CUDA_ERROR_NO_BINARY_FOR_GPU",
+                    218 => "CUDA_ERROR_INVALID_PTX",
+                    400 => "CUDA_ERROR_INVALID_HANDLE",
+                    600 => "CUDA_ERROR_NOT_READY",
                     700 => "CUDA_ERROR_ILLEGAL_ADDRESS",
                     _   => "CUDA_ERROR_UNKNOWN",
                 };
@@ -455,13 +467,20 @@ impl NvJpeg {
     /// Returns the handle and a flag indicating which backend was selected.
     fn create_handle() -> Result<(nvjpegHandle_t, bool)> {
         let mut handle: nvjpegHandle_t = ptr::null_mut();
-        // SAFETY: nvjpegCreate initialises a fresh library handle with the chosen backend.
+        // SAFETY: nvjpegCreateEx initialises a fresh library handle with the chosen backend.
         // NULL allocator pointers request the default CUDA device/pinned allocators.
+        // flags must be 0 (reserved; any other value returns NVJPEG_STATUS_INVALID_PARAMETER).
         let hw_status = unsafe {
-            nvjpegCreate(NVJPEG_BACKEND_HARDWARE, ptr::null_mut(), ptr::addr_of_mut!(handle))
+            nvjpegCreateEx(
+                NVJPEG_BACKEND_HARDWARE,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::addr_of_mut!(handle),
+            )
         };
         if hw_status == NVJPEG_STATUS_SUCCESS {
-            assert!(!handle.is_null(), "nvjpegCreate(HARDWARE) succeeded but returned null handle");
+            assert!(!handle.is_null(), "nvjpegCreateEx(HARDWARE) succeeded but returned null handle");
             return Ok((handle, true));
         }
 
@@ -469,12 +488,20 @@ impl NvJpeg {
             "nvJPEG HARDWARE backend unavailable ({hw_status}), falling back to DEFAULT backend"
         );
         handle = ptr::null_mut();
-        // SAFETY: nvjpegCreateSimple uses NVJPEG_BACKEND_DEFAULT with default allocators.
-        let status = unsafe { nvjpegCreateSimple(ptr::addr_of_mut!(handle)) };
+        // SAFETY: same as above; NVJPEG_BACKEND_DEFAULT with default allocators.
+        let status = unsafe {
+            nvjpegCreateEx(
+                NVJPEG_BACKEND_DEFAULT,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::addr_of_mut!(handle),
+            )
+        };
         if status != NVJPEG_STATUS_SUCCESS {
             return Err(NvJpegError::NvjpegStatus(status));
         }
-        assert!(!handle.is_null(), "nvjpegCreateSimple succeeded but returned null handle");
+        assert!(!handle.is_null(), "nvjpegCreateEx(DEFAULT) succeeded but returned null handle");
         Ok((handle, false))
     }
 
@@ -536,12 +563,20 @@ impl NvJpeg {
         self.state = ptr::null_mut();
 
         let mut handle: nvjpegHandle_t = ptr::null_mut();
-        // SAFETY: nvjpegCreateSimple uses NVJPEG_BACKEND_DEFAULT.
-        let status = unsafe { nvjpegCreateSimple(ptr::addr_of_mut!(handle)) };
+        // SAFETY: nvjpegCreateEx with DEFAULT backend and null allocators is always valid.
+        let status = unsafe {
+            nvjpegCreateEx(
+                NVJPEG_BACKEND_DEFAULT,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::addr_of_mut!(handle),
+            )
+        };
         if status != NVJPEG_STATUS_SUCCESS {
             return Err(NvJpegError::NvjpegStatus(status));
         }
-        assert!(!handle.is_null(), "nvjpegCreateSimple succeeded but returned null handle");
+        assert!(!handle.is_null(), "nvjpegCreateEx(DEFAULT) succeeded but returned null handle");
 
         let mut state: nvjpegJpegState_t = ptr::null_mut();
         // SAFETY: handle is valid.
@@ -682,7 +717,7 @@ impl Drop for NvJpeg {
 /// Manages its own CUDA primary context and stream via the raw CUDA driver API
 /// (`libcuda.so`), completely independent of any higher-level CUDA wrapper such
 /// as cudarc.  This is necessary because nvJPEG captures the CUDA context that
-/// is current at `nvjpegCreate` time; mixing cudarc's context management with
+/// is current at `nvjpegCreateEx` time; mixing cudarc's context management with
 /// nvJPEG's internal context causes `CUDA_ERROR_INVALID_CONTEXT (201)` on every
 /// subsequent `cuStreamSynchronize`.
 ///
@@ -714,7 +749,7 @@ impl NvJpegDecoder {
     ///
     /// `ordinal` is the GPU index (0 for the first GPU).  Follows the verified
     /// C initialisation sequence: `cuInit → cuDeviceGet →
-    /// cuDevicePrimaryCtxRetain → cuCtxSetCurrent → cuStreamCreate → nvjpegCreate`.
+    /// cuDevicePrimaryCtxRetain → cuCtxSetCurrent → cuStreamCreate → nvjpegCreateEx`.
     ///
     /// # Errors
     ///
@@ -772,7 +807,7 @@ impl NvJpegDecoder {
         }
         assert!(!stream.is_null(), "cuStreamCreate returned null despite success");
 
-        // Step 6 — initialise nvJPEG.  nvjpegCreate captures the current context
+        // Step 6 — initialise nvJPEG.  nvjpegCreateEx captures the current context
         // (set in step 4), so the handle and stream now share the same context.
         let dec = NvJpeg::new().inspect_err(|_| {
             // SAFETY: stream was successfully created; no work enqueued yet.

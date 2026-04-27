@@ -165,31 +165,18 @@ const MOVDIR64B_THRESHOLD_PX: usize = 256;
 #[cfg(target_arch = "x86_64")]
 /// Query CPUID leaf 7, subleaf 0, ECX bit 28 to detect `movdir64b`.
 ///
+/// Uses `std::arch::x86_64::__cpuid_count` (stable since 1.27) which handles
+/// the rbx save/restore internally on all supported platforms.
 /// Result is cached in a `OnceLock` so CPUID is executed at most once per process.
 fn has_movdir64b() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        let ecx: u32;
-        // SAFETY: CPUID with leaf 7 / subleaf 0 is always valid on x86-64.
-        // We save and restore rbx manually because it is callee-saved and
-        // CPUID overwrites it; the compiler does not know about this clobber
-        // unless we handle it ourselves.
-        unsafe {
-            std::arch::asm!(
-                "push rbx",
-                "cpuid",
-                "pop rbx",
-                inout("eax") 7u32 => _,
-                inout("ecx") 0u32 => ecx, // subleaf 0
-                out("edx") _,
-                // preserves_flags: CPUID does not modify EFLAGS.
-                // nostack is intentionally absent: push/pop rbx uses the stack.
-                options(preserves_flags),
-            );
-        }
+        // leaf 7 / subleaf 0: on CPUs that don't support leaf 7 this returns
+        // all-zeros, which correctly produces `false`.
+        let result = std::arch::x86_64::__cpuid_count(7, 0);
         // ECX bit 28 = MOVDIR64B (Intel SDM vol. 2A, CPUID.07H.00H:ECX[28])
-        (ecx >> 28) & 1 != 0
+        (result.ecx >> 28) & 1 != 0
     })
 }
 

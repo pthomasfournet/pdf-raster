@@ -6,7 +6,7 @@
 //!
 //! # Acceleration
 //!
-//! - **SSE4.1** (x86-64): expand two source bytes → 16 output bytes per
+//! - **SSE2** (x86-64): expand two source bytes → 16 output bytes per
 //!   iteration using bit-isolating masks and `_mm_cmpeq_epi8`.
 //! - **Scalar**: one byte at a time, 8 output bytes per iteration.
 
@@ -21,19 +21,24 @@ pub(super) fn unpack_mono_row_scalar(packed: &[u8], width: usize, out: &mut [u8]
     }
 }
 
-// ── SSE4.1 path ───────────────────────────────────────────────────────────────
+// ── SSE2 path ─────────────────────────────────────────────────────────────────
+//
+// All intrinsics used here (_mm_and_si128, _mm_cmpeq_epi8, _mm_set_epi8,
+// _mm_set1_epi8, _mm_setzero_si128, _mm_storeu_si128, _mm_xor_si128) are
+// SSE2, stable in std::arch since Rust 1.27.  No SSE4.1 instructions are
+// actually emitted; the gate was overstated when _mm_blendv_epi8 was removed.
 
 #[cfg(target_arch = "x86_64")]
-/// Expand two packed bytes into 16 output bytes via SSE4.1.
+/// Expand two packed bytes into 16 output bytes via SSE2.
 ///
 /// `b0` and `b1` are consecutive packed bytes (b0 first in the bit stream).
 /// Writes 16 bytes into `out`.
 ///
 /// # Safety
 ///
-/// Caller must ensure SSE4.1 is available and `out` has room for ≥ 16 bytes.
-#[target_feature(enable = "sse4.1")]
-unsafe fn expand_two_bytes_sse41(b0: u8, b1: u8, out: &mut [u8]) {
+/// Caller must ensure SSE2 is available and `out` has room for ≥ 16 bytes.
+#[target_feature(enable = "sse2")]
+unsafe fn expand_two_bytes_sse2(b0: u8, b1: u8, out: &mut [u8]) {
     use std::arch::x86_64::{
         __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_set_epi8, _mm_set1_epi8, _mm_setzero_si128,
         _mm_storeu_si128, _mm_xor_si128,
@@ -42,7 +47,7 @@ unsafe fn expand_two_bytes_sse41(b0: u8, b1: u8, out: &mut [u8]) {
 
     // SAFETY (entire block): all SIMD intrinsics here are either pure register
     // operations (no memory access) or write to `out`, which has ≥ 16 bytes.
-    // The `sse4.1` feature is guaranteed by the `#[target_feature]` attribute.
+    // The `sse2` feature is guaranteed by the `#[target_feature]` attribute.
     unsafe {
         // Bit-isolation masks for the 8 bit positions, MSB first.
         // _mm_set_epi8 fills from lane 15 (arg 0) down to lane 0 (arg 15).
@@ -101,20 +106,20 @@ unsafe fn expand_two_bytes_sse41(b0: u8, b1: u8, out: &mut [u8]) {
 }
 
 #[cfg(target_arch = "x86_64")]
-/// SSE4.1 row unpacker: processes pairs of packed bytes (16 pixels) at a time.
+/// SSE2 row unpacker: processes pairs of packed bytes (16 pixels) at a time.
 ///
 /// # Safety
 ///
-/// Caller must ensure SSE4.1 is available.
-#[target_feature(enable = "sse4.1")]
-unsafe fn unpack_mono_row_sse41(packed: &[u8], width: usize, out: &mut [u8]) {
+/// Caller must ensure SSE2 is available.
+#[target_feature(enable = "sse2")]
+unsafe fn unpack_mono_row_sse2(packed: &[u8], width: usize, out: &mut [u8]) {
     // Process 16 pixels (2 packed bytes) at a time.
     let mut px = 0usize;
     while px + 16 <= width {
         let b0 = packed[px / 8];
         let b1 = packed[px / 8 + 1];
         // SAFETY: px + 16 ≤ width ≤ out.len(); out[px..] has ≥ 16 bytes.
-        unsafe { expand_two_bytes_sse41(b0, b1, &mut out[px..]) };
+        unsafe { expand_two_bytes_sse2(b0, b1, &mut out[px..]) };
         px += 16;
     }
     // Scalar tail for the remaining pixels.
@@ -130,15 +135,15 @@ unsafe fn unpack_mono_row_sse41(packed: &[u8], width: usize, out: &mut [u8]) {
 /// Expand `width` MSB-first packed bits from `packed` into `out`.
 ///
 /// Each output byte is `0xFF` if the corresponding bit was set, `0x00` otherwise.
-/// Uses SSE4.1 when available at runtime, otherwise scalar.
+/// Uses SSE2 when available at runtime (always true on x86-64), otherwise scalar.
 pub fn unpack_mono_row(packed: &[u8], width: usize, out: &mut [u8]) {
     debug_assert!(out.len() >= width);
     debug_assert!(packed.len() >= width.div_ceil(8));
 
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("sse4.1") && width >= 16 {
-        // SAFETY: we just confirmed SSE4.1 is available.
-        unsafe { unpack_mono_row_sse41(packed, width, out) };
+    if is_x86_feature_detected!("sse2") && width >= 16 {
+        // SAFETY: we just confirmed SSE2 is available.
+        unsafe { unpack_mono_row_sse2(packed, width, out) };
         return;
     }
 
@@ -224,26 +229,26 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn sse41_expand_two_bytes_known() {
-        if !is_x86_feature_detected!("sse4.1") {
+    fn sse2_expand_two_bytes_known() {
+        if !is_x86_feature_detected!("sse2") {
             return;
         }
         // b0 = 0xAA = 0b1010_1010 → pixels 0..8: FF,00,FF,00,FF,00,FF,00
         // b1 = 0x55 = 0b0101_0101 → pixels 8..16: 00,FF,00,FF,00,FF,00,FF
         let mut out = [0u8; 16];
-        // SAFETY: we just confirmed SSE4.1 is available and out has 16 bytes.
-        unsafe { expand_two_bytes_sse41(0xAA, 0x55, &mut out) };
+        // SAFETY: we just confirmed SSE2 is available and out has 16 bytes.
+        unsafe { expand_two_bytes_sse2(0xAA, 0x55, &mut out) };
         let expected = [
             0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
             0x00, 0xFF,
         ];
-        assert_eq!(out, expected, "SSE4.1 two-byte expand mismatch");
+        assert_eq!(out, expected, "SSE2 two-byte expand mismatch");
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn sse41_matches_scalar_random() {
-        if !is_x86_feature_detected!("sse4.1") {
+    fn sse2_matches_scalar_random() {
+        if !is_x86_feature_detected!("sse2") {
             return;
         }
         let packed = [0b1001_1010u8, 0b0110_0101u8, 0b1111_0000u8, 0b0000_1111u8];
@@ -251,8 +256,8 @@ mod tests {
         let mut expected = vec![0u8; width];
         unpack_mono_row_scalar(&packed, width, &mut expected);
         let mut got = vec![0u8; width];
-        // SAFETY: SSE4.1 is available.
-        unsafe { unpack_mono_row_sse41(&packed, width, &mut got) };
-        assert_eq!(got, expected, "SSE4.1 row unpack mismatch");
+        // SAFETY: SSE2 is available.
+        unsafe { unpack_mono_row_sse2(&packed, width, &mut got) };
+        assert_eq!(got, expected, "SSE2 row unpack mismatch");
     }
 }
