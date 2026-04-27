@@ -96,13 +96,15 @@ unsafe impl DeviceRepr for TileRecord {}
 ///
 /// # Panics
 ///
-/// Panics if `segs.len()` is not a multiple of 4.
+/// Panics if `segs.len()` is not a multiple of 4, or if `width` or `height`
+/// require more than 65535 tiles in either dimension (i.e. exceed `65535 × TILE_W`
+/// or `65535 × TILE_H` pixels) — the sort key packs tile coordinates into 16 bits each.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "tile indices derived from bbox-clamped coordinates; within u16 range for realistic pages; f32 precision sufficient for tile geometry"
+    reason = "tile indices are bounds-checked to fit u16; f32 precision sufficient for tile geometry at realistic page sizes"
 )]
 pub fn build_tile_records(
     segs: &[f32],
@@ -113,11 +115,16 @@ pub fn build_tile_records(
 ) -> (Vec<TileRecord>, Vec<u32>, Vec<u32>, u32) {
     assert!(
         segs.len().is_multiple_of(4),
-        "segs.len() must be a multiple of 4"
+        "segs.len() must be a multiple of 4 (got {})",
+        segs.len()
     );
 
     let grid_w = width.div_ceil(TILE_W);
     let grid_h = height.div_ceil(TILE_H);
+    assert!(
+        grid_w <= 0xFFFF && grid_h <= 0xFFFF,
+        "raster too large: grid {grid_w}×{grid_h} tiles exceeds 16-bit tile key range",
+    );
     let n_tiles = (grid_w * grid_h) as usize;
 
     let mut records: Vec<TileRecord> = Vec::new();
@@ -130,12 +137,12 @@ pub fn build_tile_records(
             seg[3] - y_min,
         );
 
-        // Skip horizontal segments.
+        // Skip horizontal segments (no winding contribution).
         if (sy1 - sy0).abs() < 1e-6 {
             continue;
         }
 
-        // Enforce y0 ≤ y1 (record sign for winding).
+        // Enforce sy0 ≤ sy1; record crossing direction as sign.
         let sign = if sy0 > sy1 {
             std::mem::swap(&mut sx0, &mut sx1);
             std::mem::swap(&mut sy0, &mut sy1);
@@ -153,32 +160,47 @@ pub fn build_tile_records(
             continue;
         }
 
-        // Emit one record per tile row the segment crosses.
+        // First and last tile rows the segment (after clamping) crosses.
+        // Subtract a small epsilon from ey1 so a segment ending exactly on a
+        // tile boundary doesn't bleed into the next tile row.
         let ty0 = (ey0 / TILE_H as f32).floor() as u32;
         let ty1 = ((ey1 - 1e-6).max(0.0) / TILE_H as f32).floor() as u32;
 
         for ty in ty0..=ty1.min(grid_h - 1) {
             let tile_top = (ty * TILE_H) as f32;
             let tile_bot = tile_top + TILE_H as f32;
+
+            // Segment y-extent clipped to this tile row, in tile-local coords.
             let seg_y0_tile = ey0.max(tile_top) - tile_top;
             let seg_y1_tile = ey1.min(tile_bot) - tile_top;
             if seg_y0_tile >= seg_y1_tile {
                 continue;
             }
 
+            // Global x where the segment enters this tile row (at the clipped ey0).
             let x_enter_global = dxdy.mul_add(ey0.max(tile_top) - sy0, sx0);
-            let x_at_y0 = x_enter_global;
-            let x_at_y1 = dxdy.mul_add(seg_y1_tile - seg_y0_tile, x_enter_global);
+            // Global x at the exit of this tile row.
+            let x_at_exit = dxdy.mul_add(seg_y1_tile - seg_y0_tile, x_enter_global);
 
-            // Tile columns this segment crosses.
-            let xl = x_at_y0.min(x_at_y1);
-            let xr = x_at_y0.max(x_at_y1);
-            let tx0 = ((xl / TILE_W as f32).floor() as i32).max(0) as u32;
-            let tx1 = ((xr / TILE_W as f32).floor() as i32).min(grid_w.cast_signed() - 1) as u32;
+            // Tile columns spanned by this segment within the tile row.
+            let xl = x_enter_global.min(x_at_exit);
+            let xr = x_enter_global.max(x_at_exit);
 
-            for tx in tx0..=tx1.min(grid_w - 1) {
+            // Compute tx0/tx1 as i32 first to handle negative x safely, then
+            // clamp to [0, grid_w-1].  A negative tx1 means the segment is
+            // entirely left of the raster — skip the whole tile row.
+            let tx0_i = (xl / TILE_W as f32).floor() as i32;
+            let tx1_i = (xr / TILE_W as f32).floor() as i32;
+            if tx1_i < 0 {
+                continue;
+            }
+            let tx0 = tx0_i.max(0) as u32;
+            let tx1 = (tx1_i as u32).min(grid_w - 1);
+
+            for tx in tx0..=tx1 {
                 records.push(TileRecord {
                     key: (ty << 16) | tx,
+                    // tile-local x: subtract this tile column's left edge.
                     x_enter: x_enter_global - (tx * TILE_W) as f32,
                     dxdy,
                     y0_tile: seg_y0_tile,
@@ -191,25 +213,30 @@ pub fn build_tile_records(
         }
     }
 
-    // Sort records by (tile_y, tile_x) key.
+    // Sort records by (tile_y, tile_x) key — CPU sort is faster than CUB radix
+    // sort for typical PDF segment counts (O(100–1000) records).
     records.sort_unstable_by_key(|r| r.key);
 
-    // Build prefix-sum index (tile_starts / tile_counts).
+    // Build exclusive prefix-sum index: tile_starts[i] = first record index for tile i.
     let mut tile_starts = vec![0u32; n_tiles];
     let mut tile_counts = vec![0u32; n_tiles];
 
-    for (i, rec) in records.iter().enumerate() {
+    for rec in &records {
         let tile_idx = ((rec.key >> 16) * grid_w + (rec.key & 0xFFFF)) as usize;
+        // tile_idx is always < n_tiles: key components are clamped to [0, grid_w/h-1]
+        // at record-build time above.
+        debug_assert!(tile_idx < n_tiles, "record key out of tile grid range");
         if tile_idx < n_tiles {
             tile_counts[tile_idx] += 1;
         }
-        let _ = i;
     }
 
     let mut running = 0u32;
     for (start, count) in tile_starts.iter_mut().zip(tile_counts.iter()) {
         *start = running;
-        running += count;
+        running = running
+            .checked_add(*count)
+            .expect("tile record count overflows u32");
     }
 
     (records, tile_starts, tile_counts, grid_w)
@@ -410,16 +437,17 @@ impl GpuCtx {
     /// This is the GPU equivalent of the CPU scanline scanner but uses analytical
     /// per-pixel coverage (vello-style trapezoid integrals) rather than sampling.
     ///
+    /// All coordinates in `records` are already tile-local (produced by
+    /// [`build_tile_records`]); no origin offset is applied in the kernel.
+    ///
     /// # Arguments
     ///
     /// - `records` — tile records sorted by `(tile_y << 16 | tile_x)`, one per
-    ///   (segment, tile-row) crossing.  Build with [`build_tile_records`] and sort
-    ///   before calling.  Must match the layout of `TileRecord` in `tile_fill.cu`.
+    ///   (segment, tile-row) crossing.  Build with [`build_tile_records`].
     /// - `tile_starts` / `tile_counts` — prefix-sum index into `records` per flat
     ///   tile index `tile_y * grid_w + tile_x`.  Both have length `grid_w * grid_h`.
-    /// - `grid_w`, `grid_h` — tile grid dimensions (`ceil(width / TILE_W)` each).
-    /// - `x_min`, `y_min` — fill bbox origin in device pixels.
-    /// - `width`, `height` — fill bbox size in device pixels.
+    /// - `grid_w` — number of tiles in the x direction (`width.div_ceil(TILE_W)`).
+    /// - `width` / `height` — fill bbox size in device pixels (coverage buffer dims).
     /// - `eo` — `true` for even-odd fill rule, `false` for non-zero winding.
     ///
     /// # Returns
@@ -432,8 +460,7 @@ impl GpuCtx {
     ///
     /// # Panics
     ///
-    /// Panics if `tile_starts.len() != tile_counts.len()` or if `width * height`
-    /// overflows `u32::MAX`.
+    /// Panics if `tile_starts.len() != tile_counts.len()`.
     #[allow(clippy::too_many_arguments)]
     pub fn tile_fill(
         &self,
@@ -441,8 +468,6 @@ impl GpuCtx {
         tile_starts: &[u32],
         tile_counts: &[u32],
         grid_w: u32,
-        x_min: f32,
-        y_min: f32,
         width: u32,
         height: u32,
         eo: bool,
@@ -480,13 +505,12 @@ impl GpuCtx {
         let _ = builder.arg(&d_tile_starts);
         let _ = builder.arg(&d_tile_counts);
         let _ = builder.arg(&grid_w);
-        let _ = builder.arg(&x_min);
-        let _ = builder.arg(&y_min);
         let _ = builder.arg(&width);
         let _ = builder.arg(&height);
         let _ = builder.arg(&eo_int);
         let _ = builder.arg(&mut d_coverage);
-        // SAFETY: kernel arguments match the PTX signature; bounds verified above.
+        // SAFETY: kernel arguments match the PTX signature exactly (8 args, no
+        // x_min/y_min — coords are tile-local from build_tile_records).
         let _ = unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
@@ -981,6 +1005,77 @@ mod tests {
         assert_eq!(cpu.len(), gpu.len());
         for (i, (&c, &g)) in cpu.iter().zip(gpu.iter()).enumerate() {
             assert_eq!(c, g, "pixel {i}: CPU coverage {c} != GPU coverage {g}");
+        }
+    }
+
+    // --- build_tile_records tests ---
+
+    #[test]
+    fn tile_records_empty_segs() {
+        let (recs, starts, counts, grid_w) = super::build_tile_records(&[], 0.0, 0.0, 32, 32);
+        assert!(recs.is_empty());
+        assert_eq!(grid_w, 2); // 32 / TILE_W=16
+        assert!(starts.iter().all(|&s| s == 0));
+        assert!(counts.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn tile_records_segment_entirely_left_of_raster() {
+        // Segment from (-50,-50) to (-50,50) — entirely left of origin.
+        // After x_min subtraction (x_min=0) it's still at x=-50, so tx1_i = -4.
+        // Must produce zero records (not wrap to u32::MAX).
+        let segs = [-50.0f32, -50.0, -50.0, 50.0];
+        let (recs, _, _, _) = super::build_tile_records(&segs, 0.0, 0.0, 64, 64);
+        assert!(
+            recs.is_empty(),
+            "segment left of raster should produce no records, got {}",
+            recs.len()
+        );
+    }
+
+    #[test]
+    fn tile_records_horizontal_segment_skipped() {
+        // Horizontal segment: sy0 == sy1, should be skipped entirely.
+        let segs = [0.0f32, 10.0, 100.0, 10.0];
+        let (recs, _, _, _) = super::build_tile_records(&segs, 0.0, 0.0, 128, 128);
+        assert!(
+            recs.is_empty(),
+            "horizontal segment must produce no records"
+        );
+    }
+
+    #[test]
+    fn tile_records_prefix_sum_consistent() {
+        // A diagonal segment crossing several tiles.  Verify that
+        // sum(tile_counts) == recs.len() and all starts are consistent.
+        let segs = [0.0f32, 0.0, 64.0, 64.0]; // 45-degree diagonal
+        let (recs, starts, counts, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 80, 80);
+        assert!(!recs.is_empty());
+        let total: u32 = counts.iter().sum();
+        assert_eq!(
+            total as usize,
+            recs.len(),
+            "sum of tile_counts must equal record count"
+        );
+        // Each start[i] == sum of counts[0..i].
+        let mut running = 0u32;
+        for (i, (&s, &c)) in starts.iter().zip(counts.iter()).enumerate() {
+            assert_eq!(s, running, "tile_starts[{i}] wrong (grid_w={grid_w})");
+            running += c;
+        }
+    }
+
+    #[test]
+    fn tile_records_key_coords_in_range() {
+        // All keys must have tile_y and tile_x within the grid.
+        let segs = [0.0f32, 0.0, 48.0, 48.0];
+        let (recs, _, _, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 64, 64);
+        let grid_h = 64u32.div_ceil(super::TILE_H);
+        for rec in &recs {
+            let tx = rec.key & 0xFFFF;
+            let ty = rec.key >> 16;
+            assert!(tx < grid_w, "tx {tx} >= grid_w {grid_w}");
+            assert!(ty < grid_h, "ty {ty} >= grid_h {grid_h}");
         }
     }
 }
