@@ -18,13 +18,17 @@
 //! - Text showing: `Tj TJ ' "` (via `FreeType` through font crate)
 //! - Font encoding `Differences` array — resolved via Adobe Glyph List
 //!
+//! - Type 0 / `CIDFont` composite fonts — `Encoding` CMap (including
+//!   embedded stream CMaps and `Identity-H`/`V`), `CIDToGIDMap`, `DW`/`W`
+//!   advance widths, and multi-byte character code iteration
+//!
 //! # Not yet implemented
 //!
 //! - Image `XObjects`: `JBIG2Decode` filter
 //! - Shading (`sh`) — requires shading resource lookup
 //! - `ExtGState` blend mode (`BM`) — only `Normal` is currently mapped
-//! - Type 0 / `CIDFont` composite fonts (phase 2)
-//! - Type 3 paint-procedure fonts (phase 2)
+//! - Type 0 named CMaps other than `Identity-H`/`V` (e.g. `/GB-EUC-H`)
+//! - Type 3 paint-procedure fonts
 
 mod text_ops;
 
@@ -508,29 +512,82 @@ impl<'doc> PageRenderer<'doc> {
                 return;
             };
 
-            for &byte in bytes {
-                let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
+            // Iterate character codes.  Simple fonts use one byte per character;
+            // Type 0 composite fonts use 1–4 bytes determined by the Encoding CMap.
+            let cid_enc = descriptor.cid_encoding.as_ref();
 
-                if let Some(bmp) = face.make_glyph(u32::from(byte), 0) {
-                    records.push(GlyphRecord {
-                        pen_x,
-                        pen_y,
-                        x_off: bmp.x_off,
-                        y_off: bmp.y_off,
-                        width: bmp.width,
-                        height: bmp.height,
-                        aa: bmp.aa,
-                        data: bmp.data,
-                    });
+            if let Some(enc) = cid_enc {
+                // Type 0 composite font: decode via CMap then map CID → GID.
+                let code_bytes = enc
+                    .encoding_cmap
+                    .as_ref()
+                    .map_or(2, |cm| cm.code_bytes);
+
+                let mut pos = 0usize;
+                while pos + usize::from(code_bytes) <= bytes.len() {
+                    let mut char_code = 0u32;
+                    for &b in &bytes[pos..pos + usize::from(code_bytes)] {
+                        char_code = (char_code << 8) | u32::from(b);
+                    }
+                    pos += usize::from(code_bytes);
+
+                    let gid = enc.code_to_gid(char_code);
+                    let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
+
+                    if let Some(bmp) = face.make_glyph(gid, 0) {
+                        records.push(GlyphRecord {
+                            pen_x,
+                            pen_y,
+                            x_off: bmp.x_off,
+                            y_off: bmp.y_off,
+                            width: bmp.width,
+                            height: bmp.height,
+                            aa: bmp.aa,
+                            data: bmp.data,
+                        });
+                    }
+
+                    // Advance in CID-font design units (PDF §9.7.4.3).
+                    // CID widths are in thousandths of a text-space unit (same
+                    // scale as simple-font Widths), so the advance formula is
+                    // identical: w / 1000 * font_size.
+                    let cid_width = enc.width_for_cid(enc
+                        .encoding_cmap
+                        .as_ref()
+                        .and_then(|cm| cm.map.get(&char_code).copied())
+                        .unwrap_or(char_code));
+                    let advance_glyph = f64::from(cid_width) / 1000.0;
+                    let tx_adv = (advance_glyph * font_size + char_spacing) * horiz_scaling;
+                    let [a, b_m, c, d, e, f] = tm;
+                    tm = [a, b_m, c, d, e + tx_adv * a, f + tx_adv * b_m];
                 }
+            } else {
+                // Simple font: one byte per character code.
+                for &byte in bytes {
+                    let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
 
-                // Advance regardless of whether the glyph rendered — PDF §9.4.4
-                // requires the pen to advance even for missing/invisible glyphs.
-                let advance_glyph = face.glyph_advance(u32::from(byte)).max(0.0);
-                let extra = if byte == b' ' { word_spacing } else { 0.0 };
-                let tx_adv = (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
-                let [a, b_m, c, d, e, f] = tm;
-                tm = [a, b_m, c, d, e + tx_adv * a, f + tx_adv * b_m];
+                    if let Some(bmp) = face.make_glyph(u32::from(byte), 0) {
+                        records.push(GlyphRecord {
+                            pen_x,
+                            pen_y,
+                            x_off: bmp.x_off,
+                            y_off: bmp.y_off,
+                            width: bmp.width,
+                            height: bmp.height,
+                            aa: bmp.aa,
+                            data: bmp.data,
+                        });
+                    }
+
+                    // Advance regardless of whether the glyph rendered — PDF §9.4.4
+                    // requires the pen to advance even for missing/invisible glyphs.
+                    let advance_glyph = face.glyph_advance(u32::from(byte)).max(0.0);
+                    let extra = if byte == b' ' { word_spacing } else { 0.0 };
+                    let tx_adv =
+                        (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
+                    let [a, b_m, c, d, e, f] = tm;
+                    tm = [a, b_m, c, d, e + tx_adv * a, f + tx_adv * b_m];
+                }
             }
         } // font_cache borrow released here
 

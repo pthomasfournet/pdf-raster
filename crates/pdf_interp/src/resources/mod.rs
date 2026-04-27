@@ -13,6 +13,7 @@
 //! stays stateless and easy to test.
 
 pub(crate) mod dict_ext;
+pub mod cmap;
 pub mod font;
 pub mod image;
 pub mod shading;

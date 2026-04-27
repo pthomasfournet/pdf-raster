@@ -25,6 +25,7 @@
 
 use lopdf::{Dictionary, Document, Object};
 
+use crate::resources::cmap::{CMap, parse_cmap};
 use crate::resources::dict_ext::DictExt;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -38,6 +39,76 @@ pub enum PdfFontKind {
     TrueType,
     /// Anything else (OpenType-CFF, CID, unknown).
     Other,
+}
+
+/// CID encoding information for Type 0 composite fonts.
+///
+/// Type 0 fonts encode character codes as 1–4 byte sequences.  The `Encoding`
+/// CMap maps byte sequences to CIDs; the `CIDToGIDMap` (or identity) then maps
+/// CIDs to FreeType GIDs.
+#[derive(Debug)]
+pub struct CidEncoding {
+    /// Decoded `Encoding` CMap — maps char codes to CIDs.
+    ///
+    /// `None` when no CMap stream could be parsed (Identity-H/V or missing);
+    /// in that case charcode == CID (identity mapping).
+    pub encoding_cmap: Option<CMap>,
+
+    /// Precomputed CID → GID lookup from `CIDToGIDMap`.
+    ///
+    /// `None` means Identity (CID == GID, the common case for OpenType-CFF and
+    /// TrueType CIDFonts).
+    pub cid_to_gid: Option<Vec<u32>>,
+
+    /// Default advance width in thousandths of a text-space unit (`DW` key).
+    pub default_width: i32,
+
+    /// Explicit per-CID advance widths from the `W` array.
+    ///
+    /// Stored as `(first_cid, [widths…])` segments matching the PDF `W` format.
+    pub widths: Vec<(u32, Vec<i32>)>,
+}
+
+impl CidEncoding {
+    /// Return the advance width for `cid` in thousandths of a text-space unit.
+    ///
+    /// Searches the explicit `W` table first; falls back to `default_width`.
+    pub fn width_for_cid(&self, cid: u32) -> i32 {
+        for (first, ws) in &self.widths {
+            if cid >= *first {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "index bounded by W segment length, which is always < usize::MAX"
+                )]
+                let idx = (cid - first) as usize;
+                if idx < ws.len() {
+                    return ws[idx];
+                }
+            }
+        }
+        self.default_width
+    }
+
+    /// Map a character code to a GID, applying both `encoding_cmap` and
+    /// `cid_to_gid`.
+    ///
+    /// Returns 0 (`.notdef`) when the code is absent from either map.
+    pub fn code_to_gid(&self, char_code: u32) -> u32 {
+        // Step 1: char code → CID.
+        let cid = match &self.encoding_cmap {
+            Some(cmap) => cmap.map.get(&char_code).copied().unwrap_or(0),
+            None => char_code, // Identity-H/V or no CMap.
+        };
+
+        // Step 2: CID → GID.
+        match &self.cid_to_gid {
+            Some(table) => {
+                let idx = cid as usize;
+                if idx < table.len() { table[idx] } else { 0 }
+            }
+            None => cid, // Identity CIDToGIDMap.
+        }
+    }
 }
 
 /// Everything needed to load a `FreeType` face for one PDF font resource.
@@ -61,6 +132,9 @@ pub struct FontDescriptor {
     /// Used by [`FontCache`] to resolve names → Unicode → GID via `FreeType`'s
     /// active charmap at face-load time.
     pub differences: Box<[Option<Box<str>>; 256]>,
+    /// CID encoding for Type 0 composite fonts.  `Some` when `Subtype` is
+    /// `Type0`; `None` for all simple fonts (Type1, TrueType, MMType1).
+    pub cid_encoding: Option<CidEncoding>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -71,6 +145,12 @@ pub struct FontDescriptor {
 /// default so the renderer can always produce *something*, even if it is wrong.
 #[must_use]
 pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
+    let subtype = dict.get_name(b"Subtype").unwrap_or(b"");
+
+    if matches!(subtype, b"Type0") {
+        return resolve_type0_font(doc, dict);
+    }
+
     let kind = classify_kind(dict);
     let bytes = extract_bytes(doc, dict);
     let (first_char, widths) = extract_widths(dict);
@@ -83,6 +163,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         first_char,
         code_to_gid,
         differences,
+        cid_encoding: None,
     }
 }
 
@@ -108,20 +189,7 @@ fn classify_kind(dict: &Dictionary) -> PdfFontKind {
 ///
 /// Returns `None` if nothing is embedded.
 fn extract_bytes(doc: &Document, dict: &Dictionary) -> Option<Vec<u8>> {
-    let fd = resolve_fd(doc, dict)?;
-
-    let kind = classify_kind(dict);
-    let priority: &[&[u8]] = match kind {
-        PdfFontKind::Type1 => &[b"FontFile", b"FontFile3"],
-        _ => &[b"FontFile2", b"FontFile3", b"FontFile"],
-    };
-
-    for key in priority {
-        if let Some(bytes) = read_stream(doc, fd, key) {
-            return Some(bytes);
-        }
-    }
-    None
+    extract_bytes_with_kind(doc, dict, classify_kind(dict))
 }
 
 /// Dereference the `FontDescriptor` entry, which is almost always an indirect
@@ -214,7 +282,7 @@ fn empty_differences() -> Box<[Option<Box<str>>; 256]> {
         .expect("256-element Vec must convert to [_; 256]")
 }
 
-/// Extract encoding information from the font dictionary.
+/// Extract encoding information from a simple (non-Type0) font dictionary.
 ///
 /// Returns `(code_to_gid, differences)`:
 /// - `code_to_gid`: non-empty only for encodings fully resolved at PDF-parse
@@ -231,12 +299,6 @@ fn extract_encoding(
     dict: &Dictionary,
     _kind: PdfFontKind,
 ) -> (Vec<u32>, Box<[Option<Box<str>>; 256]>) {
-    // Type 0 / CID composite fonts: descendant font carries the GID map.
-    let subtype = dict.get_name(b"Subtype").unwrap_or(b"");
-    if matches!(subtype, b"Type0") {
-        return (vec![], empty_differences());
-    }
-
     let Some(encoding) = dict.get(b"Encoding").ok() else {
         return (vec![], empty_differences());
     };
@@ -253,6 +315,280 @@ fn extract_encoding(
         // Named standard encoding or anything else: `FreeType` handles char → GID.
         _ => (vec![], empty_differences()),
     }
+}
+
+// ── Type 0 / CIDFont extraction ───────────────────────────────────────────────
+
+/// Resolve a `Type0` composite font dictionary into a [`FontDescriptor`].
+///
+/// # Structure
+///
+/// ```text
+/// Type0 dict
+///   Encoding: /Identity-H | /Identity-V | stream (CMap)
+///   DescendantFonts: [ref]          ← array with exactly one entry
+///     Subtype: CIDFontType0 | CIDFontType2
+///     FontDescriptor: ref           ← embedded font bytes live here
+///     DW: integer                   ← default advance width
+///     W: array                      ← per-CID widths
+///     CIDToGIDMap: /Identity | ref  ← CID → GID (CIDFontType2 only)
+///   ToUnicode: stream               ← optional; not used for rendering
+/// ```
+fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
+    // 1. Encoding CMap: maps char codes to CIDs.
+    let encoding_cmap = extract_type0_encoding_cmap(doc, dict);
+
+    // 2. DescendantFonts: the actual CIDFont dict with bytes and widths.
+    let descendant = extract_descendant(doc, dict);
+
+    // 3. Extract bytes from the CIDFont's FontDescriptor.
+    let bytes = descendant
+        .as_ref()
+        .and_then(|d| extract_bytes_from_descendant(doc, d));
+
+    // 4. CIDToGIDMap (CIDFontType2 only; CIDFontType0/CFF uses identity).
+    let cid_to_gid = descendant
+        .as_ref()
+        .and_then(|d| extract_cid_to_gid(doc, d));
+
+    // 5. CIDFont metrics: DW and W.
+    let (default_width, widths) = descendant
+        .as_ref()
+        .map(|d| extract_cid_widths(d))
+        .unwrap_or((1000, vec![]));
+
+    // 6. Determine font kind from CIDFont Subtype.
+    let kind = descendant
+        .as_ref()
+        .map(|d| classify_kind(d))
+        .unwrap_or(PdfFontKind::Other);
+
+    FontDescriptor {
+        kind,
+        bytes,
+        widths: vec![],
+        first_char: 0,
+        code_to_gid: vec![],
+        differences: empty_differences(),
+        cid_encoding: Some(CidEncoding {
+            encoding_cmap,
+            cid_to_gid,
+            default_width,
+            widths,
+        }),
+    }
+}
+
+/// Parse the `Encoding` entry of a Type 0 font into a [`CMap`].
+///
+/// Identity-H and Identity-V are predefined CMaps where char code == CID.
+/// We represent these as `None` (identity).  Any stream reference is parsed.
+fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap> {
+    let enc = dict.get(b"Encoding").ok()?;
+    match enc {
+        // Named CMaps: Identity-H / Identity-V are identity (None = passthrough).
+        Object::Name(n) if n == b"Identity-H" || n == b"Identity-V" => None,
+        // Named non-identity CMaps (e.g. /GB-EUC-H) — we cannot parse these
+        // without a CMap resource database.  Fall through to None and treat as
+        // identity, which will produce wrong glyphs for CJK but not crash.
+        Object::Name(n) => {
+            log::warn!(
+                "font: named CMap /{} is not Identity — text may render incorrectly",
+                String::from_utf8_lossy(n)
+            );
+            None
+        }
+        // Stream reference — parse the CMap.
+        Object::Reference(id) => {
+            let obj = doc.get_object(*id).ok()?;
+            let stream = obj.as_stream().ok()?;
+            let content = stream.decompressed_content().ok()?;
+            let cmap = parse_cmap(&content);
+            if cmap.is_none() {
+                log::warn!("font: Type0 Encoding CMap stream could not be parsed");
+            }
+            cmap
+        }
+        _ => {
+            log::warn!("font: Type0 Encoding is not a Name or Reference — treating as identity");
+            None
+        }
+    }
+}
+
+/// Resolve the first entry of `DescendantFonts` to a dictionary.
+///
+/// The PDF spec requires exactly one descendant; we take the first and warn if
+/// the array is absent or empty.
+fn extract_descendant<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a Dictionary> {
+    let arr_obj = dict.get(b"DescendantFonts").ok()?;
+    let arr = match arr_obj {
+        Object::Array(a) => a,
+        Object::Reference(id) => {
+            let obj = doc.get_object(*id).ok()?;
+            return obj.as_array().ok()?.first().and_then(|o| resolve_obj_to_dict(doc, o));
+        }
+        _ => return None,
+    };
+
+    let first = arr.first()?;
+    resolve_obj_to_dict(doc, first)
+}
+
+/// Dereference an `Object` (possibly a `Reference`) to a `&Dictionary`.
+fn resolve_obj_to_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
+    match obj {
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        Object::Dictionary(d) => Some(d),
+        _ => None,
+    }
+}
+
+/// Extract embedded font bytes from the `FontDescriptor` of a CIDFont dict.
+fn extract_bytes_from_descendant(doc: &Document, descendant: &Dictionary) -> Option<Vec<u8>> {
+    // CIDFont kind determines file key priority.
+    let kind = classify_kind(descendant);
+    extract_bytes_with_kind(doc, descendant, kind)
+}
+
+/// Shared byte-extraction logic that works on any font dict (direct or descendant).
+fn extract_bytes_with_kind(doc: &Document, dict: &Dictionary, kind: PdfFontKind) -> Option<Vec<u8>> {
+    let fd = resolve_fd(doc, dict)?;
+    let priority: &[&[u8]] = match kind {
+        PdfFontKind::Type1 => &[b"FontFile", b"FontFile3"],
+        _ => &[b"FontFile2", b"FontFile3", b"FontFile"],
+    };
+    for key in priority {
+        if let Some(bytes) = read_stream(doc, fd, key) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Parse the `CIDToGIDMap` stream from a CIDFontType2 (TrueType) descendant.
+///
+/// The map is a byte array of 2-byte big-endian GIDs indexed by CID.
+/// `/Identity` (or absent) means CID == GID; we represent that as `None`.
+fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32>> {
+    let obj = descendant.get(b"CIDToGIDMap").ok()?;
+    match obj {
+        Object::Name(n) if n == b"Identity" => None,
+        Object::Name(_) => None,
+        Object::Reference(id) => {
+            let stream_obj = doc.get_object(*id).ok()?;
+            let stream = stream_obj.as_stream().ok()?;
+            let bytes = stream.decompressed_content().ok()?;
+            // CIDToGIDMap is pairs of bytes: GID[cid] = (bytes[2*cid] << 8) | bytes[2*cid+1].
+            if bytes.len() % 2 != 0 {
+                log::warn!(
+                    "font: CIDToGIDMap stream length {} is odd — ignoring",
+                    bytes.len()
+                );
+                return None;
+            }
+            let table: Vec<u32> = bytes
+                .chunks_exact(2)
+                .map(|pair| u32::from(pair[0]) << 8 | u32::from(pair[1]))
+                .collect();
+            Some(table)
+        }
+        _ => None,
+    }
+}
+
+/// Parse `DW` and `W` from a CIDFont dictionary.
+///
+/// Returns `(default_width, segments)` where segments match the PDF `W` format:
+/// `[first_cid, [w0, w1, …]]` (the `c [w...]` variant only; the `c1 c2 w`
+/// range variant is also handled).
+fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "DW is a glyph advance in design units, always small; safe to i32"
+    )]
+    let dw = dict
+        .get_i64(b"DW")
+        .map_or(1000, |v| v as i32);
+
+    let Some(w_arr) = dict
+        .get(b"W")
+        .ok()
+        .and_then(|o| o.as_array().ok())
+    else {
+        return (dw, vec![]);
+    };
+
+    let mut segments: Vec<(u32, Vec<i32>)> = Vec::new();
+    let mut i = 0;
+
+    while i < w_arr.len() {
+        // Each segment starts with a CID integer.
+        let Some(first_cid) = w_arr[i].as_i64().ok() else {
+            i += 1;
+            continue;
+        };
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "first_cid is a CID value (>= 0, < 65536)"
+        )]
+        let first_cid = first_cid as u32;
+        i += 1;
+
+        if i >= w_arr.len() {
+            break;
+        }
+
+        match &w_arr[i] {
+            // `first_cid [w0 w1 …]` form.
+            Object::Array(ws) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "PDF glyph widths are in [0, 4096]"
+                )]
+                let widths: Vec<i32> = ws
+                    .iter()
+                    .map(|o| o.as_i64().map_or(0, |v| v as i32))
+                    .collect();
+                segments.push((first_cid, widths));
+                i += 1;
+            }
+            // `first_cid last_cid w` form.
+            Object::Integer(last_cid) => {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "last_cid >= 0, bounded by PDF spec (< 65536)"
+                )]
+                let last_cid = *last_cid as u32;
+                i += 1;
+                if i >= w_arr.len() {
+                    break;
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "PDF glyph width in [0, 4096]"
+                )]
+                let w = w_arr[i].as_i64().map_or(0, |v| v as i32);
+                i += 1;
+
+                if last_cid >= first_cid && last_cid - first_cid < 0x1_0000 {
+                    let count = (last_cid - first_cid + 1) as usize;
+                    segments.push((first_cid, vec![w; count]));
+                } else {
+                    log::warn!(
+                        "font: W array degenerate CID range {first_cid}–{last_cid}, skipping"
+                    );
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    (dw, segments)
 }
 
 /// Parse the `Differences` array from a dictionary-form `Encoding` object.

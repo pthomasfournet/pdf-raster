@@ -1,0 +1,9 @@
+[build]
+# Cap parallel jobs to half the logical CPUs to avoid RAM spikes during
+# debug builds (each codegen unit needs ~300–600 MiB of LLVM working set).
+jobs = 6
+
+[profile.test]
+# Single codegen unit per crate in test builds.  The test binary for
+# pdf_interp grows to ~96 MiB with the default split; one CGU halves that.
+codegen-units = 1
