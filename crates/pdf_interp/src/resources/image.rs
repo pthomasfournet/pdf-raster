@@ -111,9 +111,9 @@ pub fn resolve_image(
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
 
     let mut img = match filter.as_deref() {
-        None => decode_raw(stream.content.as_slice(), w, h, is_mask, &stream.dict),
+        None => decode_raw(doc, stream.content.as_slice(), w, h, is_mask, &stream.dict),
         Some("FlateDecode") => match stream.decompressed_content() {
-            Ok(data) => decode_raw(&data, w, h, is_mask, &stream.dict),
+            Ok(data) => decode_raw(doc, &data, w, h, is_mask, &stream.dict),
             Err(e) => {
                 log::warn!("image: FlateDecode decompression failed: {e}");
                 None
@@ -144,9 +144,7 @@ pub fn resolve_image(
             // mask would paint the image's colour over a large area it should
             // not cover (e.g. a solid-colour overlay that is transparent
             // everywhere the mask is zero).  Skip the image instead.
-            log::debug!(
-                "image: skipping image — SMask (object {smask_id:?}) could not be decoded"
-            );
+            log::debug!("image: skipping image — SMask (object {smask_id:?}) could not be decoded");
             return None;
         }
     }
@@ -271,15 +269,24 @@ fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(usize::try_from(dst_w * dst_h).unwrap_or(0));
     for dy in 0..dh {
         // sy = floor(dy * src_h / dst_h); since dy < dst_h, result < src_h ≤ u32::MAX.
-        #[expect(clippy::cast_possible_truncation, reason = "dy < dst_h ⟹ sy < src_h ≤ 65536")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dy < dst_h ⟹ sy < src_h ≤ 65536"
+        )]
         let sy = (u64::from(dy) * src_h / dst_h) as u32;
         for dx in 0..dw {
             // sx = floor(dx * src_w / dst_w); since dx < dst_w, result < src_w ≤ u32::MAX.
-            #[expect(clippy::cast_possible_truncation, reason = "dx < dst_w ⟹ sx < src_w ≤ 65536")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "dx < dst_w ⟹ sx < src_w ≤ 65536"
+            )]
             let sx = (u64::from(dx) * src_w / dst_w) as u32;
             // sy * src_w + sx < src_h * src_w ≤ 65536² = 2³², fits in usize on any target
             // (pdf_interp only runs on 32-bit+ systems; usize is at least 32 bits).
-            #[expect(clippy::cast_possible_truncation, reason = "index < src_h*src_w ≤ 65536² = 4G; usize ≥ 32 bits")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "index < src_h*src_w ≤ 65536² = 4G; usize ≥ 32 bits"
+            )]
             out.push(src[(u64::from(sy) * src_w + u64::from(sx)) as usize]);
         }
     }
@@ -338,9 +345,14 @@ fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
 
 /// Expand raw (already-decompressed) pixel bytes into a normalised form.
 ///
-/// Handles 1-bit-per-sample images (packed MSB first) by expanding to 1 byte
-/// per pixel.  All other bit depths must be 8.
+/// Handles:
+/// - 1-bit-per-sample images (packed MSB first) → expanded to 1 byte/pixel
+/// - 8-bit images: device colour spaces, `ICCBased`, `Indexed`, CMYK
+///
+/// CMYK images are converted to RGB inline (255=full ink → 0=white convention).
+/// `Indexed` images are expanded through the palette to Gray or RGB.
 fn decode_raw(
+    doc: &Document,
     data: &[u8],
     width: u32,
     height: u32,
@@ -349,56 +361,208 @@ fn decode_raw(
 ) -> Option<ImageDescriptor> {
     let bpc = dict.get_i64(b"BitsPerComponent").unwrap_or(8);
 
-    let cs = if is_mask {
-        ImageColorSpace::Mask
-    } else {
-        color_space_from_dict(dict)
-    };
+    if is_mask {
+        // Stencil mask — always 1 byte per pixel, no colour space conversion.
+        return match bpc {
+            1 => {
+                let pixels = expand_1bpp(data, width, height)?;
+                Some(ImageDescriptor {
+                    width,
+                    height,
+                    color_space: ImageColorSpace::Mask,
+                    data: pixels,
+                    smask: None,
+                })
+            }
+            8 => {
+                let expected = (width as usize).checked_mul(height as usize)?;
+                if data.len() < expected {
+                    log::warn!(
+                        "image: mask raw data too short ({} bytes, need {expected})",
+                        data.len()
+                    );
+                    return None;
+                }
+                Some(ImageDescriptor {
+                    width,
+                    height,
+                    color_space: ImageColorSpace::Mask,
+                    data: data[..expected].to_vec(),
+                    smask: None,
+                })
+            }
+            other => {
+                log::debug!("image: mask {other} bpc not yet implemented");
+                None
+            }
+        };
+    }
+
+    // Read raw ColorSpace object to detect Indexed before resolving.
+    let cs_obj = dict.get(b"ColorSpace").ok();
+
+    // Check for Indexed colour space: [/Indexed base hival lookup].
+    // These images carry 1-byte palette indices regardless of the base space's
+    // component count, so they need special handling before the general path.
+    if let Some(Object::Array(arr)) = cs_obj
+        && arr
+            .first()
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|n| n == b"Indexed")
+    {
+        return decode_raw_indexed(doc, data, width, height, bpc, arr);
+    }
+
+    // General path: resolve the colour space to Gray / Rgb / Cmyk.
+    let resolved = cs_obj.map_or(ResolvedCs::Gray, |o| resolve_cs(doc, o));
 
     match bpc {
         1 => {
-            // Packed 1-bit: expand to one byte per pixel.
             let pixels = expand_1bpp(data, width, height)?;
             Some(ImageDescriptor {
                 width,
                 height,
-                color_space: cs,
+                color_space: resolved.to_image_cs(),
                 data: pixels,
                 smask: None,
             })
         }
-        8 => {
-            let components: usize = match cs {
-                ImageColorSpace::Gray | ImageColorSpace::Mask => 1,
-                ImageColorSpace::Rgb => 3,
-            };
-            let expected = (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|p| p.checked_mul(components));
-            let Some(expected) = expected else {
-                log::warn!("image: dimensions overflow usize ({width}×{height}×{components})");
-                return None;
-            };
-            if data.len() < expected {
-                log::warn!(
-                    "image: raw data too short ({} bytes, need {expected} for {width}×{height}×{components})",
-                    data.len()
-                );
-                return None;
-            }
-            Some(ImageDescriptor {
-                width,
-                height,
-                color_space: cs,
-                data: data[..expected].to_vec(),
-                smask: None,
-            })
-        }
+        8 => decode_raw_8bpp(data, width, height, resolved),
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
             None
         }
     }
+}
+
+/// Decode an 8-bpp non-indexed raw image for `resolved` colour space.
+///
+/// CMYK images are converted to RGB.  Gray and RGB are returned as-is.
+fn decode_raw_8bpp(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    resolved: ResolvedCs,
+) -> Option<ImageDescriptor> {
+    let components = resolved.components();
+    let npixels = (width as usize).checked_mul(height as usize)?;
+    let expected = npixels.checked_mul(components)?;
+
+    if data.len() < expected {
+        log::warn!(
+            "image: raw data too short ({} bytes, need {expected} for {width}×{height}×{components})",
+            data.len()
+        );
+        return None;
+    }
+
+    let raw = &data[..expected];
+
+    if resolved == ResolvedCs::Cmyk {
+        // Raw PDF CMYK: 255 = full ink, 0 = no ink.
+        let rgb_cap = npixels.checked_mul(3)?;
+        let mut rgb = Vec::with_capacity(rgb_cap);
+        for chunk in raw.chunks_exact(4) {
+            let (r, g, b) = cmyk_raw_to_rgb_triple(chunk[0], chunk[1], chunk[2], chunk[3]);
+            rgb.push(r);
+            rgb.push(g);
+            rgb.push(b);
+        }
+        Some(ImageDescriptor {
+            width,
+            height,
+            color_space: ImageColorSpace::Rgb,
+            data: rgb,
+            smask: None,
+        })
+    } else {
+        Some(ImageDescriptor {
+            width,
+            height,
+            color_space: resolved.to_image_cs(),
+            data: raw.to_vec(),
+            smask: None,
+        })
+    }
+}
+
+/// Decode a raw `Indexed` colour space image.
+///
+/// The raw data carries 1-byte palette indices (regardless of `bpc`; only 8-bit
+/// Indexed images are supported here — 1-bpp Indexed is extraordinarily rare
+/// and not worth the complexity).  Each index is expanded through the palette.
+fn decode_raw_indexed(
+    doc: &Document,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    bpc: i64,
+    cs_arr: &[Object],
+) -> Option<ImageDescriptor> {
+    if bpc != 8 {
+        log::debug!("image: Indexed with {bpc} bpc not yet implemented");
+        return None;
+    }
+
+    let (palette, out_cs) = indexed_palette(doc, cs_arr)?;
+    let stride = out_cs.components();
+
+    let npixels = (width as usize).checked_mul(height as usize)?;
+    if data.len() < npixels {
+        log::warn!(
+            "image: Indexed raw data too short ({} bytes, need {npixels})",
+            data.len()
+        );
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(npixels.checked_mul(stride)?);
+    let n_entries = palette.len() / stride;
+    for &idx in &data[..npixels] {
+        let i = usize::from(idx).min(n_entries.saturating_sub(1));
+        out.extend_from_slice(&palette[i * stride..(i + 1) * stride]);
+    }
+
+    Some(ImageDescriptor {
+        width,
+        height,
+        color_space: out_cs.to_image_cs(),
+        data: out,
+        smask: None,
+    })
+}
+
+/// Convert raw PDF CMYK (255 = full ink) to RGB.
+///
+/// Direct ink density convention (non-JPEG): 255 = full ink, 0 = no ink.
+/// Equivalent to: subtract each channel and K from 255, then apply K attenuation.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "CMYK and RGB are conventional single-letter colour channel names"
+)]
+#[inline]
+fn cmyk_raw_to_rgb_triple(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
+    // Direct form: 255 = full ink → invert to get reflectance, then attenuate by K.
+    // Both c and k are ink densities; (255-c) and (255-k) are reflectances (0..=255).
+    // Intermediate product fits in u32: 255*255 = 65025.
+    let inv_k = u32::from(255 - k);
+    // Each intermediate x ≤ 255 * 255 = 65025; x / 255 ≤ 255 — cast is lossless.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "(255 - ch) * (255 - k) / 255 ≤ 255"
+    )]
+    let r = ((u32::from(255 - c) * inv_k) / 255) as u8;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "(255 - ch) * (255 - k) / 255 ≤ 255"
+    )]
+    let g = ((u32::from(255 - m) * inv_k) / 255) as u8;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "(255 - ch) * (255 - k) / 255 ≤ 255"
+    )]
+    let b = ((u32::from(255 - y) * inv_k) / 255) as u8;
+    (r, g, b)
 }
 
 /// Expand 1-bit-per-pixel packed data (MSB first) to 1 byte per pixel.
@@ -799,23 +963,357 @@ const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
 
 // ── Color space helpers ───────────────────────────────────────────────────────
 
-fn color_space_from_dict(dict: &Dictionary) -> ImageColorSpace {
-    let name = dict.get(b"ColorSpace").ok().and_then(cs_name);
-    match name.as_deref() {
-        Some("DeviceRGB" | "CalRGB" | "sRGB") => ImageColorSpace::Rgb,
-        _ => ImageColorSpace::Gray, // DeviceGray, CalGray, ICCBased, unknown, or absent
+/// Internal resolved colour space — what the decode path will actually produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedCs {
+    Gray,
+    Rgb,
+    /// Raw CMYK (4 bytes/pixel, 255 = full ink).  Converted to RGB before returning.
+    Cmyk,
+}
+
+impl ResolvedCs {
+    const fn components(self) -> usize {
+        match self {
+            Self::Gray => 1,
+            Self::Rgb => 3,
+            Self::Cmyk => 4,
+        }
+    }
+
+    const fn to_image_cs(self) -> ImageColorSpace {
+        match self {
+            Self::Gray => ImageColorSpace::Gray,
+            Self::Rgb | Self::Cmyk => ImageColorSpace::Rgb,
+        }
     }
 }
 
-/// Extract the colour-space name from a `ColorSpace` value (either a `Name` or
-/// the first element of an array).
-fn cs_name(obj: &Object) -> Option<Cow<'_, str>> {
+/// Resolve the `ColorSpace` entry of an image stream dictionary to one of the
+/// three device spaces the blit path understands.
+///
+/// Handles:
+/// - `DeviceGray` / `CalGray`        → Gray
+/// - `DeviceRGB`  / `CalRGB` / `sRGB` → Rgb
+/// - `DeviceCMYK`                    → Cmyk (caller converts to RGB)
+/// - `ICCBased`   → inspect `N` in the ICC stream dict (1→Gray, 3→Rgb, 4→Cmyk)
+/// - `Indexed`    → resolve the base space; Indexed expansion happens separately
+/// - `Separation` / `DeviceN`        → approximate as Gray (tint 0 = full ink = dark)
+/// - unknown / absent                → Gray (safe fallback)
+fn resolve_cs<'a>(doc: &'a Document, cs_obj: &'a Object) -> ResolvedCs {
+    match cs_obj {
+        Object::Name(n) => device_cs_name(n),
+        Object::Array(arr) => {
+            let name = arr.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
+            match name {
+                b"DeviceRGB" | b"CalRGB" => ResolvedCs::Rgb,
+                b"DeviceCMYK" => ResolvedCs::Cmyk,
+                b"ICCBased" => {
+                    // Second element is a reference to the ICC stream.
+                    let stream_dict = arr.get(1).and_then(|o| resolve_obj_dict(doc, o));
+                    icc_based_cs(stream_dict)
+                }
+                b"Indexed" => {
+                    // [/Indexed base hival lookup] — base is element 1.
+                    arr.get(1).map_or(ResolvedCs::Gray, |o| resolve_cs(doc, o))
+                }
+                // DeviceGray, CalGray, Separation, DeviceN, and unknown → Gray.
+                _ => {
+                    if !matches!(
+                        name,
+                        b"DeviceGray" | b"CalGray" | b"Separation" | b"DeviceN"
+                    ) {
+                        log::debug!(
+                            "image: unknown array colour space {:?} — treating as Gray",
+                            String::from_utf8_lossy(name)
+                        );
+                    }
+                    ResolvedCs::Gray
+                }
+            }
+        }
+        _ => ResolvedCs::Gray,
+    }
+}
+
+fn device_cs_name(name: &[u8]) -> ResolvedCs {
+    match name {
+        b"DeviceRGB" | b"CalRGB" => ResolvedCs::Rgb,
+        b"DeviceCMYK" => ResolvedCs::Cmyk,
+        _ => ResolvedCs::Gray,
+    }
+}
+
+/// Inspect the `N` key in an `ICCBased` stream dict to determine the colour space.
+fn icc_based_cs(stream_dict: Option<&Dictionary>) -> ResolvedCs {
+    match stream_dict.and_then(|d| d.get_i64(b"N")) {
+        Some(1) => ResolvedCs::Gray,
+        Some(3) => ResolvedCs::Rgb,
+        Some(4) => ResolvedCs::Cmyk,
+        Some(n) => {
+            log::debug!("image: ICCBased with N={n}, treating as Gray");
+            ResolvedCs::Gray
+        }
+        None => {
+            log::debug!("image: ICCBased missing N, treating as Gray");
+            ResolvedCs::Gray
+        }
+    }
+}
+
+/// Dereference a direct or indirect object to a `&Dictionary`.
+///
+/// For `ICCBased`, the second element of the array is a reference to a stream;
+/// we need the stream's dictionary, not the stream body.
+fn resolve_obj_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
     match obj {
-        Object::Name(n) => Some(String::from_utf8_lossy(n)),
-        Object::Array(arr) => arr
-            .first()
-            .and_then(|o| o.as_name().ok())
-            .map(String::from_utf8_lossy),
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(id) => {
+            // get_object borrows from `doc` with lifetime 'a, so the returned
+            // reference outlives this function.
+            match doc.get_object(*id).ok()? {
+                Object::Stream(s) => Some(&s.dict),
+                Object::Dictionary(d) => Some(d),
+                _ => None,
+            }
+        }
         _ => None,
+    }
+}
+
+/// Try to decode an `Indexed` colour space lookup table into a flat RGB/Gray
+/// byte palette indexed by the 1-byte pixel values (0..=hival, inclusive).
+///
+/// Returns `(palette, base_cs)` where `palette[i * stride .. i * stride + stride]`
+/// is the colour for index `i`, and `stride` is 1 for Gray or 3 for Rgb.
+///
+/// Returns `None` if the array is malformed or the lookup stream cannot be read.
+fn indexed_palette<'a>(doc: &'a Document, cs_arr: &'a [Object]) -> Option<(Vec<u8>, ResolvedCs)> {
+    // [/Indexed base hival lookup]
+    if cs_arr.len() < 4 {
+        return None;
+    }
+    let base = resolve_cs(doc, &cs_arr[1]);
+    // hival is clamped to [0, 255] before converting — cast is lossless.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "clamped to [0, 255] — never negative"
+    )]
+    let hival = cs_arr[2].as_i64().ok()?.clamp(0, 255) as usize;
+    let n_entries = hival + 1;
+
+    // Lookup is either a hex/literal string or a stream reference.
+    let lookup_bytes: Vec<u8> = match &cs_arr[3] {
+        Object::String(bytes, _) => bytes.clone(),
+        Object::Reference(id) => {
+            let obj = doc.get_object(*id).ok()?;
+            match obj {
+                Object::Stream(s) => s.decompressed_content().ok()?,
+                Object::String(bytes, _) => bytes.clone(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Validate: need at least n_entries * base.components() bytes.
+    let base_stride = base.components();
+    let needed = n_entries.checked_mul(base_stride)?;
+    if lookup_bytes.len() < needed {
+        log::debug!(
+            "image: Indexed palette too short ({} bytes, need {needed})",
+            lookup_bytes.len()
+        );
+        return None;
+    }
+
+    // Build the output palette: convert CMYK entries to RGB if needed.
+    let palette: Vec<u8> = if base == ResolvedCs::Cmyk {
+        let mut out = Vec::with_capacity(n_entries * 3);
+        for chunk in lookup_bytes[..needed].chunks_exact(4) {
+            let (r, g, b) = cmyk_raw_to_rgb_triple(chunk[0], chunk[1], chunk[2], chunk[3]);
+            out.push(r);
+            out.push(g);
+            out.push(b);
+        }
+        out
+    } else {
+        lookup_bytes[..needed].to_vec()
+    };
+
+    let out_cs = if base == ResolvedCs::Gray {
+        ResolvedCs::Gray
+    } else {
+        ResolvedCs::Rgb
+    };
+    Some((palette, out_cs))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── cmyk_raw_to_rgb_triple ────────────────────────────────────────────────
+
+    #[test]
+    fn cmyk_no_ink_is_white() {
+        // All channels 0 = no ink = white.
+        assert_eq!(cmyk_raw_to_rgb_triple(0, 0, 0, 0), (255, 255, 255));
+    }
+
+    #[test]
+    fn cmyk_full_k_is_black() {
+        // K = 255 (full black ink), no other ink → black.
+        assert_eq!(cmyk_raw_to_rgb_triple(0, 0, 0, 255), (0, 0, 0));
+    }
+
+    #[test]
+    fn cmyk_full_cyan_no_k() {
+        // C=255, M=0, Y=0, K=0 → R=0, G=255, B=255.
+        let (r, g, b) = cmyk_raw_to_rgb_triple(255, 0, 0, 0);
+        assert_eq!(r, 0);
+        assert_eq!(g, 255);
+        assert_eq!(b, 255);
+    }
+
+    #[test]
+    fn cmyk_midtone() {
+        // C=128, M=0, Y=0, K=0 → R ≈ 127, G=255, B=255.
+        let (r, g, b) = cmyk_raw_to_rgb_triple(128, 0, 0, 0);
+        assert!((127..=128).contains(&r), "r={r}");
+        assert_eq!(g, 255);
+        assert_eq!(b, 255);
+    }
+
+    // ── resolve_cs (Name variants) ────────────────────────────────────────────
+
+    #[test]
+    fn device_cs_name_gray() {
+        assert_eq!(device_cs_name(b"DeviceGray"), ResolvedCs::Gray);
+        assert_eq!(device_cs_name(b"CalGray"), ResolvedCs::Gray);
+    }
+
+    #[test]
+    fn device_cs_name_rgb() {
+        assert_eq!(device_cs_name(b"DeviceRGB"), ResolvedCs::Rgb);
+        assert_eq!(device_cs_name(b"CalRGB"), ResolvedCs::Rgb);
+    }
+
+    #[test]
+    fn device_cs_name_cmyk() {
+        assert_eq!(device_cs_name(b"DeviceCMYK"), ResolvedCs::Cmyk);
+    }
+
+    #[test]
+    fn device_cs_name_unknown_is_gray() {
+        assert_eq!(device_cs_name(b"Unknown"), ResolvedCs::Gray);
+    }
+
+    // ── expand_1bpp ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn expand_1bpp_single_byte() {
+        // 0b1010_0000 → pixels [white, black, white, black, black, black, black, black].
+        let data = [0b1010_0000u8];
+        let out = expand_1bpp(&data, 8, 1).unwrap();
+        assert_eq!(out[0], 0xFF); // bit 7 = 1 → white
+        assert_eq!(out[1], 0x00); // bit 6 = 0 → black
+        assert_eq!(out[2], 0xFF); // bit 5 = 1 → white
+        assert_eq!(out[3], 0x00); // bit 4 = 0 → black
+    }
+
+    #[test]
+    fn expand_1bpp_partial_row() {
+        // width=4, 1 byte: 0b1111_0000 → 4 white pixels (only top 4 bits used).
+        let data = [0b1111_0000u8];
+        let out = expand_1bpp(&data, 4, 1).unwrap();
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|&b| b == 0xFF));
+    }
+
+    // ── decode_raw (Gray, Rgb) ────────────────────────────────────────────────
+
+    #[test]
+    fn decode_raw_gray_8bpp() {
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let data = vec![0u8, 128, 255];
+        let desc = decode_raw(&doc, &data, 3, 1, false, &dict).unwrap();
+        assert_eq!(desc.color_space, ImageColorSpace::Gray);
+        assert_eq!(desc.data, &[0, 128, 255]);
+    }
+
+    #[test]
+    fn decode_raw_rgb_8bpp() {
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
+        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let data = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255];
+        let desc = decode_raw(&doc, &data, 3, 1, false, &dict).unwrap();
+        assert_eq!(desc.color_space, ImageColorSpace::Rgb);
+        assert_eq!(desc.width, 3);
+        assert_eq!(desc.data.len(), 9);
+    }
+
+    #[test]
+    fn decode_raw_mask_ignores_cs() {
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let data = vec![0u8, 255];
+        let desc = decode_raw(&doc, &data, 2, 1, true, &dict).unwrap();
+        assert_eq!(desc.color_space, ImageColorSpace::Mask);
+    }
+
+    #[test]
+    fn decode_raw_cmyk_converts_to_rgb() {
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceCMYK".to_vec()));
+        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        // Single pixel: C=0, M=0, Y=0, K=0 → white (255, 255, 255).
+        let data = vec![0u8, 0, 0, 0];
+        let desc = decode_raw(&doc, &data, 1, 1, false, &dict).unwrap();
+        assert_eq!(desc.color_space, ImageColorSpace::Rgb);
+        assert_eq!(desc.data, &[255, 255, 255]);
+    }
+
+    #[test]
+    fn decode_raw_too_short_returns_none() {
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
+        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        // Claim 2×2 RGB but supply only 3 bytes (need 12).
+        let data = vec![0u8, 0, 0];
+        assert!(decode_raw(&doc, &data, 2, 2, false, &dict).is_none());
+    }
+
+    // ── scale_smask ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn scale_smask_identity() {
+        let src = vec![10u8, 20, 30, 40];
+        let result = scale_smask(src.clone(), 2, 2, 2, 2);
+        assert_eq!(result, src);
+    }
+
+    #[test]
+    fn scale_smask_upsample_2x() {
+        // 1×1 pixel of value 99 → 2×2 all 99.
+        let src = vec![99u8];
+        let result = scale_smask(src, 1, 1, 2, 2);
+        assert_eq!(result, &[99, 99, 99, 99]);
+    }
+
+    #[test]
+    fn scale_smask_zero_dst_returns_empty() {
+        let result = scale_smask(vec![1, 2, 3], 3, 1, 0, 1);
+        assert!(result.is_empty());
     }
 }

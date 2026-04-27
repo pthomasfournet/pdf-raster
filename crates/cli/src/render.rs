@@ -207,12 +207,12 @@ pub fn render_page_native(
     }
 
     let pages = doc.get_pages();
-    let page_id = *pages.get(&page_num).ok_or_else(|| {
-        pdf_interp::InterpError::PageOutOfRange {
+    let page_id = *pages
+        .get(&page_num)
+        .ok_or_else(|| pdf_interp::InterpError::PageOutOfRange {
             page: page_num,
             total: pdf_interp::page_count(doc),
-        }
-    })?;
+        })?;
 
     let ops = pdf_interp::parse_page(doc, page_num)?;
     let mut renderer =
@@ -230,9 +230,9 @@ pub fn render_page_native(
     match format {
         OutputFormat::Ppm => write_ppm(&bitmap, &mut out)?,
         OutputFormat::Png => write_png(&bitmap, &mut out)?,
-        OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!(
-            "JPEG/TIFF rejected above; this arm cannot be reached"
-        ),
+        OutputFormat::Jpeg | OutputFormat::Tiff => {
+            unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+        }
     }
 
     out.flush()?;
@@ -248,9 +248,9 @@ fn write_page_rgb<W: std::io::Write>(
     match format {
         OutputFormat::Ppm => write_ppm(&bitmap, out)?,
         OutputFormat::Png => write_png(&bitmap, out)?,
-        OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!(
-            "JPEG/TIFF rejected in render_page_poppler before reaching write_page_rgb"
-        ),
+        OutputFormat::Jpeg | OutputFormat::Tiff => {
+            unreachable!("JPEG/TIFF rejected in render_page_poppler before reaching write_page_rgb")
+        }
     }
     Ok(())
 }

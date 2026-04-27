@@ -53,10 +53,9 @@ impl std::fmt::Display for InterpError {
                 )
             }
             Self::MissingResource(name) => write!(f, "missing PDF resource: {name}"),
-            Self::JavaScript { location } => write!(
-                f,
-                "document contains JavaScript ({location}) — refused"
-            ),
+            Self::JavaScript { location } => {
+                write!(f, "document contains JavaScript ({location}) — refused")
+            }
         }
     }
 }
@@ -155,7 +154,10 @@ fn action_is_js(doc: &Document, obj: &lopdf::Object) -> bool {
 }
 
 /// Dereference a `Dictionary` or `Reference → Dictionary`.
-fn resolve_dict_obj<'a>(doc: &'a Document, obj: &'a lopdf::Object) -> Option<&'a lopdf::Dictionary> {
+fn resolve_dict_obj<'a>(
+    doc: &'a Document,
+    obj: &'a lopdf::Object,
+) -> Option<&'a lopdf::Dictionary> {
     match obj {
         lopdf::Object::Dictionary(d) => Some(d),
         lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
@@ -260,9 +262,8 @@ mod js_guard_tests {
 
     fn make_doc_with_open_action(subtype: &str) -> Document {
         let mut doc = Document::with_version("1.4");
-        let action = Dictionary::from_iter([
-            (b"S".to_vec(), Object::Name(subtype.as_bytes().to_vec())),
-        ]);
+        let action =
+            Dictionary::from_iter([(b"S".to_vec(), Object::Name(subtype.as_bytes().to_vec()))]);
         let pages_id = doc.add_object(Dictionary::from_iter([
             (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
             (b"Kids".to_vec(), Object::Array(vec![])),
@@ -279,12 +280,8 @@ mod js_guard_tests {
 
     fn make_doc_with_names_js() -> Document {
         let mut doc = Document::with_version("1.4");
-        let js_tree = Dictionary::from_iter([
-            (b"Names".to_vec(), Object::Array(vec![])),
-        ]);
-        let names = Dictionary::from_iter([
-            (b"JavaScript".to_vec(), Object::Dictionary(js_tree)),
-        ]);
+        let js_tree = Dictionary::from_iter([(b"Names".to_vec(), Object::Array(vec![]))]);
+        let names = Dictionary::from_iter([(b"JavaScript".to_vec(), Object::Dictionary(js_tree))]);
         let pages_id = doc.add_object(Dictionary::from_iter([
             (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
             (b"Kids".to_vec(), Object::Array(vec![])),

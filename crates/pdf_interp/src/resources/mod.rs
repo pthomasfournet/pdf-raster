@@ -61,7 +61,10 @@ impl ExtGStateParams {
 fn real_or_int(d: &Dictionary, key: &[u8]) -> Option<f64> {
     match d.get(key).ok()? {
         Object::Real(r) => Some(f64::from(*r)),
-        #[expect(clippy::cast_precision_loss, reason = "ExtGState numeric params are small integers")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "ExtGState numeric params are small integers"
+        )]
         Object::Integer(n) => Some(*n as f64),
         _ => None,
     }
@@ -80,7 +83,10 @@ fn real_to_u8(d: &Dictionary, key: &[u8]) -> Option<u8> {
 
 /// Read an integer key.
 fn int_val(d: &Dictionary, key: &[u8]) -> Option<i32> {
-    #[expect(clippy::cast_possible_truncation, reason = "line cap/join values are 0–2")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "line cap/join values are 0–2"
+    )]
     d.get(key).ok()?.as_i64().ok().map(|n| n as i32)
 }
 
@@ -228,7 +234,10 @@ fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
     for (i, obj) in arr.iter().take(6).enumerate() {
         m[i] = match obj {
             Object::Real(r) => f64::from(*r),
-            #[expect(clippy::cast_precision_loss, reason = "PDF matrix values are small integers; precision loss is negligible")]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "PDF matrix values are small integers; precision loss is negligible"
+            )]
             Object::Integer(n) => *n as f64,
             _ => return None,
         };

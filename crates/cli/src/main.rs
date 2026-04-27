@@ -56,14 +56,20 @@ fn main() {
         let done = AtomicU32::new(0);
         let start = Instant::now();
 
-        #[expect(clippy::cast_sign_loss, reason = "total validated ≥ 1 via i32::try_from above")]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "total validated ≥ 1 via i32::try_from above"
+        )]
         let total_u32 = total as u32;
 
         let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
             pages
                 .par_iter()
                 .filter_map(|&page_num| {
-                    #[expect(clippy::cast_sign_loss, reason = "page_num ≥ 1, enforced by build_page_list")]
+                    #[expect(
+                        clippy::cast_sign_loss,
+                        reason = "page_num ≥ 1, enforced by build_page_list"
+                    )]
                     let page_u32 = page_num as u32;
                     let result = render::render_page_native(&doc, page_u32, total_u32, &args);
                     report_progress(&args, &done, n_pages, &start, page_num);
@@ -134,7 +140,9 @@ fn build_page_list(total: i32, args: &Args) -> Vec<i32> {
     }
 
     if first > last {
-        eprintln!("pdf-raster: first page ({first}) is after last page ({last}); nothing to render");
+        eprintln!(
+            "pdf-raster: first page ({first}) is after last page ({last}); nothing to render"
+        );
         std::process::exit(1);
     }
 
@@ -150,13 +158,7 @@ fn build_page_list(total: i32, args: &Args) -> Vec<i32> {
 }
 
 /// Print per-page progress to stderr if `--progress` was requested.
-fn report_progress(
-    args: &Args,
-    done: &AtomicU32,
-    n_pages: usize,
-    start: &Instant,
-    page_num: i32,
-) {
+fn report_progress(args: &Args, done: &AtomicU32, n_pages: usize, start: &Instant, page_num: i32) {
     if !args.progress {
         return;
     }

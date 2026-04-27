@@ -279,7 +279,9 @@ fn parse_differences(dict: &Dictionary) -> Box<[Option<Box<str>>; 256]> {
                     clippy::cast_possible_truncation,
                     reason = "n validated ≥ 0 and < 256 above; safe cast to usize"
                 )]
-                { code = *n as usize; }
+                {
+                    code = *n as usize;
+                }
             }
             Object::Name(name) if code < NUM_CODES => {
                 let s = String::from_utf8_lossy(name).into_owned().into_boxed_str();

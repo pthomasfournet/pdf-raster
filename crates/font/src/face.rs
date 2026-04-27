@@ -282,9 +282,7 @@ impl FontFace {
     /// from glyph names resolved via the Adobe Glyph List.
     #[must_use]
     pub fn raw_get_char_index(&self, unicode: u32) -> u32 {
-        self.face
-            .get_char_index(unicode as usize)
-            .unwrap_or(0)
+        self.face.get_char_index(unicode as usize).unwrap_or(0)
     }
 
     /// Resolve a character code to a `FreeType` glyph index.
