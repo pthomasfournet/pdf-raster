@@ -137,9 +137,9 @@ output[py * width + px] = (uint8_t)((coverage * 255) / 32);
 
 `__ballot_sync` + `__popc` gives 32-sample coverage in a single warp cycle. With 2 warps/pixel: 64 samples. Quality far exceeds the CPU 4×4 grid; cost is lower because the 4352 CUDA cores run all pixels in parallel. The CPU AA path remains as fallback below the dispatch threshold.
 
-- [ ] CUDA kernel: jittered 64-sample winding test per pixel
-- [ ] Warp-ballot reduction: `__ballot_sync` + `__popc` for coverage count
-- [ ] Wire into `render_aa_line` dispatch: if fill area > threshold → GPU kernel
+- [x] CUDA kernel: jittered 64-sample winding test per pixel (`kernels/aa_fill.cu`; Halton(2,3) sample table; winding-number + EO rule; scales 0..64 → 0..255 via `(total*255+32)>>6`)
+- [x] Warp-ballot reduction: `__ballot_sync` + `__popc` per warp (2 warps/pixel = 64 samples); warp counts aggregated via shared memory; thread 0 writes final byte
+- [x] Wire into fill dispatch: `PageRenderer::try_gpu_aa_fill` (gated on `pdf_interp/gpu-aa` feature); CPU fallback below `GPU_AA_FILL_THRESHOLD = 16384 px`; pattern fills always CPU
 - [ ] Validate quality vs CPU AA on pixel-diff benchmark
 
 **3. Tile-parallel fill rasterisation — GPU path only**

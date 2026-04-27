@@ -8,6 +8,10 @@ edition = "2024"
 # Requires CUDA 12 and a NVIDIA GPU.  Falls back to zune-jpeg when the GPU
 # context is unavailable or the image is below the dispatch threshold.
 nvjpeg = ["gpu/nvjpeg"]
+# Enable GPU supersampled AA fill (64-sample warp-ballot kernel).
+# Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU 4× scanline AA when
+# the fill area is below the dispatch threshold or no GPU is available.
+gpu-aa = ["dep:gpu"]
 
 [dependencies]
 raster = { path = "../raster" }
