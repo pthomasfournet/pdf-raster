@@ -92,7 +92,7 @@ Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to. All pat
 Track and close fidelity gaps against pdftoppm once the native path is default.
 
 - [ ] Coons patch / tensor mesh shading (Type 4–7)
-- [ ] Non-axis-aligned image transforms (currently nearest-neighbour bounding-box approximation)
+- [x] Non-axis-aligned image transforms — exact inverse-CTM nearest-neighbour sampling for arbitrary rotated/sheared images; row-constant hoisting eliminates redundant multiplies per inner loop
 - [ ] Halftone screens for CMYK separation output
 - [ ] PDF transparency groups (isolated / non-isolated / knockout) at the page level
 

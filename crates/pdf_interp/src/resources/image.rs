@@ -262,8 +262,10 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
 fn decode_run_length(data: &[u8]) -> Vec<u8> {
     // 256 MiB: enough for a 65536×65536 single-channel image, hard limit against
     // adversarial run-length streams that encode billions of bytes from a few bytes.
-    const MAX_OUTPUT: usize = 256 * 1024 * 1024;
+    decode_run_length_capped(data, 256 * 1024 * 1024)
+}
 
+fn decode_run_length_capped(data: &[u8], max_output: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
@@ -274,8 +276,8 @@ fn decode_run_length(data: &[u8]) -> Vec<u8> {
             0..=127 => {
                 let count = run_byte as usize + 1;
                 let end = i.saturating_add(count).min(data.len());
-                if out.len() + (end - i) > MAX_OUTPUT {
-                    log::warn!("inline image: RunLengthDecode output exceeds 256 MiB — truncating");
+                if out.len() + (end - i) > max_output {
+                    log::warn!("inline image: RunLengthDecode output exceeds limit — truncating");
                     break;
                 }
                 out.extend_from_slice(&data[i..end]);
@@ -285,9 +287,9 @@ fn decode_run_length(data: &[u8]) -> Vec<u8> {
                 // 129..=255: repeat = 257 - run_byte
                 let repeat = 257usize.saturating_sub(run_byte as usize);
                 if let Some(&b) = data.get(i) {
-                    if out.len() + repeat > MAX_OUTPUT {
+                    if out.len() + repeat > max_output {
                         log::warn!(
-                            "inline image: RunLengthDecode output exceeds 256 MiB — truncating"
+                            "inline image: RunLengthDecode output exceeds limit — truncating"
                         );
                         break;
                     }
@@ -1924,19 +1926,20 @@ mod tests {
 
     #[test]
     fn run_length_truncates_at_max_output() {
-        // Build a stream of repeat-255 runs that would expand to far more than
-        // 256 MiB.  Each run encodes 129 (repeat = 257-129 = 128) copies of
-        // a byte; 2 bytes per run.  We send enough runs to exceed the cap and
-        // verify the output is capped, not panicking or OOM-ing.
-        const MAX_OUT: usize = 256 * 1024 * 1024;
-        let runs_needed = MAX_OUT / 128 + 2;
-        let mut data = Vec::with_capacity(runs_needed * 2);
-        for _ in 0..runs_needed {
-            data.push(129u8); // repeat = 257 - 129 = 128
-            data.push(0xABu8);
+        // Use a tiny synthetic cap so the test allocates almost nothing.
+        // Each record (2 bytes: 0x81, byte) expands to 128 copies.
+        // Cap at 1000 bytes; send enough records to exceed it.
+        const CAP: usize = 1000;
+        let mut data = Vec::new();
+        for _ in 0..20 {
+            data.push(0x81_u8); // repeat = 257 - 129 = 128
+            data.push(0xAB_u8);
         }
-        let out = decode_run_length(&data);
-        assert!(out.len() <= MAX_OUT, "output exceeded MAX_OUTPUT cap");
+        // 20 × 128 = 2560 bytes would be decoded without cap.
+        let out = decode_run_length_capped(&data, CAP);
+        assert!(out.len() <= CAP, "output {} exceeded cap {CAP}", out.len());
+        assert!(!out.is_empty(), "should have decoded something before truncation");
+        assert!(out.iter().all(|&b| b == 0xAB), "all bytes should be 0xAB");
     }
 
     // ── decode_inline_image ────────────────────────────────────────────────────

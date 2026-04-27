@@ -1,7 +1,8 @@
-//! PDF shading resource resolution (Types 2 and 3 — axial and radial).
+//! PDF shading resource resolution (Types 2–5 — axial, radial, Gouraud mesh).
 //!
 //! [`resolve_shading`] looks up a named `Shading` resource and returns a
-//! `Box<dyn Pattern>` ready for use with [`raster::shading::shaded_fill`].
+//! [`ShadingResult`] which is either a [`raster::pipe::Pattern`] (for smooth
+//! gradient types 2–3) or a pre-decoded triangle mesh (for mesh types 4–5).
 //!
 //! # Supported shading types
 //!
@@ -9,7 +10,9 @@
 //! |---|---|---|
 //! | 2 | Axial (linear) | yes |
 //! | 3 | Radial | yes |
-//! | 1, 4–7 | Function / mesh | stub (logged + skipped) |
+//! | 4 | Free-form Gouraud triangle mesh | yes |
+//! | 5 | Lattice-form Gouraud mesh | yes |
+//! | 1, 6–7 | Function / Coons / tensor patch | stub (logged + skipped) |
 //!
 //! # Colour spaces
 //!
@@ -23,18 +26,34 @@
 //! and Type 3 (Stitching) functions are implemented; other types are treated
 //! as a solid mid-point colour.
 
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{Dictionary, Document, Object, Stream};
 use raster::pipe::Pattern;
 use raster::shading::axial::AxialPattern;
+use raster::shading::gouraud::GouraudVertex;
 use raster::shading::radial::RadialPattern;
 
 use super::dict_ext::DictExt;
 use super::image::{ImageColorSpace, cs_to_image_color_space};
 
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// Result of resolving a named shading resource.
+///
+/// - `Pattern`: smooth gradient — use with [`raster::shading::shaded_fill`].
+/// - `Mesh`: pre-decoded Gouraud triangle list — call
+///   [`raster::shading::gouraud::gouraud_triangle_fill`] for each triangle.
+pub enum ShadingResult {
+    /// Smooth gradient — use with [`raster::shading::shaded_fill`].
+    /// The `[f64; 4]` is an approximate bounding box `[xmin, ymin, xmax, ymax]`.
+    Pattern(Box<dyn Pattern + Send + Sync>, [f64; 4]),
+    /// Pre-decoded Gouraud triangle list — call
+    /// [`raster::shading::gouraud::gouraud_triangle_fill`] for each element.
+    Mesh(Vec<[GouraudVertex; 3]>),
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Resolve the named shading from the page/form resource dict and return a
-/// [`Pattern`] + the bounding box in device space `[xmin, ymin, xmax, ymax]`.
+/// Resolve the named shading from the page/form resource dict.
 ///
 /// Returns `None` if the name is absent, the type is unsupported, or any
 /// required key is missing.  A warning is logged for unsupported types so the
@@ -46,11 +65,23 @@ pub fn resolve_shading(
     name: &[u8],
     ctm: &[f64; 6],
     page_h: f64,
-) -> Option<(Box<dyn Pattern + Send + Sync>, [f64; 4])> {
+) -> Option<ShadingResult> {
     let res = super::image::resolve_dict(doc, resource_context_dict.get(b"Resources").ok()?)?;
     let sh_res = super::image::resolve_dict(doc, res.get(b"Shading").ok()?)?;
     let sh_obj = sh_res.get(name).ok()?;
-    let sh_dict = super::image::resolve_dict(doc, sh_obj)?;
+
+    // Shading types 2–3 are plain dicts; types 4–7 are streams.
+    // Try stream first (stream has a dict too), then fall back to plain dict.
+    let (sh_dict, stream_data): (&Dictionary, Option<Vec<u8>>) = match sh_obj {
+        Object::Stream(s) => (&s.dict, stream_content(s)),
+        Object::Reference(id) => {
+            match doc.get_object(*id).ok()? {
+                Object::Stream(s) => (&s.dict, stream_content(s)),
+                obj => (super::image::resolve_dict(doc, obj)?, None),
+            }
+        }
+        obj => (super::image::resolve_dict(doc, obj)?, None),
+    };
 
     let shading_type = sh_dict.get_i64(b"ShadingType")?;
 
@@ -59,13 +90,32 @@ pub fn resolve_shading(
     let n_channels = cs_channel_count(cs);
 
     match shading_type {
-        2 => resolve_axial(doc, sh_dict, cs, n_channels, ctm, page_h),
-        3 => resolve_radial(doc, sh_dict, cs, n_channels, ctm, page_h),
+        2 => resolve_axial(doc, sh_dict, cs, n_channels, ctm, page_h)
+            .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
+        3 => resolve_radial(doc, sh_dict, cs, n_channels, ctm, page_h)
+            .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
+        4 => {
+            let data = stream_data?;
+            Some(ShadingResult::Mesh(decode_type4_mesh(
+                sh_dict, &data, cs, n_channels, ctm, page_h,
+            )))
+        }
+        5 => {
+            let data = stream_data?;
+            Some(ShadingResult::Mesh(decode_type5_mesh(
+                sh_dict, &data, cs, n_channels, ctm, page_h,
+            )))
+        }
         other => {
             log::warn!("shading: ShadingType {other} not yet implemented — skipping sh operator");
             None
         }
     }
+}
+
+/// Decompress a stream, returning `None` on failure (logged as a debug message).
+fn stream_content(s: &Stream) -> Option<Vec<u8>> {
+    s.decompressed_content().ok()
 }
 
 // ── Axial (Type 2) ────────────────────────────────────────────────────────────
@@ -171,6 +221,285 @@ fn resolve_radial(
         rgb0, rgb1, dx0, dy0, dr0, dx1, dy1, dr1, t0, t1, ext_s, ext_e,
     );
     Some((Box::new(pattern), bbox))
+}
+
+// ── Type 4 — Free-form Gouraud triangle mesh ──────────────────────────────────
+
+/// Bit-stream reader — reads `bits` bits at a time from a byte slice.
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_pos: usize,
+    bit_buf: u32,
+    bits_in_buf: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_pos: 0,
+            bit_buf: 0,
+            bits_in_buf: 0,
+        }
+    }
+
+    /// Read `n` bits (1–32) and return as `u32`. Returns `None` on EOF.
+    fn read_bits(&mut self, n: u8) -> Option<u32> {
+        while self.bits_in_buf < n {
+            if self.byte_pos >= self.data.len() {
+                return None;
+            }
+            self.bit_buf = (self.bit_buf << 8) | u32::from(self.data[self.byte_pos]);
+            self.byte_pos += 1;
+            self.bits_in_buf += 8;
+        }
+        self.bits_in_buf -= n;
+        let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+        Some((self.bit_buf >> self.bits_in_buf) & mask)
+    }
+}
+
+/// Decode a Type 4 (free-form Gouraud triangle mesh) shading stream.
+///
+/// Records: `flag(8 bits)`, `x(BitsPerCoordinate bits)`, `y(BitsPerCoordinate bits)`,
+/// then `n_channels × BitsPerComponent bits` per colour channel.
+/// Flag 0 = new triangle (3 vertices); flag 1 = shared edge v[1]–v[2]; flag 2 = shared edge v[0]–v[2].
+fn decode_type4_mesh(
+    sh: &Dictionary,
+    data: &[u8],
+    cs: ImageColorSpace,
+    n_channels: usize,
+    ctm: &[f64; 6],
+    page_h: f64,
+) -> Vec<[GouraudVertex; 3]> {
+    let Some(bits_per_coord) = sh.get_i64(b"BitsPerCoordinate").map(|v| v as u8) else {
+        log::warn!("shading/type4: missing BitsPerCoordinate");
+        return vec![];
+    };
+    let Some(bits_per_comp) = sh.get_i64(b"BitsPerComponent").map(|v| v as u8) else {
+        log::warn!("shading/type4: missing BitsPerComponent");
+        return vec![];
+    };
+    let decode = read_decode_array(sh, n_channels);
+
+    let mut reader = BitReader::new(data);
+    let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
+    let mut prev: Vec<GouraudVertex> = Vec::new();
+
+    loop {
+        let Some(flag) = reader.read_bits(8) else { break };
+        let n_new = if flag == 0 { 3 } else { 1 };
+        let mut new_verts = Vec::with_capacity(n_new);
+
+        for _ in 0..n_new {
+            let Some(raw_x) = reader.read_bits(bits_per_coord) else { break };
+            let Some(raw_y) = reader.read_bits(bits_per_coord) else { break };
+            let mut channels = Vec::with_capacity(n_channels);
+            let mut ok = true;
+            for _ in 0..n_channels {
+                if let Some(raw_c) = reader.read_bits(bits_per_comp) {
+                    channels.push(raw_c);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+            let v = decode_vertex(
+                raw_x,
+                raw_y,
+                &channels,
+                bits_per_coord,
+                bits_per_comp,
+                &decode,
+                cs,
+                ctm,
+                page_h,
+            );
+            new_verts.push(v);
+        }
+
+        let tri_opt: Option<[GouraudVertex; 3]> = match (flag, new_verts.as_slice()) {
+            (0, [a, b, c]) => Some([*a, *b, *c]),
+            (1, [c]) if prev.len() >= 2 => Some([prev[prev.len() - 2], prev[prev.len() - 1], *c]),
+            (2, [c]) if prev.len() >= 2 => Some([prev[prev.len() - 3 + 2], prev[prev.len() - 1], *c]),
+            _ => None,
+        };
+
+        if let Some(tri) = tri_opt {
+            prev = tri.to_vec();
+            triangles.push(tri);
+        }
+    }
+
+    triangles
+}
+
+// ── Type 5 — Lattice-form Gouraud mesh ───────────────────────────────────────
+
+/// Decode a Type 5 (lattice-form Gouraud) shading stream.
+///
+/// `VerticesPerRow` vertices wide, rows of vertices form a grid.
+/// Adjacent 2×2 quads are split into two triangles each.
+fn decode_type5_mesh(
+    sh: &Dictionary,
+    data: &[u8],
+    cs: ImageColorSpace,
+    n_channels: usize,
+    ctm: &[f64; 6],
+    page_h: f64,
+) -> Vec<[GouraudVertex; 3]> {
+    let Some(bits_per_coord) = sh.get_i64(b"BitsPerCoordinate").map(|v| v as u8) else {
+        log::warn!("shading/type5: missing BitsPerCoordinate");
+        return vec![];
+    };
+    let Some(bits_per_comp) = sh.get_i64(b"BitsPerComponent").map(|v| v as u8) else {
+        log::warn!("shading/type5: missing BitsPerComponent");
+        return vec![];
+    };
+    let Some(verts_per_row) = sh.get_i64(b"VerticesPerRow") else {
+        log::warn!("shading/type5: missing VerticesPerRow");
+        return vec![];
+    };
+    if verts_per_row < 2 {
+        log::warn!("shading/type5: VerticesPerRow < 2 ({verts_per_row}) — skipping");
+        return vec![];
+    }
+    #[expect(clippy::cast_sign_loss, reason = "guarded >= 2 above")]
+    let vpr = verts_per_row as usize;
+    let decode = read_decode_array(sh, n_channels);
+
+    let mut reader = BitReader::new(data);
+    let mut all_rows: Vec<Vec<GouraudVertex>> = Vec::new();
+
+    // Read all rows of vertices.
+    'outer: loop {
+        let mut row = Vec::with_capacity(vpr);
+        for _ in 0..vpr {
+            let Some(raw_x) = reader.read_bits(bits_per_coord) else { break 'outer };
+            let Some(raw_y) = reader.read_bits(bits_per_coord) else { break 'outer };
+            let mut channels = Vec::with_capacity(n_channels);
+            let mut ok = true;
+            for _ in 0..n_channels {
+                if let Some(raw_c) = reader.read_bits(bits_per_comp) {
+                    channels.push(raw_c);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break 'outer;
+            }
+            row.push(decode_vertex(
+                raw_x,
+                raw_y,
+                &channels,
+                bits_per_coord,
+                bits_per_comp,
+                &decode,
+                cs,
+                ctm,
+                page_h,
+            ));
+        }
+        all_rows.push(row);
+    }
+
+    // Tessellate adjacent row pairs into triangles.
+    let mut triangles = Vec::new();
+    for rows in all_rows.windows(2) {
+        let (top, bot) = (&rows[0], &rows[1]);
+        for col in 0..vpr.saturating_sub(1) {
+            // Quad: top[col], top[col+1], bot[col], bot[col+1]
+            // Split into two triangles.
+            triangles.push([top[col], top[col + 1], bot[col]]);
+            triangles.push([top[col + 1], bot[col + 1], bot[col]]);
+        }
+    }
+
+    triangles
+}
+
+// ── Mesh vertex helpers ───────────────────────────────────────────────────────
+
+/// Decode arrays for Type 4/5: `Decode` = `[xmin, xmax, ymin, ymax, c0min, c0max, …]`.
+fn read_decode_array(sh: &Dictionary, n_channels: usize) -> Vec<f64> {
+    let expected = 4 + n_channels * 2; // x,y + per-channel
+    sh.get(b"Decode")
+        .ok()
+        .and_then(|o| o.as_array().ok())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| match o {
+                    Object::Real(r) => Some(f64::from(*r)),
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "decode values are small PDF numbers"
+                    )]
+                    Object::Integer(i) => Some(*i as f64),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            // Default: x,y in [0,1], each colour channel in [0,1].
+            let mut d = vec![0.0_f64, 1.0, 0.0, 1.0];
+            d.extend(std::iter::repeat_n([0.0_f64, 1.0], n_channels).flatten());
+            d
+        })
+        .into_iter()
+        .take(expected)
+        .collect()
+}
+
+/// Decode one raw vertex from bit-fields to a [`GouraudVertex`] in device space.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "raw bit fields are at most 32 bits; f64 has 53-bit mantissa, so values up to 2^32 are exact"
+)]
+fn decode_vertex(
+    raw_x: u32,
+    raw_y: u32,
+    raw_channels: &[u32],
+    bits_per_coord: u8,
+    bits_per_comp: u8,
+    decode: &[f64],
+    cs: ImageColorSpace,
+    ctm: &[f64; 6],
+    page_h: f64,
+) -> GouraudVertex {
+    let max_coord = ((1u64 << bits_per_coord) - 1) as f64;
+    let max_comp = if bits_per_comp == 0 {
+        1.0
+    } else {
+        ((1u64 << bits_per_comp) - 1) as f64
+    };
+
+    let x_min = decode.first().copied().unwrap_or(0.0);
+    let x_max = decode.get(1).copied().unwrap_or(1.0);
+    let y_min = decode.get(2).copied().unwrap_or(0.0);
+    let y_max = decode.get(3).copied().unwrap_or(1.0);
+
+    let ux = x_min + (raw_x as f64 / max_coord) * (x_max - x_min);
+    let uy = y_min + (raw_y as f64 / max_coord) * (y_max - y_min);
+
+    let channels: Vec<f64> = raw_channels
+        .iter()
+        .enumerate()
+        .map(|(i, &raw)| {
+            let c_min = decode.get(4 + i * 2).copied().unwrap_or(0.0);
+            let c_max = decode.get(4 + i * 2 + 1).copied().unwrap_or(1.0);
+            c_min + (raw as f64 / max_comp) * (c_max - c_min)
+        })
+        .collect();
+
+    let color = cs_to_rgb(cs, &channels);
+    let (dx, dy) = transform_point(ctm, ux, uy, page_h);
+
+    GouraudVertex { x: dx, y: dy, color }
 }
 
 // ── PDF Function evaluation ───────────────────────────────────────────────────

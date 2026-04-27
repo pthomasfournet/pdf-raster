@@ -49,7 +49,7 @@ use raster::{
     glyph::{GlyphBitmap, fill_glyph},
     path::PathBuilder,
     pipe::{Pattern, PipeSrc, PipeState},
-    shading::shaded_fill,
+    shading::{gouraud::gouraud_triangle_fill, shaded_fill},
     state::TransferSet,
     stroke::{StrokeParams, stroke},
     types::{BlendMode, LineCap, LineJoin},
@@ -1038,13 +1038,12 @@ impl<'doc> PageRenderer<'doc> {
 
     /// Execute an `sh` shading operator.
     ///
-    /// Looks up the named shading resource, builds a rectangle covering the
-    /// current clip bounds as the bounding shape, and calls `shaded_fill`.
-    /// The PDF spec allows `sh` to paint outside the clip region, but in
-    /// practice the clip constrains the painted area; using the clip's bounding
-    /// box as the path is correct for all axis-aligned clips and is a safe
-    /// approximation for rotated clips.
+    /// Looks up the named shading resource and dispatches to either
+    /// `shaded_fill` (for smooth gradient types 2–3) or `gouraud_triangle_fill`
+    /// (for mesh types 4–5).
     fn do_shading(&mut self, name: &[u8]) {
+        use crate::resources::shading::ShadingResult;
+
         let gs = self.gstate.current();
         let ctm = gs.ctm;
         let clip = gs.clip.clone_shared();
@@ -1053,7 +1052,7 @@ impl<'doc> PageRenderer<'doc> {
         let blend_mode = gs.blend_mode;
         let page_h = f64::from(self.height);
 
-        let Some((pattern, _bbox)) = self.resources.shading(name, &ctm, page_h) else {
+        let Some(result) = self.resources.shading(name, &ctm, page_h) else {
             log::warn!(
                 "pdf_interp: sh /{} — shading not available (unsupported type or missing resource)",
                 String::from_utf8_lossy(name)
@@ -1061,29 +1060,43 @@ impl<'doc> PageRenderer<'doc> {
             return;
         };
 
-        // Build a path covering the full clip bounding box.
-        let path = {
-            let mut pb = PathBuilder::new();
-            let _ = pb.move_to(clip.x_min, clip.y_min);
-            let _ = pb.line_to(clip.x_max, clip.y_min);
-            let _ = pb.line_to(clip.x_max, clip.y_max);
-            let _ = pb.line_to(clip.x_min, clip.y_max);
-            let _ = pb.close(true);
-            pb.build()
-        };
-
         let pipe = Self::make_pipe(alpha, blend_mode);
-        shaded_fill::<color::Rgb8>(
-            &mut self.bitmap,
-            &clip,
-            &path,
-            &pipe,
-            pattern.as_ref(),
-            &DEVICE_MATRIX,
-            flatness,
-            true,
-            false,
-        );
+
+        match result {
+            ShadingResult::Pattern(pattern, _bbox) => {
+                // Build a path covering the full clip bounding box.
+                let path = {
+                    let mut pb = PathBuilder::new();
+                    let _ = pb.move_to(clip.x_min, clip.y_min);
+                    let _ = pb.line_to(clip.x_max, clip.y_min);
+                    let _ = pb.line_to(clip.x_max, clip.y_max);
+                    let _ = pb.line_to(clip.x_min, clip.y_max);
+                    let _ = pb.close(true);
+                    pb.build()
+                };
+                shaded_fill::<color::Rgb8>(
+                    &mut self.bitmap,
+                    &clip,
+                    &path,
+                    &pipe,
+                    pattern.as_ref(),
+                    &DEVICE_MATRIX,
+                    flatness,
+                    true,
+                    false,
+                );
+            }
+            ShadingResult::Mesh(triangles) => {
+                for tri in triangles {
+                    gouraud_triangle_fill::<color::Rgb8>(
+                        &mut self.bitmap,
+                        &clip,
+                        &pipe,
+                        tri,
+                    );
+                }
+            }
+        }
     }
 
     /// Execute a Form `XObject`'s content stream in the current graphics context.
