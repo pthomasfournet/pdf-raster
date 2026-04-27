@@ -9,12 +9,13 @@
 //! | Filter | `ImageMask` | Support |
 //! |---|---|---|
 //! | `CCITTFaxDecode` (`K<0`, Group 4 / T.6) | yes/no | yes |
+//! | `CCITTFaxDecode` (`K=0`, Group 3 1D / T.4) | yes/no | yes |
 //! | `FlateDecode` | yes/no | yes |
 //! | none (raw) | yes/no | yes |
 //! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`) |
 //! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`) |
 //! | `JBIG2Decode` | — | stub |
-//! | `CCITTFaxDecode` (`K≥0`, Group 3) | — | stub |
+//! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | — | stub |
 //!
 //! # Pixel layout in `ImageDescriptor::data`
 //!
@@ -617,10 +618,13 @@ fn expand_1bpp(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 
 /// Decode a `CCITTFaxDecode` stream.
 ///
-/// `K` in `DecodeParms`:
-/// - `K < 0` → Group 4 (T.6) — supported.
-/// - `K = 0` → Group 3 1D — not yet implemented.
-/// - `K > 0` → Group 3 2D — not yet implemented.
+/// `K` in `DecodeParms` (PDF §7.4.6):
+/// - `K < 0` → Group 4 (T.6, 2D) — fully supported.
+/// - `K = 0` → Group 3 1D (T.4 1D) — supported.
+/// - `K > 0` → Group 3 mixed 1D/2D (T.4 2D) — not yet implemented.
+///
+/// `Rows` (if present) caps the number of rows decoded; otherwise decodes
+/// until the bitstream signals end-of-data.
 fn decode_ccitt(
     data: &[u8],
     width: u32,
@@ -628,69 +632,159 @@ fn decode_ccitt(
     is_mask: bool,
     parms: Option<&Object>,
 ) -> Option<ImageDescriptor> {
-    // Resolve DecodeParms once; both K and BlackIs1 live in the same dict.
+    // Resolve DecodeParms once; all CCITT params live in the same dict.
     let parms_dict = parms.and_then(|o| o.as_dict().ok());
 
     let k = parms_dict.and_then(|d| d.get_i64(b"K")).unwrap_or(0);
 
-    // BlackIs1: when true, 1-bits encode black (the reverse of the default).
+    // BlackIs1: when true, 1-bits encode black (reversed from the T.4/T.6 default).
     let black_is_1 = parms_dict
         .and_then(|d| d.get_bool(b"BlackIs1"))
         .unwrap_or(false);
 
-    if k >= 0 {
-        log::debug!("image: CCITTFaxDecode K={k} (Group 3) not yet implemented");
-        return None;
-    }
+    // Rows: optional override for the number of rows in the stream.  When present
+    // and smaller than height, we stop early; when absent we decode until EOD and
+    // pad any missing rows with white.
+    let rows_limit = parms_dict
+        .and_then(|d| d.get_i64(b"Rows"))
+        .and_then(|r| u32::try_from(r).ok())
+        .unwrap_or(height);
 
-    // Group 4 (K < 0).
     let w_u16 = u16::try_from(width).ok()?;
-    let h_u16 = u16::try_from(height).ok()?;
-
     let capacity = (width as usize).checked_mul(height as usize)?;
-    let mut data_out: Vec<u8> = Vec::with_capacity(capacity);
+    let p = CcittParams {
+        w_u16,
+        capacity,
+        width,
+        height,
+        is_mask,
+        black_is_1,
+    };
+
+    match k.cmp(&0) {
+        std::cmp::Ordering::Less => decode_ccitt_g4(data, &p),
+        std::cmp::Ordering::Equal => decode_ccitt_g3_1d(data, &p, rows_limit),
+        std::cmp::Ordering::Greater => {
+            log::debug!("image: CCITTFaxDecode K={k} (Group 3 mixed 2D) not yet implemented");
+            None
+        }
+    }
+}
+
+/// Shared parameters for the CCITT decode helpers.
+struct CcittParams {
+    w_u16: u16,
+    capacity: usize,
+    width: u32,
+    height: u32,
+    is_mask: bool,
+    black_is_1: bool,
+}
+
+/// Decode a Group 4 (K<0, T.6) CCITT fax stream.
+fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
+    let h_u16 = u16::try_from(p.height).ok()?;
+    let mut data_out: Vec<u8> = Vec::with_capacity(p.capacity);
     let mut rows_decoded: u32 = 0;
 
     let completed =
-        fax::decoder::decode_g4(data.iter().copied(), w_u16, Some(h_u16), |transitions| {
-            let row_start = data_out.len();
-            data_out.extend(fax::decoder::pels(transitions, w_u16).map(|color| {
-                // Map fax Color to PDF image convention: 0x00 = black, 0xFF = white.
-                let is_black = match color {
-                    fax::Color::Black => !black_is_1,
-                    fax::Color::White => black_is_1,
-                };
-                if is_black { 0x00u8 } else { 0xFFu8 }
-            }));
-            // Pad any short row (defensive against malformed data).
-            let row_end = row_start + width as usize;
-            data_out.resize(row_end, 0xFF);
+        fax::decoder::decode_g4(data.iter().copied(), p.w_u16, Some(h_u16), |transitions| {
+            append_ccitt_row(&mut data_out, transitions, p.w_u16, p.width, p.black_is_1);
             rows_decoded += 1;
         });
 
     if completed.is_none() {
         log::warn!(
-            "image: CCITTFaxDecode Group4 decode incomplete — got {rows_decoded}/{height} rows"
+            "image: CCITTFaxDecode Group4 decode incomplete — got {rows_decoded}/{} rows",
+            p.height
         );
         if rows_decoded == 0 {
             return None;
         }
-        // Partial decode: pad remaining rows with white so the image is not garbage.
-        data_out.resize(capacity, 0xFF);
+        data_out.resize(p.capacity, 0xFF);
     }
 
-    let cs = if is_mask {
+    let cs = if p.is_mask {
         ImageColorSpace::Mask
     } else {
         ImageColorSpace::Gray
     };
     Some(ImageDescriptor {
-        width,
-        height,
+        width: p.width,
+        height: p.height,
         color_space: cs,
         data: data_out,
         smask: None,
     })
+}
+
+/// Decode a Group 3 1D (K=0, T.4) CCITT fax stream.
+///
+/// `rows_limit` is the maximum number of rows to emit (from `DecodeParms/Rows`
+/// or `height` when absent).  Extra rows in the stream are discarded; missing
+/// rows are padded with white.
+fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<ImageDescriptor> {
+    let mut data_out: Vec<u8> = Vec::with_capacity(p.capacity);
+    let mut rows_decoded: u32 = 0;
+
+    // decode_g3 fires the callback once per decoded row (after each EOL).
+    // It returns Some(()) on clean EOD, None on bitstream error.
+    let result = fax::decoder::decode_g3(data.iter().copied(), |transitions| {
+        if rows_decoded >= rows_limit {
+            return; // discard extra rows beyond the declared height
+        }
+        append_ccitt_row(&mut data_out, transitions, p.w_u16, p.width, p.black_is_1);
+        rows_decoded += 1;
+    });
+
+    if result.is_none() && rows_decoded == 0 {
+        log::warn!("image: CCITTFaxDecode Group3 1D decode failed with no rows");
+        return None;
+    }
+    if rows_decoded < p.height {
+        log::debug!(
+            "image: CCITTFaxDecode Group3 1D: got {rows_decoded}/{} rows — padding remainder",
+            p.height
+        );
+        data_out.resize(p.capacity, 0xFF);
+    }
+
+    let cs = if p.is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: p.width,
+        height: p.height,
+        color_space: cs,
+        data: data_out,
+        smask: None,
+    })
+}
+
+/// Expand one row of CCITT transitions into bytes and append to `out`.
+///
+/// The row is padded/truncated to exactly `width` bytes.
+/// `0x00` = black, `0xFF` = white (PDF image convention).
+fn append_ccitt_row(
+    out: &mut Vec<u8>,
+    transitions: &[u16],
+    w_u16: u16,
+    width: u32,
+    black_is_1: bool,
+) {
+    let row_start = out.len();
+    out.extend(fax::decoder::pels(transitions, w_u16).map(|color| {
+        let is_black = match color {
+            fax::Color::Black => !black_is_1,
+            fax::Color::White => black_is_1,
+        };
+        if is_black { 0x00u8 } else { 0xFFu8 }
+    }));
+    // Pad short rows (malformed data) with white.
+    let row_end = row_start + width as usize;
+    out.resize(row_end, 0xFF);
 }
 
 // ── DCTDecode (JPEG) ──────────────────────────────────────────────────────────
