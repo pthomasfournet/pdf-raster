@@ -54,6 +54,10 @@ use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
 #[cfg(feature = "gpu-icc")]
 use gpu::GpuCtx;
 
+#[cfg(feature = "gpu-icc")]
+#[path = "icc.rs"]
+mod icc;
+
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
 /// Below this threshold `PCIe` transfer overhead dominates and CPU `zune-jpeg`
@@ -221,13 +225,13 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
     let filter = dict.get(b"Filter").ok().and_then(filter_name);
 
     match filter.as_deref() {
-        None => decode_raw(doc, data, w, h, is_mask, &dict),
+        None => decode_raw(doc, data, w, h, is_mask, &dict, #[cfg(feature = "gpu-icc")] None),
         Some("FlateDecode") => {
             use lopdf::Stream;
             // Use lopdf to run Flate decompression on raw bytes.
             let stream = Stream::new(dict.clone(), data.to_vec());
             match stream.decompressed_content() {
-                Ok(raw) => decode_raw(doc, &raw, w, h, is_mask, &dict),
+                Ok(raw) => decode_raw(doc, &raw, w, h, is_mask, &dict, #[cfg(feature = "gpu-icc")] None),
                 Err(e) => {
                     log::warn!("inline image: FlateDecode failed: {e}");
                     None
@@ -241,11 +245,19 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
         Some("DCTDecode") => {
             // Inline images are typically small (embedded in the content stream).
             // GPU dispatch for inline images is not worthwhile — use CPU always.
-            #[cfg(feature = "nvjpeg")]
+            #[cfg(all(feature = "nvjpeg", feature = "gpu-icc"))]
+            {
+                decode_dct(data, w, h, None, None)
+            }
+            #[cfg(all(feature = "nvjpeg", not(feature = "gpu-icc")))]
             {
                 decode_dct(data, w, h, None)
             }
-            #[cfg(not(feature = "nvjpeg"))]
+            #[cfg(all(not(feature = "nvjpeg"), feature = "gpu-icc"))]
+            {
+                decode_dct(data, w, h, None)
+            }
+            #[cfg(all(not(feature = "nvjpeg"), not(feature = "gpu-icc")))]
             {
                 decode_dct(data, w, h)
             }
@@ -257,7 +269,7 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
         }
         Some("RunLengthDecode") => {
             let raw = decode_run_length(data);
-            decode_raw(doc, &raw, w, h, is_mask, &dict)
+            decode_raw(doc, &raw, w, h, is_mask, &dict, #[cfg(feature = "gpu-icc")] None)
         }
         Some(other) => {
             log::warn!("inline image: unknown filter {other:?}");
@@ -750,6 +762,17 @@ fn decode_raw(
     // General path: resolve the colour space to Gray / Rgb / Cmyk.
     let resolved = cs_obj.map_or(ResolvedCs::Gray, |o| resolve_cs(doc, o));
 
+    // For ICCBased CMYK, extract the raw ICC profile bytes so they can be baked
+    // into a CLUT for the GPU path.  Only performed under the gpu-icc feature and
+    // only when the resolved space is actually CMYK (avoids unnecessary work for
+    // Gray/RGB ICCBased images).
+    #[cfg(feature = "gpu-icc")]
+    let icc_bytes: Option<Vec<u8>> = if resolved == ResolvedCs::Cmyk {
+        cs_obj.and_then(|o| extract_icc_bytes(doc, o))
+    } else {
+        None
+    };
+
     match bpc {
         1 => {
             let pixels = expand_1bpp(data, width, height)?;
@@ -761,7 +784,16 @@ fn decode_raw(
                 smask: None,
             })
         }
-        8 => decode_raw_8bpp(data, width, height, resolved, #[cfg(feature = "gpu-icc")] gpu_ctx),
+        8 => decode_raw_8bpp(
+            data,
+            width,
+            height,
+            resolved,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            icc_bytes,
+        ),
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
             None
@@ -778,6 +810,7 @@ fn decode_raw_8bpp(
     height: u32,
     resolved: ResolvedCs,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] icc_bytes: Option<Vec<u8>>,
 ) -> Option<ImageDescriptor> {
     let components = resolved.components();
     let npixels = (width as usize).checked_mul(height as usize)?;
@@ -795,7 +828,13 @@ fn decode_raw_8bpp(
 
     if resolved == ResolvedCs::Cmyk {
         // Raw PDF CMYK: 255 = full ink, 0 = no ink.
-        let rgb = cmyk_raw_to_rgb(raw, #[cfg(feature = "gpu-icc")] gpu_ctx)?;
+        let rgb = cmyk_raw_to_rgb(
+            raw,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            icc_bytes.as_deref(),
+        )?;
         Some(ImageDescriptor {
             width,
             height,
@@ -1211,7 +1250,15 @@ fn decode_dct(
             // zune-jpeg returns JPEG CMYK with inverted convention (0=full ink, 255=no ink).
             // Complement to direct convention (255=full ink, 0=no ink) before dispatch.
             let direct: Vec<u8> = pixels.iter().map(|&b| 255 - b).collect();
-            let rgb = cmyk_raw_to_rgb(&direct, #[cfg(feature = "gpu-icc")] gpu_ctx)?;
+            // JPEG streams embed their own colour profile; the PDF ICCBased stream
+            // is not available here, so ICC CLUT baking is not performed for DCT.
+            let rgb = cmyk_raw_to_rgb(
+                &direct,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                None,
+            )?;
             Some(ImageDescriptor {
                 width: jw,
                 height: jh,
@@ -1275,23 +1322,41 @@ fn decode_dct_gpu(
     })
 }
 
-/// Convert a flat CMYK byte buffer (inverted ink densities, 4 bytes/pixel) to
-/// an RGB byte buffer (3 bytes/pixel).
-///
 /// Convert a raw CMYK pixel buffer to RGB, dispatching to GPU when available.
 ///
 /// Input convention (raw images / `decode_raw_8bpp`): 0 = no ink, 255 = full ink.
 /// This matches the `GpuCtx::icc_cmyk_to_rgb` matrix kernel directly.
 ///
+/// `icc_bytes` — raw ICC profile bytes extracted from an `ICCBased` colour space.
+/// When provided (and the `gpu-icc` feature is active), a CLUT is baked from the
+/// profile and used for the colour transform instead of the fast matrix approximation.
+///
 /// Returns `None` only on arithmetic overflow (degenerate image size).
 fn cmyk_raw_to_rgb(
     pixels: &[u8],
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
 ) -> Option<Vec<u8>> {
     // GPU path: delegate to GpuCtx which handles threshold + CPU fallback internally.
     #[cfg(feature = "gpu-icc")]
     if let Some(ctx) = gpu_ctx {
-        match ctx.icc_cmyk_to_rgb(pixels, None) {
+        // If we have ICC bytes, bake a CLUT for accurate colour conversion.
+        // Fall back to the fast matrix path if baking fails.
+        let clut_data: Option<Vec<u8>> = icc_bytes.and_then(|bytes| {
+            match icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N) {
+                Ok(table) => Some(table),
+                Err(e) => {
+                    log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
+                    None
+                }
+            }
+        });
+
+        let clut_arg = clut_data
+            .as_deref()
+            .map(|table| (table, icc::DEFAULT_GRID_N));
+
+        match ctx.icc_cmyk_to_rgb(pixels, clut_arg) {
             Ok(rgb) => return Some(rgb),
             Err(e) => {
                 log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}");
@@ -1656,6 +1721,28 @@ fn icc_based_cs(stream_dict: Option<&Dictionary>) -> ResolvedCs {
     }
 }
 
+/// Extract the raw ICC profile bytes from an `ICCBased` colour space object.
+///
+/// Returns `None` if the object is not `[/ICCBased <ref>]`, the stream cannot be
+/// dereferenced, or decompression fails.  Only called under the `gpu-icc` feature.
+#[cfg(feature = "gpu-icc")]
+fn extract_icc_bytes(doc: &Document, cs_obj: &Object) -> Option<Vec<u8>> {
+    let arr = cs_obj.as_array().ok()?;
+    if arr.first().and_then(|o| o.as_name().ok()) != Some(b"ICCBased") {
+        return None;
+    }
+    let stream_ref = arr.get(1)?;
+    let id = match stream_ref {
+        Object::Reference(id) => *id,
+        _ => return None,
+    };
+    let stream = doc.get_object(id).ok()?.as_stream().ok()?;
+    stream
+        .decompressed_content()
+        .map_err(|e| log::debug!("image: ICCBased stream decompression failed: {e}"))
+        .ok()
+}
+
 /// Dereference a direct or indirect object to a `&Dictionary`.
 ///
 /// For `ICCBased`, the second element of the array is a reference to a stream;
@@ -1837,7 +1924,7 @@ mod tests {
         dict.set("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         let data = vec![0u8, 128, 255];
-        let desc = decode_raw(&doc, &data, 3, 1, false, &dict).unwrap();
+        let desc = decode_raw(&doc, &data, 3, 1, false, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Gray);
         assert_eq!(desc.data, &[0, 128, 255]);
     }
@@ -1849,7 +1936,7 @@ mod tests {
         dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         let data = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255];
-        let desc = decode_raw(&doc, &data, 3, 1, false, &dict).unwrap();
+        let desc = decode_raw(&doc, &data, 3, 1, false, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
         assert_eq!(desc.width, 3);
         assert_eq!(desc.data.len(), 9);
@@ -1861,7 +1948,7 @@ mod tests {
         let mut dict = lopdf::Dictionary::new();
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         let data = vec![0u8, 255];
-        let desc = decode_raw(&doc, &data, 2, 1, true, &dict).unwrap();
+        let desc = decode_raw(&doc, &data, 2, 1, true, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Mask);
     }
 
@@ -1873,7 +1960,7 @@ mod tests {
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         // Single pixel: C=0, M=0, Y=0, K=0 → white (255, 255, 255).
         let data = vec![0u8, 0, 0, 0];
-        let desc = decode_raw(&doc, &data, 1, 1, false, &dict).unwrap();
+        let desc = decode_raw(&doc, &data, 1, 1, false, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
         assert_eq!(desc.data, &[255, 255, 255]);
     }
@@ -1886,7 +1973,7 @@ mod tests {
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         // Claim 2×2 RGB but supply only 3 bytes (need 12).
         let data = vec![0u8, 0, 0];
-        assert!(decode_raw(&doc, &data, 2, 2, false, &dict).is_none());
+        assert!(decode_raw(&doc, &data, 2, 2, false, &dict, #[cfg(feature = "gpu-icc")] None).is_none());
     }
 
     // ── scale_smask ───────────────────────────────────────────────────────────

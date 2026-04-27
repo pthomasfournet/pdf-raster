@@ -1155,6 +1155,7 @@ dependencies = [
  "jpeg2k",
  "log",
  "lopdf",
+ "moxcms",
  "raster",
  "zune-core",
  "zune-jpeg",

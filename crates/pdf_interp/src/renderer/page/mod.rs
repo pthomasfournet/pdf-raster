@@ -71,11 +71,11 @@ use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use super::text::TextState;
 use crate::content::{Operator, TextArrayElement};
 use crate::resources::{ImageColorSpace, PageResources, image::decode_inline_image};
-#[cfg(feature = "gpu-aa")]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use gpu::GpuCtx;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
-#[cfg(feature = "gpu-aa")]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 
 /// Identity CTM for passing to raster functions — coordinate transform is
@@ -142,10 +142,9 @@ pub struct PageRenderer<'doc> {
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
     nvjpeg: Option<NvJpegDecoder>,
-    /// Shared GPU context for AA fill dispatch.  When set, filled paths whose
-    /// bounding-box pixel area exceeds [`gpu::GPU_AA_FILL_THRESHOLD`] are
-    /// rasterised on the GPU using a 64-sample jittered warp-ballot kernel.
-    #[cfg(feature = "gpu-aa")]
+    /// Shared GPU context for AA fill dispatch and ICC CMYK→RGB colour conversion.
+    /// Present when `gpu-aa` or `gpu-icc` features are enabled.
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     gpu_ctx: Option<Arc<GpuCtx>>,
 }
 
@@ -207,7 +206,7 @@ impl<'doc> PageRenderer<'doc> {
             ocg_stack: Vec::new(),
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
-            #[cfg(feature = "gpu-aa")]
+            #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
             gpu_ctx: None,
         }
     }
@@ -231,7 +230,7 @@ impl<'doc> PageRenderer<'doc> {
     /// jittered warp-ballot kernel instead of the CPU 4× scanline AA path.
     ///
     /// Call with `None` to revert to CPU-only AA.
-    #[cfg(feature = "gpu-aa")]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     pub fn set_gpu_ctx(&mut self, ctx: Option<Arc<GpuCtx>>) {
         self.gpu_ctx = ctx;
     }
