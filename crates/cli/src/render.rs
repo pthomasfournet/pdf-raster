@@ -1,11 +1,10 @@
 //! Per-page rendering: poppler or native Rust renderer → pixel buffer → file.
 //!
-//! [`render_page`] dispatches to the poppler path (default) or the native
-//! path (`--native`) based on `args.native`.  The two paths share the same
-//! output-encoding logic.
+//! [`render_page_poppler`] and [`render_page_native`] share the same
+//! output-encoding logic.  Dispatch is done by the caller based on `args.native`.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write as _};
 
 use color::{Gray8, Rgb8};
 use encode::{EncodeError, write_pgm, write_png, write_ppm};
@@ -14,6 +13,12 @@ use raster::Bitmap;
 
 use crate::args::{Args, OutputFormat};
 use crate::naming::output_path;
+
+/// Maximum pixel dimension (width or height) accepted from a PDF page.
+///
+/// Prevents absurdly large allocations from malformed or adversarial documents.
+/// 32 768 px at 150 DPI corresponds to roughly 366 inches (a 30-foot page).
+const MAX_PX_DIMENSION: u32 = 32_768;
 
 /// Error type for per-page rendering operations.
 #[derive(Debug)]
@@ -35,6 +40,13 @@ pub enum RenderError {
         /// The pixel format that was rendered.
         pixel: Option<ImageFormat>,
     },
+    /// The computed pixel dimensions exceed the safety limit.
+    PageTooLarge {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+    },
 }
 
 impl std::fmt::Display for RenderError {
@@ -48,6 +60,11 @@ impl std::fmt::Display for RenderError {
             Self::UnsupportedFormatCombination { output, pixel } => write!(
                 f,
                 "output format {output:?} is not supported for pixel format {pixel:?}"
+            ),
+            Self::PageTooLarge { width, height } => write!(
+                f,
+                "page pixel dimensions {width}×{height} exceed the safety limit \
+                 ({MAX_PX_DIMENSION}); lower the DPI or check the document"
             ),
         }
     }
@@ -125,14 +142,15 @@ pub fn render_page_poppler(
 
     let img = page.render(&params)?;
     let out_path = output_path(args, page_num, total_pages, format);
-    let out = BufWriter::new(File::create(&out_path)?);
+    let mut out = BufWriter::new(File::create(&out_path)?);
 
     match img.format() {
-        Some(ImageFormat::Rgb24) => write_page_rgb(&img, format, out)?,
-        Some(ImageFormat::Gray8) => write_page_gray(&img, format, out)?,
+        Some(ImageFormat::Rgb24) => write_page_rgb(&img, format, &mut out)?,
+        Some(ImageFormat::Gray8) => write_page_gray(&img, format, &mut out)?,
         fmt => return Err(RenderError::UnexpectedFormat(fmt)),
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -141,8 +159,8 @@ pub fn render_page_poppler(
 /// `page_num` is 1-based.  Only PPM and PNG output are supported; JPEG/TIFF
 /// are rejected with [`RenderError::UnsupportedFormatCombination`].
 ///
-/// Gray and mono output are not yet supported by the native renderer: the
-/// bitmap is always RGB, and `--gray`/`--mono` flags are silently ignored.
+/// `--gray`/`--mono` are silently ignored by the caller before this is reached
+/// (a warning is printed at startup instead).  The bitmap is always RGB.
 pub fn render_page_native(
     doc: &lopdf::Document,
     page_num: u32,
@@ -161,8 +179,9 @@ pub fn render_page_native(
     let (w_pts, h_pts) = pdf_interp::page_size_pts(doc, page_num)?;
     let x_dpi = args.x_dpi();
     let y_dpi = args.y_dpi();
-    let scale_x = x_dpi / 72.0;
-    let scale_y = y_dpi / 72.0;
+
+    // Use the geometric mean so the square-pixel CTM matches the pixel box.
+    let scale = (x_dpi / 72.0 * (y_dpi / 72.0)).sqrt();
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -170,13 +189,22 @@ pub fn render_page_native(
         reason = "page dimensions in pts × scale are always positive and ≪ u32::MAX"
     )]
     let (w_px, h_px) = (
-        (w_pts * scale_x).round() as u32,
-        (h_pts * scale_y).round() as u32,
+        (w_pts * scale).round() as u32,
+        (h_pts * scale).round() as u32,
     );
 
-    // The native renderer only produces a square-pixel CTM today.  Use the
-    // geometric mean of x/y scales so the page fits the computed pixel box.
-    let scale = (scale_x * scale_y).sqrt();
+    if w_px == 0 || h_px == 0 {
+        return Err(RenderError::PageTooLarge {
+            width: w_px,
+            height: h_px,
+        });
+    }
+    if w_px > MAX_PX_DIMENSION || h_px > MAX_PX_DIMENSION {
+        return Err(RenderError::PageTooLarge {
+            width: w_px,
+            height: h_px,
+        });
+    }
 
     let pages = doc.get_pages();
     let page_id = *pages.get(&page_num).ok_or_else(|| {
@@ -194,22 +222,20 @@ pub fn render_page_native(
 
     #[expect(
         clippy::cast_possible_wrap,
-        reason = "total_pages ≤ i32::MAX for real documents"
+        reason = "total_pages ≤ i32::MAX; validated in main before calling this function"
     )]
     let out_path = output_path(args, page_num as i32, total_pages as i32, format);
-    let out = BufWriter::new(File::create(&out_path)?);
+    let mut out = BufWriter::new(File::create(&out_path)?);
 
     match format {
-        OutputFormat::Ppm => write_ppm(&bitmap, out)?,
-        OutputFormat::Png => write_png(&bitmap, out)?,
-        OutputFormat::Jpeg | OutputFormat::Tiff => {
-            return Err(RenderError::UnsupportedFormatCombination {
-                output: format,
-                pixel: None,
-            });
-        }
+        OutputFormat::Ppm => write_ppm(&bitmap, &mut out)?,
+        OutputFormat::Png => write_png(&bitmap, &mut out)?,
+        OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!(
+            "JPEG/TIFF rejected above; this arm cannot be reached"
+        ),
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -222,12 +248,9 @@ fn write_page_rgb<W: std::io::Write>(
     match format {
         OutputFormat::Ppm => write_ppm(&bitmap, out)?,
         OutputFormat::Png => write_png(&bitmap, out)?,
-        OutputFormat::Jpeg | OutputFormat::Tiff => {
-            return Err(RenderError::UnsupportedFormatCombination {
-                output: format,
-                pixel: Some(ImageFormat::Rgb24),
-            });
-        }
+        OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!(
+            "JPEG/TIFF rejected in render_page_poppler before reaching write_page_rgb"
+        ),
     }
     Ok(())
 }
@@ -241,12 +264,9 @@ fn write_page_gray<W: std::io::Write>(
     match format {
         OutputFormat::Ppm => write_pgm(&bitmap, out)?,
         OutputFormat::Png => write_png(&bitmap, out)?,
-        OutputFormat::Jpeg | OutputFormat::Tiff => {
-            return Err(RenderError::UnsupportedFormatCombination {
-                output: format,
-                pixel: Some(ImageFormat::Gray8),
-            });
-        }
+        OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!(
+            "JPEG/TIFF rejected in render_page_poppler before reaching write_page_gray"
+        ),
     }
     Ok(())
 }
