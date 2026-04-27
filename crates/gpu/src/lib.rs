@@ -9,6 +9,14 @@
 //! let ctx = GpuCtx::init().expect("no CUDA device");
 //! // … call ctx.composite_rgba8(src, dst) etc.
 //! ```
+//!
+//! # Feature flags
+//!
+//! - `nvjpeg` — enables [`nvjpeg`] module for GPU-accelerated JPEG decoding
+//!   via NVIDIA nvJPEG.  Requires `libnvjpeg.so` at link time.
+
+#[cfg(feature = "nvjpeg")]
+pub mod nvjpeg;
 
 use std::sync::Arc;
 

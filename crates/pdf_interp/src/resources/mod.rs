@@ -22,6 +22,8 @@ use raster::types::BlendMode;
 
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
+#[cfg(feature = "nvjpeg")]
+pub use gpu::nvjpeg::NvJpegDecoder;
 
 /// Selected parameters extracted from a PDF `ExtGState` resource dictionary.
 ///
@@ -213,10 +215,23 @@ impl<'doc> PageResources<'doc> {
     ///
     /// Returns `None` if the name is absent, the object is not an image, or
     /// decoding fails.
+    ///
+    /// `gpu` enables GPU-accelerated JPEG decoding for large `DCTDecode` streams
+    /// when the `nvjpeg` feature is active.  Pass `None` for CPU-only behaviour.
     #[must_use]
-    pub fn image(&self, name: &[u8]) -> Option<image::ImageDescriptor> {
+    pub fn image(
+        &self,
+        name: &[u8],
+        #[cfg(feature = "nvjpeg")] gpu: Option<&mut gpu::nvjpeg::NvJpegDecoder>,
+    ) -> Option<image::ImageDescriptor> {
         let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        image::resolve_image(self.doc, page_dict, name)
+        image::resolve_image(
+            self.doc,
+            page_dict,
+            name,
+            #[cfg(feature = "nvjpeg")]
+            gpu,
+        )
     }
 
     /// Look up a named `ExtGState` resource and return selected parameters.

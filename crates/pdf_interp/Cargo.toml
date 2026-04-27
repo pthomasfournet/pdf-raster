@@ -3,11 +3,18 @@ name    = "pdf_interp"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enable GPU-accelerated JPEG decoding via nvJPEG for DCTDecode streams.
+# Requires CUDA 12 and a NVIDIA GPU.  Falls back to zune-jpeg when the GPU
+# context is unavailable or the image is below the dispatch threshold.
+nvjpeg = ["gpu/nvjpeg"]
+
 [dependencies]
 raster = { path = "../raster" }
 color  = { path = "../color" }
 font   = { path = "../font" }
 encode = { path = "../encode" }
+gpu    = { path = "../gpu", optional = true }
 lopdf  = "0.40"
 log    = { workspace = true }
 fax = "0.2.6"

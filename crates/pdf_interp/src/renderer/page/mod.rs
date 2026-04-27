@@ -54,6 +54,8 @@ use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use crate::content::{Operator, TextArrayElement};
 use crate::resources::{ImageColorSpace, PageResources, image::decode_inline_image};
+#[cfg(feature = "nvjpeg")]
+use gpu::nvjpeg::NvJpegDecoder;
 
 /// Identity CTM for passing to raster functions — coordinate transform is
 /// already baked into the path points by `to_device`.
@@ -90,6 +92,10 @@ pub struct PageRenderer<'doc> {
     resources: PageResources<'doc>,
     /// Current Form `XObject` nesting depth (0 = top-level page).
     form_depth: u32,
+    /// GPU-accelerated JPEG decoder, present when the `nvjpeg` feature is enabled
+    /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
+    #[cfg(feature = "nvjpeg")]
+    nvjpeg: Option<NvJpegDecoder>,
 }
 
 impl<'doc> PageRenderer<'doc> {
@@ -147,7 +153,21 @@ impl<'doc> PageRenderer<'doc> {
             font_cache,
             resources,
             form_depth: 0,
+            #[cfg(feature = "nvjpeg")]
+            nvjpeg: None,
         }
+    }
+
+    /// Attach a GPU JPEG decoder to this renderer.
+    ///
+    /// When set, `DCTDecode` image streams with pixel area ≥
+    /// [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are decoded on the
+    /// GPU via nvJPEG rather than `zune-jpeg`.
+    ///
+    /// Calling this with `None` detaches any existing decoder (reverts to CPU).
+    #[cfg(feature = "nvjpeg")]
+    pub fn set_nvjpeg(&mut self, dec: Option<NvJpegDecoder>) {
+        self.nvjpeg = dec;
     }
 
     /// Consume the renderer and return the finished bitmap.
@@ -729,7 +749,12 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
         // Try Image.
-        if let Some(img) = self.resources.image(name) {
+        let img = self.resources.image(
+            name,
+            #[cfg(feature = "nvjpeg")]
+            self.nvjpeg.as_mut(),
+        );
+        if let Some(img) = img {
             self.blit_image(&img);
             return;
         }

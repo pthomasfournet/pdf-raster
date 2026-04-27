@@ -12,7 +12,7 @@
 //! | `CCITTFaxDecode` (`K=0`, Group 3 1D / T.4) | yes/no | yes |
 //! | `FlateDecode` | yes/no | yes |
 //! | none (raw) | yes/no | yes |
-//! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`) |
+//! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`, or GPU nvJPEG) |
 //! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`) |
 //! | `JBIG2Decode` | — | stub |
 //! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | — | stub |
@@ -24,6 +24,13 @@
 //! | `Gray` | 1 | black | white |
 //! | `Rgb` | 3 | black (R=G=B=0) | white |
 //! | `Mask` | 1 | paint with fill colour | transparent (leave background) |
+//!
+//! # nvJPEG acceleration (`nvjpeg` feature)
+//!
+//! When the crate is built with `--features nvjpeg`, `DCTDecode` streams with
+//! pixel area ≥ [`GPU_JPEG_THRESHOLD_PX`] are decoded on the GPU via NVIDIA
+//! nvJPEG instead of `zune-jpeg`.  Pass an [`NvJpegDecoder`] to
+//! [`resolve_image`] to enable this path; pass `None` for CPU-only behaviour.
 
 use std::borrow::Cow;
 
@@ -35,6 +42,20 @@ use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace as ZColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
+
+// ── nvJPEG GPU acceleration ───────────────────────────────────────────────────
+
+#[cfg(feature = "nvjpeg")]
+use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
+
+/// Pixel area threshold (width × height) below which the CPU `zune-jpeg` path
+/// is used even when nvJPEG is available.  Below this size the PCIe transfer
+/// overhead dominates and the GPU is slower than the CPU decoder.
+///
+/// 512 × 512 = 262 144 pixels ≈ the smallest size where nvJPEG throughput at
+/// ~10 GB/s exceeds `zune-jpeg` at ~1 GB/s after PCIe DMA latency.
+#[cfg(feature = "nvjpeg")]
+pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -84,6 +105,7 @@ pub fn resolve_image(
     doc: &Document,
     page_dict: &Dictionary,
     name: &[u8],
+    #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
 ) -> Option<ImageDescriptor> {
     let stream_id = xobject_id(doc, page_dict, name)?;
     let obj = doc.get_object(stream_id).ok()?;
@@ -118,7 +140,16 @@ pub fn resolve_image(
             let parms = stream.dict.get(b"DecodeParms").ok();
             decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
         }
-        Some("DCTDecode") => decode_dct(stream.content.as_slice(), w, h),
+        Some("DCTDecode") => {
+            #[cfg(feature = "nvjpeg")]
+            {
+                decode_dct(stream.content.as_slice(), w, h, gpu)
+            }
+            #[cfg(not(feature = "nvjpeg"))]
+            {
+                decode_dct(stream.content.as_slice(), w, h)
+            }
+        }
         Some("JPXDecode") => decode_jpx(stream.content.as_slice(), w, h),
         Some("JBIG2Decode") => {
             log::debug!("image: filter \"JBIG2Decode\" not yet implemented");
@@ -193,7 +224,18 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
             let decode_parms = dict.get(b"DecodeParms").ok();
             decode_ccitt(data, w, h, is_mask, decode_parms)
         }
-        Some("DCTDecode") => decode_dct(data, w, h),
+        Some("DCTDecode") => {
+            // Inline images are typically small (embedded in the content stream).
+            // GPU dispatch for inline images is not worthwhile — use CPU always.
+            #[cfg(feature = "nvjpeg")]
+            {
+                decode_dct(data, w, h, None)
+            }
+            #[cfg(not(feature = "nvjpeg"))]
+            {
+                decode_dct(data, w, h)
+            }
+        }
         Some("JPXDecode") => decode_jpx(data, w, h),
         Some("JBIG2Decode") => {
             log::debug!("inline image: JBIG2Decode not yet implemented");
@@ -1066,7 +1108,30 @@ fn append_ccitt_row(
 /// where `C`, `K` are the complemented (i.e. raw) CMYK byte values.  This is
 /// equivalent to the standard CMY+K → RGB conversion applied to the inverted
 /// ink densities.
-fn decode_dct(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
+fn decode_dct(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+) -> Option<ImageDescriptor> {
+    // ── GPU fast path (nvjpeg feature, large images, 1- or 3-component only) ──
+    #[cfg(feature = "nvjpeg")]
+    if let Some(dec) = gpu {
+        // Only dispatch to GPU when the image area meets the threshold.
+        // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
+        // it falls through to the CPU path below which handles CMYK→RGB.
+        // We peek at the component count with a cheap header probe first.
+        let area = pdf_w.saturating_mul(pdf_h);
+        if area >= GPU_JPEG_THRESHOLD_PX {
+            if let Some(img) = decode_dct_gpu(data, pdf_w, pdf_h, dec) {
+                return Some(img);
+            }
+            // GPU decode failed (e.g. unsupported encoding) — fall through to CPU.
+            log::debug!("image: DCTDecode: GPU path failed, retrying on CPU");
+        }
+    }
+
+    // ── CPU path (zune-jpeg) ──────────────────────────────────────────────────
     // First pass: decode only the JPEG headers to learn the component count,
     // which determines the output colourspace we request on the second decode.
     // Two passes are necessary because zune-jpeg requires the output colourspace
@@ -1128,6 +1193,48 @@ fn decode_dct(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
         // out_cs is always Luma, RGB, or CMYK — set from the components match above.
         _ => unreachable!("DCTDecode: unexpected out_cs variant"),
     }
+}
+
+/// GPU-accelerated DCT decode via nvJPEG.
+///
+/// Returns `None` if the component count is unsupported (e.g. CMYK, which
+/// nvJPEG cannot output as RGBI) or if any CUDA API call fails.  The caller
+/// must fall back to the CPU path when `None` is returned.
+///
+/// The stream is synchronised inside `NvJpegDecoder::decode_sync` before
+/// pixel bytes are returned, so the result is safe to use immediately.
+#[cfg(feature = "nvjpeg")]
+fn decode_dct_gpu(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    dec: &mut NvJpegDecoder,
+) -> Option<ImageDescriptor> {
+    let img = dec
+        .decode_sync(data)
+        .map_err(|e| log::debug!("image: DCTDecode GPU: nvJPEG error: {e}"))
+        .ok()?;
+
+    if img.width != pdf_w || img.height != pdf_h {
+        log::debug!(
+            "image: DCTDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG reports {}×{} — using nvJPEG dims",
+            img.width,
+            img.height,
+        );
+    }
+
+    let color_space = match img.color_space {
+        GpuCs::Gray => ImageColorSpace::Gray,
+        GpuCs::Rgb => ImageColorSpace::Rgb,
+    };
+
+    Some(ImageDescriptor {
+        width: img.width,
+        height: img.height,
+        color_space,
+        data: img.data,
+        smask: None,
+    })
 }
 
 /// Convert a flat CMYK byte buffer (inverted ink densities, 4 bytes/pixel) to

@@ -3,6 +3,11 @@ name    = "gpu"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enable GPU-accelerated JPEG decoding via NVIDIA nvJPEG.
+# Requires libnvjpeg.so to be present at link time (ships with CUDA 12).
+nvjpeg = []
+
 [dependencies]
 cudarc = { version = "0.19", features = ["cuda-12080"] }
 color  = { path = "../color" }
