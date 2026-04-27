@@ -216,7 +216,13 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
 /// - Byte `n` in [0, 127] → copy the next `n + 1` literal bytes.
 /// - Byte `n` in [129, 255] → repeat the next byte `257 − n` times.
 /// - Byte `128` → end-of-data marker.
+///
+/// Output is capped at 256 MiB to prevent adversarial OOM from a crafted stream.
 fn decode_run_length(data: &[u8]) -> Vec<u8> {
+    // 256 MiB: enough for a 65536×65536 single-channel image, hard limit against
+    // adversarial run-length streams that encode billions of bytes from a few bytes.
+    const MAX_OUTPUT: usize = 256 * 1024 * 1024;
+
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
@@ -227,6 +233,10 @@ fn decode_run_length(data: &[u8]) -> Vec<u8> {
             0..=127 => {
                 let count = run_byte as usize + 1;
                 let end = i.saturating_add(count).min(data.len());
+                if out.len() + (end - i) > MAX_OUTPUT {
+                    log::warn!("inline image: RunLengthDecode output exceeds 256 MiB — truncating");
+                    break;
+                }
                 out.extend_from_slice(&data[i..end]);
                 i = end;
             }
@@ -234,6 +244,12 @@ fn decode_run_length(data: &[u8]) -> Vec<u8> {
                 // 129..=255: repeat = 257 - run_byte
                 let repeat = 257usize.saturating_sub(run_byte as usize);
                 if let Some(&b) = data.get(i) {
+                    if out.len() + repeat > MAX_OUTPUT {
+                        log::warn!(
+                            "inline image: RunLengthDecode output exceeds 256 MiB — truncating"
+                        );
+                        break;
+                    }
                     out.extend(std::iter::repeat_n(b, repeat));
                     i += 1;
                 }
@@ -1790,6 +1806,23 @@ mod tests {
     #[test]
     fn run_length_empty_input() {
         assert_eq!(decode_run_length(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn run_length_truncates_at_max_output() {
+        // Build a stream of repeat-255 runs that would expand to far more than
+        // 256 MiB.  Each run encodes 129 (repeat = 257-129 = 128) copies of
+        // a byte; 2 bytes per run.  We send enough runs to exceed the cap and
+        // verify the output is capped, not panicking or OOM-ing.
+        const MAX_OUT: usize = 256 * 1024 * 1024;
+        let runs_needed = MAX_OUT / 128 + 2;
+        let mut data = Vec::with_capacity(runs_needed * 2);
+        for _ in 0..runs_needed {
+            data.push(129u8); // repeat = 257 - 129 = 128
+            data.push(0xABu8);
+        }
+        let out = decode_run_length(&data);
+        assert!(out.len() <= MAX_OUT, "output exceeded MAX_OUTPUT cap");
     }
 
     // ── decode_inline_image ────────────────────────────────────────────────────

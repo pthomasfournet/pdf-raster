@@ -758,7 +758,7 @@ impl<'doc> PageRenderer<'doc> {
         let page_h = f64::from(self.height);
 
         let Some((pattern, _bbox)) = self.resources.shading(name, &ctm, page_h) else {
-            log::debug!(
+            log::warn!(
                 "pdf_interp: sh /{} — shading not available (unsupported type or missing resource)",
                 String::from_utf8_lossy(name)
             );

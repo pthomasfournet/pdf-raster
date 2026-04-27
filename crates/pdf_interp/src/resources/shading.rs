@@ -62,7 +62,7 @@ pub fn resolve_shading(
         2 => resolve_axial(doc, sh_dict, cs, n_channels, ctm, page_h),
         3 => resolve_radial(doc, sh_dict, cs, n_channels, ctm, page_h),
         other => {
-            log::debug!("shading: ShadingType {other} not yet implemented");
+            log::warn!("shading: ShadingType {other} not yet implemented — skipping sh operator");
             None
         }
     }
@@ -95,9 +95,20 @@ fn resolve_axial(
     let rgb0 = cs_to_rgb(cs, &c0_user);
     let rgb1 = cs_to_rgb(cs, &c1_user);
 
+    // Reject non-finite user-space coordinates before transforming.
+    if !coords.iter().all(|v| v.is_finite()) {
+        log::warn!("shading/axial: non-finite Coords — skipping");
+        return None;
+    }
+
     // Transform Coords from user space to device space (y-flip included).
     let (dx0, dy0) = transform_point(ctm, coords[0], coords[1], page_h);
     let (dx1, dy1) = transform_point(ctm, coords[2], coords[3], page_h);
+
+    if !dx0.is_finite() || !dy0.is_finite() || !dx1.is_finite() || !dy1.is_finite() {
+        log::warn!("shading/axial: non-finite device coords after CTM transform — skipping");
+        return None;
+    }
 
     let bbox = bbox_from_coords(&[dx0, dy0, dx1, dy1]);
 
@@ -128,9 +139,21 @@ fn resolve_radial(
     let rgb0 = cs_to_rgb(cs, &c0_user);
     let rgb1 = cs_to_rgb(cs, &c1_user);
 
+    // Reject non-finite user-space coordinates before transforming.
+    if !coords.iter().all(|v| v.is_finite()) {
+        log::warn!("shading/radial: non-finite Coords — skipping");
+        return None;
+    }
+
     // Transform centres; scale radius by the geometric mean of the CTM scale.
     let (dx0, dy0) = transform_point(ctm, coords[0], coords[1], page_h);
     let (dx1, dy1) = transform_point(ctm, coords[3], coords[4], page_h);
+
+    if !dx0.is_finite() || !dy0.is_finite() || !dx1.is_finite() || !dy1.is_finite() {
+        log::warn!("shading/radial: non-finite device coords after CTM transform — skipping");
+        return None;
+    }
+
     let scale = ctm_scale(ctm);
     let dr0 = coords[2] * scale;
     let dr1 = coords[5] * scale;
@@ -218,6 +241,19 @@ fn eval_stitching(doc: &Document, fn_dict: &Dictionary, t: f64, n: usize) -> Opt
         .map(|arr| arr.iter().filter_map(obj_to_f64).collect())
         .unwrap_or_default();
 
+    // PDF spec: Bounds must have exactly num_fns−1 values.  A malformed dict
+    // with the wrong count would cause out-of-bounds access in `breaks[idx+1]`.
+    if bounds.len() != num_fns - 1 {
+        log::warn!(
+            "shading: Type 3 function has {} sub-functions but {} Bounds values (expected {}); \
+             using first sub-function as fallback",
+            num_fns,
+            bounds.len(),
+            num_fns - 1,
+        );
+        return eval_function(doc, &fns[0], t_clamped, n);
+    }
+
     // Build breakpoint list: [d0, bounds..., d1].
     let mut breaks = Vec::with_capacity(num_fns + 1);
     breaks.push(d0);
@@ -225,6 +261,7 @@ fn eval_stitching(doc: &Document, fn_dict: &Dictionary, t: f64, n: usize) -> Opt
     breaks.push(d1);
 
     // Find which sub-function `t_clamped` falls into.
+    // Clamp idx to num_fns−1 to guard against rounding/NaN edge cases.
     let idx = if t_clamped >= d1 {
         num_fns - 1
     } else {
@@ -232,6 +269,7 @@ fn eval_stitching(doc: &Document, fn_dict: &Dictionary, t: f64, n: usize) -> Opt
             .windows(2)
             .position(|w| t_clamped < w[1])
             .unwrap_or(num_fns - 1)
+            .min(num_fns - 1)
     };
 
     // Encode: maps [breaks[i], breaks[i+1]] → [Encode[2i], Encode[2i+1]].
@@ -407,10 +445,14 @@ fn transform_point(ctm: &[f64; 6], x: f64, y: f64, page_h: f64) -> (f64, f64) {
 }
 
 /// Compute the uniform scale factor of the CTM (geometric mean of x and y scales).
+///
+/// Falls back to `1.0` when the CTM contains non-finite entries or produces a
+/// non-finite scale (e.g., from an extreme anisotropic or degenerate matrix).
 fn ctm_scale(ctm: &[f64; 6]) -> f64 {
     let sx = ctm[0].hypot(ctm[1]);
     let sy = ctm[2].hypot(ctm[3]);
-    (sx * sy).sqrt()
+    let result = (sx * sy).sqrt();
+    if result.is_finite() { result } else { 1.0 }
 }
 
 /// Compute a bounding box from a flat list of interleaved `[x, y, x, y, …]` values.
@@ -523,5 +565,57 @@ mod tests {
     fn ctm_scale_uniform_2x() {
         let ctm = [2.0f64, 0.0, 0.0, 2.0, 0.0, 0.0];
         assert!((ctm_scale(&ctm) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ctm_scale_nan_falls_back_to_one() {
+        let ctm = [f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(ctm_scale(&ctm), 1.0);
+    }
+
+    #[test]
+    fn ctm_scale_inf_falls_back_to_one() {
+        let ctm = [f64::INFINITY, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(ctm_scale(&ctm), 1.0);
+    }
+
+    #[test]
+    fn eval_stitching_wrong_bounds_count_falls_back() {
+        // 2 sub-functions need 1 bound value; giving 0 should not panic.
+        let doc = lopdf::Document::new();
+        let mut fn_dict = lopdf::Dictionary::new();
+        fn_dict.set("FunctionType", lopdf::Object::Integer(3));
+        fn_dict.set(
+            "Domain",
+            lopdf::Object::Array(vec![lopdf::Object::Real(0.0), lopdf::Object::Real(1.0)]),
+        );
+        // Two sub-functions.
+        let sub = {
+            let mut d = lopdf::Dictionary::new();
+            d.set("FunctionType", lopdf::Object::Integer(2));
+            d.set("C0", lopdf::Object::Array(vec![lopdf::Object::Real(0.0)]));
+            d.set("C1", lopdf::Object::Array(vec![lopdf::Object::Real(1.0)]));
+            d.set("N", lopdf::Object::Real(1.0));
+            d.set(
+                "Domain",
+                lopdf::Object::Array(vec![lopdf::Object::Real(0.0), lopdf::Object::Real(1.0)]),
+            );
+            lopdf::Object::Dictionary(d)
+        };
+        fn_dict.set("Functions", lopdf::Object::Array(vec![sub.clone(), sub]));
+        // Wrong: 0 bounds values for 2 sub-functions.
+        fn_dict.set("Bounds", lopdf::Object::Array(vec![]));
+        fn_dict.set(
+            "Encode",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Real(0.0),
+                lopdf::Object::Real(1.0),
+                lopdf::Object::Real(0.0),
+                lopdf::Object::Real(1.0),
+            ]),
+        );
+        // Must not panic; result is Some (fallback to first sub-function).
+        let result = eval_stitching(&doc, &fn_dict, 0.5, 1);
+        assert!(result.is_some());
     }
 }
