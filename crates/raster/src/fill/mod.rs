@@ -191,16 +191,19 @@ pub(super) fn fill_impl<P: Pixel>(
             }
         }
     } else {
-        for y in y_min_i..=y_max_i {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "bitmap.width ≤ i32::MAX in practice"
+        )]
+        let width_i = bitmap.width as i32;
+
+        // Iterate only over scanlines that have at least one intersection —
+        // skips empty rows in the bounding box without touching the fill loop.
+        for y in scanner.nonempty_rows() {
             #[expect(clippy::cast_sign_loss, reason = "cast after y < 0 guard")]
             if y < 0 || (y as u32) >= bitmap.height {
                 continue;
             }
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "bitmap.width ≤ i32::MAX in practice"
-            )]
-            let width_i = bitmap.width as i32;
             for (x0, x1) in ScanIterator::new(&scanner, y) {
                 let (mut sx0, mut sx1) = (x0, x1);
                 let inner_clip = if clip_res == ClipResult::AllInside {

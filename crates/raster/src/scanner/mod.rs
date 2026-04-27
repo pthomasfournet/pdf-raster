@@ -264,6 +264,25 @@ impl XPathScanner {
         self.x_min > self.x_max
     }
 
+    /// Iterate over only the scanlines that have at least one intersection.
+    ///
+    /// Skips empty rows using the `row_start` sentinel array — an empty row has
+    /// `row_start[i] == row_start[i+1]`.  For paths that are sparse over the
+    /// bounding-box height (e.g., a thin diagonal across a tall page), this
+    /// eliminates the per-row overhead for all-empty rows.
+    ///
+    /// Yields absolute device-pixel `y` values in ascending order.
+    pub fn nonempty_rows(&self) -> impl Iterator<Item = i32> + '_ {
+        // row_start has length n_rows + 1 (sentinel).  Row i is non-empty
+        // iff row_start[i] < row_start[i + 1].
+        self.row_start
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] < w[1])
+            // i < n_rows ≤ i32::MAX for any real page
+            .map(|(i, _)| self.y_min + i32::try_from(i).unwrap_or(i32::MAX))
+    }
+
     /// The intersections for scanline `y`, sorted by `x0`.
     ///
     /// Returns an empty slice if `y` is outside `[y_min, y_max]`. Never panics.

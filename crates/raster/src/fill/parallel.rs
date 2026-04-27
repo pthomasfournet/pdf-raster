@@ -227,8 +227,11 @@ fn fill_band<P: Pixel>(
     )]
     let width_i = band.width as i32;
 
-    // y_start >= y_band_min >= 0 (band.y_start is u32), so y is always non-negative.
-    for y in y_start..=y_end {
+    // Iterate only over scanlines in this band that have at least one intersection.
+    for y in scanner
+        .nonempty_rows()
+        .filter(|&y| y >= y_start && y <= y_end)
+    {
         for (x0, x1) in ScanIterator::new(scanner, y) {
             let (mut sx0, mut sx1) = (x0, x1);
             let inner_clip = if clip_res == ClipResult::AllInside {
