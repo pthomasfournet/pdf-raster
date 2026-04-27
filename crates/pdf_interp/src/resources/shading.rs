@@ -113,9 +113,15 @@ pub fn resolve_shading(
     }
 }
 
-/// Decompress a stream, returning `None` on failure (logged as a debug message).
+/// Decompress a stream, logging a warning on failure.
 fn stream_content(s: &Stream) -> Option<Vec<u8>> {
-    s.decompressed_content().ok()
+    match s.decompressed_content() {
+        Ok(data) => Some(data),
+        Err(e) => {
+            log::warn!("shading: failed to decompress stream — {e}");
+            None
+        }
+    }
 }
 
 // ── Axial (Type 2) ────────────────────────────────────────────────────────────
@@ -225,10 +231,16 @@ fn resolve_radial(
 
 // ── Type 4 — Free-form Gouraud triangle mesh ──────────────────────────────────
 
-/// Bit-stream reader — reads `bits` bits at a time from a byte slice.
+/// Bit-stream reader for packed mesh vertex data (PDF §8.7.4.5).
+///
+/// PDF mesh shading streams pack coordinates and colour components into
+/// consecutive bit fields (MSB first, byte-aligned at the record level only
+/// for the flag byte; the rest are truly packed).  `read_bits` pulls `n`
+/// bits (1–32) from the stream, returning `None` on EOF.
 struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
+    /// Bits already fetched from `data` but not yet consumed (MSB-justified).
     bit_buf: u32,
     bits_in_buf: u8,
 }
@@ -243,8 +255,15 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Read `n` bits (1–32) and return as `u32`. Returns `None` on EOF.
+    /// Read exactly `n` bits (1–32) and return as a right-justified `u32`.
+    ///
+    /// Returns `None` when the stream is exhausted before `n` bits are available.
+    /// Callers must not pass `n == 0` (asserted in debug builds; release returns 0).
     fn read_bits(&mut self, n: u8) -> Option<u32> {
+        debug_assert!(n >= 1 && n <= 32, "read_bits: n={n} out of range 1..=32");
+        if n == 0 || n > 32 {
+            return Some(0);
+        }
         while self.bits_in_buf < n {
             if self.byte_pos >= self.data.len() {
                 return None;
@@ -254,16 +273,54 @@ impl<'a> BitReader<'a> {
             self.bits_in_buf += 8;
         }
         self.bits_in_buf -= n;
+        // Safe: n ∈ [1,32], bits_in_buf ≥ 0 after subtraction.
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         Some((self.bit_buf >> self.bits_in_buf) & mask)
     }
 }
 
+/// PDF-legal values for `BitsPerCoordinate` and `BitsPerComponent` (Table 84/85).
+const VALID_BITS: &[u8] = &[1, 2, 4, 8, 12, 16, 24, 32];
+
+/// Validate and extract `BitsPerCoordinate` from a mesh shading dictionary.
+///
+/// Logs a warning and returns `None` if the key is absent or the value is not
+/// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
+fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
+    let v = sh.get_i64(b"BitsPerCoordinate")?;
+    match u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
+        Some(bits) => Some(bits),
+        None => {
+            log::warn!("shading/{tag}: BitsPerCoordinate={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
+            None
+        }
+    }
+}
+
+/// Validate and extract `BitsPerComponent` from a mesh shading dictionary.
+///
+/// Logs a warning and returns `None` if the key is absent or the value is not
+/// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
+fn parse_bits_per_comp(sh: &Dictionary, tag: &str) -> Option<u8> {
+    let v = sh.get_i64(b"BitsPerComponent")?;
+    match u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
+        Some(bits) => Some(bits),
+        None => {
+            log::warn!("shading/{tag}: BitsPerComponent={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
+            None
+        }
+    }
+}
+
 /// Decode a Type 4 (free-form Gouraud triangle mesh) shading stream.
 ///
-/// Records: `flag(8 bits)`, `x(BitsPerCoordinate bits)`, `y(BitsPerCoordinate bits)`,
-/// then `n_channels × BitsPerComponent bits` per colour channel.
-/// Flag 0 = new triangle (3 vertices); flag 1 = shared edge v[1]–v[2]; flag 2 = shared edge v[0]–v[2].
+/// Stream layout: for each record, 8-bit flag followed by `BitsPerCoordinate`
+/// bits each for X and Y, then `BitsPerComponent` bits per colour channel.
+///
+/// Flag semantics (PDF §8.7.4.5.3):
+/// - 0 → new triangle: 3 new vertices A, B, C
+/// - 1 → extend from edge (B, C) of previous triangle: 1 new vertex D → triangle (B, C, D)
+/// - 2 → extend from edge (C, A) of previous triangle: 1 new vertex D → triangle (C, A, D)
 fn decode_type4_mesh(
     sh: &Dictionary,
     data: &[u8],
@@ -272,65 +329,66 @@ fn decode_type4_mesh(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Vec<[GouraudVertex; 3]> {
-    let Some(bits_per_coord) = sh.get_i64(b"BitsPerCoordinate").map(|v| v as u8) else {
-        log::warn!("shading/type4: missing BitsPerCoordinate");
-        return vec![];
-    };
-    let Some(bits_per_comp) = sh.get_i64(b"BitsPerComponent").map(|v| v as u8) else {
-        log::warn!("shading/type4: missing BitsPerComponent");
-        return vec![];
-    };
+    let Some(bpc) = parse_bits_per_coord(sh, "type4") else { return vec![] };
+    let Some(bpcomp) = parse_bits_per_comp(sh, "type4") else { return vec![] };
     let decode = read_decode_array(sh, n_channels);
 
     let mut reader = BitReader::new(data);
     let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
-    let mut prev: Vec<GouraudVertex> = Vec::new();
+    // The three vertices of the most recently emitted triangle, for fan continuation.
+    let mut prev: Option<[GouraudVertex; 3]> = None;
 
     loop {
-        let Some(flag) = reader.read_bits(8) else { break };
-        let n_new = if flag == 0 { 3 } else { 1 };
-        let mut new_verts = Vec::with_capacity(n_new);
+        // Flag is 8 bits; read_bits(8) guarantees value ≤ 255.
+        let Some(flag_raw) = reader.read_bits(8) else { break };
+        #[expect(clippy::cast_possible_truncation, reason = "read_bits(8) returns at most 255")]
+        let flag = flag_raw as u8;
 
-        for _ in 0..n_new {
-            let Some(raw_x) = reader.read_bits(bits_per_coord) else { break };
-            let Some(raw_y) = reader.read_bits(bits_per_coord) else { break };
-            let mut channels = Vec::with_capacity(n_channels);
-            let mut ok = true;
-            for _ in 0..n_channels {
-                if let Some(raw_c) = reader.read_bits(bits_per_comp) {
-                    channels.push(raw_c);
-                } else {
-                    ok = false;
-                    break;
-                }
+        let n_new: usize = if flag == 0 { 3 } else { 1 };
+
+        // Read new vertices; bail out of the entire mesh on any truncation.
+        let mut new_verts = [GouraudVertex { x: 0.0, y: 0.0, color: [0; 3] }; 3];
+        for slot in new_verts.iter_mut().take(n_new) {
+            let Some(raw_x) = reader.read_bits(bpc) else { return triangles };
+            let Some(raw_y) = reader.read_bits(bpc) else { return triangles };
+            let mut channels = [0u32; 4]; // max 4 channels (CMYK)
+            for ch in channels.iter_mut().take(n_channels) {
+                let Some(raw_c) = reader.read_bits(bpcomp) else { return triangles };
+                *ch = raw_c;
             }
-            if !ok {
-                break;
-            }
-            let v = decode_vertex(
+            *slot = decode_vertex(
                 raw_x,
                 raw_y,
-                &channels,
-                bits_per_coord,
-                bits_per_comp,
+                &channels[..n_channels],
+                bpc,
+                bpcomp,
                 &decode,
                 cs,
                 ctm,
                 page_h,
             );
-            new_verts.push(v);
         }
 
-        let tri_opt: Option<[GouraudVertex; 3]> = match (flag, new_verts.as_slice()) {
-            (0, [a, b, c]) => Some([*a, *b, *c]),
-            (1, [c]) if prev.len() >= 2 => Some([prev[prev.len() - 2], prev[prev.len() - 1], *c]),
-            (2, [c]) if prev.len() >= 2 => Some([prev[prev.len() - 3 + 2], prev[prev.len() - 1], *c]),
-            _ => None,
+        // Build the triangle from flag + previous vertices.
+        let tri: Option<[GouraudVertex; 3]> = match (flag, prev) {
+            // Flag 0: independent triangle from 3 fresh vertices.
+            (0, _) => Some([new_verts[0], new_verts[1], new_verts[2]]),
+            // Flag 1: extend from edge (B=prev[1], C=prev[2]) with new vertex D.
+            (1, Some(p)) => Some([p[1], p[2], new_verts[0]]),
+            // Flag 2: extend from edge (C=prev[2], A=prev[0]) with new vertex D.
+            (2, Some(p)) => Some([p[2], p[0], new_verts[0]]),
+            // Flag 1/2 with no prior triangle, or unknown flag: skip record.
+            (f, _) => {
+                if f > 2 {
+                    log::debug!("shading/type4: unknown flag {f} — skipping record");
+                }
+                None
+            }
         };
 
-        if let Some(tri) = tri_opt {
-            prev = tri.to_vec();
-            triangles.push(tri);
+        if let Some(t) = tri {
+            prev = Some(t);
+            triangles.push(t);
         }
     }
 
@@ -341,8 +399,9 @@ fn decode_type4_mesh(
 
 /// Decode a Type 5 (lattice-form Gouraud) shading stream.
 ///
-/// `VerticesPerRow` vertices wide, rows of vertices form a grid.
-/// Adjacent 2×2 quads are split into two triangles each.
+/// `VerticesPerRow` vertices wide; vertices are laid out in row-major order.
+/// Adjacent rows of vertices form a grid; each 2×2 quad is split into two
+/// triangles (top-left + bottom-right of the quad diagonal).
 fn decode_type5_mesh(
     sh: &Dictionary,
     data: &[u8],
@@ -351,73 +410,72 @@ fn decode_type5_mesh(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Vec<[GouraudVertex; 3]> {
-    let Some(bits_per_coord) = sh.get_i64(b"BitsPerCoordinate").map(|v| v as u8) else {
-        log::warn!("shading/type5: missing BitsPerCoordinate");
-        return vec![];
-    };
-    let Some(bits_per_comp) = sh.get_i64(b"BitsPerComponent").map(|v| v as u8) else {
-        log::warn!("shading/type5: missing BitsPerComponent");
-        return vec![];
-    };
+    let Some(bpc) = parse_bits_per_coord(sh, "type5") else { return vec![] };
+    let Some(bpcomp) = parse_bits_per_comp(sh, "type5") else { return vec![] };
     let Some(verts_per_row) = sh.get_i64(b"VerticesPerRow") else {
-        log::warn!("shading/type5: missing VerticesPerRow");
+        log::warn!("shading/type5: missing VerticesPerRow — skipping");
         return vec![];
     };
     if verts_per_row < 2 {
-        log::warn!("shading/type5: VerticesPerRow < 2 ({verts_per_row}) — skipping");
+        log::warn!("shading/type5: VerticesPerRow={verts_per_row} < 2 — skipping");
         return vec![];
     }
-    #[expect(clippy::cast_sign_loss, reason = "guarded >= 2 above")]
+    #[expect(clippy::cast_sign_loss, reason = "guarded ≥ 2 above")]
     let vpr = verts_per_row as usize;
     let decode = read_decode_array(sh, n_channels);
 
     let mut reader = BitReader::new(data);
-    let mut all_rows: Vec<Vec<GouraudVertex>> = Vec::new();
+    // Keep only two rows at a time; tessellate as we go to avoid storing the entire mesh.
+    let mut prev_row: Vec<GouraudVertex> = Vec::with_capacity(vpr);
+    let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
 
-    // Read all rows of vertices.
-    'outer: loop {
+    loop {
         let mut row = Vec::with_capacity(vpr);
         for _ in 0..vpr {
-            let Some(raw_x) = reader.read_bits(bits_per_coord) else { break 'outer };
-            let Some(raw_y) = reader.read_bits(bits_per_coord) else { break 'outer };
-            let mut channels = Vec::with_capacity(n_channels);
+            let Some(raw_x) = reader.read_bits(bpc) else { break };
+            let Some(raw_y) = reader.read_bits(bpc) else { break };
+            let mut channels = [0u32; 4];
             let mut ok = true;
-            for _ in 0..n_channels {
-                if let Some(raw_c) = reader.read_bits(bits_per_comp) {
-                    channels.push(raw_c);
+            for ch in channels.iter_mut().take(n_channels) {
+                if let Some(raw_c) = reader.read_bits(bpcomp) {
+                    *ch = raw_c;
                 } else {
                     ok = false;
                     break;
                 }
             }
             if !ok {
-                break 'outer;
+                break;
             }
             row.push(decode_vertex(
                 raw_x,
                 raw_y,
-                &channels,
-                bits_per_coord,
-                bits_per_comp,
+                &channels[..n_channels],
+                bpc,
+                bpcomp,
                 &decode,
                 cs,
                 ctm,
                 page_h,
             ));
         }
-        all_rows.push(row);
-    }
 
-    // Tessellate adjacent row pairs into triangles.
-    let mut triangles = Vec::new();
-    for rows in all_rows.windows(2) {
-        let (top, bot) = (&rows[0], &rows[1]);
-        for col in 0..vpr.saturating_sub(1) {
-            // Quad: top[col], top[col+1], bot[col], bot[col+1]
-            // Split into two triangles.
-            triangles.push([top[col], top[col + 1], bot[col]]);
-            triangles.push([top[col + 1], bot[col + 1], bot[col]]);
+        if row.len() < vpr {
+            // Truncated row at EOF — discard partial row.
+            break;
         }
+
+        if !prev_row.is_empty() {
+            // Tessellate the strip between prev_row and row.
+            for col in 0..vpr - 1 {
+                // Quad corners: TL=prev[col], TR=prev[col+1], BL=row[col], BR=row[col+1].
+                // Two triangles: (TL, TR, BL) and (TR, BR, BL).
+                triangles.push([prev_row[col], prev_row[col + 1], row[col]]);
+                triangles.push([prev_row[col + 1], row[col + 1], row[col]]);
+            }
+        }
+
+        prev_row = row;
     }
 
     triangles
@@ -425,10 +483,16 @@ fn decode_type5_mesh(
 
 // ── Mesh vertex helpers ───────────────────────────────────────────────────────
 
-/// Decode arrays for Type 4/5: `Decode` = `[xmin, xmax, ymin, ymax, c0min, c0max, …]`.
+/// Build the Decode range array for Type 4/5 streams.
+///
+/// Layout: `[xmin, xmax, ymin, ymax, c0min, c0max, …]` (PDF Table 84).
+/// If the dict lacks `Decode` or has the wrong number of entries, a
+/// warning is logged and the identity range `[0, 1]` is used for each slot.
 fn read_decode_array(sh: &Dictionary, n_channels: usize) -> Vec<f64> {
-    let expected = 4 + n_channels * 2; // x,y + per-channel
-    sh.get(b"Decode")
+    let expected = 4 + n_channels * 2; // coords (x,y) + per-channel pairs
+
+    let parsed: Option<Vec<f64>> = sh
+        .get(b"Decode")
         .ok()
         .and_then(|o| o.as_array().ok())
         .map(|arr| {
@@ -437,29 +501,38 @@ fn read_decode_array(sh: &Dictionary, n_channels: usize) -> Vec<f64> {
                     Object::Real(r) => Some(f64::from(*r)),
                     #[expect(
                         clippy::cast_precision_loss,
-                        reason = "decode values are small PDF numbers"
+                        reason = "Decode values are small PDF numbers; i64→f64 precision loss is negligible"
                     )]
                     Object::Integer(i) => Some(*i as f64),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            // Default: x,y in [0,1], each colour channel in [0,1].
-            let mut d = vec![0.0_f64, 1.0, 0.0, 1.0];
-            d.extend(std::iter::repeat_n([0.0_f64, 1.0], n_channels).flatten());
-            d
-        })
-        .into_iter()
-        .take(expected)
-        .collect()
+        });
+
+    match parsed {
+        Some(v) if v.len() == expected => v,
+        Some(v) => {
+            log::warn!(
+                "shading: Decode array has {} entries, expected {expected} — using defaults",
+                v.len()
+            );
+            default_decode(n_channels)
+        }
+        None => default_decode(n_channels),
+    }
 }
 
-/// Decode one raw vertex from bit-fields to a [`GouraudVertex`] in device space.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "raw bit fields are at most 32 bits; f64 has 53-bit mantissa, so values up to 2^32 are exact"
-)]
+/// Identity decode range: `[0,1]` for x, `[0,1]` for y, `[0,1]` per channel.
+fn default_decode(n_channels: usize) -> Vec<f64> {
+    let mut d = vec![0.0_f64, 1.0, 0.0, 1.0];
+    d.extend(std::iter::repeat_n([0.0_f64, 1.0], n_channels).flatten());
+    d
+}
+
+/// Decode one packed vertex into a [`GouraudVertex`] in device space.
+///
+/// Raw bit values are mapped from `[0, 2^bits − 1]` to the user-space range
+/// given by the `Decode` array, then transformed through the CTM to device space.
 fn decode_vertex(
     raw_x: u32,
     raw_y: u32,
@@ -471,21 +544,30 @@ fn decode_vertex(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> GouraudVertex {
-    let max_coord = ((1u64 << bits_per_coord) - 1) as f64;
-    let max_comp = if bits_per_comp == 0 {
-        1.0
-    } else {
-        ((1u64 << bits_per_comp) - 1) as f64
-    };
+    // bits_per_coord and bits_per_comp are validated ∈ VALID_BITS before this
+    // function is called, so both are in [1, 32] — the shift is safe.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bit fields are at most 32 bits; f64 has 53-bit mantissa, exact for all u32 values"
+    )]
+    let max_coord = ((1u64 << bits_per_coord) - 1) as f64; // always > 0 (bits ≥ 1)
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "same as max_coord — bits_per_comp ∈ [1,32]"
+    )]
+    let max_comp = ((1u64 << bits_per_comp) - 1) as f64; // always > 0
 
     let x_min = decode.first().copied().unwrap_or(0.0);
     let x_max = decode.get(1).copied().unwrap_or(1.0);
     let y_min = decode.get(2).copied().unwrap_or(0.0);
     let y_max = decode.get(3).copied().unwrap_or(1.0);
 
+    #[expect(clippy::cast_precision_loss, reason = "u32 → f64 exact up to 2^53")]
     let ux = x_min + (raw_x as f64 / max_coord) * (x_max - x_min);
+    #[expect(clippy::cast_precision_loss, reason = "u32 → f64 exact up to 2^53")]
     let uy = y_min + (raw_y as f64 / max_coord) * (y_max - y_min);
 
+    #[expect(clippy::cast_precision_loss, reason = "u32 → f64 exact up to 2^53")]
     let channels: Vec<f64> = raw_channels
         .iter()
         .enumerate()
