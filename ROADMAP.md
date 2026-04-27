@@ -40,8 +40,8 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 ### Nice-to-have before default (won't block, but improve coverage)
 
-- [ ] **Text render modes 4–7** — text-as-clip (glyph outlines → XPath intersection); rare in practice but used in some graphics-heavy docs
-- [ ] **Type 0 / CIDFont composite fonts** — needed for CJK and other multi-byte encodings
+- [x] **Text render modes 4–7** — text-as-clip via `glyph_path` outline collection; glyph paths unioned and intersected into clip per PDF §9.3.6
+- [x] **Type 0 / CIDFont composite fonts** — CMap parsing, DescendantFonts, CIDToGIDMap, DW/W metrics, multi-byte charcode iteration
 - [x] **Tiling patterns** — `scn`/`SCN` with Pattern colour space; `PatternType` 1 tiles rasterised via child `PageRenderer` and tiled with `rem_euclid`; PaintType 2 (uncoloured) falls through to solid fill
 
 ### Phase 1 parking lot (post-shipping coverage work)

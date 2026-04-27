@@ -1133,7 +1133,6 @@ impl<'doc> PageRenderer<'doc> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
         reason = "device pixel coords are always in page bounds after clamping; safe casts"
     )]
     fn blit_image(&mut self, img: &crate::resources::ImageDescriptor) {
@@ -1192,28 +1191,53 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
 
-        // For each output pixel, compute image-space coordinates by
-        // inverse-mapping from bounding-box coordinates.  Exact for
-        // axis-aligned transforms; approximate otherwise.
+        // Inverse CTM: for each device pixel (dx, dy_device) compute image-space
+        // coordinates (u, v) ∈ [0,1]² via exact inverse affine mapping.
+        //
+        // CTM maps PDF user space (u, v) → device pixels (x, y_pdf):
+        //   x      = a*u + c*v + e
+        //   y_pdf  = b*u + d*v + f
+        //
+        // After y-flip (device_y = page_h − y_pdf) the inverse is:
+        //   u = ( d*(dx − e) − c*(dy_pdf − f)) / det
+        //   v = (−b*(dx − e) + a*(dy_pdf − f)) / det
+        // where dy_pdf = page_h − dy_device.
+        //
+        // This is exact for any invertible CTM (axis-aligned or rotated/sheared).
+        let [a, b, c, d, e, f] = ctm;
+        let det = a * d - b * c;
+        // det is guaranteed non-zero: we already checked all corners are finite,
+        // and a singular CTM would produce a degenerate bounding box caught above.
+        let inv_det = if det.abs() < 1e-12 {
+            log::debug!("pdf_interp: blit_image: near-singular CTM (det={det:.2e}) — skipping");
+            return;
+        } else {
+            1.0 / det
+        };
+
         let img_w = f64::from(img.width);
         let img_h = f64::from(img.height);
-        let span_x = (dx1 - dx0).max(1) as f64;
-        let span_y = (dy1 - dy0).max(1) as f64;
-        let origin_x = dx0 as f64;
-        let origin_y = dy0 as f64;
 
         let data = self.bitmap.data_mut();
         let stride = self.width as usize * 3; // Rgb8: 3 bytes per pixel
 
         for dy in by0..by1 {
+            let dy_pdf = page_h - f64::from(dy);
+            let dy_rel = dy_pdf - f;
+            // Precompute the row-constant parts of the u/v formulas.
+            let u_row = (-c * dy_rel) * inv_det;
+            let v_row = (a * dy_rel) * inv_det;
             for dx in bx0..bx1 {
-                // tx ∈ [0,1] left→right; ty ∈ [0,1] bottom→top (PDF convention).
-                let tx = ((f64::from(dx) - origin_x) / span_x).clamp(0.0, 1.0);
-                let ty = 1.0 - ((f64::from(dy) - origin_y) / span_y).clamp(0.0, 1.0);
+                let dx_rel = f64::from(dx) - e;
+                // Image-space coordinates ∈ [0, 1]; clamp to guard edges.
+                let u = (d * dx_rel * inv_det + u_row).clamp(0.0, 1.0);
+                let v = ((-b) * dx_rel * inv_det + v_row).clamp(0.0, 1.0);
 
                 // Nearest-neighbour sample.  Clamp so ix < img.width, iy < img.height.
-                let ix = (tx * img_w).min(img_w - 1.0).max(0.0) as usize;
-                let iy = ((1.0 - ty) * img_h).min(img_h - 1.0).max(0.0) as usize;
+                // u maps to image column (left→right);
+                // v maps to image row, flipped: v=0 is top, v=1 is bottom (PDF origin=bottom-left).
+                let ix = (u * img_w).min(img_w - 1.0) as usize;
+                let iy = ((1.0 - v) * img_h).min(img_h - 1.0) as usize;
                 let img_idx = iy * img.width as usize + ix;
 
                 // If a soft mask is present, skip fully-transparent pixels.
