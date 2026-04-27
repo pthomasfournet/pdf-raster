@@ -12,12 +12,11 @@
 //!
 //! # Memory model
 //!
-//! `nvjpegDecode` writes to a plain heap `Vec<u8>` (not pinned/page-locked
-//! memory).  The CUDA driver can page-lock it on-demand; this is slightly
-//! slower than `cuMemAllocHost`-pinned memory for the DMA transfer, but avoids
-//! a mandatory copy into the rest of the pipeline.  If profiling shows
-//! the H2D/D2H transfer as a bottleneck, switch `decode` to allocate via
-//! `cuMemAllocHost` and return a `PinnedBuf` wrapper.
+//! `nvjpegDecode` writes to a `PinnedBuf` — page-locked host memory allocated
+//! via `cuMemAllocHost_v2`.  Pinned memory is required for GPU DMA; plain heap
+//! allocations (`Vec<u8>`) are not DMA-accessible and segfault on some driver
+//! versions.  After `cuStreamSynchronize` confirms all writes are complete, the
+//! pinned buffer is copied into a `Vec<u8>` that the caller owns freely.
 //!
 //! # Usage
 //!
@@ -32,13 +31,15 @@
 //! # Feature flag
 //!
 //! This module is only compiled when the `nvjpeg` feature is enabled on the
-//! `gpu` crate.  Callers that want a CPU fallback should check
-//! [`NvJpeg::new`] at startup and fall back to `zune-jpeg` if it returns `Err`.
+//! `gpu` crate.  Callers that want a CPU fallback should call
+//! [`NvJpegDecoder::new`] at startup and fall back to `zune-jpeg` if it
+//! returns `Err`.
 //!
 //! # Thread safety
 //!
-//! [`NvJpeg`] is `Send` but not `Sync`: each thread must own its own instance.
-//! Creating one per thread is cheap (two CUDA API calls).
+//! [`NvJpegDecoder`] is `Send` but not `Sync`: each thread must own its own
+//! instance.  Creating one per thread is cheap — it retains the primary GPU
+//! context (reference-counted by the driver) and creates one stream.
 
 // All nvJPEG calls are FFI through raw pointers.
 #![cfg(feature = "nvjpeg")]
@@ -96,7 +97,8 @@ const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 type nvjpegBackend_t = i32;
 
 /// Auto-select the best available backend (typically `HYBRID`).
-#[expect(dead_code, reason = "used as literal 0 in nvjpegCreateSimple fallback; kept for documentation")]
+/// Not referenced in code — `nvjpegCreateSimple` selects it implicitly.
+#[expect(dead_code, reason = "documents the numeric value; nvjpegCreateSimple selects DEFAULT implicitly")]
 const NVJPEG_BACKEND_DEFAULT: nvjpegBackend_t = 0;
 /// Hardware JPEG decode engine — fastest for baseline JPEGs on Turing+/Blackwell.
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;
@@ -204,8 +206,8 @@ unsafe extern "C" {
 const NVJPEG_STATUS_SUCCESS: nvjpegStatus_t = 0;
 /// JPEG encoding not supported by the chosen backend (e.g. progressive JPEG on HARDWARE backend).
 const NVJPEG_STATUS_JPEG_NOT_SUPPORTED: nvjpegStatus_t = 4;
-/// Bitstream is truncated or incomplete — included for documentation; matched by name in Display.
-#[expect(dead_code, reason = "matched as an integer literal in NvJpegError::Display; kept for documentation")]
+/// Bitstream is truncated or incomplete.
+#[expect(dead_code, reason = "named in NvJpegError::Display match arm as integer 10; kept as readable documentation")]
 const NVJPEG_STATUS_INCOMPLETE_BITSTREAM: nvjpegStatus_t = 10;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -236,10 +238,12 @@ pub enum NvJpegError {
     },
     /// Arithmetic overflow computing pixel buffer size (image dimensions unreasonably large).
     Overflow,
-    /// CUDA driver API error from `cuStreamSynchronize`.
+    /// CUDA driver API error (`CUresult`).
     ///
-    /// The `CUresult` error code is distinct from nvJPEG status codes; see
-    /// `cuda.h` for the full list (`CUDA_ERROR_*`).
+    /// Returned from any raw CUDA call: `cuInit`, `cuDeviceGet`,
+    /// `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuStreamCreate`,
+    /// `cuMemAllocHost`, or `cuStreamSynchronize`.
+    /// The code is distinct from nvJPEG status codes; see `cuda.h` (`CUDA_ERROR_*`).
     CudaError(i32),
 }
 
@@ -266,7 +270,22 @@ impl std::fmt::Display for NvJpegError {
                 write!(f, "JPEG reported zero or negative dimension {width}×{height}")
             }
             Self::Overflow => write!(f, "pixel buffer size overflow (image too large)"),
-            Self::CudaError(code) => write!(f, "CUDA driver error {code} from cuStreamSynchronize"),
+            Self::CudaError(code) => {
+                let name = match *code {
+                    1   => "CUDA_ERROR_INVALID_VALUE",
+                    2   => "CUDA_ERROR_OUT_OF_MEMORY",
+                    3   => "CUDA_ERROR_NOT_INITIALIZED",
+                    35  => "CUDA_ERROR_INSUFFICIENT_DRIVER",
+                    100 => "CUDA_ERROR_NO_DEVICE",
+                    101 => "CUDA_ERROR_INVALID_DEVICE",
+                    200 => "CUDA_ERROR_INVALID_IMAGE",
+                    201 => "CUDA_ERROR_INVALID_CONTEXT",
+                    209 => "CUDA_ERROR_MAP_FAILED",
+                    700 => "CUDA_ERROR_ILLEGAL_ADDRESS",
+                    _   => "CUDA_ERROR_UNKNOWN",
+                };
+                write!(f, "CUDA driver error {code} ({name})")
+            }
         }
     }
 }
@@ -326,10 +345,10 @@ impl PinnedBuf {
 
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: ptr came from cuMemAllocHost; no other references exist at drop time.
-            let _ = unsafe { cuMemFreeHost(self.ptr.cast()) };
-        }
+        // alloc() asserts non-null before returning Ok, so ptr is always valid here.
+        debug_assert!(!self.ptr.is_null(), "PinnedBuf::ptr is null — construction invariant violated");
+        // SAFETY: ptr came from cuMemAllocHost_v2; no other references exist at drop time.
+        let _ = unsafe { cuMemFreeHost(self.ptr.cast()) };
     }
 }
 
@@ -357,7 +376,10 @@ pub struct DecodedJpeg {
 ///
 /// Holds the library handle and a reusable per-decode state object.
 /// `Send` but not `Sync`: each thread should own its own instance.
-pub struct NvJpeg {
+///
+/// This type is an implementation detail of [`NvJpegDecoder`]; use that
+/// public API instead.
+pub(crate) struct NvJpeg {
     handle: nvjpegHandle_t,
     state: nvjpegJpegState_t,
     /// True when the handle was opened with `NVJPEG_BACKEND_HARDWARE`.
@@ -386,10 +408,17 @@ impl PendingDecode {
     /// Must only be called after the stream is synchronised; otherwise the GPU
     /// may still be writing and the copy will read partial data.
     fn into_decoded_jpeg(self) -> DecodedJpeg {
+        // width and height are i32 and were validated > 0 in decode_inner;
+        // positive i32 always fits in u32, so the cast is safe.
+        debug_assert!(self.width > 0 && self.height > 0);
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "validated > 0 in decode_inner before PendingDecode is constructed"
+        )]
         DecodedJpeg {
             data: self.pinned.to_vec(),
-            width: u32::try_from(self.width).expect("width already validated > 0"),
-            height: u32::try_from(self.height).expect("height already validated > 0"),
+            width: self.width as u32,
+            height: self.height as u32,
             color_space: self.color_space,
         }
     }
@@ -415,7 +444,7 @@ impl NvJpeg {
     /// # Errors
     ///
     /// Returns an error if nvJPEG device initialisation or state allocation fails.
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         // Try hardware engine first; fall back to default (hybrid) if unavailable.
         let (handle, hardware_backend) = Self::create_handle()?;
         Self::with_handle(handle, hardware_backend)
@@ -472,8 +501,15 @@ impl NvJpeg {
     /// Handles the hardware→default backend fallback for progressive JPEGs.
     fn decode(&mut self, data: &[u8], stream: CUstream) -> Result<PendingDecode> {
         match self.decode_inner(data, stream) {
-            // Hardware backend can't handle this JPEG (progressive / multi-scan).
-            // Re-open with DEFAULT backend and retry once.
+            // HARDWARE backend rejects progressive / multi-scan JPEGs with
+            // NVJPEG_STATUS_JPEG_NOT_SUPPORTED.  Fall back to DEFAULT (hybrid)
+            // which handles them.  This retry happens at most once per NvJpeg
+            // instance: after reinit, hardware_backend is false and the guard
+            // no longer fires.
+            //
+            // If the DEFAULT backend also returns NVJPEG_STATUS_JPEG_NOT_SUPPORTED
+            // the JPEG encoding is genuinely unsupported (not a backend limitation)
+            // and the error propagates to the caller.
             Err(NvJpegError::NvjpegStatus(NVJPEG_STATUS_JPEG_NOT_SUPPORTED))
                 if self.hardware_backend =>
             {
@@ -601,6 +637,12 @@ impl NvJpeg {
             )
         };
         if status != NVJPEG_STATUS_SUCCESS {
+            // nvjpegDecode may have enqueued partial GPU work before returning the
+            // error.  Synchronise the stream before dropping `pinned` so the driver
+            // cannot write into freed memory after we return.
+            // SAFETY: stream is valid; ignoring the sync error here is intentional —
+            // we are already on an error path and can only do best-effort cleanup.
+            let _ = unsafe { cuStreamSynchronize(stream) };
             return Err(NvJpegError::NvjpegStatus(status));
         }
 
@@ -615,10 +657,20 @@ impl Drop for NvJpeg {
     fn drop(&mut self) {
         // Ignore error codes on teardown — if the device is gone there is nothing
         // meaningful we can do, and panicking in Drop is unsound.
-        // SAFETY: handle and state are valid; no other references exist (NvJpeg is not Sync).
+        //
+        // Null-check both handles: `reinit_default_backend` sets them to null
+        // before creating the replacement pair, so a mid-reinit failure leaves
+        // nulls in the struct.  The nvJPEG API does not document null as a no-op,
+        // so we guard explicitly.
+        //
+        // SAFETY: non-null handles are valid and exclusively owned; no aliases exist.
         unsafe {
-            let _ = nvjpegJpegStateDestroy(self.state);
-            let _ = nvjpegDestroy(self.handle);
+            if !self.state.is_null() {
+                let _ = nvjpegJpegStateDestroy(self.state);
+            }
+            if !self.handle.is_null() {
+                let _ = nvjpegDestroy(self.handle);
+            }
         }
     }
 }
@@ -642,7 +694,9 @@ impl Drop for NvJpeg {
 ///
 /// `Send` but not `Sync`: each thread must own its own instance.
 pub struct NvJpegDecoder {
-    dec: NvJpeg,
+    /// Wrapped in `ManuallyDrop` so we can explicitly drop it (calling
+    /// nvjpegDestroy) before releasing the primary context in `Drop::drop`.
+    dec: std::mem::ManuallyDrop<NvJpeg>,
     /// Raw CUDA device handle (i32 ordinal).
     device: i32,
     /// Retained primary context for `device`.  Owned by this struct; released in Drop.
@@ -680,11 +734,11 @@ impl NvJpegDecoder {
         }
 
         // Step 2 — get device handle.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "ordinal is always a small index; truncation is intentional"
-        )]
-        let ordinal_i32 = ordinal as i32;
+        // cuDeviceGet takes a signed ordinal; real CUDA systems have at most a few
+        // hundred GPUs, so anything outside i32 range is a caller error.
+        // CUDA_ERROR_INVALID_DEVICE = 101.
+        let ordinal_i32 = i32::try_from(ordinal)
+            .map_err(|_| NvJpegError::CudaError(101))?;
         let mut device: i32 = 0;
         let r = unsafe { cuDeviceGet(ptr::addr_of_mut!(device), ordinal_i32) };
         if r != 0 {
@@ -728,7 +782,7 @@ impl NvJpegDecoder {
             }
         })?;
 
-        Ok(Self { dec, device, cu_ctx, stream })
+        Ok(Self { dec: std::mem::ManuallyDrop::new(dec), device, cu_ctx, stream })
     }
 
     /// Decode a JPEG bitstream synchronously, returning host-resident pixels.
@@ -766,14 +820,25 @@ impl NvJpegDecoder {
 
 impl Drop for NvJpegDecoder {
     fn drop(&mut self) {
-        // Bind context before teardown so the driver can clean up properly.
-        // SAFETY: cu_ctx is valid while we hold the primary-context retain.
+        // Explicit teardown order matters: nvjpegDestroy must run while the CUDA
+        // primary context is still current and our retain is still held.
+        //
+        // SAFETY: cu_ctx is valid; we hold the primary-context retain.
         unsafe {
+            // 1. Bind the context so all CUDA calls below land in the right context.
             let _ = cuCtxSetCurrent(self.cu_ctx);
+
+            // 2. Destroy the nvJPEG handle and state explicitly before releasing
+            //    the context retain.  `dec` is ManuallyDrop so it does not run
+            //    its own destructor automatically.
+            std::mem::ManuallyDrop::drop(&mut self.dec);
+
+            // 3. Destroy the stream (no work enqueued at drop time).
             if !self.stream.is_null() {
                 let _ = cuStreamDestroy(self.stream);
             }
-            // dec (NvJpeg) Drop runs here — handle and state destroyed while ctx is current.
+
+            // 4. Release our retain of the primary context.
             let _ = cuDevicePrimaryCtxRelease(self.device);
         }
     }
