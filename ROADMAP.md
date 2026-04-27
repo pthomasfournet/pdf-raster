@@ -69,17 +69,21 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 ---
 
-## Phase 2.5 — CPU-side AVX-512 specialisation
+## Phase 2.5 — CPU-side AVX-512 specialisation ✓ COMPLETE (except ICC item)
 
-Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to, but that have direct applicability to the hot paths identified above. All items gated on `#[cfg(target_feature = "avx512...")]` with scalar fallbacks; no unsafe required beyond the intrinsic calls themselves.
+Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to. All paths use runtime detection (`is_x86_feature_detected!` / CPUID) with scalar fallbacks; binary runs on non-AVX-512 machines.
 
-- [ ] **`avx512_bitalg` AA popcount** — replace the `NIBBLE_POP` lookup-table loop in `aa_coverage()` (`fill/mod.rs`) with `_mm_popcnt_epi8` / `vpshufbitqmb`. The current loop reads 4 bytes and does 4 table lookups per output pixel; the SIMD path collapses an entire AaBuf row (AA_SIZE=4 sub-rows, `bitmap_width/2` bytes) into a single `VPOPCNTB` + horizontal reduce. Expected 4–8× speedup on the AA fill path.
+- [x] **`avx512bitalg` + `avx512bw` AA popcount** (`simd/popcnt.rs`) — `aa_coverage_span` uses `_mm512_popcnt_epi8` on nibble-masked AaBuf rows, processing 128 output pixels per 64-byte iteration. Falls back to `avx512vpopcntdq` + `avx512bw` (`popcnt_aa_row`), then scalar `NIBBLE_POP` table.
 
-- [ ] **`avx512vnni` ICC colour matrix** — when the ICC CMYK→RGB transform lands (Phase 4 item 4), use `_mm512_dpbusds_epi32` (int8 dot product, 4-element accumulate per cycle) for the 3×4 matrix multiply per pixel. Saturating int8 arithmetic matches ICC profile precision requirements. Falls back to the scalar f32 path on non-AVX-512VNNI targets.
+- [x] **`avx512vpopcntdq` + `avx512bw` row popcount** (`simd/popcnt.rs`) — `popcnt_aa_row` uses `_mm512_popcnt_epi8` on 64-byte chunks; falls back to hardware `popcnt` on 8-byte chunks, then scalar `u8::count_ones`.
 
-- [ ] **`movdir64b` non-temporal solid fill** — add a non-temporal store path to `draw_span` / `render_span` for large solid fills (span width above a cache-line threshold, e.g. > 256 px) where the output bitmap will not be read back immediately. `MOVDIR64B` writes 64 bytes atomically without polluting L3 with write-only data, preserving the edge table's residency in the 128 MiB V-Cache. Gate on span width; fall back to the existing AVX-512 store for small spans.
+- [x] **`movdir64b` non-temporal solid fill** (`simd/blend.rs`) — `blend_solid_rgb8` uses 192-byte tiles (LCM of 3 and 64) of inline-asm `movdir64b` stores for spans > 256 px; bypasses L3 for write-only solid fill data, preserving edge table residency in V-Cache. CPUID.07H.00H:ECX[28] detection via inline asm. Falls back to AVX2 32-px chunks, then scalar.
 
-- [ ] **`cat_l3` / `cdp_l3` cache partitioning** — document (and optionally wire) Linux `resctrl` to reserve a fixed L3 partition for the edge table across page renders in a server/batch context. Not a code change — a deployment note in the benchmarking section.
+- [x] **`avx2` blend / glyph unpack** (`simd/blend.rs`, `simd/glyph_unpack.rs`) — `blend_solid_rgb8` and `blend_solid_gray8` use AVX2 for 32-px solid fill chunks; `unpack_mono_row` uses SSE4.1 `_mm_blendv_epi8` for 1-bpp → 8-bpp glyph expansion.
+
+- [ ] **`avx512vnni` ICC colour matrix** — when ICC CMYK→RGB lands (Phase 4 item 4), use `_mm512_dpbusds_epi32` for the 3×4 matrix per pixel. Blocked on Phase 4 ICC work.
+
+- [ ] **`cat_l3` / `cdp_l3` cache partitioning** — deployment note: Linux `resctrl` to reserve a fixed L3 partition for edge tables in batch/server context.
 
 ---
 
