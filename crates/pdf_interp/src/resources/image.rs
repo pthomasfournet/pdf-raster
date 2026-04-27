@@ -299,7 +299,7 @@ fn xobject_id(doc: &Document, page_dict: &Dictionary, name: &[u8]) -> Option<Obj
 }
 
 /// Dereference a `Dictionary` or `Reference → Dictionary`.
-fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
+pub(crate) fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
     match obj {
         Object::Dictionary(d) => Some(d),
         Object::Reference(id) => doc.get_dictionary(*id).ok(),

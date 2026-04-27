@@ -18,8 +18,7 @@
 //!
 //! # Not yet implemented
 //!
-//! - Image `XObjects`: `DCTDecode` (JPEG), `JBIG2Decode`, `JPXDecode`
-//! - Form `XObjects` — recursive content streams
+//! - Image `XObjects`: `JBIG2Decode`
 //! - Shading (`sh`) — requires shading resource lookup
 //! - Extended graphics state (`gs`) — requires `ExtGState` dict lookup
 //! - Clip paths (W W*) — stub; page-rect clip used as fallback
@@ -58,6 +57,12 @@ use crate::resources::{ImageColorSpace, PageResources};
 /// already baked into the path points by `to_device`.
 const DEVICE_MATRIX: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
+/// Maximum nesting depth for Form `XObjects`.
+///
+/// Prevents unbounded recursion from self-referencing or mutually-referencing
+/// form streams in malformed documents.
+const MAX_FORM_DEPTH: u32 = 32;
+
 /// Renders a decoded operator sequence onto a `Bitmap<Rgb8>`.
 pub struct PageRenderer<'doc> {
     /// Target pixel buffer.
@@ -72,8 +77,10 @@ pub struct PageRenderer<'doc> {
     path: Option<PathBuilder>,
     /// Font face cache for this page.
     font_cache: FontCache,
-    /// Resource accessor for the current page.
+    /// Resource accessor for the current page or innermost form.
     resources: PageResources<'doc>,
+    /// Current Form `XObject` nesting depth (0 = top-level page).
+    form_depth: u32,
 }
 
 impl<'doc> PageRenderer<'doc> {
@@ -129,6 +136,7 @@ impl<'doc> PageRenderer<'doc> {
             path: None,
             font_cache,
             resources,
+            form_depth: 0,
         }
     }
 
@@ -637,19 +645,61 @@ impl<'doc> PageRenderer<'doc> {
 
     /// Execute a `Do` operator: look up and render the named `XObject`.
     ///
-    /// Only image `XObjects` are implemented; form `XObject`s are logged and
-    /// skipped until recursive content-stream execution is added.
+    /// Image `XObjects` are blitted directly.  Form `XObjects` are executed
+    /// recursively via [`do_form_xobject`].
     fn do_xobject(&mut self, name: &[u8]) {
-        let Some(img) = self.resources.image(name) else {
-            // Possible causes: Form XObject (not yet implemented), unsupported
-            // filter (JBIG2Decode / CCITTFaxDecode Group 3), or a missing resource entry.
-            log::debug!(
-                "pdf_interp: Do /{} skipped (Form XObject, unsupported filter, or missing resource)",
-                String::from_utf8_lossy(name)
+        // Try Form first (cheap dict lookup, no pixel decoding).
+        if let Some(form) = self.resources.form_xobject(name) {
+            self.do_form_xobject(&form);
+            return;
+        }
+        // Try Image.
+        if let Some(img) = self.resources.image(name) {
+            self.blit_image(&img);
+            return;
+        }
+        // Missing resource or unsupported filter.
+        log::debug!(
+            "pdf_interp: Do /{} skipped (unsupported filter or missing resource)",
+            String::from_utf8_lossy(name)
+        );
+    }
+
+    /// Execute a Form `XObject`'s content stream in the current graphics context.
+    ///
+    /// PDF §8.10.1: the form's `Matrix` is concatenated onto the current CTM,
+    /// graphics state is saved/restored around execution, and the form's own
+    /// `Resources` dict (if present) is used to resolve fonts and images inside
+    /// the form.
+    fn do_form_xobject(&mut self, form: &crate::resources::FormXObject) {
+        if self.form_depth >= MAX_FORM_DEPTH {
+            log::warn!(
+                "pdf_interp: Form XObject nesting depth {MAX_FORM_DEPTH} exceeded — skipping"
             );
             return;
-        };
-        self.blit_image(&img);
+        }
+
+        // Save graphics state (equivalent to `q`).
+        self.gstate.save();
+        self.form_depth += 1;
+
+        // Concatenate the form's Matrix onto the current CTM (always safe;
+        // multiplying by the identity is a no-op numerically).
+        let old = self.gstate.current().ctm;
+        self.gstate.current_mut().ctm = ctm_multiply(&old, &form.matrix);
+
+        // Switch to the form's resource context, keeping the parent for restore.
+        let child_resources = self.resources.for_form(form);
+        let parent_resources = std::mem::replace(&mut self.resources, child_resources);
+
+        // Parse and execute the form's content stream.
+        let ops = crate::content::parse(&form.content);
+        self.execute(&ops);
+
+        // Restore resources and graphics state.
+        self.resources = parent_resources;
+        self.form_depth -= 1;
+        self.gstate.restore();
     }
 
     /// Blit a decoded image `XObject` onto the bitmap using the current CTM.
