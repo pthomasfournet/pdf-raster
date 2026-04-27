@@ -460,25 +460,41 @@ fn is_id_in_ref_array(
         .any(|x| matches!(x, Object::Reference(r) if *r == target_id))
 }
 
-/// Read the `BBox` array `[llx, lly, urx, ury]` from a dictionary.
+/// Parse a fixed-length array of `f64` values from a PDF dictionary.
 ///
-/// Returns `None` if absent or fewer than 4 numeric entries.
-fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
-    let arr = dict.get(b"BBox").ok()?.as_array().ok()?;
-    if arr.len() < 4 {
+/// Returns `None` if the key is absent, the value is not an array, the array
+/// has fewer than `N` elements, or any of the first `N` elements is not numeric.
+pub(crate) fn read_f64_n<const N: usize>(dict: &lopdf::Dictionary, key: &[u8]) -> Option<[f64; N]> {
+    let arr = dict.get(key).ok()?.as_array().ok()?;
+    if arr.len() < N {
         return None;
     }
-    let mut r = [0.0f64; 4];
-    for (i, obj) in arr.iter().take(4).enumerate() {
-        r[i] = match obj {
+    let mut out = [0.0f64; N];
+    for (i, obj) in arr.iter().take(N).enumerate() {
+        out[i] = match obj {
             Object::Real(v) => f64::from(*v),
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "PDF BBox coords are small integers in practice"
+                reason = "PDF numeric values fit within f64 mantissa in all real-world uses"
             )]
             Object::Integer(v) => *v as f64,
             _ => return None,
         };
+    }
+    Some(out)
+}
+
+/// Read the `BBox` array `[llx, lly, urx, ury]` from a dictionary.
+///
+/// Returns `None` if absent or fewer than 4 numeric entries.
+fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+    let mut r = read_f64_n::<4>(dict, b"BBox")?;
+    // Normalise so llx ≤ urx and lly ≤ ury — PDF allows inverted BBox.
+    if r[0] > r[2] {
+        r.swap(0, 2);
+    }
+    if r[1] > r[3] {
+        r.swap(1, 3);
     }
     Some(r)
 }
@@ -515,23 +531,7 @@ fn read_transparency_group(
 /// Read a 6-element `Matrix` array from a dictionary, returning `None` if the
 /// key is absent or has fewer than 6 numeric entries.
 fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
-    let arr = dict.get(b"Matrix").ok()?.as_array().ok()?;
-    if arr.len() < 6 {
-        return None;
-    }
-    let mut m = [0.0f64; 6];
-    for (i, obj) in arr.iter().take(6).enumerate() {
-        m[i] = match obj {
-            Object::Real(r) => f64::from(*r),
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "PDF matrix values are small integers; precision loss is negligible"
-            )]
-            Object::Integer(n) => *n as f64,
-            _ => return None,
-        };
-    }
-    Some(m)
+    read_f64_n::<6>(dict, b"Matrix")
 }
 
 #[cfg(test)]

@@ -287,19 +287,9 @@ impl<'doc> PageRenderer<'doc> {
         // Build the FormXObject from the appearance stream.
         let Some(mut form) = self.resources.form_from_stream_id(stream_id) else { return };
 
-        // Compute the BBox→Rect mapping and compose with the stream's own Matrix.
-        // The appearance stream's Matrix maps form coords → a space where Rect is
-        // the clip/position area (PDF §12.5.5).
-        let bbox = {
-            let doc = self.resources.doc();
-            let Ok(obj) = doc.get_object(stream_id) else { return };
-            let Ok(stream) = obj.as_stream() else { return };
-            let Some(r) = read_rect(&stream.dict) else { return };
-            r
-        };
-
+        // form.bbox was populated by form_from_stream_id; appearance streams carry BBox not Rect.
         let [llx, lly, urx, ury] = rect;
-        let [bx0, by0, bx1, by1] = bbox;
+        let [bx0, by0, bx1, by1] = form.bbox;
         let bw = bx1 - bx0;
         let bh = by1 - by0;
         if bw.abs() < f64::EPSILON || bh.abs() < f64::EPSILON {
@@ -1383,6 +1373,12 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
 
+        // Capture the parent's compositing state before saving, so the group is
+        // painted using the opacity/blend that was active when the form was invoked
+        // (PDF §11.6.6: the group is composited using the surrounding context).
+        let parent_fill_alpha = self.gstate.current().fill_alpha;
+        let parent_blend_mode = self.gstate.current().blend_mode;
+
         // Save graphics state (equivalent to `q`).
         self.gstate.save();
         self.form_depth += 1;
@@ -1397,7 +1393,7 @@ impl<'doc> PageRenderer<'doc> {
 
         // Transparency group: allocate an intermediate bitmap, render into it,
         // then composite back onto the page.
-        let mut group = form.transparency.map(|tg| {
+        let mut group = form.transparency.and_then(|tg| {
             // Map BBox corners through the new CTM to get the device-space extent.
             let ctm = self.gstate.current().ctm;
             let page_h = f64::from(self.height);
@@ -1408,6 +1404,13 @@ impl<'doc> PageRenderer<'doc> {
                 ctm_transform(&ctm, bx0, by1),
                 ctm_transform(&ctm, bx1, by1),
             ];
+            // A non-finite BBox or degenerate CTM produces NaN corners; the
+            // subsequent as-i32 cast would be UB on some platforms.  Fall back
+            // to rendering without a group (paint directly onto the page).
+            if corners.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+                log::warn!("pdf_interp: transparency group BBox is non-finite — rendering without group");
+                return None;
+            }
             let left   = corners.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min).floor();
             let top    = corners.iter().map(|(_, y)| page_h - y).fold(f64::INFINITY, f64::min).floor();
             let right  = corners.iter().map(|(x, _)| *x).fold(f64::NEG_INFINITY, f64::max).ceil();
@@ -1424,7 +1427,7 @@ impl<'doc> PageRenderer<'doc> {
                 soft_mask_type: raster::transparency::SoftMaskType::None,
             };
             let clip = self.gstate.current().clip.clone_shared();
-            begin_group(&self.bitmap, &clip, params)
+            Some(begin_group(&self.bitmap, &clip, params))
         });
 
         // Swap in the group bitmap when present.
@@ -1436,11 +1439,11 @@ impl<'doc> PageRenderer<'doc> {
         let ops = crate::content::parse(&form.content);
         self.execute(&ops);
 
-        // Swap the group bitmap back and composite.
+        // Swap the group bitmap back and composite using the parent's opacity/blend
+        // (captured before gstate.save() — the form's own state is irrelevant here).
         if let Some(mut g) = group {
             std::mem::swap(&mut self.bitmap, &mut g.bitmap);
-            let gs = self.gstate.current();
-            let pipe = Self::make_pipe(gs.fill_alpha, gs.blend_mode);
+            let pipe = Self::make_pipe(parent_fill_alpha, parent_blend_mode);
             paint_group(&mut self.bitmap, g, &pipe);
         }
 
@@ -1648,22 +1651,7 @@ const fn int_to_join(v: i32) -> LineJoin {
 ///
 /// Returns `None` if the `Rect` key is absent or has fewer than 4 numeric entries.
 fn read_rect(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
-    let arr = dict.get(b"Rect").ok()?.as_array().ok()?;
-    if arr.len() < 4 {
-        return None;
-    }
-    let mut r = [0.0f64; 4];
-    for (i, obj) in arr.iter().take(4).enumerate() {
-        r[i] = match obj {
-            Object::Real(v) => f64::from(*v),
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "PDF rect coords are always well within f64 precision range"
-            )]
-            Object::Integer(v) => *v as f64,
-            _ => return None,
-        };
-    }
+    let mut r = crate::resources::read_f64_n::<4>(dict, b"Rect")?;
     // Normalise so llx ≤ urx and lly ≤ ury.
     if r[0] > r[2] {
         r.swap(0, 2);

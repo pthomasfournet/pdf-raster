@@ -7,3 +7,9 @@ jobs = 6
 # Single codegen unit per crate in test builds.  The test binary for
 # pdf_interp grows to ~96 MiB with the default split; one CGU halves that.
 codegen-units = 1
+
+[test]
+# Run tests serially to prevent concurrent large allocations from OOMing.
+# pdf_interp has tests with multi-hundred-MiB working sets; parallelism kills
+# the machine under cargo test --lib.
+test-threads = 1
