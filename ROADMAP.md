@@ -2,11 +2,11 @@
 
 Goal: full PDF → pixels pipeline in pure Rust. Zero poppler. Zero C++ in the render path.
 
-The raster crate is complete at the pixel level. The `pdf_interp` crate is the in-progress native renderer. The `pdf_bridge` / poppler path exists only as a reference baseline until the native path reaches parity.
+The raster crate is complete at the pixel level. The `pdf_interp` crate is the native renderer and is now the only CLI path. The `pdf_bridge` / poppler crate is retained as a reference baseline but is no longer linked by the CLI binary.
 
 ---
 
-## Phase 1 — Native PDF interpreter (in progress)
+## Phase 1 — Native PDF interpreter ✓ COMPLETE
 
 ### Done
 
