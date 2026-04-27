@@ -56,6 +56,11 @@ pub struct FontDescriptor {
     /// Glyph-index table: `code_to_gid[char_code]` → FT glyph index.
     /// Empty means the identity map (`char_code` == glyph index).
     pub code_to_gid: Vec<u32>,
+    /// Per-character glyph name overrides from the PDF `Encoding/Differences`
+    /// array.  Index = char code (0–255); `None` = inherit from base encoding.
+    /// Used by [`FontCache`] to resolve names → Unicode → GID via `FreeType`'s
+    /// active charmap at face-load time.
+    pub differences: Box<[Option<Box<str>>; 256]>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -69,7 +74,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     let kind = classify_kind(dict);
     let bytes = extract_bytes(doc, dict);
     let (first_char, widths) = extract_widths(dict);
-    let code_to_gid = extract_code_to_gid(doc, dict, kind);
+    let (code_to_gid, differences) = extract_encoding(doc, dict, kind);
 
     FontDescriptor {
         kind,
@@ -77,6 +82,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         widths,
         first_char,
         code_to_gid,
+        differences,
     }
 }
 
@@ -191,67 +197,100 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
 
 // ── Char → glyph-index mapping ────────────────────────────────────────────────
 
-/// Build a char-to-glyph-index table from the font's `Encoding` entry.
+/// The number of char codes in a single-byte PDF encoding.
+const NUM_CODES: usize = 256;
+
+/// Empty differences table — all `None` (inherit from base encoding).
+fn empty_differences() -> Box<[Option<Box<str>>; 256]> {
+    // Box::new([None; 256]) doesn't work because Option<Box<str>> is not Copy.
+    // We use a Vec collect + try_into.
+    let v: Vec<Option<Box<str>>> = (0..NUM_CODES).map(|_| None).collect();
+    #[expect(
+        clippy::expect_used,
+        reason = "the Vec always has exactly NUM_CODES = 256 elements; conversion cannot fail"
+    )]
+    v.try_into()
+        .map(Box::new)
+        .expect("256-element Vec must convert to [_; 256]")
+}
+
+/// Extract encoding information from the font dictionary.
 ///
-/// Returns an empty `Vec` when the identity map is appropriate (most CID fonts,
-/// or simple fonts with no explicit encoding).
-fn extract_code_to_gid(doc: &Document, dict: &Dictionary, kind: PdfFontKind) -> Vec<u32> {
-    // Type 0 / CID composite fonts: the descendant font carries the GID map.
-    // For now, return identity — full CMap support is phase 2.
+/// Returns `(code_to_gid, differences)`:
+/// - `code_to_gid`: non-empty only for encodings fully resolved at PDF-parse
+///   time (currently none — `FreeType` handles standard encodings).
+/// - `differences`: 256-entry table of glyph-name overrides parsed from the
+///   `Differences` array.  The font cache resolves these to GIDs at face-load
+///   time via `FreeType`'s charmap.
+#[expect(
+    clippy::type_complexity,
+    reason = "private helper; introducing a type alias for (Vec<u32>, Box<[Option<Box<str>>; 256]>) would obscure rather than clarify"
+)]
+fn extract_encoding(
+    doc: &Document,
+    dict: &Dictionary,
+    _kind: PdfFontKind,
+) -> (Vec<u32>, Box<[Option<Box<str>>; 256]>) {
+    // Type 0 / CID composite fonts: descendant font carries the GID map.
     let subtype = dict.get_name(b"Subtype").unwrap_or(b"");
     if matches!(subtype, b"Type0") {
-        return vec![];
+        return (vec![], empty_differences());
     }
 
     let Some(encoding) = dict.get(b"Encoding").ok() else {
-        return vec![];
+        return (vec![], empty_differences());
     };
 
     match encoding {
-        Object::Name(name) => standard_encoding_table(name.as_slice()),
-        Object::Reference(id) => doc
-            .get_dictionary(*id)
-            .ok()
-            .map(|d| dict_encoding_table(doc, d, kind))
-            .unwrap_or_default(),
-        Object::Dictionary(d) => dict_encoding_table(doc, d, kind),
-        _ => vec![],
+        Object::Reference(id) => {
+            let diffs = doc
+                .get_dictionary(*id)
+                .ok()
+                .map_or_else(empty_differences, parse_differences);
+            (vec![], diffs)
+        }
+        Object::Dictionary(d) => (vec![], parse_differences(d)),
+        // Named standard encoding or anything else: `FreeType` handles char → GID.
+        _ => (vec![], empty_differences()),
     }
 }
 
-/// Produce a code→glyph table for a standard named encoding.
+/// Parse the `Differences` array from a dictionary-form `Encoding` object.
 ///
-/// Returns an empty `Vec` for encodings that use the identity map
-/// (`WinAnsiEncoding`, `MacRomanEncoding`, `StandardEncoding`), since `FreeType`
-/// can handle these itself via `FT_Get_Char_Index`.
-///
-/// `Symbol` and `ZapfDingbats` have non-standard mappings, but they are rare
-/// and deferring full support is acceptable for now.
-#[expect(
-    clippy::missing_const_for_fn,
-    reason = "vec![] is not const; clippy false-positive for this pattern"
-)]
-fn standard_encoding_table(_name: &[u8]) -> Vec<u32> {
-    // For all standard encodings, FreeType's charmap handles the mapping.
-    vec![]
-}
+/// The array has the form `[base_code /Name /Name ... base_code /Name ...]`.
+/// Each integer resets the current char code; each name assigns a glyph name
+/// to that code and advances the counter.  Codes outside `[0, 255]` are ignored.
+fn parse_differences(dict: &Dictionary) -> Box<[Option<Box<str>>; 256]> {
+    let mut table = empty_differences();
 
-/// Parse a dictionary-form `Encoding` object.
-///
-/// Dictionary encodings have an optional `BaseEncoding` plus a `Differences`
-/// array of the form `[base_code /GlyphName ...]`.  We map glyph names to
-/// glyph indices using `FT_Get_Name_Index`.
-///
-/// For now we return empty (identity map) to keep phase-1 scope small;
-/// full `Differences` parsing is phase 2.
-#[expect(
-    clippy::missing_const_for_fn,
-    reason = "vec![] is not const; clippy false-positive for this pattern"
-)]
-fn dict_encoding_table(_doc: &Document, _dict: &Dictionary, _kind: PdfFontKind) -> Vec<u32> {
-    // TODO(phase2): parse BaseEncoding + Differences array and build
-    // a proper 256-entry code_to_gid table via FT_Get_Name_Index.
-    vec![]
+    let Ok(arr_obj) = dict.get(b"Differences") else {
+        return table;
+    };
+    let Ok(arr) = arr_obj.as_array() else {
+        return table;
+    };
+
+    let mut code: usize = 0;
+    for obj in arr {
+        match obj {
+            Object::Integer(n) if *n >= 0 && *n < 256 => {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "n validated ≥ 0 and < 256 above; safe cast to usize"
+                )]
+                { code = *n as usize; }
+            }
+            Object::Name(name) if code < NUM_CODES => {
+                let s = String::from_utf8_lossy(name).into_owned().into_boxed_str();
+                table[code] = Some(s);
+                code += 1;
+            }
+            _ => {}
+        }
+    }
+
+    table
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

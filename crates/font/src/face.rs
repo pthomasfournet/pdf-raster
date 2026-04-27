@@ -35,7 +35,9 @@ pub struct FontFace {
     face: freetype::Face,
     /// Glyph-index map: `code_to_gid[char_code]` → FT glyph index.
     /// An empty `Vec` means `char_code == glyph_id` (identity map).
-    code_to_gid: Vec<u32>,
+    /// Set after face construction by the font cache when `Differences` entries
+    /// are present; resolved via `FreeType`'s active charmap.
+    pub code_to_gid: Vec<u32>,
     /// Font kind, for hinting-mode selection.
     pub kind: FontKind,
     /// Pixel size, computed as `splashRound(dist(mat[2], mat[3]))`.
@@ -271,6 +273,18 @@ impl FontFace {
         )]
         let advance = self.face.glyph().metrics().horiAdvance as f64;
         advance / 64.0 / f64::from(self.size_px)
+    }
+
+    /// Look up a Unicode codepoint in `FreeType`'s active charmap and return
+    /// the glyph index.  Returns 0 (`.notdef`) if the codepoint has no glyph.
+    ///
+    /// Used by the PDF interpreter's font cache to build a `code_to_gid` table
+    /// from glyph names resolved via the Adobe Glyph List.
+    #[must_use]
+    pub fn raw_get_char_index(&self, unicode: u32) -> u32 {
+        self.face
+            .get_char_index(unicode as usize)
+            .unwrap_or(0)
     }
 
     /// Resolve a character code to a `FreeType` glyph index.
