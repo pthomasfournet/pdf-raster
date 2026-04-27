@@ -52,7 +52,7 @@ use super::color::RasterColor;
 use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use crate::content::{Operator, TextArrayElement};
-use crate::resources::{ImageColorSpace, PageResources};
+use crate::resources::{ImageColorSpace, PageResources, image::decode_inline_image};
 
 /// Identity CTM for passing to raster functions — coordinate transform is
 /// already baked into the path points by `to_device`.
@@ -386,8 +386,12 @@ impl<'doc> PageRenderer<'doc> {
             Operator::PaintXObject(name) => {
                 self.do_xobject(name);
             }
-            Operator::InlineImage { .. } => {
-                log::debug!("pdf_interp: inline image not yet implemented");
+            Operator::InlineImage { params, data } => {
+                if let Some(img) = decode_inline_image(self.resources.doc(), params, data) {
+                    self.blit_image(&img);
+                } else {
+                    log::debug!("pdf_interp: inline image decode failed — skipping");
+                }
             }
             Operator::PaintShading(name) => {
                 log::debug!(

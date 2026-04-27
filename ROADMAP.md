@@ -32,8 +32,8 @@ The raster crate is complete at the pixel level. The `pdf_interp` crate is the i
 Ordered by priority. Wire CLI by default is the finish line.
 
 - [x] **ICCBased / Indexed / Separation colour spaces** — resolve_cs inspects ICC `N`, expands Indexed palettes, converts CMYK inline; Separation/DeviceN fall back to Gray
-- [ ] **ExtGState blend modes (`BM`)** — only `Normal` mapped; `Multiply`, `Screen`, `Overlay`, etc. composite wrong
-- [ ] **CCITTFaxDecode Group 3 (K≥0)** — Group 4 (K<0) done; Group 3 stub silently skips fax images
+- [x] **ExtGState blend modes (`BM`)** — all 16 PDF modes parsed + threaded through make_pipe to raster compositor
+- [x] **CCITTFaxDecode Group 3 (K=0)** — 1D T.4 supported via fax::decoder::decode_g3; K>0 (mixed 2D) stub
 - [ ] **Inline images (`BI ID EI`)** — stub; some generators use these heavily
 - [ ] **Shading (`sh`)** — gradients visually obvious when missing; needs shading resource lookup + axial/radial rasterisation wired through
 - [ ] **Wire CLI by default** — remove `--native` flag; make native the only path; delete `pdf_bridge`
