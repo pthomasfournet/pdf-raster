@@ -37,7 +37,7 @@ use std::ptr;
 // bindgen at build time while keeping the binding surface minimal and auditable.
 
 /// nvJPEG status codes.  Only `NVJPEG_STATUS_SUCCESS = 0` is success.
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
 type nvjpegStatus_t = i32;
 
 /// Opaque nvJPEG library handle (wraps device allocators, backend state).
@@ -45,7 +45,7 @@ type nvjpegStatus_t = i32;
 struct NvjpegHandle_ {
     _opaque: [u8; 0],
 }
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
 type nvjpegHandle_t = *mut NvjpegHandle_;
 
 /// Opaque per-decode state (Huffman tables, coefficient buffers, etc.).
@@ -53,17 +53,17 @@ type nvjpegHandle_t = *mut NvjpegHandle_;
 struct NvjpegJpegState_ {
     _opaque: [u8; 0],
 }
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
 type nvjpegJpegState_t = *mut NvjpegJpegState_;
 
-/// Chroma subsampling type — only used as an out-parameter; we inspect it to
-/// validate that the image is a standard YUV JPEG (not CMYK).
-#[allow(non_camel_case_types)]
+/// Chroma subsampling type — required out-parameter for `nvjpegGetImageInfo`;
+/// we don't inspect it (component count alone drives dispatch).
+#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
 type nvjpegChromaSubsampling_t = i32;
 
 /// Output format: we use `NVJPEG_OUTPUT_RGBI` (interleaved RGB, channel[0])
 /// and `NVJPEG_OUTPUT_Y` (luma-only, channel[0]).
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
 type nvjpegOutputFormat_t = i32;
 
 /// NVJPEG_OUTPUT_Y — single-channel luma output to channel[0].
@@ -96,7 +96,6 @@ impl NvjpegImage {
 
 /// A raw CUDA stream handle as an opaque pointer.  This is the C type
 /// `CUstream` / `cudaStream_t`; we only pass it through to nvJPEG.
-#[allow(non_camel_case_types)]
 type CUstream = *mut std::ffi::c_void;
 
 // NVJPEGAPI on Linux is the default calling convention — no special attribute.
@@ -207,9 +206,9 @@ unsafe impl Send for NvJpeg {}
 impl NvJpeg {
     /// Initialise nvJPEG.
     ///
-    /// Returns `None` if the shared library is absent or device initialisation
-    /// fails.  Callers should treat `None` as "nvJPEG unavailable, fall back
-    /// to CPU".
+    /// Returns `Err` if the shared library is absent, the CUDA device cannot be
+    /// initialised, or per-decode state allocation fails.  Callers should treat
+    /// the error as "nvJPEG unavailable; fall back to CPU" and not propagate it.
     ///
     /// # Errors
     ///
@@ -256,7 +255,9 @@ impl NvJpeg {
     pub fn decode(&mut self, data: &[u8], stream: CUstream) -> Result<DecodedJpeg> {
         // ── Phase 1: inspect headers ──────────────────────────────────────────
         let mut n_components: i32 = 0;
-        let mut subsampling: nvjpegChromaSubsampling_t = 0;
+        // Chroma subsampling type — required out-parameter for `nvjpegGetImageInfo`;
+        // we don't inspect it (component count alone drives dispatch).
+        let mut _subsampling: nvjpegChromaSubsampling_t = 0;
         let mut widths = [0i32; NVJPEG_MAX_COMPONENT];
         let mut heights = [0i32; NVJPEG_MAX_COMPONENT];
 
@@ -267,7 +268,7 @@ impl NvJpeg {
                 data.as_ptr(),
                 data.len(),
                 ptr::addr_of_mut!(n_components),
-                ptr::addr_of_mut!(subsampling),
+                ptr::addr_of_mut!(_subsampling),
                 widths.as_mut_ptr(),
                 heights.as_mut_ptr(),
             )
@@ -288,8 +289,8 @@ impl NvJpeg {
         if width <= 0 || height <= 0 {
             return Err(NvJpegError::ZeroDimension { width, height });
         }
-        let width_u = width as usize;
-        let height_u = height as usize;
+        let width_u = usize::try_from(width).expect("width > 0 already checked");
+        let height_u = usize::try_from(height).expect("height > 0 already checked");
 
         // ── Phase 2: allocate host output buffer ──────────────────────────────
         // nvjpegDecode with RGBI / Y writes to channel[0] which must be a
@@ -337,8 +338,8 @@ impl NvJpeg {
 
         Ok(DecodedJpeg {
             data: pixels,
-            width: width as u32,
-            height: height as u32,
+            width: u32::try_from(width).expect("width > 0 already checked"),
+            height: u32::try_from(height).expect("height > 0 already checked"),
             color_space,
         })
     }
@@ -401,6 +402,7 @@ impl NvJpegDecoder {
     ///
     /// Returns an error if nvJPEG device initialisation fails.
     pub fn new(stream: CUstream) -> Result<Self> {
+        assert!(!stream.is_null(), "NvJpegDecoder::new: stream must not be null — pass a valid CUstream from CudaContext::default_stream()");
         Ok(Self { dec: NvJpeg::new()?, stream })
     }
 
@@ -433,6 +435,17 @@ impl NvJpegDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Initialise CUDA device 0 and return the raw stream handle.
+    /// Returns `None` if no GPU is available — callers should early-return.
+    fn try_cuda_stream() -> Option<(*mut std::ffi::c_void, cudarc::driver::CudaStream, std::sync::Arc<cudarc::driver::CudaContext>)> {
+        use cudarc::driver::CudaContext;
+        use std::sync::Arc;
+        let ctx: Arc<CudaContext> = CudaContext::new(0).ok()?;
+        let stream = ctx.default_stream();
+        let raw = stream.cu_stream() as *mut std::ffi::c_void;
+        Some((raw, stream, ctx))
+    }
 
     /// Minimal valid 1×1 grayscale JPEG (SOI + APP0 + DQT + SOF0 + DHT + SOS + EOI).
     /// Generated with: `convert -size 1x1 xc:gray50 -quality 50 /tmp/gray1x1.jpg && xxd -i`
@@ -474,16 +487,8 @@ mod tests {
     /// Skipped if no GPU is available.
     #[test]
     fn decode_gray_1x1() {
-        use cudarc::driver::CudaContext;
-        use std::sync::Arc;
-
         // Init CUDA; skip if no device.
-        let ctx: Arc<CudaContext> = match CudaContext::new(0) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let stream = ctx.default_stream();
-        let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+        let Some((raw_stream, stream, _ctx)) = try_cuda_stream() else { return };
 
         let mut dec = match NvJpeg::new() {
             Ok(d) => d,
@@ -502,15 +507,7 @@ mod tests {
     /// `decode` with an empty slice must return an error, not panic or UB.
     #[test]
     fn decode_empty_returns_error() {
-        use cudarc::driver::CudaContext;
-        use std::sync::Arc;
-
-        let ctx: Arc<CudaContext> = match CudaContext::new(0) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let stream = ctx.default_stream();
-        let raw_stream = stream.cu_stream() as *mut std::ffi::c_void;
+        let Some((raw_stream, _stream, _ctx)) = try_cuda_stream() else { return };
 
         let mut dec = match NvJpeg::new() {
             Ok(d) => d,

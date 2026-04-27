@@ -1119,8 +1119,8 @@ fn decode_dct(
     if let Some(dec) = gpu {
         // Only dispatch to GPU when the image area meets the threshold.
         // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
-        // it falls through to the CPU path below which handles CMYK→RGB.
-        // We peek at the component count with a cheap header probe first.
+        // decode_dct_gpu returns None for 4-component images, which causes
+        // the fall-through to the CPU path below that handles CMYK→RGB.
         let area = pdf_w.saturating_mul(pdf_h);
         if area >= GPU_JPEG_THRESHOLD_PX {
             if let Some(img) = decode_dct_gpu(data, pdf_w, pdf_h, dec) {
@@ -1210,10 +1210,18 @@ fn decode_dct_gpu(
     pdf_h: u32,
     dec: &mut NvJpegDecoder,
 ) -> Option<ImageDescriptor> {
-    let img = dec
-        .decode_sync(data)
-        .map_err(|e| log::debug!("image: DCTDecode GPU: nvJPEG error: {e}"))
-        .ok()?;
+    let img = match dec.decode_sync(data) {
+        Ok(img) => img,
+        Err(gpu::nvjpeg::NvJpegError::UnsupportedComponents(_)) => {
+            // CMYK or other unsupported component count — expected, fall back silently.
+            return None;
+        }
+        Err(e) => {
+            // Unexpected CUDA/nvJPEG failure — log at warn so it's visible.
+            log::warn!("image: DCTDecode GPU: unexpected nvJPEG error: {e}");
+            return None;
+        }
+    };
 
     if img.width != pdf_w || img.height != pdf_h {
         log::debug!(

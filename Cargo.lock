@@ -1133,6 +1133,7 @@ dependencies = [
  "env_logger",
  "fax",
  "font",
+ "gpu",
  "jpeg2k",
  "log",
  "lopdf",

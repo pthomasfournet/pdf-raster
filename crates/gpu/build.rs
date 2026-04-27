@@ -12,6 +12,7 @@ fn main() {
     if env::var("CARGO_FEATURE_NVJPEG").is_ok() {
         // Prefer the versioned CUDA 12 install directory so the exact .so is
         // found even when /usr/local/cuda is a symlink to a different version.
+        let mut found = false;
         for dir in [
             "/usr/local/cuda-12/targets/x86_64-linux/lib",
             "/usr/local/cuda/targets/x86_64-linux/lib",
@@ -19,11 +20,14 @@ fn main() {
         ] {
             if std::path::Path::new(dir).exists() {
                 println!("cargo:rustc-link-search=native={dir}");
+                found = true;
                 break;
             }
         }
+        if !found {
+            println!("cargo:warning=nvjpeg feature enabled but no CUDA lib directory found; linker will search default paths. Set CUDA_LIB_DIR or install CUDA 12.");
+        }
         println!("cargo:rustc-link-lib=dylib=nvjpeg");
-        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NVJPEG");
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
