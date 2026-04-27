@@ -142,18 +142,18 @@ output[py * width + px] = (uint8_t)((coverage * 255) / 32);
 - [x] Wire into fill dispatch: `PageRenderer::try_gpu_aa_fill` (gated on `pdf_interp/gpu-aa` feature); CPU fallback below `GPU_AA_FILL_THRESHOLD = 16384 px`; pattern fills always CPU
 - [ ] Validate quality vs CPU AA on pixel-diff benchmark
 
-**3. Tile-parallel fill rasterisation — GPU path only**
+**3. Tile-parallel fill rasterisation — GPU path only** ✓ COMPLETE (kernel + Rust API; PageRenderer integration pending)
 
-Tile records (sorted by (y, x)) are the natural GPU work unit. One thread block per tile strip, independent coverage accumulation per tile, no warp divergence. The sort is done on the GPU via CUB radix sort (ships with CUDA toolkit).
+Tile records (sorted by (tile_y, tile_x)) are the natural GPU work unit. One 16×16 thread block per tile, independent analytical coverage accumulation per pixel, no inter-tile communication required.
 
-This is the correct implementation of the ROADMAP's original "sparse tile rasterisation" item — done once, for the GPU, where it actually matters. The CPU scanline scanner is retained unchanged for fills below the dispatch threshold (large solid fills are already near-memset speed on the CPU via AVX-512 `render_span`).
+CUB radix sort was evaluated and rejected for this use case: typical PDF pages have O(100–1000) segments, generating O(1000–10000) tile records. CPU `sort_unstable_by_key` is faster end-to-end than the CUB two-pass launch + temp-buffer allocation at these sizes. The sort stays on the CPU; the heavy per-pixel integration runs on the GPU.
 
-- [ ] Tile record format: `{x: u16, y: u16, packed: u32}` (8 bytes, matches vello_common layout)
-- [ ] GPU segment upload: XPath edge list → device buffer via cudarc
-- [ ] CUB radix sort: sort tile records by (y << 16 | x) on device
-- [ ] Fill kernel: one thread block per strip, analytical trapezoid coverage (vello algorithm)
-- [ ] Winding kernel: accumulate integer winding across tile rows using prefix sum
-- [ ] Integrate with `fill_impl_parallel` dispatch: if `vector_antialias && area > threshold` → GPU
+- [x] Tile record format: `TileRecord` (32 bytes, `repr(C)`): `{key: u32, x_enter: f32, dxdy: f32, y0_tile: f32, y1_tile: f32, sign: f32, _pad: u32, _pad2: u32}`; 32-byte alignment matches CUDA global memory transaction size
+- [x] CPU record builder: `build_tile_records(segs, x_min, y_min, width, height)` — one record per (segment, tile-row) crossing; sorted CPU-side by `key = (tile_y << 16) | tile_x`; prefix-sum `tile_starts`/`tile_counts` index built inline; `bytemuck::Pod` + `cudarc::DeviceRepr` for zero-copy upload
+- [~] CUB radix sort: replaced with CPU `sort_unstable_by_key` (see rationale above; CUB left as a future micro-optimisation if segment counts exceed ~50k)
+- [x] Fill kernel (`kernels/tile_fill.cu`): grid `(grid_w, grid_h, 1)`, block `(TILE_W=16, TILE_H=16, 1)`; each thread accumulates signed trapezoidal area for its pixel column across all segments crossing its tile row; NZ rule: `min(|area|, 1) × 255.5`; EO rule: folded-fraction formula
+- [x] `GpuCtx::tile_fill()` Rust API: uploads records/starts/counts via `stream.clone_htod`, launches kernel, synchronises, copies coverage bytes back; threshold `GPU_TILE_FILL_THRESHOLD = 65536 px`
+- [ ] Wire into `PageRenderer` fill dispatch (analogous to `try_gpu_aa_fill`): select tile-fill path when `area > GPU_TILE_FILL_THRESHOLD` and `!vector_antialias` (or as a higher-quality alternative to warp-ballot AA at large sizes)
 
 **4. ICC colour transforms (cuBLAS / custom kernel)**
 

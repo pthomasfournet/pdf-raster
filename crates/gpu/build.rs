@@ -57,7 +57,7 @@ fn main() {
     // Default is sm_80 which runs on Ampere, Ada, Hopper, and Blackwell.
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_owned());
 
-    for kernel in ["composite_rgba8", "apply_soft_mask", "aa_fill"] {
+    for kernel in ["composite_rgba8", "apply_soft_mask", "aa_fill", "tile_fill"] {
         let src = kernels_dir.join(format!("{kernel}.cu"));
         let ptx = out_dir.join(format!("{kernel}.ptx"));
 

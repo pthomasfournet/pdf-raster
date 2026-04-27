@@ -21,13 +21,14 @@ pub mod nvjpeg;
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
 const PTX_COMPOSITE: &str = include_str!(concat!(env!("OUT_DIR"), "/composite_rgba8.ptx"));
 const PTX_SOFT_MASK: &str = include_str!(concat!(env!("OUT_DIR"), "/apply_soft_mask.ptx"));
 const PTX_AA_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/aa_fill.ptx"));
+const PTX_TILE_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/tile_fill.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
 pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
@@ -38,11 +39,187 @@ pub const GPU_SOFTMASK_THRESHOLD: usize = 500_000;
 /// Below this threshold the H2D/D2H transfer latency for the segment list and
 /// coverage buffer dominates. Calibrated for RTX 5070 + [`PCIe`] 5.0 at ~150 DPI.
 pub const GPU_AA_FILL_THRESHOLD: usize = 16_384;
+/// Minimum fill area (pixels) for the tile-parallel analytical fill to be faster
+/// than the GPU warp-ballot AA kernel.
+///
+/// Tile fill incurs sorting overhead; below this threshold the AA kernel is faster.
+pub const GPU_TILE_FILL_THRESHOLD: usize = 65_536;
+/// Tile width in pixels (must match [`TILE_W`] in `tile_fill.cu`).
+pub const TILE_W: u32 = 16;
+/// Tile height in pixels (must match [`TILE_H`] in `tile_fill.cu`).
+pub const TILE_H: u32 = 16;
+
+/// One tile record per (segment, tile-row) crossing.
+///
+/// Layout must match `struct TileRecord` in `tile_fill.cu` exactly.
+/// The struct is `repr(C)` and 32 bytes so that `bytemuck::cast_slice` can
+/// transmit it to the GPU without additional copying.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct TileRecord {
+    /// Sort key: `(tile_y << 16) | tile_x`.  Set by [`build_tile_records`].
+    pub key: u32,
+    /// Segment x at the top of the segment's y-extent within this tile (tile-local).
+    pub x_enter: f32,
+    /// Slope: dx/dy in device pixels.
+    pub dxdy: f32,
+    /// Segment start y within this tile row (0..`TILE_H`).
+    pub y0_tile: f32,
+    /// Segment end y within this tile row (0..`TILE_H`).
+    pub y1_tile: f32,
+    /// Sign: `+1.0` for an upward-crossing segment, `-1.0` for downward.
+    pub sign: f32,
+    /// Padding (must be 0).
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad: u32,
+    /// Padding (must be 0).
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad2: u32,
+}
+
+// SAFETY: TileRecord is repr(C), all fields are primitive types (u32, f32), no
+// uninitialised padding — bytemuck::Pod and cudarc::DeviceRepr are safe.
+unsafe impl bytemuck::Pod for TileRecord {}
+unsafe impl bytemuck::Zeroable for TileRecord {}
+// SAFETY: TileRecord has no pointer types or other non-device-representable fields;
+// all fields are plain u32/f32 with repr(C) alignment.
+unsafe impl DeviceRepr for TileRecord {}
+
+/// Build a sorted list of [`TileRecord`]s from a flat segment list, plus the
+/// `tile_starts` / `tile_counts` index arrays required by [`GpuCtx::tile_fill`].
+///
+/// `segs` is packed `[x0, y0, x1, y1]` per segment in device pixels, same
+/// format as [`GpuCtx::aa_fill`].  `x_min`, `y_min`, `width`, `height` define
+/// the fill bounding box in device pixels.
+///
+/// Returns `(records, tile_starts, tile_counts, grid_w)`.
+///
+/// # Panics
+///
+/// Panics if `segs.len()` is not a multiple of 4.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "tile indices derived from bbox-clamped coordinates; within u16 range for realistic pages; f32 precision sufficient for tile geometry"
+)]
+pub fn build_tile_records(
+    segs: &[f32],
+    x_min: f32,
+    y_min: f32,
+    width: u32,
+    height: u32,
+) -> (Vec<TileRecord>, Vec<u32>, Vec<u32>, u32) {
+    assert!(
+        segs.len().is_multiple_of(4),
+        "segs.len() must be a multiple of 4"
+    );
+
+    let grid_w = width.div_ceil(TILE_W);
+    let grid_h = height.div_ceil(TILE_H);
+    let n_tiles = (grid_w * grid_h) as usize;
+
+    let mut records: Vec<TileRecord> = Vec::new();
+
+    for seg in segs.chunks_exact(4) {
+        let (mut sx0, mut sy0, mut sx1, mut sy1) = (
+            seg[0] - x_min,
+            seg[1] - y_min,
+            seg[2] - x_min,
+            seg[3] - y_min,
+        );
+
+        // Skip horizontal segments.
+        if (sy1 - sy0).abs() < 1e-6 {
+            continue;
+        }
+
+        // Enforce y0 ≤ y1 (record sign for winding).
+        let sign = if sy0 > sy1 {
+            std::mem::swap(&mut sx0, &mut sx1);
+            std::mem::swap(&mut sy0, &mut sy1);
+            -1.0f32
+        } else {
+            1.0f32
+        };
+
+        let dxdy = (sx1 - sx0) / (sy1 - sy0);
+
+        // Clamp to output bounds.
+        let ey0 = sy0.max(0.0);
+        let ey1 = sy1.min(height as f32);
+        if ey0 >= ey1 {
+            continue;
+        }
+
+        // Emit one record per tile row the segment crosses.
+        let ty0 = (ey0 / TILE_H as f32).floor() as u32;
+        let ty1 = ((ey1 - 1e-6).max(0.0) / TILE_H as f32).floor() as u32;
+
+        for ty in ty0..=ty1.min(grid_h - 1) {
+            let tile_top = (ty * TILE_H) as f32;
+            let tile_bot = tile_top + TILE_H as f32;
+            let seg_y0_tile = ey0.max(tile_top) - tile_top;
+            let seg_y1_tile = ey1.min(tile_bot) - tile_top;
+            if seg_y0_tile >= seg_y1_tile {
+                continue;
+            }
+
+            let x_enter_global = dxdy.mul_add(ey0.max(tile_top) - sy0, sx0);
+            let x_at_y0 = x_enter_global;
+            let x_at_y1 = dxdy.mul_add(seg_y1_tile - seg_y0_tile, x_enter_global);
+
+            // Tile columns this segment crosses.
+            let xl = x_at_y0.min(x_at_y1);
+            let xr = x_at_y0.max(x_at_y1);
+            let tx0 = ((xl / TILE_W as f32).floor() as i32).max(0) as u32;
+            let tx1 = ((xr / TILE_W as f32).floor() as i32).min(grid_w.cast_signed() - 1) as u32;
+
+            for tx in tx0..=tx1.min(grid_w - 1) {
+                records.push(TileRecord {
+                    key: (ty << 16) | tx,
+                    x_enter: x_enter_global - (tx * TILE_W) as f32,
+                    dxdy,
+                    y0_tile: seg_y0_tile,
+                    y1_tile: seg_y1_tile,
+                    sign,
+                    _pad: 0,
+                    _pad2: 0,
+                });
+            }
+        }
+    }
+
+    // Sort records by (tile_y, tile_x) key.
+    records.sort_unstable_by_key(|r| r.key);
+
+    // Build prefix-sum index (tile_starts / tile_counts).
+    let mut tile_starts = vec![0u32; n_tiles];
+    let mut tile_counts = vec![0u32; n_tiles];
+
+    for (i, rec) in records.iter().enumerate() {
+        let tile_idx = ((rec.key >> 16) * grid_w + (rec.key & 0xFFFF)) as usize;
+        if tile_idx < n_tiles {
+            tile_counts[tile_idx] += 1;
+        }
+        let _ = i;
+    }
+
+    let mut running = 0u32;
+    for (start, count) in tile_starts.iter_mut().zip(tile_counts.iter()) {
+        *start = running;
+        running += count;
+    }
+
+    (records, tile_starts, tile_counts, grid_w)
+}
 
 struct GpuKernels {
     composite_rgba8: CudaFunction,
     apply_soft_mask: CudaFunction,
     aa_fill: CudaFunction,
+    tile_fill: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -76,6 +253,7 @@ impl GpuCtx {
                 composite_rgba8: load(PTX_COMPOSITE, "composite_rgba8")?,
                 apply_soft_mask: load(PTX_SOFT_MASK, "apply_soft_mask")?,
                 aa_fill: load(PTX_AA_FILL, "aa_fill")?,
+                tile_fill: load(PTX_TILE_FILL, "tile_fill")?,
             },
         })
     }
@@ -212,6 +390,96 @@ impl GpuCtx {
         // PushKernelArg::arg returns &mut Self; chain results are intentionally unused.
         let _ = builder.arg(&d_segs);
         let _ = builder.arg(&n_segs);
+        let _ = builder.arg(&x_min);
+        let _ = builder.arg(&y_min);
+        let _ = builder.arg(&width);
+        let _ = builder.arg(&height);
+        let _ = builder.arg(&eo_int);
+        let _ = builder.arg(&mut d_coverage);
+        // SAFETY: kernel arguments match the PTX signature; bounds verified above.
+        let _ = unsafe { builder.launch(cfg) }?;
+
+        stream.synchronize()?;
+        let mut coverage = vec![0u8; n_pixels];
+        stream.memcpy_dtoh(&d_coverage, &mut coverage)?;
+        Ok(coverage)
+    }
+
+    /// Tile-parallel analytical fill rasterisation using signed-area integration.
+    ///
+    /// This is the GPU equivalent of the CPU scanline scanner but uses analytical
+    /// per-pixel coverage (vello-style trapezoid integrals) rather than sampling.
+    ///
+    /// # Arguments
+    ///
+    /// - `records` — tile records sorted by `(tile_y << 16 | tile_x)`, one per
+    ///   (segment, tile-row) crossing.  Build with [`build_tile_records`] and sort
+    ///   before calling.  Must match the layout of `TileRecord` in `tile_fill.cu`.
+    /// - `tile_starts` / `tile_counts` — prefix-sum index into `records` per flat
+    ///   tile index `tile_y * grid_w + tile_x`.  Both have length `grid_w * grid_h`.
+    /// - `grid_w`, `grid_h` — tile grid dimensions (`ceil(width / TILE_W)` each).
+    /// - `x_min`, `y_min` — fill bbox origin in device pixels.
+    /// - `width`, `height` — fill bbox size in device pixels.
+    /// - `eo` — `true` for even-odd fill rule, `false` for non-zero winding.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` of `width × height` coverage bytes (0 = outside, 255 = inside).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU data transfer or kernel launch fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tile_starts.len() != tile_counts.len()` or if `width * height`
+    /// overflows `u32::MAX`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tile_fill(
+        &self,
+        records: &[TileRecord],
+        tile_starts: &[u32],
+        tile_counts: &[u32],
+        grid_w: u32,
+        x_min: f32,
+        y_min: f32,
+        width: u32,
+        height: u32,
+        eo: bool,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        assert_eq!(
+            tile_starts.len(),
+            tile_counts.len(),
+            "tile_starts and tile_counts must have the same length"
+        );
+        let n_pixels = width as usize * height as usize;
+        let stream = &self.stream;
+
+        // Upload inputs.
+        let d_records = if records.is_empty() {
+            // cudarc refuses zero-size allocations — use a dummy 1-element buffer.
+            stream.clone_htod(&[TileRecord::default()])?
+        } else {
+            stream.clone_htod(records)?
+        };
+        let d_tile_starts = stream.clone_htod(tile_starts)?;
+        let d_tile_counts = stream.clone_htod(tile_counts)?;
+        let d_cov_init = vec![0u8; n_pixels];
+        let mut d_coverage = stream.clone_htod(&d_cov_init)?;
+
+        let grid_h = height.div_ceil(TILE_H);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_w, grid_h, 1),
+            block_dim: (TILE_W, TILE_H, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let eo_int: i32 = i32::from(eo);
+        let mut builder = stream.launch_builder(&self.kernels.tile_fill);
+        let _ = builder.arg(&d_records);
+        let _ = builder.arg(&d_tile_starts);
+        let _ = builder.arg(&d_tile_counts);
+        let _ = builder.arg(&grid_w);
         let _ = builder.arg(&x_min);
         let _ = builder.arg(&y_min);
         let _ = builder.arg(&width);

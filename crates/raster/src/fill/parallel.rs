@@ -14,7 +14,7 @@ use crate::types::AA_SIZE;
 use crate::xpath::XPath;
 use color::Pixel;
 
-use super::{RowSink, draw_span, draw_span_clipped, fill_impl};
+use super::{draw_span, draw_span_clipped, fill_impl};
 
 /// Minimum fill height (in output pixel rows) for which the parallel path is
 /// activated.  Below this threshold the thread-spawn overhead dominates and
@@ -115,7 +115,7 @@ fn fill_impl_parallel<P: Pixel + Send>(
     // Bitmap height must fit in i32 so band y-coordinates can be compared with
     // scanner coordinates (which are i32). Any real PDF page is far below 2^31 px.
     assert!(
-        bitmap.height <= i32::MAX as u32,
+        i32::try_from(bitmap.height).is_ok(),
         "bitmap height {} exceeds i32::MAX; cannot compute band y-coordinates",
         bitmap.height,
     );

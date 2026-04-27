@@ -1,4 +1,4 @@
-//! Synthetic fill-path benchmark: our raster crate vs vello_cpu.
+//! Synthetic fill-path benchmark: our raster crate vs `vello_cpu`.
 //!
 //! Renders N star polygons into a 1024×1024 buffer and reports throughput.
 //! Both engines get pre-built path objects; only rasterization is timed.
@@ -60,6 +60,10 @@ const H: u32 = 1024;
 
 // ── Shared path generation ────────────────────────────────────────────────────
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "star count fits in f64 mantissa for realistic values"
+)]
 fn star_params(stars: usize) -> Vec<(f64, f64, f64, f64, usize)> {
     let (w, h) = (f64::from(W), f64::from(H));
     (0..stars)
@@ -73,6 +77,10 @@ fn star_params(stars: usize) -> Vec<(f64, f64, f64, f64, usize)> {
         .collect()
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "star vertex count fits in f64 mantissa"
+)]
 fn make_kurbo_star(cx: f64, cy: f64, r_o: f64, r_i: f64, n: usize) -> BezPath {
     let mut p = BezPath::new();
     for k in 0..n * 2 {
@@ -89,6 +97,11 @@ fn make_kurbo_star(cx: f64, cy: f64, r_o: f64, r_i: f64, n: usize) -> BezPath {
     p
 }
 
+#[expect(
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss,
+    reason = "star geometry; usize vertex index fits in f64"
+)]
 fn make_raster_star(cx: f64, cy: f64, r_o: f64, r_i: f64, n: usize) -> Path {
     let mut b = PathBuilder::new();
     for k in 0..n * 2 {
@@ -141,10 +154,18 @@ fn bench_vello(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
         num_threads: 0,
         render_mode: RenderMode::OptimizeSpeed,
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "W and H are compile-time constants ≤ 1024"
+    )]
     let mut pixmap = Pixmap::new(W as u16, H as u16);
 
     // Warmup.
     {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "W and H are compile-time constants ≤ 1024"
+        )]
         let mut ctx = RenderContext::new_with(W as u16, H as u16, settings);
         for (i, p) in paths.iter().enumerate() {
             ctx.set_paint(VELLO_COLORS[i % VELLO_COLORS.len()]);
@@ -156,6 +177,10 @@ fn bench_vello(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
 
     let t0 = Instant::now();
     for _ in 0..cfg.iters {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "W and H are compile-time constants ≤ 1024"
+        )]
         let mut ctx = RenderContext::new_with(W as u16, H as u16, settings);
         for (i, p) in paths.iter().enumerate() {
             ctx.set_paint(VELLO_COLORS[i % VELLO_COLORS.len()]);
@@ -177,7 +202,7 @@ fn bench_ours(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
         a_input: 255,
         overprint_mask: 0xFFFF_FFFF,
         overprint_additive: false,
-        transfer: transfer,
+        transfer,
         soft_mask: None,
         alpha0: None,
         knockout: false,
