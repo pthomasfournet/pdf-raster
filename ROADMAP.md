@@ -56,7 +56,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 ## Phase 2 — Raster performance ✓ COMPLETE
 
-**Hardware context (Ryzen 9 9900X3D):** 128 MiB 3D V-Cache means edge tables and scanline sweep structures for most real-world documents fit in L3. The scanline sweep is therefore compute-bound, not memory-bound — algorithms that improve cache utilisation (sparse tiles) give less uplift here than on a normal CPU. AVX-512 (F/BW/VL/VNNI/BF16/VPOPCNTDQ) is fully available; target `avx512f,avx512bw,avx512vl` with `-C target-cpu=native`.
+**Hardware context (Ryzen 9 9900X3D):** 128 MiB 3D V-Cache means edge tables and scanline sweep structures for most real-world documents fit in L3. The scanline sweep is therefore compute-bound, not memory-bound — algorithms that improve cache utilisation (sparse tiles) give less uplift here than on a normal CPU. AVX-512 extensions available: `avx512f/bw/vl/dq/cd/ifma/vbmi/vbmi2/vnni/bf16/bitalg/vpopcntdq/vp2intersect`. Target `-C target-cpu=native`.
 
 - [x] **Eliminate per-span heap allocations** — `PipeSrc::Solid` and pattern scratch bufs use thread-local grow-never-shrink `PAT_BUF`; zero allocation per span
 - [x] **u16×16 compositing inner loop** — `composite_aa_rgb8_opaque` processes 16 pixels/iter as `[u16; 16]`, `div255_u16 = (v+255)>>8`; LLVM auto-vectorizes to AVX2/AVX-512
@@ -66,6 +66,20 @@ Ordered by priority. Wire CLI by default is the finish line.
 **Decision: CPU sparse tile rasterisation is deferred.** The original item (replace flat SoA with tile records sorted by (y,x)) was motivated by cache-miss reduction. On the 9900X3D the working set fits in L3, so the scanline sweep is already compute-bound and the win would be marginal. Tile records become high-value as the **GPU dispatch format** (Phase 4), where they map directly to warp-parallel execution. Implementing them twice — once for CPU, once for GPU — is redundant; Phase 4 will do it once, correctly, for the right target.
 
 **AA quality note:** the current 4× scanline supersampling (`render_aa_line`) is an approximation. Analytical sub-pixel coverage (vello-style trapezoid integrals) is strictly better in quality and would be faster on the GPU. This is addressed in Phase 4.
+
+---
+
+## Phase 2.5 — CPU-side AVX-512 specialisation
+
+Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to, but that have direct applicability to the hot paths identified above. All items gated on `#[cfg(target_feature = "avx512...")]` with scalar fallbacks; no unsafe required beyond the intrinsic calls themselves.
+
+- [ ] **`avx512_bitalg` AA popcount** — replace the `NIBBLE_POP` lookup-table loop in `aa_coverage()` (`fill/mod.rs`) with `_mm_popcnt_epi8` / `vpshufbitqmb`. The current loop reads 4 bytes and does 4 table lookups per output pixel; the SIMD path collapses an entire AaBuf row (AA_SIZE=4 sub-rows, `bitmap_width/2` bytes) into a single `VPOPCNTB` + horizontal reduce. Expected 4–8× speedup on the AA fill path.
+
+- [ ] **`avx512vnni` ICC colour matrix** — when the ICC CMYK→RGB transform lands (Phase 4 item 4), use `_mm512_dpbusds_epi32` (int8 dot product, 4-element accumulate per cycle) for the 3×4 matrix multiply per pixel. Saturating int8 arithmetic matches ICC profile precision requirements. Falls back to the scalar f32 path on non-AVX-512VNNI targets.
+
+- [ ] **`movdir64b` non-temporal solid fill** — add a non-temporal store path to `draw_span` / `render_span` for large solid fills (span width above a cache-line threshold, e.g. > 256 px) where the output bitmap will not be read back immediately. `MOVDIR64B` writes 64 bytes atomically without polluting L3 with write-only data, preserving the edge table's residency in the 128 MiB V-Cache. Gate on span width; fall back to the existing AVX-512 store for small spans.
+
+- [ ] **`cat_l3` / `cdp_l3` cache partitioning** — document (and optionally wire) Linux `resctrl` to reserve a fixed L3 partition for the edge table across page renders in a server/batch context. Not a code change — a deployment note in the benchmarking section.
 
 ---
 
@@ -175,6 +189,12 @@ RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --st
 
 # GPU AA benchmark (once Phase 4 item 2 lands)
 RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --stars 200 --aa gpu
+
+# L3 occupancy monitoring via hardware CQM counters (9900X3D specific)
+# Requires kernel resctrl mount: mount -t resctrl resctrl /sys/fs/resctrl
+# Reports per-process L3 occupancy in bytes — use to verify edge table stays
+# resident in the 128 MiB V-Cache across sequential page renders.
+# cat /sys/fs/resctrl/mon_data/mon_L3_XX/llc_occupancy
 ```
 
 Current pixel diff vs poppler (--native, 150 dpi):
