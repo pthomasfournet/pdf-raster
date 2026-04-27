@@ -30,6 +30,8 @@
 //! - Optional Content Groups (OCG / layers) — `BDC /OC` respects `OCProperties/D`
 //!   default state; inactive groups are skipped at operator level
 //! - Annotation rendering — `AP/N` normal appearance streams blitted after page content
+//! - Transparency groups — Form `XObjects` with `Group /S /Transparency` rendered into an
+//!   intermediate bitmap via `raster::transparency` and composited back (PDF §11.6.6)
 //!
 //! # Not yet implemented
 //!
@@ -55,6 +57,7 @@ use raster::{
     shading::{gouraud::gouraud_triangle_fill, shaded_fill},
     state::TransferSet,
     stroke::{StrokeParams, stroke},
+    transparency::{GroupParams, begin_group, paint_group},
     types::{BlendMode, LineCap, LineJoin},
     xpath::XPath,
 };
@@ -1369,6 +1372,9 @@ impl<'doc> PageRenderer<'doc> {
     /// graphics state is saved/restored around execution, and the form's own
     /// `Resources` dict (if present) is used to resolve fonts and images inside
     /// the form.
+    ///
+    /// When the form carries a `Group /S /Transparency` entry, content is rendered
+    /// into an intermediate group bitmap and composited back (PDF §11.6.6).
     fn do_form_xobject(&mut self, form: &crate::resources::FormXObject) {
         if self.form_depth >= MAX_FORM_DEPTH {
             log::warn!(
@@ -1381,18 +1387,62 @@ impl<'doc> PageRenderer<'doc> {
         self.gstate.save();
         self.form_depth += 1;
 
-        // Concatenate the form's Matrix onto the current CTM (always safe;
-        // multiplying by the identity is a no-op numerically).
-        let old = self.gstate.current().ctm;
-        self.gstate.current_mut().ctm = ctm_multiply(&old, &form.matrix);
+        // Concatenate the form's Matrix onto the current CTM.
+        let old_ctm = self.gstate.current().ctm;
+        self.gstate.current_mut().ctm = ctm_multiply(&old_ctm, &form.matrix);
 
         // Switch to the form's resource context, keeping the parent for restore.
         let child_resources = self.resources.for_form(form);
         let parent_resources = std::mem::replace(&mut self.resources, child_resources);
 
+        // Transparency group: allocate an intermediate bitmap, render into it,
+        // then composite back onto the page.
+        let mut group = form.transparency.map(|tg| {
+            // Map BBox corners through the new CTM to get the device-space extent.
+            let ctm = self.gstate.current().ctm;
+            let page_h = f64::from(self.height);
+            let [bx0, by0, bx1, by1] = form.bbox;
+            let corners = [
+                ctm_transform(&ctm, bx0, by0),
+                ctm_transform(&ctm, bx1, by0),
+                ctm_transform(&ctm, bx0, by1),
+                ctm_transform(&ctm, bx1, by1),
+            ];
+            let left   = corners.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min).floor();
+            let top    = corners.iter().map(|(_, y)| page_h - y).fold(f64::INFINITY, f64::min).floor();
+            let right  = corners.iter().map(|(x, _)| *x).fold(f64::NEG_INFINITY, f64::max).ceil();
+            let bottom = corners.iter().map(|(_, y)| page_h - y).fold(f64::NEG_INFINITY, f64::max).ceil();
+
+            #[expect(clippy::cast_possible_truncation, reason = "device coords bounded by page dimensions")]
+            let params = GroupParams {
+                x_min: left as i32,
+                y_min: top as i32,
+                x_max: right as i32,
+                y_max: bottom as i32,
+                isolated: tg.isolated,
+                knockout: tg.knockout,
+                soft_mask_type: raster::transparency::SoftMaskType::None,
+            };
+            let clip = self.gstate.current().clip.clone_shared();
+            begin_group(&self.bitmap, &clip, params)
+        });
+
+        // Swap in the group bitmap when present.
+        if let Some(ref mut g) = group {
+            std::mem::swap(&mut self.bitmap, &mut g.bitmap);
+        }
+
         // Parse and execute the form's content stream.
         let ops = crate::content::parse(&form.content);
         self.execute(&ops);
+
+        // Swap the group bitmap back and composite.
+        if let Some(mut g) = group {
+            std::mem::swap(&mut self.bitmap, &mut g.bitmap);
+            let gs = self.gstate.current();
+            let pipe = Self::make_pipe(gs.fill_alpha, gs.blend_mode);
+            paint_group(&mut self.bitmap, g, &pipe);
+        }
 
         // Restore resources and graphics state.
         self.resources = parent_resources;

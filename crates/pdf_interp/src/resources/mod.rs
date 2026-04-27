@@ -153,11 +153,27 @@ pub struct FormXObject {
     pub content: Vec<u8>,
     /// Optional form Matrix `[a b c d e f]` (default: identity).
     pub matrix: [f64; 6],
+    /// Form bounding box in form user space `[llx, lly, urx, ury]`.
+    ///
+    /// Used when computing the device-space extent of a transparency group.
+    /// Defaults to `[0.0, 0.0, 1.0, 1.0]` when absent.
+    pub bbox: [f64; 4],
     /// The object ID of the form stream, used to build a child `PageResources`.
     pub resources_id: ObjectId,
     /// True if the form has its own `Resources` dict; false means it inherits
     /// from the parent context (the caller should keep the parent resources).
     pub has_own_resources: bool,
+    /// Transparency group parameters, present when `Group /S /Transparency` is set.
+    pub transparency: Option<TransparencyGroupParams>,
+}
+
+/// Parameters extracted from a Form `XObject`'s `Group` dictionary.
+#[derive(Clone, Copy, Debug)]
+pub struct TransparencyGroupParams {
+    /// `I` flag: isolated group (default: false).
+    pub isolated: bool,
+    /// `K` flag: knockout group (default: false).
+    pub knockout: bool,
 }
 
 /// Thin accessor wrapping a `(Document, resource_context_id)` pair.
@@ -288,13 +304,19 @@ impl<'doc> PageResources<'doc> {
         // Optional Matrix — defaults to identity if absent or malformed.
         let matrix = read_matrix(&stream.dict).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
 
+        let bbox = read_bbox(&stream.dict).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+
         let has_own_resources = stream.dict.get(b"Resources").is_ok();
+
+        let transparency = read_transparency_group(self.doc, &stream.dict);
 
         Some(FormXObject {
             content,
             matrix,
+            bbox,
             resources_id: stream_id,
             has_own_resources,
+            transparency,
         })
     }
 
@@ -308,12 +330,16 @@ impl<'doc> PageResources<'doc> {
         let stream = obj.as_stream().ok()?;
         let content = stream.decompressed_content().ok()?;
         let matrix = read_matrix(&stream.dict).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let bbox = read_bbox(&stream.dict).unwrap_or([0.0, 0.0, 1.0, 1.0]);
         let has_own_resources = stream.dict.get(b"Resources").is_ok();
+        let transparency = read_transparency_group(self.doc, &stream.dict);
         Some(FormXObject {
             content,
             matrix,
+            bbox,
             resources_id: stream_id,
             has_own_resources,
+            transparency,
         })
     }
 
@@ -432,6 +458,58 @@ fn is_id_in_ref_array(
     };
     arr.iter()
         .any(|x| matches!(x, Object::Reference(r) if *r == target_id))
+}
+
+/// Read the `BBox` array `[llx, lly, urx, ury]` from a dictionary.
+///
+/// Returns `None` if absent or fewer than 4 numeric entries.
+fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+    let arr = dict.get(b"BBox").ok()?.as_array().ok()?;
+    if arr.len() < 4 {
+        return None;
+    }
+    let mut r = [0.0f64; 4];
+    for (i, obj) in arr.iter().take(4).enumerate() {
+        r[i] = match obj {
+            Object::Real(v) => f64::from(*v),
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "PDF BBox coords are small integers in practice"
+            )]
+            Object::Integer(v) => *v as f64,
+            _ => return None,
+        };
+    }
+    Some(r)
+}
+
+/// Extract transparency group parameters from a Form `XObject` stream dictionary.
+///
+/// Returns `Some` when `Group /S /Transparency` is present; `None` otherwise.
+fn read_transparency_group(
+    doc: &Document,
+    dict: &lopdf::Dictionary,
+) -> Option<TransparencyGroupParams> {
+    let grp_obj = dict.get(b"Group").ok()?;
+    let grp = match grp_obj {
+        Object::Dictionary(d) => d,
+        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        _ => return None,
+    };
+    // Must be /S /Transparency.
+    if grp.get(b"S").ok()?.as_name().ok()? != b"Transparency" {
+        return None;
+    }
+    let bool_flag = |key: &[u8]| {
+        grp.get(key)
+            .ok()
+            .and_then(|o| o.as_bool().ok())
+            .unwrap_or(false)
+    };
+    Some(TransparencyGroupParams {
+        isolated: bool_flag(b"I"),
+        knockout: bool_flag(b"K"),
+    })
 }
 
 /// Read a 6-element `Matrix` array from a dictionary, returning `None` if the
