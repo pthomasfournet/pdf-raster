@@ -1,8 +1,8 @@
-//! PDF shading resource resolution (Types 2–5 — axial, radial, Gouraud mesh).
+//! PDF shading resource resolution (Types 2–7).
 //!
 //! [`resolve_shading`] looks up a named `Shading` resource and returns a
 //! [`ShadingResult`] which is either a [`raster::pipe::Pattern`] (for smooth
-//! gradient types 2–3) or a pre-decoded triangle mesh (for mesh types 4–5).
+//! gradient types 2–3) or a pre-decoded triangle mesh (for mesh types 4–7).
 //!
 //! # Supported shading types
 //!
@@ -12,7 +12,9 @@
 //! | 3 | Radial | yes |
 //! | 4 | Free-form Gouraud triangle mesh | yes |
 //! | 5 | Lattice-form Gouraud mesh | yes |
-//! | 1, 6–7 | Function / Coons / tensor patch | stub (logged + skipped) |
+//! | 6 | Coons patch mesh | yes |
+//! | 7 | Tensor-product patch mesh | yes |
+//! | 1 | Function-based | stub (logged + skipped) |
 //!
 //! # Colour spaces
 //!
@@ -150,7 +152,7 @@ fn resolve_axial(
     let coords = read_f64_array(sh, b"Coords", 4)?;
 
     // Domain: [t0, t1] — defaults to [0, 1].
-    let (t0, t1) = read_domain(sh);
+    let (t0, t1) = read_fn_domain(sh);
 
     // Extend: [extend_start, extend_end].
     let (ext_s, ext_e) = read_extend(sh);
@@ -197,7 +199,7 @@ fn resolve_radial(
     // Coords: [x0, y0, r0, x1, y1, r1] in user space.
     let coords = read_f64_array(sh, b"Coords", 6)?;
 
-    let (t0, t1) = read_domain(sh);
+    let (t0, t1) = read_fn_domain(sh);
     let (ext_s, ext_e) = read_extend(sh);
 
     let fn_obj = sh.get(b"Function").ok()?;
@@ -258,7 +260,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    const fn new(data: &'a [u8]) -> Self {
         Self {
             data,
             byte_pos: 0,
@@ -272,7 +274,7 @@ impl<'a> BitReader<'a> {
     /// Returns `None` when the stream is exhausted before `n` bits are available.
     /// Callers must not pass `n == 0` (asserted in debug builds; release returns 0).
     fn read_bits(&mut self, n: u8) -> Option<u32> {
-        debug_assert!(n >= 1 && n <= 32, "read_bits: n={n} out of range 1..=32");
+        debug_assert!((1..=32).contains(&n), "read_bits: n={n} out of range 1..=32");
         if n == 0 || n > 32 {
             return Some(0);
         }
@@ -300,12 +302,12 @@ const VALID_BITS: &[u8] = &[1, 2, 4, 8, 12, 16, 24, 32];
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
     let v = sh.get_i64(b"BitsPerCoordinate")?;
-    match u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
-        Some(bits) => Some(bits),
-        None => {
-            log::warn!("shading/{tag}: BitsPerCoordinate={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
-            None
-        }
+    #[expect(clippy::option_if_let_else, reason = "else branch has a side-effect (log::warn); map_or_else would be less clear")]
+    if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
+        Some(bits)
+    } else {
+        log::warn!("shading/{tag}: BitsPerCoordinate={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
+        None
     }
 }
 
@@ -315,12 +317,12 @@ fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 fn parse_bits_per_comp(sh: &Dictionary, tag: &str) -> Option<u8> {
     let v = sh.get_i64(b"BitsPerComponent")?;
-    match u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
-        Some(bits) => Some(bits),
-        None => {
-            log::warn!("shading/{tag}: BitsPerComponent={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
-            None
-        }
+    #[expect(clippy::option_if_let_else, reason = "else branch has a side-effect (log::warn); map_or_else would be less clear")]
+    if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
+        Some(bits)
+    } else {
+        log::warn!("shading/{tag}: BitsPerComponent={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping");
+        None
     }
 }
 
@@ -350,10 +352,9 @@ fn decode_type4_mesh(
     // The three vertices of the most recently emitted triangle, for fan continuation.
     let mut prev: Option<[GouraudVertex; 3]> = None;
 
-    loop {
-        // Flag is 8 bits; read_bits(8) guarantees value ≤ 255.
-        let Some(flag_raw) = reader.read_bits(8) else { break };
-        #[expect(clippy::cast_possible_truncation, reason = "read_bits(8) returns at most 255")]
+    // Flag is 8 bits; read_bits(8) guarantees value ≤ 255.
+    #[expect(clippy::cast_possible_truncation, reason = "read_bits(8) returns at most 255")]
+    while let Some(flag_raw) = reader.read_bits(8) {
         let flag = flag_raw as u8;
 
         let n_new: usize = if flag == 0 { 3 } else { 1 };
@@ -432,8 +433,10 @@ fn decode_type5_mesh(
         log::warn!("shading/type5: VerticesPerRow={verts_per_row} < 2 — skipping");
         return vec![];
     }
-    #[expect(clippy::cast_sign_loss, reason = "guarded ≥ 2 above")]
-    let vpr = verts_per_row as usize;
+    let Ok(vpr) = usize::try_from(verts_per_row) else {
+        log::warn!("shading/type5: VerticesPerRow={verts_per_row} overflows usize — skipping");
+        return vec![];
+    };
     let decode = read_decode_array(sh, n_channels);
 
     let mut reader = BitReader::new(data);
@@ -441,23 +444,15 @@ fn decode_type5_mesh(
     let mut prev_row: Vec<GouraudVertex> = Vec::with_capacity(vpr);
     let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
 
-    loop {
+    'rows: loop {
         let mut row = Vec::with_capacity(vpr);
         for _ in 0..vpr {
-            let Some(raw_x) = reader.read_bits(bpc) else { break };
-            let Some(raw_y) = reader.read_bits(bpc) else { break };
+            let Some(raw_x) = reader.read_bits(bpc) else { break 'rows };
+            let Some(raw_y) = reader.read_bits(bpc) else { break 'rows };
             let mut channels = [0u32; 4];
-            let mut ok = true;
             for ch in channels.iter_mut().take(n_channels) {
-                if let Some(raw_c) = reader.read_bits(bpcomp) {
-                    *ch = raw_c;
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if !ok {
-                break;
+                let Some(raw_c) = reader.read_bits(bpcomp) else { break 'rows };
+                *ch = raw_c;
             }
             row.push(decode_vertex(
                 raw_x,
@@ -498,7 +493,7 @@ fn decode_type5_mesh(
 
 /// A bicubic patch: 4×4 control points in device space + 2×2 corner colours.
 ///
-/// Grid convention (matches poppler GfxPatch / PDF §8.7.4.5.6):
+/// Grid convention (matches poppler `GfxPatch` / PDF §8.7.4.5.6):
 /// - `xy[row][col]` where row 0 = "first" edge (u=0), row 3 = "last" edge (u=1).
 /// - `color[u_corner][v_corner]` where 0 = min, 1 = max.
 ///
@@ -510,7 +505,7 @@ struct Patch {
 }
 
 impl Patch {
-    fn zero() -> Self {
+    const fn zero() -> Self {
         Self {
             xy: [[[0.0; 2]; 4]; 4],
             color: [[[0u8; 3]; 2]; 2],
@@ -531,7 +526,7 @@ const VALID_FLAG_BITS: &[u8] = &[2, 4, 8];
 
 /// Componentwise midpoint of two device-space points — exact, never overflows.
 #[inline]
-fn mid2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+const fn mid2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     [f64::midpoint(a[0], b[0]), f64::midpoint(a[1], b[1])]
 }
 
@@ -555,8 +550,8 @@ fn color_delta(p: &Patch) -> f64 {
     let mut max_d = 0.0_f64;
     for i in 0..4 {
         for j in (i + 1)..4 {
-            for ch in 0..3 {
-                let d = f64::from(corners[i][ch].abs_diff(corners[j][ch])) / 255.0;
+            for (a, b) in corners[i].iter().zip(corners[j].iter()) {
+                let d = f64::from(a.abs_diff(*b)) / 255.0;
                 if d > max_d {
                     max_d = d;
                 }
@@ -572,7 +567,11 @@ fn color_delta(p: &Patch) -> f64 {
 ///
 /// Returns `(left, right)` where each is a 4-point row.
 #[inline]
-fn casteljau_row(row: [[f64; 2]; 4]) -> ([[f64; 2]; 4], [[f64; 2]; 4]) {
+#[expect(
+    clippy::similar_names,
+    reason = "m01/m012/m0123 are standard de Casteljau intermediate-point names; renaming obscures the algorithm"
+)]
+const fn casteljau_row(row: [[f64; 2]; 4]) -> ([[f64; 2]; 4], [[f64; 2]; 4]) {
     let m01 = mid2(row[0], row[1]);
     let m12 = mid2(row[1], row[2]);
     let m23 = mid2(row[2], row[3]);
@@ -637,7 +636,7 @@ fn split_patch_v(p: &Patch) -> (Patch, Patch) {
 ///
 /// `u=0` → row 0; `u=1` → row 3. `v=0` → col 0; `v=1` → col 3.
 #[inline]
-fn corner_vertex(p: &Patch, u: usize, v: usize) -> GouraudVertex {
+const fn corner_vertex(p: &Patch, u: usize, v: usize) -> GouraudVertex {
     let row = u * 3;
     let col = v * 3;
     GouraudVertex {
@@ -652,6 +651,10 @@ fn corner_vertex(p: &Patch, u: usize, v: usize) -> GouraudVertex {
 /// Subdivision stops when all corner colours are within [`COLOR_DELTA`] of each
 /// other or [`MAX_PATCH_DEPTH`] is reached, matching poppler's strategy.
 /// Uses an explicit work stack (no recursion) to avoid stack overflow.
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "Patch (272 B) is consumed on the work stack; reference would require a Clone per push"
+)]
 fn tessellate_patch(patch: Patch, out: &mut Vec<[GouraudVertex; 3]>) {
     // Pre-allocate the work stack; worst case is 4 * MAX_PATCH_DEPTH live entries.
     let mut stack: Vec<(Patch, u8)> = Vec::with_capacity(4 * MAX_PATCH_DEPTH as usize);
@@ -694,6 +697,8 @@ fn read_patch_points(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Option<Vec<[f64; 2]>> {
+    // bpc ∈ VALID_BITS ⊆ [1,32]; u64 fits the shift; cast to f64 is exact (≤ 2^32−1 < 2^53).
+    #[expect(clippy::cast_precision_loss, reason = "max_coord ≤ 2^32−1; f64 mantissa is 52 bits")]
     let max_coord = ((1u64 << bpc) - 1) as f64;
     let x_min = decode.first().copied().unwrap_or(0.0);
     let x_max = decode.get(1).copied().unwrap_or(1.0);
@@ -704,18 +709,10 @@ fn read_patch_points(
     for _ in 0..n_pts {
         let raw_x = reader.read_bits(bpc)?;
         let raw_y = reader.read_bits(bpc)?;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "raw bit fields ≤ 32 bits; f64 mantissa exact for u32 values"
-        )]
-        let ux = x_min + (raw_x as f64 / max_coord) * (x_max - x_min);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "same as ux — u32 → f64 exact up to 2^53"
-        )]
-        let uy = y_min + (raw_y as f64 / max_coord) * (y_max - y_min);
-        let (dx, dy) = transform_point(ctm, ux, uy, page_h);
-        pts.push([dx, dy]);
+        // u32 → f64 is always lossless (u32 < 2^32 ≤ 2^53 mantissa bits).
+        let ux = (f64::from(raw_x) / max_coord).mul_add(x_max - x_min, x_min);
+        let uy = (f64::from(raw_y) / max_coord).mul_add(y_max - y_min, y_min);
+        pts.push(<[f64; 2]>::from(transform_point(ctm, ux, uy, page_h)));
     }
     Some(pts)
 }
@@ -731,6 +728,8 @@ fn read_patch_colors(
     decode: &[f64],
     cs: ImageColorSpace,
 ) -> Option<Vec<[u8; 3]>> {
+    // bpcomp ∈ VALID_BITS ⊆ [1,32]; cast to f64 exact for u32-range values.
+    #[expect(clippy::cast_precision_loss, reason = "max_comp ≤ 2^32−1; f64 mantissa is 52 bits")]
     let max_comp = ((1u64 << bpcomp) - 1) as f64;
     let mut colors = Vec::with_capacity(n_colors);
     for _ in 0..n_colors {
@@ -738,17 +737,14 @@ fn read_patch_colors(
         for ch in raw.iter_mut().take(n_channels) {
             *ch = reader.read_bits(bpcomp)?;
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "u32 → f64 exact up to 2^53; colour component values are small"
-        )]
+        // u32 → f64 is always lossless; mul_add avoids a separate rounding step.
         let channels: Vec<f64> = raw[..n_channels]
             .iter()
             .enumerate()
             .map(|(i, &v)| {
                 let c_min = decode.get(4 + i * 2).copied().unwrap_or(0.0);
                 let c_max = decode.get(4 + i * 2 + 1).copied().unwrap_or(1.0);
-                c_min + (v as f64 / max_comp) * (c_max - c_min)
+                (f64::from(v) / max_comp).mul_add(c_max - c_min, c_min)
             })
             .collect();
         colors.push(cs_to_rgb(cs, &channels));
@@ -759,15 +755,15 @@ fn read_patch_colors(
 /// Validate and extract `BitsPerFlag` from a patch mesh shading dictionary.
 fn parse_bits_per_flag(sh: &Dictionary, tag: &str) -> Option<u8> {
     let v = sh.get_i64(b"BitsPerFlag")?;
-    match u8::try_from(v).ok().filter(|b| VALID_FLAG_BITS.contains(b)) {
-        Some(bits) => Some(bits),
-        None => {
-            log::warn!(
-                "shading/{tag}: BitsPerFlag={v} is not a legal PDF value \
-                 (must be one of {VALID_FLAG_BITS:?}) — skipping"
-            );
-            None
-        }
+    #[expect(clippy::option_if_let_else, reason = "else branch has a side-effect (log::warn); map_or_else would be less clear")]
+    if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_FLAG_BITS.contains(b)) {
+        Some(bits)
+    } else {
+        log::warn!(
+            "shading/{tag}: BitsPerFlag={v} is not a legal PDF value \
+             (must be one of {VALID_FLAG_BITS:?}) — skipping"
+        );
+        None
     }
 }
 
@@ -810,10 +806,12 @@ fn fill_type6_interior(p: &mut Patch) {
         let [p10, p13]            = [p.xy[1][0][k], p.xy[1][3][k]];
         let [p20, p23]            = [p.xy[2][0][k], p.xy[2][3][k]];
         let [p30, p31, p32, p33] = [p.xy[3][0][k], p.xy[3][1][k], p.xy[3][2][k], p.xy[3][3][k]];
-        p.xy[1][1][k] = (-4.0*p00 + 6.0*(p01+p10) - 2.0*(p03+p30) + 3.0*(p31+p13) - p33) / 9.0;
-        p.xy[1][2][k] = (-4.0*p03 + 6.0*(p02+p13) - 2.0*(p00+p33) + 3.0*(p32+p10) - p30) / 9.0;
-        p.xy[2][1][k] = (-4.0*p30 + 6.0*(p31+p20) - 2.0*(p33+p00) + 3.0*(p01+p23) - p03) / 9.0;
-        p.xy[2][2][k] = (-4.0*p33 + 6.0*(p32+p23) - 2.0*(p30+p03) + 3.0*(p02+p20) - p00) / 9.0;
+        // Coons formula: (-4a + 6(b+c) - 2(d+e) + 3(f+g) - h) / 9
+        // Written with mul_add to minimise rounding error.
+        p.xy[1][1][k] = ((-4.0f64).mul_add(p00, 6.0*(p01+p10)).mul_add(1.0, (-2.0f64).mul_add(p03+p30, 3.0*(p31+p13))) - p33) / 9.0;
+        p.xy[1][2][k] = ((-4.0f64).mul_add(p03, 6.0*(p02+p13)).mul_add(1.0, (-2.0f64).mul_add(p00+p33, 3.0*(p32+p10))) - p30) / 9.0;
+        p.xy[2][1][k] = ((-4.0f64).mul_add(p30, 6.0*(p31+p20)).mul_add(1.0, (-2.0f64).mul_add(p33+p00, 3.0*(p01+p23))) - p03) / 9.0;
+        p.xy[2][2][k] = ((-4.0f64).mul_add(p33, 6.0*(p32+p23)).mul_add(1.0, (-2.0f64).mul_add(p30+p03, 3.0*(p02+p20))) - p00) / 9.0;
     }
 }
 
@@ -979,9 +977,8 @@ fn decode_type6_mesh(
     let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
     let mut prev: Option<Patch> = None;
 
-    loop {
-        let Some(flag_raw) = reader.read_bits(bpf) else { break };
-        #[expect(clippy::cast_possible_truncation, reason = "bpf ∈ {2,4,8}; value fits u8")]
+    #[expect(clippy::cast_possible_truncation, reason = "bpf ∈ {2,4,8}; value fits u8")]
+    while let Some(flag_raw) = reader.read_bits(bpf) {
         let flag = flag_raw as u8;
 
         let (n_pts, n_colors): (usize, usize) = if flag == 0 { (12, 4) } else { (8, 2) };
@@ -1033,9 +1030,8 @@ fn decode_type7_mesh(
     let mut triangles: Vec<[GouraudVertex; 3]> = Vec::new();
     let mut prev: Option<Patch> = None;
 
-    loop {
-        let Some(flag_raw) = reader.read_bits(bpf) else { break };
-        #[expect(clippy::cast_possible_truncation, reason = "bpf ∈ {2,4,8}; value fits u8")]
+    #[expect(clippy::cast_possible_truncation, reason = "bpf ∈ {2,4,8}; value fits u8")]
+    while let Some(flag_raw) = reader.read_bits(bpf) {
         let flag = flag_raw as u8;
 
         let (n_pts, n_colors): (usize, usize) = if flag == 0 { (16, 4) } else { (12, 2) };
@@ -1117,6 +1113,10 @@ fn default_decode(n_channels: usize) -> Vec<f64> {
 ///
 /// Raw bit values are mapped from `[0, 2^bits − 1]` to the user-space range
 /// given by the `Decode` array, then transformed through the CTM to device space.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all args are required by the PDF mesh vertex decode formula; no sensible grouping"
+)]
 fn decode_vertex(
     raw_x: u32,
     raw_y: u32,
@@ -1128,37 +1128,29 @@ fn decode_vertex(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> GouraudVertex {
-    // bits_per_coord and bits_per_comp are validated ∈ VALID_BITS before this
-    // function is called, so both are in [1, 32] — the shift is safe.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "bit fields are at most 32 bits; f64 has 53-bit mantissa, exact for all u32 values"
-    )]
-    let max_coord = ((1u64 << bits_per_coord) - 1) as f64; // always > 0 (bits ≥ 1)
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "same as max_coord — bits_per_comp ∈ [1,32]"
-    )]
-    let max_comp = ((1u64 << bits_per_comp) - 1) as f64; // always > 0
+    // bits_per_coord/comp ∈ VALID_BITS ⊆ [1,32]; shift is safe.
+    // Cast from u64 to f64: max_coord ≤ 2^32−1 < 2^53, so conversion is exact.
+    #[expect(clippy::cast_precision_loss, reason = "max_coord ≤ 2^32−1; f64 mantissa is 52 bits")]
+    let max_coord = ((1u64 << bits_per_coord) - 1) as f64;
+    #[expect(clippy::cast_precision_loss, reason = "max_comp ≤ 2^32−1; f64 mantissa is 52 bits")]
+    let max_comp  = ((1u64 << bits_per_comp)  - 1) as f64;
 
     let x_min = decode.first().copied().unwrap_or(0.0);
     let x_max = decode.get(1).copied().unwrap_or(1.0);
     let y_min = decode.get(2).copied().unwrap_or(0.0);
     let y_max = decode.get(3).copied().unwrap_or(1.0);
 
-    #[expect(clippy::cast_precision_loss, reason = "u32 → f64 exact up to 2^53")]
-    let ux = x_min + (raw_x as f64 / max_coord) * (x_max - x_min);
-    #[expect(clippy::cast_precision_loss, reason = "u32 → f64 exact up to 2^53")]
-    let uy = y_min + (raw_y as f64 / max_coord) * (y_max - y_min);
+    // u32 → f64 is always lossless (u32 < 2^32 ≤ 2^53 mantissa bits).
+    let ux = (f64::from(raw_x) / max_coord).mul_add(x_max - x_min, x_min);
+    let uy = (f64::from(raw_y) / max_coord).mul_add(y_max - y_min, y_min);
 
-    #[expect(clippy::cast_precision_loss, reason = "u32 → f64 exact up to 2^53")]
     let channels: Vec<f64> = raw_channels
         .iter()
         .enumerate()
         .map(|(i, &raw)| {
             let c_min = decode.get(4 + i * 2).copied().unwrap_or(0.0);
             let c_max = decode.get(4 + i * 2 + 1).copied().unwrap_or(1.0);
-            c_min + (raw as f64 / max_comp) * (c_max - c_min)
+            (f64::from(raw) / max_comp).mul_add(c_max - c_min, c_min)
         })
         .collect();
 
@@ -1386,11 +1378,6 @@ fn read_fn_domain(dict: &Dictionary) -> (f64, f64) {
         Some([d0, d1, ..]) => (*d0, *d1),
         _ => (0.0, 1.0),
     }
-}
-
-/// Read the shading `Domain` key; defaults to `[0, 1]`.
-fn read_domain(sh: &Dictionary) -> (f64, f64) {
-    read_fn_domain(sh)
 }
 
 /// Read the `Extend` array `[extend_start, extend_end]`; both default to `false`.
