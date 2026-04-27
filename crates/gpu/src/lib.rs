@@ -1256,10 +1256,7 @@ mod tests {
 
         fn rect_segs(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<f32> {
             vec![
-                x0, y0, x1, y0,
-                x1, y0, x1, y1,
-                x1, y1, x0, y1,
-                x0, y1, x0, y0,
+                x0, y0, x1, y0, x1, y0, x1, y1, x1, y1, x0, y1, x0, y1, x0, y0,
             ]
         }
 
@@ -1277,7 +1274,10 @@ mod tests {
             let gpu_cov = gpu()
                 .aa_fill_gpu(&segs, 0.0, 0.0, 1, 1, false)
                 .expect("GPU aa_fill failed");
-            assert_eq!(cpu, gpu_cov, "fully-covered pixel: CPU={cpu:?} GPU={gpu_cov:?}");
+            assert_eq!(
+                cpu, gpu_cov,
+                "fully-covered pixel: CPU={cpu:?} GPU={gpu_cov:?}"
+            );
             assert_eq!(cpu[0], 255);
         }
 
@@ -1322,23 +1322,24 @@ mod tests {
                 cpu[0], gpu_cov[0]
             );
             // Sanity: neither fully covered nor empty.
-            assert!(cpu[0] > 0 && cpu[0] < 255, "expected partial coverage, got {}", cpu[0]);
+            assert!(
+                cpu[0] > 0 && cpu[0] < 255,
+                "expected partial coverage, got {}",
+                cpu[0]
+            );
         }
 
         #[test]
         fn aa_fill_gpu_vs_cpu_multi_pixel_region() {
             // 8×8 region with a diagonal rect covering the upper-left triangle.
-            let segs = vec![
-                0.0, 0.0, 8.0, 0.0,
-                8.0, 0.0, 0.0, 8.0,
-                0.0, 8.0, 0.0, 0.0,
-            ];
+            let segs = vec![0.0, 0.0, 8.0, 0.0, 8.0, 0.0, 0.0, 8.0, 0.0, 8.0, 0.0, 0.0];
             let cpu = aa_fill_cpu(&segs, 0.0, 0.0, 8, 8, false);
             let gpu_cov = gpu()
                 .aa_fill_gpu(&segs, 0.0, 0.0, 8, 8, false)
                 .expect("GPU aa_fill failed");
             assert_eq!(
-                cpu, gpu_cov,
+                cpu,
+                gpu_cov,
                 "multi-pixel region mismatch — first diff at byte {}",
                 cpu.iter()
                     .zip(gpu_cov.iter())
