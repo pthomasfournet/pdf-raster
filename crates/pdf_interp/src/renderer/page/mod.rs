@@ -516,12 +516,27 @@ impl<'doc> PageRenderer<'doc> {
             // Type 0 composite fonts use 1–4 bytes determined by the Encoding CMap.
             let cid_enc = descriptor.cid_encoding.as_ref();
 
+            // Shared helper: push a rasterized glyph into `records` if visible.
+            let mut push_glyph = |gid: u32, pen_x: i32, pen_y: i32| {
+                if let Some(bmp) = face.make_glyph(gid, 0) {
+                    records.push(GlyphRecord {
+                        pen_x,
+                        pen_y,
+                        x_off: bmp.x_off,
+                        y_off: bmp.y_off,
+                        width: bmp.width,
+                        height: bmp.height,
+                        aa: bmp.aa,
+                        data: bmp.data,
+                    });
+                }
+            };
+
             if let Some(enc) = cid_enc {
-                // Type 0 composite font: decode via CMap then map CID → GID.
-                let code_bytes = enc
-                    .encoding_cmap
-                    .as_ref()
-                    .map_or(2, |cm| cm.code_bytes);
+                // Type 0 composite font: multi-byte character codes via Encoding CMap.
+                // Identity-H/V (enc.encoding_cmap == None) uses 2-byte codes by convention
+                // (PDF spec §9.7.4, Table 118); embedded CMaps specify their own width.
+                let code_bytes = enc.encoding_cmap.as_ref().map_or(2, |cm| cm.code_bytes);
 
                 let mut pos = 0usize;
                 while pos + usize::from(code_bytes) <= bytes.len() {
@@ -531,31 +546,21 @@ impl<'doc> PageRenderer<'doc> {
                     }
                     pos += usize::from(code_bytes);
 
-                    let gid = enc.code_to_gid(char_code);
-                    let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
-
-                    if let Some(bmp) = face.make_glyph(gid, 0) {
-                        records.push(GlyphRecord {
-                            pen_x,
-                            pen_y,
-                            x_off: bmp.x_off,
-                            y_off: bmp.y_off,
-                            width: bmp.width,
-                            height: bmp.height,
-                            aa: bmp.aa,
-                            data: bmp.data,
-                        });
-                    }
-
-                    // Advance in CID-font design units (PDF §9.7.4.3).
-                    // CID widths are in thousandths of a text-space unit (same
-                    // scale as simple-font Widths), so the advance formula is
-                    // identical: w / 1000 * font_size.
-                    let cid_width = enc.width_for_cid(enc
+                    // charcode → CID (identity if no CMap), then CID → GID.
+                    let cid = enc
                         .encoding_cmap
                         .as_ref()
                         .and_then(|cm| cm.map.get(&char_code).copied())
-                        .unwrap_or(char_code));
+                        .unwrap_or(char_code);
+                    let gid = enc.code_to_gid(char_code);
+
+                    let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
+                    push_glyph(gid, pen_x, pen_y);
+
+                    // CID width lookup uses the CID, not the raw char code.
+                    // Advance formula: w/1000 * font_size (PDF §9.7.4.3).
+                    // Word spacing does not apply to composite fonts (PDF §9.3.3).
+                    let cid_width = enc.width_for_cid(cid);
                     let advance_glyph = f64::from(cid_width) / 1000.0;
                     let tx_adv = (advance_glyph * font_size + char_spacing) * horiz_scaling;
                     let [a, b_m, c, d, e, f] = tm;
@@ -565,26 +570,13 @@ impl<'doc> PageRenderer<'doc> {
                 // Simple font: one byte per character code.
                 for &byte in bytes {
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
-
-                    if let Some(bmp) = face.make_glyph(u32::from(byte), 0) {
-                        records.push(GlyphRecord {
-                            pen_x,
-                            pen_y,
-                            x_off: bmp.x_off,
-                            y_off: bmp.y_off,
-                            width: bmp.width,
-                            height: bmp.height,
-                            aa: bmp.aa,
-                            data: bmp.data,
-                        });
-                    }
+                    push_glyph(u32::from(byte), pen_x, pen_y);
 
                     // Advance regardless of whether the glyph rendered — PDF §9.4.4
                     // requires the pen to advance even for missing/invisible glyphs.
                     let advance_glyph = face.glyph_advance(u32::from(byte)).max(0.0);
                     let extra = if byte == b' ' { word_spacing } else { 0.0 };
-                    let tx_adv =
-                        (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
+                    let tx_adv = (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
                     let [a, b_m, c, d, e, f] = tm;
                     tm = [a, b_m, c, d, e + tx_adv * a, f + tx_adv * b_m];
                 }

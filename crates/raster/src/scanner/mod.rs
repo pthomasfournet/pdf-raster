@@ -282,7 +282,10 @@ impl XPathScanner {
             .filter(|(_, w)| w[0] < w[1])
             // i < n_rows ≤ i32::MAX (enforced by n_rows construction); saturating_add
             // is a no-cost guard against logic errors in debug builds.
-            .map(|(i, _)| self.y_min.saturating_add(i32::try_from(i).unwrap_or(i32::MAX)))
+            .map(|(i, _)| {
+                self.y_min
+                    .saturating_add(i32::try_from(i).unwrap_or(i32::MAX))
+            })
     }
 
     /// The intersections for scanline `y`, sorted by `x0`.

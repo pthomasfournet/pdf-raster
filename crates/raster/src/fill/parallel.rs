@@ -141,10 +141,12 @@ fn fill_impl_parallel<P: Pixel + Send>(
 
     let (y_min_clip, y_max_clip) = if vector_antialias {
         xpath.aa_scale();
-        let y_min = clip.y_min_i
+        let y_min = clip
+            .y_min_i
             .checked_mul(AA_SIZE)
             .expect("AA y_lo overflows i32: clip.y_min_i is unreasonably large");
-        let y_max = clip.y_max_i
+        let y_max = clip
+            .y_max_i
             .checked_add(1)
             .and_then(|v| v.checked_mul(AA_SIZE))
             .map(|v| v - 1)

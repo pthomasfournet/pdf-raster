@@ -133,7 +133,13 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                     ) {
                         // First codespace entry determines the byte width.
                         if code_bytes == 0 {
-                            code_bytes = lo_bytes.len().min(4).max(1) as u8;
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "clamped to 1..=4, always fits u8"
+                            )]
+                            {
+                                code_bytes = lo_bytes.len().clamp(1, 4) as u8;
+                            }
                         }
                         i += 2;
                     } else {
@@ -143,10 +149,7 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
             }
             "begincidchar" | "beginbfchar" => {
                 i += 1;
-                while i < tokens.len()
-                    && tokens[i] != "endcidchar"
-                    && tokens[i] != "endbfchar"
-                {
+                while i < tokens.len() && tokens[i] != "endcidchar" && tokens[i] != "endbfchar" {
                     // <code> value
                     if let (Some(code_bytes_v), Some(val)) = (
                         parse_hex_string(tokens.get(i).copied()),
@@ -162,10 +165,7 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
             }
             "begincidrange" | "beginbfrange" => {
                 i += 1;
-                while i < tokens.len()
-                    && tokens[i] != "endcidrange"
-                    && tokens[i] != "endbfrange"
-                {
+                while i < tokens.len() && tokens[i] != "endcidrange" && tokens[i] != "endbfrange" {
                     // <lo> <hi> base_value
                     // For bfrange, base_value may be a hex string (start Unicode).
                     if let (Some(lo_b), Some(hi_b), Some(base)) = (
@@ -186,11 +186,7 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                                 map.insert(code, base.saturating_add(offset as u32));
                             }
                         } else {
-                            log::warn!(
-                                "cmap: ignoring degenerate range {:04X}–{:04X}",
-                                lo,
-                                hi
-                            );
+                            log::warn!("cmap: ignoring degenerate range {:04X}–{:04X}", lo, hi);
                         }
                         i += 3;
                     } else {
@@ -277,13 +273,25 @@ fn tokenise(text: &str) -> Vec<&str> {
             }
 
             // Array literal [...] — include as single token (not yet decoded).
+            // Track nesting depth so `[[a] b]` is consumed as one token.
             b'[' => {
                 let start = i;
-                while i < bytes.len() && bytes[i] != b']' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    i += 1;
+                let mut depth = 0i32;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'[' => {
+                            depth += 1;
+                            i += 1;
+                        }
+                        b']' => {
+                            depth -= 1;
+                            i += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
                 }
                 tokens.push(&text[start..i]);
             }
@@ -294,7 +302,15 @@ fn tokenise(text: &str) -> Vec<&str> {
                 while i < bytes.len()
                     && !matches!(
                         bytes[i],
-                        b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'>' | b'(' | b')' | b'[' | b']'
+                        b' ' | b'\t'
+                            | b'\r'
+                            | b'\n'
+                            | b'<'
+                            | b'>'
+                            | b'('
+                            | b')'
+                            | b'['
+                            | b']'
                             | b'%'
                     )
                 {
@@ -349,7 +365,10 @@ fn parse_value(tok: Option<&str>) -> Option<u32> {
     }
 }
 
-/// Interpret `bytes` as a big-endian unsigned integer (1–4 bytes).
+/// Interpret `bytes` as a big-endian unsigned integer.
+///
+/// Only the first 4 bytes are consumed; longer inputs are silently truncated.
+/// PDF char codes are at most 4 bytes (PDF spec §9.7.6), so this is safe.
 fn bytes_to_u32(bytes: &[u8]) -> u32 {
     bytes
         .iter()

@@ -52,7 +52,10 @@ use std::ptr;
 // bindgen at build time while keeping the binding surface minimal and auditable.
 
 /// nvJPEG status codes.  Only `NVJPEG_STATUS_SUCCESS = 0` is success.
-#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
+#[expect(
+    non_camel_case_types,
+    reason = "C FFI type alias; must match the nvJPEG ABI name"
+)]
 type nvjpegStatus_t = i32;
 
 /// Opaque nvJPEG library handle (wraps device allocators, backend state).
@@ -60,7 +63,10 @@ type nvjpegStatus_t = i32;
 struct NvjpegHandle_ {
     _opaque: [u8; 0],
 }
-#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
+#[expect(
+    non_camel_case_types,
+    reason = "C FFI type alias; must match the nvJPEG ABI name"
+)]
 type nvjpegHandle_t = *mut NvjpegHandle_;
 
 /// Opaque per-decode state (Huffman tables, coefficient buffers, etc.).
@@ -68,17 +74,26 @@ type nvjpegHandle_t = *mut NvjpegHandle_;
 struct NvjpegJpegState_ {
     _opaque: [u8; 0],
 }
-#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
+#[expect(
+    non_camel_case_types,
+    reason = "C FFI type alias; must match the nvJPEG ABI name"
+)]
 type nvjpegJpegState_t = *mut NvjpegJpegState_;
 
 /// Chroma subsampling type — required out-parameter for `nvjpegGetImageInfo`;
 /// we don't inspect it (component count alone drives dispatch).
-#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
+#[expect(
+    non_camel_case_types,
+    reason = "C FFI type alias; must match the nvJPEG ABI name"
+)]
 type nvjpegChromaSubsampling_t = i32;
 
 /// Output format: we use `NVJPEG_OUTPUT_RGBI` (interleaved RGB, channel[0])
 /// and `NVJPEG_OUTPUT_Y` (luma-only, channel[0]).
-#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
+#[expect(
+    non_camel_case_types,
+    reason = "C FFI type alias; must match the nvJPEG ABI name"
+)]
 type nvjpegOutputFormat_t = i32;
 
 /// `NVJPEG_OUTPUT_Y` — single-channel luma output to `channel[0]`.
@@ -93,7 +108,10 @@ const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 /// JPEGs; the library returns `NVJPEG_STATUS_JPEG_NOT_SUPPORTED` for progressive
 /// or multi-scan streams, which the caller catches and retries with the DEFAULT
 /// backend.
-#[expect(non_camel_case_types, reason = "C FFI type alias; must match the nvJPEG ABI name")]
+#[expect(
+    non_camel_case_types,
+    reason = "C FFI type alias; must match the nvJPEG ABI name"
+)]
 type nvjpegBackend_t = i32;
 
 /// Auto-select the best available backend (typically `HYBRID`).
@@ -213,7 +231,10 @@ const NVJPEG_STATUS_SUCCESS: nvjpegStatus_t = 0;
 /// JPEG encoding not supported by the chosen backend (e.g. progressive JPEG on HARDWARE backend).
 const NVJPEG_STATUS_JPEG_NOT_SUPPORTED: nvjpegStatus_t = 4;
 /// Bitstream is truncated or incomplete.
-#[expect(dead_code, reason = "named in NvJpegError::Display match arm as integer 10; kept as readable documentation")]
+#[expect(
+    dead_code,
+    reason = "named in NvJpegError::Display match arm as integer 10; kept as readable documentation"
+)]
 const NVJPEG_STATUS_INCOMPLETE_BITSTREAM: nvjpegStatus_t = 10;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -273,16 +294,19 @@ impl std::fmt::Display for NvJpegError {
             }
             Self::UnsupportedComponents(n) => write!(f, "unsupported JPEG component count {n}"),
             Self::ZeroDimension { width, height } => {
-                write!(f, "JPEG reported zero or negative dimension {width}×{height}")
+                write!(
+                    f,
+                    "JPEG reported zero or negative dimension {width}×{height}"
+                )
             }
             Self::Overflow => write!(f, "pixel buffer size overflow (image too large)"),
             Self::CudaError(code) => {
                 // Codes from cuda.h (CUDA 12.8); confirmed against installed headers.
                 let name = match *code {
-                    1   => "CUDA_ERROR_INVALID_VALUE",
-                    2   => "CUDA_ERROR_OUT_OF_MEMORY",
-                    3   => "CUDA_ERROR_NOT_INITIALIZED",
-                    35  => "CUDA_ERROR_INSUFFICIENT_DRIVER",
+                    1 => "CUDA_ERROR_INVALID_VALUE",
+                    2 => "CUDA_ERROR_OUT_OF_MEMORY",
+                    3 => "CUDA_ERROR_NOT_INITIALIZED",
+                    35 => "CUDA_ERROR_INSUFFICIENT_DRIVER",
                     100 => "CUDA_ERROR_NO_DEVICE",
                     101 => "CUDA_ERROR_INVALID_DEVICE",
                     200 => "CUDA_ERROR_INVALID_IMAGE",
@@ -293,7 +317,7 @@ impl std::fmt::Display for NvJpegError {
                     400 => "CUDA_ERROR_INVALID_HANDLE",
                     600 => "CUDA_ERROR_NOT_READY",
                     700 => "CUDA_ERROR_ILLEGAL_ADDRESS",
-                    _   => "CUDA_ERROR_UNKNOWN",
+                    _ => "CUDA_ERROR_UNKNOWN",
                 };
                 write!(f, "CUDA driver error {code} ({name})")
             }
@@ -338,8 +362,14 @@ impl PinnedBuf {
         if result != 0 {
             return Err(NvJpegError::CudaError(result));
         }
-        assert!(!raw.is_null(), "cuMemAllocHost succeeded but returned null pointer");
-        Ok(Self { ptr: raw.cast::<u8>(), len })
+        assert!(
+            !raw.is_null(),
+            "cuMemAllocHost succeeded but returned null pointer"
+        );
+        Ok(Self {
+            ptr: raw.cast::<u8>(),
+            len,
+        })
     }
 
     /// Copy the pinned buffer contents into a `Vec<u8>` for the caller.
@@ -357,7 +387,10 @@ impl PinnedBuf {
 impl Drop for PinnedBuf {
     fn drop(&mut self) {
         // alloc() asserts non-null before returning Ok, so ptr is always valid here.
-        debug_assert!(!self.ptr.is_null(), "PinnedBuf::ptr is null — construction invariant violated");
+        debug_assert!(
+            !self.ptr.is_null(),
+            "PinnedBuf::ptr is null — construction invariant violated"
+        );
         // SAFETY: ptr came from cuMemAllocHost_v2; no other references exist at drop time.
         let _ = unsafe { cuMemFreeHost(self.ptr.cast()) };
     }
@@ -479,7 +512,10 @@ impl NvJpeg {
             )
         };
         if hw_status == NVJPEG_STATUS_SUCCESS {
-            assert!(!handle.is_null(), "nvjpegCreateEx(HARDWARE) succeeded but returned null handle");
+            assert!(
+                !handle.is_null(),
+                "nvjpegCreateEx(HARDWARE) succeeded but returned null handle"
+            );
             return Ok((handle, true));
         }
 
@@ -500,7 +536,10 @@ impl NvJpeg {
         if status != NVJPEG_STATUS_SUCCESS {
             return Err(NvJpegError::NvjpegStatus(status));
         }
-        assert!(!handle.is_null(), "nvjpegCreateEx(DEFAULT) succeeded but returned null handle");
+        assert!(
+            !handle.is_null(),
+            "nvjpegCreateEx(DEFAULT) succeeded but returned null handle"
+        );
         Ok((handle, false))
     }
 
@@ -515,8 +554,15 @@ impl NvJpeg {
             let _ = unsafe { nvjpegDestroy(handle) };
             return Err(NvJpegError::NvjpegStatus(status));
         }
-        assert!(!state.is_null(), "nvjpegJpegStateCreate succeeded but returned null state");
-        Ok(Self { handle, state, hardware_backend })
+        assert!(
+            !state.is_null(),
+            "nvjpegJpegStateCreate succeeded but returned null state"
+        );
+        Ok(Self {
+            handle,
+            state,
+            hardware_backend,
+        })
     }
 
     /// Enqueue a JPEG decode on `stream`, returning a `PendingDecode`.
@@ -539,7 +585,9 @@ impl NvJpeg {
             Err(NvJpegError::NvjpegStatus(NVJPEG_STATUS_JPEG_NOT_SUPPORTED))
                 if self.hardware_backend =>
             {
-                log::debug!("nvJPEG HARDWARE backend: JPEG not supported (progressive?), retrying with DEFAULT backend");
+                log::debug!(
+                    "nvJPEG HARDWARE backend: JPEG not supported (progressive?), retrying with DEFAULT backend"
+                );
                 self.reinit_default_backend()?;
                 self.decode_inner(data, stream)
             }
@@ -575,7 +623,10 @@ impl NvJpeg {
         if status != NVJPEG_STATUS_SUCCESS {
             return Err(NvJpegError::NvjpegStatus(status));
         }
-        assert!(!handle.is_null(), "nvjpegCreateEx(DEFAULT) succeeded but returned null handle");
+        assert!(
+            !handle.is_null(),
+            "nvjpegCreateEx(DEFAULT) succeeded but returned null handle"
+        );
 
         let mut state: nvjpegJpegState_t = ptr::null_mut();
         // SAFETY: handle is valid.
@@ -584,7 +635,10 @@ impl NvJpeg {
             let _ = unsafe { nvjpegDestroy(handle) };
             return Err(NvJpegError::NvjpegStatus(status));
         }
-        assert!(!state.is_null(), "nvjpegJpegStateCreate succeeded but returned null state");
+        assert!(
+            !state.is_null(),
+            "nvjpegJpegStateCreate succeeded but returned null state"
+        );
 
         self.handle = handle;
         self.state = state;
@@ -683,7 +737,12 @@ impl NvJpeg {
         // Return the pinned buffer and metadata without copying yet.
         // The GPU is still writing; `decode_sync` synchronises the stream before
         // calling `into_decoded_jpeg` to copy the finished pixels into a Vec.
-        Ok(PendingDecode { pinned, width, height, color_space })
+        Ok(PendingDecode {
+            pinned,
+            width,
+            height,
+            color_space,
+        })
     }
 }
 
@@ -771,8 +830,7 @@ impl NvJpegDecoder {
         // cuDeviceGet takes a signed ordinal; real CUDA systems have at most a few
         // hundred GPUs, so anything outside i32 range is a caller error.
         // CUDA_ERROR_INVALID_DEVICE = 101.
-        let ordinal_i32 = i32::try_from(ordinal)
-            .map_err(|_| NvJpegError::CudaError(101))?;
+        let ordinal_i32 = i32::try_from(ordinal).map_err(|_| NvJpegError::CudaError(101))?;
         let mut device: i32 = 0;
         let r = unsafe { cuDeviceGet(ptr::addr_of_mut!(device), ordinal_i32) };
         if r != 0 {
@@ -804,7 +862,10 @@ impl NvJpegDecoder {
             let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
             return Err(NvJpegError::CudaError(r));
         }
-        assert!(!stream.is_null(), "cuStreamCreate returned null despite success");
+        assert!(
+            !stream.is_null(),
+            "cuStreamCreate returned null despite success"
+        );
 
         // Step 6 — initialise nvJPEG.  nvjpegCreateEx captures the current context
         // (set in step 4), so the handle and stream now share the same context.
@@ -816,7 +877,12 @@ impl NvJpegDecoder {
             }
         })?;
 
-        Ok(Self { dec: std::mem::ManuallyDrop::new(dec), device, cu_ctx, stream })
+        Ok(Self {
+            dec: std::mem::ManuallyDrop::new(dec),
+            device,
+            cu_ctx,
+            stream,
+        })
     }
 
     /// Decode a JPEG bitstream synchronously, returning host-resident pixels.
@@ -890,20 +956,17 @@ mod tests {
     /// nvJPEG's GPU kernels require at least one full MCU block (8×8 pixels for
     /// baseline grayscale); a 1×1 JPEG triggers an internal segfault in the driver.
     const GRAY_16X16_JPEG: &[u8] = &[
-        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43,
-        0x00, 0x06, 0x04, 0x05, 0x06, 0x05, 0x04, 0x06, 0x06, 0x05, 0x06, 0x07,
-        0x07, 0x06, 0x08, 0x0a, 0x10, 0x0a, 0x0a, 0x09, 0x09, 0x0a, 0x14, 0x0e,
-        0x0f, 0x0c, 0x10, 0x17, 0x14, 0x18, 0x18, 0x17, 0x14, 0x16, 0x16, 0x1a,
-        0x1d, 0x25, 0x1f, 0x1a, 0x1b, 0x23, 0x1c, 0x16, 0x16, 0x20, 0x2c, 0x20,
-        0x23, 0x26, 0x27, 0x29, 0x2a, 0x29, 0x19, 0x1f, 0x2d, 0x30, 0x2d, 0x28,
-        0x30, 0x25, 0x28, 0x29, 0x28, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x10,
-        0x00, 0x10, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00, 0x15, 0x00, 0x01,
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f,
-        0x00, 0x80, 0x3f, 0xff, 0xd9,
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x06, 0x04, 0x05, 0x06, 0x05,
+        0x04, 0x06, 0x06, 0x05, 0x06, 0x07, 0x07, 0x06, 0x08, 0x0a, 0x10, 0x0a, 0x0a, 0x09, 0x09,
+        0x0a, 0x14, 0x0e, 0x0f, 0x0c, 0x10, 0x17, 0x14, 0x18, 0x18, 0x17, 0x14, 0x16, 0x16, 0x1a,
+        0x1d, 0x25, 0x1f, 0x1a, 0x1b, 0x23, 0x1c, 0x16, 0x16, 0x20, 0x2c, 0x20, 0x23, 0x26, 0x27,
+        0x29, 0x2a, 0x29, 0x19, 0x1f, 0x2d, 0x30, 0x2d, 0x28, 0x30, 0x25, 0x28, 0x29, 0x28, 0xff,
+        0xc0, 0x00, 0x0b, 0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00,
+        0x15, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xda, 0x00,
+        0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x80, 0x3f, 0xff, 0xd9,
     ];
 
     /// `NvJpeg::new()` must not panic — it either succeeds or returns an error.
@@ -923,14 +986,19 @@ mod tests {
         };
 
         // decode_sync blocks until GPU work is complete.
-        let img = dec.decode_sync(GRAY_16X16_JPEG).expect("decode_sync failed");
+        let img = dec
+            .decode_sync(GRAY_16X16_JPEG)
+            .expect("decode_sync failed");
 
         assert_eq!(img.width, 16);
         assert_eq!(img.height, 16);
         assert_eq!(img.color_space, JpegColorSpace::Gray);
         assert_eq!(img.data.len(), 16 * 16);
         // gray50 encodes to ~127.
-        assert!(img.data.iter().all(|&p| p > 100 && p < 160), "unexpected luma values");
+        assert!(
+            img.data.iter().all(|&p| p > 100 && p < 160),
+            "unexpected luma values"
+        );
     }
 
     /// `decode_sync` with an empty slice must return an error, not panic or UB.

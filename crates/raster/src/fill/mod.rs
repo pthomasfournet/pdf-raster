@@ -46,7 +46,6 @@ pub(super) const AA_GAMMA: [u8; (AA_SIZE * AA_SIZE + 1) as usize] = [
     0, 4, 11, 20, 32, 45, 59, 75, 91, 108, 128, 148, 169, 191, 214, 238, 255,
 ];
 
-
 /// Non-zero winding fill.
 #[expect(
     clippy::too_many_arguments,
@@ -127,10 +126,12 @@ pub(super) fn fill_impl<P: Pixel>(
     // Clip y bounds in scanner coordinates (AA or normal).
     let (y_min_clip, y_max_clip) = if vector_antialias {
         xpath.aa_scale();
-        let y_min = clip.y_min_i
+        let y_min = clip
+            .y_min_i
             .checked_mul(AA_SIZE)
             .expect("AA y_lo overflows i32: clip.y_min_i is unreasonably large");
-        let y_max = clip.y_max_i
+        let y_max = clip
+            .y_max_i
             .checked_add(1)
             .and_then(|v| v.checked_mul(AA_SIZE))
             .map(|v| v - 1)
@@ -285,7 +286,10 @@ pub(super) fn draw_span<P: Pixel, S: RowSink<P>>(
     y: i32,
 ) {
     debug_assert!(x0 <= x1, "draw_span: x0={x0} > x1={x1}");
-    debug_assert!(x0 >= 0, "draw_span: x0={x0} is negative (caller must clamp before calling)");
+    debug_assert!(
+        x0 >= 0,
+        "draw_span: x0={x0} is negative (caller must clamp before calling)"
+    );
     debug_assert!(y >= 0, "draw_span: y={y} is negative");
     #[expect(clippy::cast_sign_loss, reason = "y >= 0 asserted above")]
     let y_u = y as u32;

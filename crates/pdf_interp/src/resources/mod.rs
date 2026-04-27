@@ -12,8 +12,8 @@
 //! ([`super::renderer::font_cache`]) rather than here, so this module
 //! stays stateless and easy to test.
 
-pub(crate) mod dict_ext;
 pub mod cmap;
+pub(crate) mod dict_ext;
 pub mod font;
 pub mod image;
 pub mod shading;
@@ -22,12 +22,12 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
 
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
-pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
 /// Re-exported from [`gpu::nvjpeg`] for callers that enable the `nvjpeg` feature.
 /// Create via [`gpu::nvjpeg::NvJpegDecoder::new`] with a raw `CUstream` handle,
 /// then pass to [`PageRenderer::set_nvjpeg`].
 #[cfg(feature = "nvjpeg")]
 pub use gpu::nvjpeg::NvJpegDecoder;
+pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
 
 /// Selected parameters extracted from a PDF `ExtGState` resource dictionary.
 ///

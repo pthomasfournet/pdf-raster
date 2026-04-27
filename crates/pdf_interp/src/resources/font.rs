@@ -100,13 +100,14 @@ impl CidEncoding {
             None => char_code, // Identity-H/V or no CMap.
         };
 
-        // Step 2: CID → GID.
+        // Step 2: CID → GID via table, or identity if no CIDToGIDMap.
         match &self.cid_to_gid {
             Some(table) => {
+                // CIDs are 16-bit values (PDF spec §9.7.4); usize is always ≥ 16 bits.
                 let idx = cid as usize;
-                if idx < table.len() { table[idx] } else { 0 }
+                table.get(idx).copied().unwrap_or(0)
             }
-            None => cid, // Identity CIDToGIDMap.
+            None => cid,
         }
     }
 }
@@ -347,9 +348,7 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         .and_then(|d| extract_bytes_from_descendant(doc, d));
 
     // 4. CIDToGIDMap (CIDFontType2 only; CIDFontType0/CFF uses identity).
-    let cid_to_gid = descendant
-        .as_ref()
-        .and_then(|d| extract_cid_to_gid(doc, d));
+    let cid_to_gid = descendant.as_ref().and_then(|d| extract_cid_to_gid(doc, d));
 
     // 5. CIDFont metrics: DW and W.
     let (default_width, widths) = descendant
@@ -421,18 +420,32 @@ fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap
 /// The PDF spec requires exactly one descendant; we take the first and warn if
 /// the array is absent or empty.
 fn extract_descendant<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a Dictionary> {
-    let arr_obj = dict.get(b"DescendantFonts").ok()?;
+    let arr_obj = match dict.get(b"DescendantFonts") {
+        Ok(o) => o,
+        Err(_) => {
+            log::warn!("font: Type0 font has no DescendantFonts — cannot load face");
+            return None;
+        }
+    };
     let arr = match arr_obj {
         Object::Array(a) => a,
         Object::Reference(id) => {
             let obj = doc.get_object(*id).ok()?;
-            return obj.as_array().ok()?.first().and_then(|o| resolve_obj_to_dict(doc, o));
+            return obj
+                .as_array()
+                .ok()?
+                .first()
+                .and_then(|o| resolve_obj_to_dict(doc, o));
         }
         _ => return None,
     };
 
-    let first = arr.first()?;
-    resolve_obj_to_dict(doc, first)
+    if arr.is_empty() {
+        log::warn!("font: Type0 DescendantFonts array is empty");
+        return None;
+    }
+
+    resolve_obj_to_dict(doc, &arr[0])
 }
 
 /// Dereference an `Object` (possibly a `Reference`) to a `&Dictionary`.
@@ -452,7 +465,11 @@ fn extract_bytes_from_descendant(doc: &Document, descendant: &Dictionary) -> Opt
 }
 
 /// Shared byte-extraction logic that works on any font dict (direct or descendant).
-fn extract_bytes_with_kind(doc: &Document, dict: &Dictionary, kind: PdfFontKind) -> Option<Vec<u8>> {
+fn extract_bytes_with_kind(
+    doc: &Document,
+    dict: &Dictionary,
+    kind: PdfFontKind,
+) -> Option<Vec<u8>> {
     let fd = resolve_fd(doc, dict)?;
     let priority: &[&[u8]] = match kind {
         PdfFontKind::Type1 => &[b"FontFile", b"FontFile3"],
@@ -479,6 +496,18 @@ fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32
             let stream_obj = doc.get_object(*id).ok()?;
             let stream = stream_obj.as_stream().ok()?;
             let bytes = stream.decompressed_content().ok()?;
+
+            // A CIDToGIDMap covers CIDs 0..65535 at most → max 65536 × 2 = 131072 bytes.
+            // Reject oversized maps to prevent memory exhaustion from malicious PDFs.
+            const MAX_CID_TO_GID_BYTES: usize = 65536 * 2;
+            if bytes.len() > MAX_CID_TO_GID_BYTES {
+                log::warn!(
+                    "font: CIDToGIDMap stream is {} bytes — exceeds {MAX_CID_TO_GID_BYTES} limit, ignoring",
+                    bytes.len()
+                );
+                return None;
+            }
+
             // CIDToGIDMap is pairs of bytes: GID[cid] = (bytes[2*cid] << 8) | bytes[2*cid+1].
             if bytes.len() % 2 != 0 {
                 log::warn!(
@@ -507,15 +536,9 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
         clippy::cast_possible_truncation,
         reason = "DW is a glyph advance in design units, always small; safe to i32"
     )]
-    let dw = dict
-        .get_i64(b"DW")
-        .map_or(1000, |v| v as i32);
+    let dw = dict.get_i64(b"DW").map_or(1000, |v| v as i32);
 
-    let Some(w_arr) = dict
-        .get(b"W")
-        .ok()
-        .and_then(|o| o.as_array().ok())
-    else {
+    let Some(w_arr) = dict.get(b"W").ok().and_then(|o| o.as_array().ok()) else {
         return (dw, vec![]);
     };
 
@@ -523,17 +546,22 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
     let mut i = 0;
 
     while i < w_arr.len() {
-        // Each segment starts with a CID integer.
-        let Some(first_cid) = w_arr[i].as_i64().ok() else {
+        // Each segment starts with a non-negative CID integer.
+        let Some(first_cid_raw) = w_arr[i].as_i64().ok() else {
             i += 1;
             continue;
         };
+        if first_cid_raw < 0 {
+            log::warn!("font: W array has negative CID {first_cid_raw}, skipping entry");
+            i += 1;
+            continue;
+        }
         #[expect(
             clippy::cast_sign_loss,
             clippy::cast_possible_truncation,
-            reason = "first_cid is a CID value (>= 0, < 65536)"
+            reason = "first_cid_raw validated >= 0 and PDF CIDs fit in u32"
         )]
-        let first_cid = first_cid as u32;
+        let first_cid = first_cid_raw as u32;
         i += 1;
 
         if i >= w_arr.len() {
@@ -555,13 +583,20 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
                 i += 1;
             }
             // `first_cid last_cid w` form.
-            Object::Integer(last_cid) => {
+            Object::Integer(last_cid_raw) => {
+                if *last_cid_raw < 0 {
+                    log::warn!(
+                        "font: W array has negative last_cid {last_cid_raw}, skipping entry"
+                    );
+                    i += 1;
+                    continue;
+                }
                 #[expect(
                     clippy::cast_sign_loss,
                     clippy::cast_possible_truncation,
-                    reason = "last_cid >= 0, bounded by PDF spec (< 65536)"
+                    reason = "last_cid_raw validated >= 0 and PDF CIDs fit in u32"
                 )]
-                let last_cid = *last_cid as u32;
+                let last_cid = *last_cid_raw as u32;
                 i += 1;
                 if i >= w_arr.len() {
                     break;

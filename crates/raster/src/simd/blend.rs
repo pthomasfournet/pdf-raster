@@ -190,7 +190,11 @@ fn has_movdir64b() -> bool {
 #[inline]
 fn preamble_len(ptr: *const u8, limit: usize, align: usize) -> usize {
     let off = ptr.align_offset(align);
-    if off == usize::MAX { limit } else { off.min(limit) }
+    if off == usize::MAX {
+        limit
+    } else {
+        off.min(limit)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -245,7 +249,10 @@ unsafe fn blend_solid_rgb8_movdir64b(dst: &mut [u8], color: [u8; 3], count: usiz
     }
 
     let blocks_start = preamble;
-    debug_assert!(blocks_start <= byte_count, "preamble_len exceeded byte_count");
+    debug_assert!(
+        blocks_start <= byte_count,
+        "preamble_len exceeded byte_count"
+    );
     let remaining = byte_count - blocks_start;
     let blocks = remaining / 192;
 
