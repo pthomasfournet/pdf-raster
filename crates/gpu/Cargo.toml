@@ -7,6 +7,9 @@ edition = "2024"
 # Enable GPU-accelerated JPEG decoding via NVIDIA nvJPEG.
 # Requires libnvjpeg.so to be present at link time (ships with CUDA 12).
 nvjpeg = []
+# Enable GPU vs CPU parity tests (requires a CUDA device at test time).
+# cargo test -p gpu --lib --features gpu-validation -- aa_fill_gpu_vs_cpu
+gpu-validation = []
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }
