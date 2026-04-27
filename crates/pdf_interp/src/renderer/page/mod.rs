@@ -217,6 +217,9 @@ impl<'doc> PageRenderer<'doc> {
                     if let Some(f) = params.flatness {
                         gs.flatness = f;
                     }
+                    if let Some(bm) = params.blend_mode {
+                        gs.blend_mode = bm;
+                    }
                 }
             }
 
@@ -512,7 +515,10 @@ impl<'doc> PageRenderer<'doc> {
         // Phase 2: blit rasterized glyphs — mutable borrow of bitmap only.
         let fill_bytes = self.gstate.current().fill_color.as_slice().to_vec();
         let clip = self.gstate.current().clip.clone_shared();
-        let pipe = Self::make_pipe_with_alpha(self.gstate.current().fill_alpha);
+        let pipe = Self::make_pipe(
+            self.gstate.current().fill_alpha,
+            self.gstate.current().blend_mode,
+        );
         let src = PipeSrc::Solid(&fill_bytes);
 
         for rec in &records {
@@ -599,10 +605,10 @@ impl<'doc> PageRenderer<'doc> {
             .clip_to_path(&xpath, even_odd);
     }
 
-    /// Build a [`PipeState`] for Normal-blend rendering with the given opacity.
-    fn make_pipe_with_alpha(a_input: u8) -> PipeState<'static> {
+    /// Build a [`PipeState`] with the given opacity and blend mode.
+    fn make_pipe(a_input: u8, blend_mode: BlendMode) -> PipeState<'static> {
         PipeState {
-            blend_mode: BlendMode::Normal,
+            blend_mode,
             a_input,
             overprint_mask: 0xFFFF_FFFF,
             overprint_additive: false,
@@ -653,7 +659,7 @@ impl<'doc> PageRenderer<'doc> {
         let color = gs.fill_color.as_slice().to_vec();
         let clip = gs.clip.clone_shared();
         let flatness = gs.flatness.max(0.1);
-        let pipe = Self::make_pipe_with_alpha(gs.fill_alpha);
+        let pipe = Self::make_pipe(gs.fill_alpha, gs.blend_mode);
         let src = PipeSrc::Solid(&color);
         if even_odd {
             eo_fill(
@@ -684,7 +690,7 @@ impl<'doc> PageRenderer<'doc> {
         let gs = self.gstate.current();
         let color = gs.stroke_color.as_slice().to_vec();
         let clip = gs.clip.clone_shared();
-        let pipe = Self::make_pipe_with_alpha(gs.stroke_alpha);
+        let pipe = Self::make_pipe(gs.stroke_alpha, gs.blend_mode);
         let src = PipeSrc::Solid(&color);
         let params = StrokeParams {
             line_width: gs.line_width,

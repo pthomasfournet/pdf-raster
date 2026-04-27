@@ -17,6 +17,7 @@ pub mod font;
 pub mod image;
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
+use raster::types::BlendMode;
 
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
@@ -41,6 +42,8 @@ pub struct ExtGStateParams {
     pub miter_limit: Option<f64>,
     /// Flatness `FL`.  `None` = unchanged.
     pub flatness: Option<f64>,
+    /// Blend mode `BM`.  `None` = unchanged (keep current).
+    pub blend_mode: Option<BlendMode>,
 }
 
 impl ExtGStateParams {
@@ -53,8 +56,51 @@ impl ExtGStateParams {
             line_join: int_val(d, b"LJ"),
             miter_limit: real_or_int(d, b"ML"),
             flatness: real_or_int(d, b"FL"),
+            blend_mode: parse_blend_mode(d),
         }
     }
+}
+
+/// Parse the `BM` key from an `ExtGState` dictionary.
+///
+/// `BM` is either a single `Name` or an array of names (priority list; the
+/// viewer uses the first one it supports).  Unknown names are silently ignored
+/// and `None` is returned, leaving the current blend mode unchanged.
+fn parse_blend_mode(d: &Dictionary) -> Option<BlendMode> {
+    let obj = d.get(b"BM").ok()?;
+    match obj {
+        Object::Name(n) => bm_name_to_mode(n),
+        // Array is a viewer-preference priority list; use the first recognised name.
+        Object::Array(arr) => arr
+            .iter()
+            .find_map(|o| o.as_name().ok().and_then(bm_name_to_mode)),
+        _ => None,
+    }
+}
+
+/// Map a PDF blend mode name to [`BlendMode`].
+///
+/// Returns `None` for unrecognised names so the caller can keep the current mode.
+const fn bm_name_to_mode(name: &[u8]) -> Option<BlendMode> {
+    Some(match name {
+        b"Normal" | b"Compatible" => BlendMode::Normal,
+        b"Multiply" => BlendMode::Multiply,
+        b"Screen" => BlendMode::Screen,
+        b"Overlay" => BlendMode::Overlay,
+        b"Darken" => BlendMode::Darken,
+        b"Lighten" => BlendMode::Lighten,
+        b"ColorDodge" => BlendMode::ColorDodge,
+        b"ColorBurn" => BlendMode::ColorBurn,
+        b"HardLight" => BlendMode::HardLight,
+        b"SoftLight" => BlendMode::SoftLight,
+        b"Difference" => BlendMode::Difference,
+        b"Exclusion" => BlendMode::Exclusion,
+        b"Hue" => BlendMode::Hue,
+        b"Saturation" => BlendMode::Saturation,
+        b"Color" => BlendMode::Color,
+        b"Luminosity" => BlendMode::Luminosity,
+        _ => return None,
+    })
 }
 
 /// Read a real or integer key from a dictionary as `f64`.
@@ -243,4 +289,86 @@ fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
         };
     }
     Some(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bm_name_all_variants_round_trip() {
+        let pairs: &[(&[u8], BlendMode)] = &[
+            (b"Normal", BlendMode::Normal),
+            (b"Compatible", BlendMode::Normal),
+            (b"Multiply", BlendMode::Multiply),
+            (b"Screen", BlendMode::Screen),
+            (b"Overlay", BlendMode::Overlay),
+            (b"Darken", BlendMode::Darken),
+            (b"Lighten", BlendMode::Lighten),
+            (b"ColorDodge", BlendMode::ColorDodge),
+            (b"ColorBurn", BlendMode::ColorBurn),
+            (b"HardLight", BlendMode::HardLight),
+            (b"SoftLight", BlendMode::SoftLight),
+            (b"Difference", BlendMode::Difference),
+            (b"Exclusion", BlendMode::Exclusion),
+            (b"Hue", BlendMode::Hue),
+            (b"Saturation", BlendMode::Saturation),
+            (b"Color", BlendMode::Color),
+            (b"Luminosity", BlendMode::Luminosity),
+        ];
+        for &(name, expected) in pairs {
+            assert_eq!(
+                bm_name_to_mode(name),
+                Some(expected),
+                "bm_name_to_mode({:?})",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn bm_name_unknown_returns_none() {
+        assert!(bm_name_to_mode(b"Dissolve").is_none());
+        assert!(bm_name_to_mode(b"").is_none());
+    }
+
+    #[test]
+    fn parse_blend_mode_bare_name() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("BM", lopdf::Object::Name(b"Multiply".to_vec()));
+        assert_eq!(parse_blend_mode(&dict), Some(BlendMode::Multiply));
+    }
+
+    #[test]
+    fn parse_blend_mode_array_picks_first_known() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(
+            "BM",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Name(b"Unknown1".to_vec()),
+                lopdf::Object::Name(b"Screen".to_vec()),
+                lopdf::Object::Name(b"Normal".to_vec()),
+            ]),
+        );
+        assert_eq!(parse_blend_mode(&dict), Some(BlendMode::Screen));
+    }
+
+    #[test]
+    fn parse_blend_mode_absent_returns_none() {
+        let dict = lopdf::Dictionary::new();
+        assert!(parse_blend_mode(&dict).is_none());
+    }
+
+    #[test]
+    fn parse_blend_mode_all_unknown_array_returns_none() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set(
+            "BM",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Name(b"Foo".to_vec()),
+                lopdf::Object::Name(b"Bar".to_vec()),
+            ]),
+        );
+        assert!(parse_blend_mode(&dict).is_none());
+    }
 }

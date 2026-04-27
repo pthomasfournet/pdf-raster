@@ -31,7 +31,7 @@ The raster crate is complete at the pixel level. The `pdf_interp` crate is the i
 
 Ordered by priority. Wire CLI by default is the finish line.
 
-- [ ] **ICCBased / Indexed / Separation colour spaces** — `SetFillColorSpace` is a no-op; silently corrupts colours in ICC-profiled and indexed images
+- [x] **ICCBased / Indexed / Separation colour spaces** — resolve_cs inspects ICC `N`, expands Indexed palettes, converts CMYK inline; Separation/DeviceN fall back to Gray
 - [ ] **ExtGState blend modes (`BM`)** — only `Normal` mapped; `Multiply`, `Screen`, `Overlay`, etc. composite wrong
 - [ ] **CCITTFaxDecode Group 3 (K≥0)** — Group 4 (K<0) done; Group 3 stub silently skips fax images
 - [ ] **Inline images (`BI ID EI`)** — stub; some generators use these heavily

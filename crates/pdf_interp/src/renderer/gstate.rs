@@ -8,7 +8,7 @@
 //! The save/restore stack is a plain `Vec`; `q` pushes a clone, `Q` pops.
 
 use raster::Clip;
-use raster::types::{LineCap, LineJoin};
+use raster::types::{BlendMode, LineCap, LineJoin};
 
 use super::color::RasterColor;
 use super::text::TextState;
@@ -91,6 +91,8 @@ pub struct InterpGState {
     pub fill_alpha: u8,
     /// Stroke opacity (PDF `CA`): 0 = transparent, 255 = opaque.
     pub stroke_alpha: u8,
+    /// Compositing blend mode (PDF `BM`).  Defaults to `Normal`.
+    pub blend_mode: BlendMode,
     /// Line width in user-space units.
     pub line_width: f64,
     /// Line cap style.
@@ -116,6 +118,7 @@ impl Clone for InterpGState {
             stroke_color: self.stroke_color.clone(),
             fill_alpha: self.fill_alpha,
             stroke_alpha: self.stroke_alpha,
+            blend_mode: self.blend_mode,
             line_width: self.line_width,
             line_cap: self.line_cap,
             line_join: self.line_join,
@@ -138,6 +141,7 @@ impl InterpGState {
             stroke_color: RasterColor::default(),
             fill_alpha: 255,
             stroke_alpha: 255,
+            blend_mode: BlendMode::Normal,
             line_width: 1.0,
             line_cap: LineCap::Butt,
             line_join: LineJoin::Miter,
