@@ -104,12 +104,13 @@ Unblocked by Phase 1 completion (poppler must be gone first). **Phase 1 is compl
 
 ### Priority order
 
-**1. nvJPEG image decoding — highest value, implement first**
+**1. nvJPEG image decoding — highest value, implement first** ✓ COMPLETE
 
 For scan-heavy corpora (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), image decoding dominates wall-clock time. nvJPEG decodes at ~10 GB/s on the RTX 5070; the CPU JPEG path (libjpeg via DCTDecode) is 10–20× slower. No rasterizer changes required — wire nvJPEG into the existing `blit_image` path behind a feature flag.
 
-- [ ] `nvjpeg` crate or raw FFI bindings to `libnvjpeg.so`
-- [ ] DCTDecode dispatch: if image area > threshold and GPU available → nvJPEG, else CPU
+- [x] `gpu::nvjpeg` module: minimal raw FFI surface (no bindgen); NvJpeg context + NvJpegDecoder safe wrapper; decode_sync handles cuStreamSynchronize
+- [x] DCTDecode dispatch: image area ≥ GPU_JPEG_THRESHOLD_PX (512×512) → nvJPEG; else CPU zune-jpeg; CMYK JPEG falls through to CPU
+- [x] Feature flags: `gpu/nvjpeg` + `pdf_interp/nvjpeg`; zero-cost when disabled; pdf_interp maintains unsafe_code = "deny"
 - [ ] nvJPEG2000 for JPXDecode (JPEG 2000); lower priority than baseline JPEG
 
 **2. GPU supersampled AA — replaces CPU 4× scanline AA**
