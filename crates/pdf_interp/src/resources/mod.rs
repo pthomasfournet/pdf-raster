@@ -15,6 +15,7 @@
 pub(crate) mod dict_ext;
 pub mod font;
 pub mod image;
+pub mod shading;
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
@@ -266,6 +267,22 @@ impl<'doc> PageResources<'doc> {
             resources_id: stream_id,
             has_own_resources,
         })
+    }
+
+    /// Resolve the named `Shading` resource and return a [`raster::pipe::Pattern`]
+    /// plus an approximate bounding box in device space `[xmin, ymin, xmax, ymax]`.
+    ///
+    /// Returns `None` if the name is absent, the shading type is unsupported,
+    /// or any required key is missing.
+    #[must_use]
+    pub fn shading(
+        &self,
+        name: &[u8],
+        ctm: &[f64; 6],
+        page_h: f64,
+    ) -> Option<(Box<dyn raster::pipe::Pattern + Send + Sync>, [f64; 4])> {
+        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        shading::resolve_shading(self.doc, ctx_dict, name, ctm, page_h)
     }
 }
 

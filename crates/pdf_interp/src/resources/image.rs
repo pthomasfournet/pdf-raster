@@ -555,6 +555,18 @@ pub(crate) fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a
     }
 }
 
+/// Resolve a PDF colour space object to an [`ImageColorSpace`].
+///
+/// Convenience wrapper around the internal `resolve_cs` for use in the shading module.
+/// CMYK colour spaces are converted to RGB as in the image decode path.
+pub(crate) fn cs_to_image_color_space(doc: &Document, cs_obj: &Object) -> ImageColorSpace {
+    match resolve_cs(doc, cs_obj) {
+        ResolvedCs::Gray => ImageColorSpace::Gray,
+        // CMYK in shadings: treat as RGB (callers convert channels before blitting).
+        ResolvedCs::Rgb | ResolvedCs::Cmyk => ImageColorSpace::Rgb,
+    }
+}
+
 // ── Filter / colour-space name extraction ─────────────────────────────────────
 
 /// Extract the filter name from a `Filter` entry.

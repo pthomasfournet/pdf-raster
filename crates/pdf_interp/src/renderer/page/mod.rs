@@ -42,6 +42,7 @@ use raster::{
     glyph::{GlyphBitmap, fill_glyph},
     path::PathBuilder,
     pipe::{PipeSrc, PipeState},
+    shading::shaded_fill,
     state::TransferSet,
     stroke::{StrokeParams, stroke},
     types::{BlendMode, LineCap, LineJoin},
@@ -394,10 +395,7 @@ impl<'doc> PageRenderer<'doc> {
                 }
             }
             Operator::PaintShading(name) => {
-                log::debug!(
-                    "pdf_interp: sh /{} not yet implemented",
-                    String::from_utf8_lossy(name)
-                );
+                self.do_shading(name);
             }
 
             // ── No-ops ────────────────────────────────────────────────────────
@@ -739,6 +737,56 @@ impl<'doc> PageRenderer<'doc> {
         log::debug!(
             "pdf_interp: Do /{} skipped (unsupported filter or missing resource)",
             String::from_utf8_lossy(name)
+        );
+    }
+
+    /// Execute an `sh` shading operator.
+    ///
+    /// Looks up the named shading resource, builds a rectangle covering the
+    /// current clip bounds as the bounding shape, and calls `shaded_fill`.
+    /// The PDF spec allows `sh` to paint outside the clip region, but in
+    /// practice the clip constrains the painted area; using the clip's bounding
+    /// box as the path is correct for all axis-aligned clips and is a safe
+    /// approximation for rotated clips.
+    fn do_shading(&mut self, name: &[u8]) {
+        let gs = self.gstate.current();
+        let ctm = gs.ctm;
+        let clip = gs.clip.clone_shared();
+        let flatness = gs.flatness.max(0.1);
+        let alpha = gs.fill_alpha;
+        let blend_mode = gs.blend_mode;
+        let page_h = f64::from(self.height);
+
+        let Some((pattern, _bbox)) = self.resources.shading(name, &ctm, page_h) else {
+            log::debug!(
+                "pdf_interp: sh /{} — shading not available (unsupported type or missing resource)",
+                String::from_utf8_lossy(name)
+            );
+            return;
+        };
+
+        // Build a path covering the full clip bounding box.
+        let path = {
+            let mut pb = PathBuilder::new();
+            let _ = pb.move_to(clip.x_min, clip.y_min);
+            let _ = pb.line_to(clip.x_max, clip.y_min);
+            let _ = pb.line_to(clip.x_max, clip.y_max);
+            let _ = pb.line_to(clip.x_min, clip.y_max);
+            let _ = pb.close(true);
+            pb.build()
+        };
+
+        let pipe = Self::make_pipe(alpha, blend_mode);
+        shaded_fill::<color::Rgb8>(
+            &mut self.bitmap,
+            &clip,
+            &path,
+            &pipe,
+            pattern.as_ref(),
+            &DEVICE_MATRIX,
+            flatness,
+            true,
+            false,
         );
     }
 
