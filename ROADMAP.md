@@ -153,7 +153,7 @@ CUB radix sort was evaluated and rejected for this use case: typical PDF pages h
 - [~] CUB radix sort: replaced with CPU `sort_unstable_by_key` (see rationale above; CUB left as a future micro-optimisation if segment counts exceed ~50k)
 - [x] Fill kernel (`kernels/tile_fill.cu`): grid `(grid_w, grid_h, 1)`, block `(TILE_W=16, TILE_H=16, 1)`; each thread accumulates signed trapezoidal area for its pixel column across all segments crossing its tile row; NZ rule: `min(|area|, 1) × 255.5`; EO rule: folded-fraction formula
 - [x] `GpuCtx::tile_fill()` Rust API: uploads records/starts/counts via `stream.clone_htod`, launches kernel, synchronises, copies coverage bytes back; threshold `GPU_TILE_FILL_THRESHOLD = 65536 px`
-- [ ] Wire into `PageRenderer` fill dispatch (analogous to `try_gpu_aa_fill`): select tile-fill path when `area > GPU_TILE_FILL_THRESHOLD` and `!vector_antialias` (or as a higher-quality alternative to warp-ballot AA at large sizes)
+- [x] Wire into `PageRenderer` fill dispatch: `try_gpu_tile_fill` (area ≥ `GPU_TILE_FILL_THRESHOLD`) tried first, then `try_gpu_aa_fill` (area ≥ `GPU_AA_FILL_THRESHOLD`), then CPU scanline AA; shared `gpu_fill_segs` + `gpu_coverage_to_bitmap` helpers eliminate duplication
 
 **4. ICC colour transforms (cuBLAS / custom kernel)**
 
