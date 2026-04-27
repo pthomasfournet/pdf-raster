@@ -35,6 +35,7 @@ use crate::path::Path;
 use crate::pipe::{self, PipeSrc, PipeState};
 use crate::scanner::XPathScanner;
 use crate::scanner::iter::ScanIterator;
+use crate::simd;
 use crate::types::AA_SIZE;
 use crate::xpath::XPath;
 use color::Pixel;
@@ -45,8 +46,6 @@ pub(super) const AA_GAMMA: [u8; (AA_SIZE * AA_SIZE + 1) as usize] = [
     0, 4, 11, 20, 32, 45, 59, 75, 91, 108, 128, 148, 169, 191, 214, 238, 255,
 ];
 
-/// Bit-count table for nibbles 0x0..=0xf — number of set bits.
-pub(super) const NIBBLE_POP: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
 
 /// Non-zero winding fill.
 #[expect(
@@ -335,8 +334,8 @@ pub(super) fn draw_span_clipped<P: Pixel, S: RowSink<P>>(
 /// Emit one composited output pixel row from the 4-row `AaBuf`.
 ///
 /// For each output pixel `x` in `[x0, x1]`, count the set bits across all 4
-/// AA sub-rows, look up the gamma-corrected shape byte, and call `render_span_aa`
-/// with shape > 0.
+/// AA sub-rows via `simd::aa_coverage_span` (SIMD-accelerated), look up the
+/// gamma-corrected shape byte, and call `render_span_aa` with shape > 0.
 fn draw_aa_line<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     pipe: &PipeState<'_>,
@@ -350,27 +349,28 @@ fn draw_aa_line<P: Pixel>(
     debug_assert!(y >= 0);
 
     #[expect(clippy::cast_sign_loss, reason = "x0 >= 0 after clip clamping")]
+    let x0_usize = x0 as usize;
+    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0")]
     let count = (x1 - x0 + 1) as usize;
 
-    // Build shape vector and find non-zero range.
+    // Gather raw coverage counts (0..=16) for each output pixel via the best
+    // available SIMD tier (AVX-512 BITALG → scalar NIBBLE_POP).
+    let rows = [
+        aa_buf.row_slice(0),
+        aa_buf.row_slice(1),
+        aa_buf.row_slice(2),
+        aa_buf.row_slice(3),
+    ];
+    let mut raw_counts = vec![0u8; count];
+    simd::aa_coverage_span(rows, x0_usize, &mut raw_counts);
+
+    // Apply gamma LUT: raw count 0 → shape 0 (skip), 1..=16 → AA_GAMMA[t].
     let mut shape = vec![0u8; count];
     let mut any_nonzero = false;
-
-    for (i, shape_byte) in shape.iter_mut().enumerate() {
-        // x0 >= 0 and i < bitmap.width ≤ i32::MAX, so the sum fits in i32.
-        #[expect(clippy::cast_sign_loss, reason = "x0 >= 0")]
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "x0 + i ≤ bitmap width ≤ i32::MAX"
-        )]
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "x0 + i ≤ bitmap width ≤ i32::MAX"
-        )]
-        let x = (x0 as usize + i) as i32;
-        let t = aa_coverage(aa_buf, x);
+    for (raw, out) in raw_counts.iter().zip(shape.iter_mut()) {
+        let t = *raw as usize;
         if t > 0 {
-            *shape_byte = AA_GAMMA[t as usize];
+            *out = AA_GAMMA[t];
             any_nonzero = true;
         }
     }
@@ -381,40 +381,17 @@ fn draw_aa_line<P: Pixel>(
 
     #[expect(clippy::cast_sign_loss, reason = "y >= 0")]
     let y_u = y as u32;
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0 after clip clamping")]
-    let byte_off = x0 as usize * P::BYTES;
+    let byte_off = x0_usize * P::BYTES;
     #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0")]
     let byte_end = (x1 as usize + 1) * P::BYTES;
-    #[expect(clippy::cast_sign_loss, reason = "x0 >= 0, x1 >= x0")]
-    let alpha_range = x0 as usize..=x1 as usize;
+    #[expect(clippy::cast_sign_loss, reason = "x1 >= x0 >= 0")]
+    let alpha_range = x0_usize..=x1 as usize;
 
     let (row, alpha) = bitmap.row_and_alpha_mut(y_u);
     let dst_pixels = &mut row[byte_off..byte_end];
     let dst_alpha = alpha.map(|a| &mut a[alpha_range]);
 
     pipe::render_span::<P>(pipe, src, dst_pixels, dst_alpha, Some(&shape), x0, x1, y);
-}
-
-/// Count set AA bits across all 4 sub-rows for one output pixel `x`.
-///
-/// Each output pixel maps to `AA_SIZE` (=4) bits in each row.
-/// The C++ equivalent reads 4 nibbles and uses `bitCount4`.
-fn aa_coverage(aa_buf: &AaBuf, x: i32) -> u32 {
-    // For splashAASize=4, pixel x maps to bits [x*4 .. x*4+3] in each row.
-    // Within a byte, 2 pixels fit: high nibble = even pixel, low nibble = odd pixel.
-    #[expect(clippy::cast_sign_loss, reason = "x >= 0 in caller")]
-    let col = x as usize;
-
-    let byte_idx = col >> 1;
-    let is_odd = col & 1 != 0;
-
-    let mut count = 0u32;
-    for row in 0..AA_SIZE as usize {
-        let byte = aa_buf.get_byte(row, byte_idx);
-        let nibble = if is_odd { byte & 0x0f } else { byte >> 4 };
-        count += u32::from(NIBBLE_POP[nibble as usize]);
-    }
-    count
 }
 
 #[cfg(test)]
