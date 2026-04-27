@@ -95,16 +95,10 @@ pub fn resolve_image(
 
     let w_raw = stream.dict.get_i64(b"Width")?;
     let h_raw = stream.dict.get_i64(b"Height")?;
-    if w_raw <= 0 || h_raw <= 0 || w_raw > 65536 || h_raw > 65536 {
+    let Some((w, h)) = validated_dims(w_raw, h_raw) else {
         log::warn!("image: degenerate dimensions {w_raw}×{h_raw}, skipping");
         return None;
-    }
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "w_raw and h_raw are validated > 0 and ≤ 65536 above; safe to cast to u32"
-    )]
-    let (w, h) = (w_raw as u32, h_raw as u32);
+    };
 
     let is_mask = stream.dict.get_bool(b"ImageMask").unwrap_or(false);
 
@@ -170,16 +164,10 @@ fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<
 
     let w_raw = stream.dict.get_i64(b"Width")?;
     let h_raw = stream.dict.get_i64(b"Height")?;
-    if w_raw <= 0 || h_raw <= 0 || w_raw > 65536 || h_raw > 65536 {
+    let Some((sm_w, sm_h)) = validated_dims(w_raw, h_raw) else {
         log::debug!("image: SMask degenerate dimensions {w_raw}×{h_raw}, skipping");
         return None;
-    }
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "w_raw and h_raw validated > 0 and ≤ 65536 above; safe to cast to u32"
-    )]
-    let (sm_w, sm_h) = (w_raw as u32, h_raw as u32);
+    };
 
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
     let bpc = stream.dict.get_i64(b"BitsPerComponent").unwrap_or(8);
@@ -255,8 +243,10 @@ fn expand_smask_1bpp(raw: &[u8], sm_w: u32, sm_h: u32) -> Option<Vec<u8>> {
 /// validated as part of image-dimension checks before `decode_smask` is called).
 /// `src` should have exactly `sw * sh` bytes; extra bytes are ignored.
 fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    // Guard against degenerate output dimensions that would cause division-by-zero.
-    if dw == 0 || dh == 0 {
+    // Guard degenerate dimensions: zero dst causes division-by-zero; zero src
+    // means there are no pixels to sample and the index calculation below would
+    // access an empty buffer.
+    if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
         return Vec::new();
     }
     if sw == dw && sh == dh {
@@ -294,6 +284,27 @@ fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
 }
 
 // ── XObject lookup ────────────────────────────────────────────────────────────
+
+/// Validate raw `i64` image dimensions and cast them to `u32`.
+///
+/// Returns `None` (caller logs and propagates) if either dimension is ≤ 0 or
+/// exceeds 65536.  The 65536 cap keeps `w × h` within `u32` and limits the
+/// maximum allocation a single image can request to ≈ 16 GiB (before component
+/// multiplication), which is checked separately by each decoder.
+///
+/// The cast is safe: after the range check, the value is in [1, 65536] which
+/// fits in both `u32` and `usize`.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "value range validated to [1, 65536] — fits in u32 without loss"
+)]
+const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)> {
+    if w_raw <= 0 || h_raw <= 0 || w_raw > 65536 || h_raw > 65536 {
+        return None;
+    }
+    Some((w_raw as u32, h_raw as u32))
+}
 
 /// Resolve the `XObject` resource named `name` to its stream `ObjectId`.
 fn xobject_id(doc: &Document, page_dict: &Dictionary, name: &[u8]) -> Option<ObjectId> {
@@ -507,6 +518,16 @@ fn decode_raw_indexed(
     let (palette, out_cs) = indexed_palette(doc, cs_arr)?;
     let stride = out_cs.components();
 
+    // `indexed_palette` guarantees stride ∈ {1, 3} and palette.len() is a
+    // multiple of stride with at least one entry, but we guard here defensively.
+    if stride == 0 || palette.is_empty() || palette.len() % stride != 0 {
+        log::debug!(
+            "image: Indexed palette invariant violated (len={}, stride={stride})",
+            palette.len()
+        );
+        return None;
+    }
+
     let npixels = (width as usize).checked_mul(height as usize)?;
     if data.len() < npixels {
         log::warn!(
@@ -516,10 +537,10 @@ fn decode_raw_indexed(
         return None;
     }
 
+    let n_entries = palette.len() / stride; // ≥ 1 guaranteed by guards above
     let mut out = Vec::with_capacity(npixels.checked_mul(stride)?);
-    let n_entries = palette.len() / stride;
     for &idx in &data[..npixels] {
-        let i = usize::from(idx).min(n_entries.saturating_sub(1));
+        let i = usize::from(idx).min(n_entries - 1);
         out.extend_from_slice(&palette[i * stride..(i + 1) * stride]);
     }
 
@@ -762,35 +783,31 @@ fn decode_dct(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
 /// an RGB byte buffer (3 bytes/pixel).
 ///
 /// PDF JPEG CMYK stores inverted ink densities: 0 = full ink, 255 = no ink.
-/// `zune-jpeg` returns bytes in this same inverted form.  The conversion is:
+/// `zune-jpeg` returns bytes in this same inverted form.  We complement each
+/// byte to get the direct ink density, then apply the simplified CMYK→RGB formula:
 ///
 /// ```text
-/// R = (255 - C) * (255 - K) / 255
+/// R = 255 - saturating(C_ink + K_ink)
 /// ```
 ///
-/// Each intermediate value `255u16.saturating_sub(x + k)` is ≤ 255,
-/// making the `as u8` cast lossless.
+/// `saturating_sub` clamps the result to [0, 255], making the `as u8` cast lossless.
 #[expect(
     clippy::many_single_char_names,
     reason = "CMYK and RGB are conventional single-letter colour channel names"
 )]
 fn cmyk_to_rgb(pixels: &[u8], width: u32, height: u32) -> Option<ImageDescriptor> {
-    let npixels = (width as usize)
-        .checked_mul(height as usize)
-        .expect("DCTDecode: CMYK pixel count overflows usize — dimensions were validated");
+    let npixels = (width as usize).checked_mul(height as usize)?;
 
-    if pixels.len() != npixels * 4 {
+    let expected_len = npixels.checked_mul(4)?;
+    if pixels.len() != expected_len {
         log::warn!(
-            "image: DCTDecode: CMYK buffer is {} bytes, expected {} for {width}×{height}",
+            "image: DCTDecode: CMYK buffer is {} bytes, expected {expected_len} for {width}×{height}",
             pixels.len(),
-            npixels * 4
         );
         return None;
     }
 
-    let rgb_cap = npixels
-        .checked_mul(3)
-        .expect("DCTDecode: RGB output size overflows usize — dimensions were validated");
+    let rgb_cap = npixels.checked_mul(3)?;
     let mut rgb = Vec::with_capacity(rgb_cap);
 
     for chunk in pixels.chunks_exact(4) {
@@ -1315,5 +1332,37 @@ mod tests {
     fn scale_smask_zero_dst_returns_empty() {
         let result = scale_smask(vec![1, 2, 3], 3, 1, 0, 1);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scale_smask_zero_src_returns_empty() {
+        // sw=0 means no source pixels; scaling into a non-empty dst would panic on
+        // src index access — must return empty instead.
+        let result = scale_smask(vec![], 0, 1, 4, 4);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn validated_dims_rejects_zero() {
+        assert!(validated_dims(0, 100).is_none());
+        assert!(validated_dims(100, 0).is_none());
+    }
+
+    #[test]
+    fn validated_dims_rejects_negative() {
+        assert!(validated_dims(-1, 100).is_none());
+        assert!(validated_dims(100, -1).is_none());
+    }
+
+    #[test]
+    fn validated_dims_rejects_oversized() {
+        assert!(validated_dims(65537, 1).is_none());
+        assert!(validated_dims(1, 65537).is_none());
+    }
+
+    #[test]
+    fn validated_dims_accepts_boundary() {
+        assert_eq!(validated_dims(1, 1), Some((1, 1)));
+        assert_eq!(validated_dims(65536, 65536), Some((65536, 65536)));
     }
 }
