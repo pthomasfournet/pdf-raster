@@ -28,6 +28,10 @@ fn main() {
             println!("cargo:warning=nvjpeg feature enabled but no CUDA lib directory found; linker will search default paths. Set CUDA_LIB_DIR or install CUDA 12.");
         }
         println!("cargo:rustc-link-lib=dylib=nvjpeg");
+        // cuStreamSynchronize lives in the CUDA driver library (libcuda.so).
+        // On Linux this is provided by the NVIDIA driver, typically at
+        // /usr/lib/x86_64-linux-gnu/libcuda.so.1 (driver-managed symlink).
+        println!("cargo:rustc-link-lib=dylib=cuda");
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));

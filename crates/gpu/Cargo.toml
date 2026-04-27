@@ -11,6 +11,7 @@ nvjpeg = []
 [dependencies]
 cudarc = { version = "0.19", features = ["cuda-12080"] }
 color  = { path = "../color" }
+log    = "0.4"
 
 # unsafe_code must be "allow" here because cudarc requires unsafe blocks.
 # We do not inherit workspace lints so we can override unsafe_code.

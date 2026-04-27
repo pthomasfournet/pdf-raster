@@ -48,12 +48,11 @@ use zune_jpeg::JpegDecoder;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
 
-/// Pixel area threshold (width × height) below which the CPU `zune-jpeg` path
-/// is used even when nvJPEG is available.  Below this size the PCIe transfer
-/// overhead dominates and the GPU is slower than the CPU decoder.
+/// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
-/// 512 × 512 = 262 144 pixels ≈ the smallest size where nvJPEG throughput at
-/// ~10 GB/s exceeds `zune-jpeg` at ~1 GB/s after PCIe DMA latency.
+/// Below this threshold `PCIe` transfer overhead dominates and CPU `zune-jpeg`
+/// is faster.  512 × 512 = 262 144 pixels — empirically the crossover between
+/// nvJPEG (~10 GB/s) and `zune-jpeg` (~1 GB/s) after `PCIe` DMA latency.
 #[cfg(feature = "nvjpeg")]
 pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
 
