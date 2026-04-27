@@ -86,13 +86,22 @@ pub struct XPathSeg {
     ///
     /// Always `y0 ≤ y1` for non-horizontal segments after construction.
     pub y1: f64,
-    /// Slope `(x1-x0)/(y1-y0)`.
+    /// Slope `(x1-x0)/(y1-y0)`, stored as both `f64` (for initialising the
+    /// fixed-point accumulator) and as a **16.16 fixed-point `i32`** (`dxdy_fp`)
+    /// for the per-scanline stepping hot loop.
     ///
-    /// Set to `0.0` for horizontal segments (where the denominator is zero) and
-    /// for vertical segments (where the numerator is zero). For all other
-    /// segments the denominator is strictly non-zero because the HORIZ early-
-    /// return in [`XPath::add_segment`] guarantees `y0 ≠ y1`.
+    /// Set to `0.0` / `0` for horizontal and vertical segments.
     pub dxdy: f64,
+    /// Slope in 16.16 fixed-point: `(dxdy * 65536.0).round() as i32`.
+    ///
+    /// Used by the scanner's incremental x-accumulator: `xx_fp += dxdy_fp` per
+    /// scanline.  Integer addition instead of f64 addition eliminates floating-
+    /// point dependency chains in the inner loop and is trivially vectorizable.
+    ///
+    /// Precision: 1/65536 ≈ 1.5 × 10⁻⁵ device pixels per scanline — sufficient
+    /// for any realistic document (the error accumulates as at most one pixel per
+    /// ~65536 scanlines, far beyond any real page height).
+    pub dxdy_fp: i32,
     /// Orientation and flip flags; see [`XPathFlags`] for the set of valid bits.
     pub flags: XPathFlags,
 }
@@ -328,6 +337,7 @@ impl XPath {
                 x1,
                 y1,
                 dxdy: 0.0,
+                dxdy_fp: 0,
                 flags,
             });
             return; // Horizontal segments are NOT flipped.
@@ -359,12 +369,33 @@ impl XPath {
             flags.insert(XPathFlags::FLIPPED);
         }
 
+        // Clamp dxdy_fp to i32 range.  The only way `dxdy * 65536` overflows i32
+        // is if the segment spans more than ~32768 pixels horizontally per pixel
+        // vertically — physically impossible for any realistic page.
+        let dxdy_fp = {
+            let fp = dxdy * 65536.0;
+            if fp >= f64::from(i32::MAX) {
+                i32::MAX
+            } else if fp <= f64::from(i32::MIN) {
+                i32::MIN
+            } else {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "fp is bounds-checked to [i32::MIN, i32::MAX] by the branches above"
+                )]
+                {
+                    fp.round() as i32
+                }
+            }
+        };
+
         self.segs.push(XPathSeg {
             x0,
             y0,
             x1,
             y1,
             dxdy,
+            dxdy_fp,
             flags,
         });
     }
@@ -596,5 +627,55 @@ mod tests {
         );
         // dxdy = (x1_orig - x0_orig)/(y1_orig - y0_orig) = (2-6)/(1-5) = 1.0
         assert!((s.dxdy - 1.0).abs() < f64::EPSILON, "dxdy={}", s.dxdy);
+    }
+
+    #[test]
+    fn dxdy_fp_matches_dxdy_for_slope_one() {
+        // Slope = 1.0 → dxdy_fp should be 65536.
+        let mut xpath = XPath {
+            segs: Vec::new(),
+            curve_data: None,
+        };
+        xpath.add_segment(0.0, 0.0, 4.0, 4.0);
+        let s = &xpath.segs[0];
+        assert!((s.dxdy - 1.0).abs() < f64::EPSILON, "dxdy={}", s.dxdy);
+        assert_eq!(s.dxdy_fp, 65536, "dxdy_fp={}", s.dxdy_fp);
+    }
+
+    #[test]
+    fn dxdy_fp_matches_dxdy_for_half_slope() {
+        // Slope = 0.5 → dxdy_fp should be 32768.
+        let mut xpath = XPath {
+            segs: Vec::new(),
+            curve_data: None,
+        };
+        xpath.add_segment(0.0, 0.0, 2.0, 4.0);
+        let s = &xpath.segs[0];
+        assert!((s.dxdy - 0.5).abs() < f64::EPSILON, "dxdy={}", s.dxdy);
+        assert_eq!(s.dxdy_fp, 32768, "dxdy_fp={}", s.dxdy_fp);
+    }
+
+    #[test]
+    fn dxdy_fp_zero_for_horizontal() {
+        let mut xpath = XPath {
+            segs: Vec::new(),
+            curve_data: None,
+        };
+        xpath.add_segment(0.0, 2.0, 5.0, 2.0);
+        let s = &xpath.segs[0];
+        assert!(s.flags.contains(XPathFlags::HORIZ));
+        assert_eq!(s.dxdy_fp, 0);
+    }
+
+    #[test]
+    fn dxdy_fp_zero_for_vertical() {
+        let mut xpath = XPath {
+            segs: Vec::new(),
+            curve_data: None,
+        };
+        xpath.add_segment(3.0, 0.0, 3.0, 5.0);
+        let s = &xpath.segs[0];
+        assert!(s.flags.contains(XPathFlags::VERT));
+        assert_eq!(s.dxdy_fp, 0);
     }
 }

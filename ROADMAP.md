@@ -60,9 +60,9 @@ Do not start until the native CLI path is the default (pdf_bridge deleted). The 
 
 **Hardware context (Ryzen 9 9900X3D):** 128 MiB 3D V-Cache means edge tables and scanline sweep structures for most real-world documents fit in L3. Algorithms that are cache-bound on a normal CPU are compute-bound here — this shifts the priority order vs. generic advice. Sparse tile rasterisation has an outsized benefit because it maximises L3 utilisation. AVX-512 (F/BW/VL/VNNI/BF16/VPOPCNTDQ) is fully available; target `avx512f,avx512bw,avx512vl` with `-C target-cpu=native`.
 
-- [ ] **Eliminate per-span heap allocations** — `PipeSrc::Solid` and pattern scratch bufs allocate a `Vec` per span; replace with thread-local grow-never-shrink buffers
-- [ ] **u16×16 compositing inner loop** — process 16 pixels/iter as `[u16; 16]`, replace `div255` with `(x + 255) >> 8`; target AVX-512BW for 32-pixel-wide SIMD under `-C target-cpu=native`
-- [ ] **Fixed-point edge stepping (FDot16)** — add `x_cur: i32` + `dx: i32` (16.16) to `XPathSeg`; hot loop does `x_cur += dx` instead of `x0 + (y−y0)×dxdy` (eliminates f64 multiply per edge per scanline)
+- [x] **Eliminate per-span heap allocations** — `PipeSrc::Solid` and pattern scratch bufs use thread-local grow-never-shrink `PAT_BUF`; zero allocation per span
+- [x] **u16×16 compositing inner loop** — `composite_aa_rgb8_opaque` processes 16 pixels/iter as `[u16; 16]`, `div255_u16 = (v+255)>>8`; LLVM auto-vectorizes to AVX2/AVX-512
+- [x] **Fixed-point edge stepping (FDot16)** — `XPathSeg::dxdy_fp: i32` (16.16) added; scanner inner loop does `xx1_fp += dxdy_fp` (integer add) instead of `f64` accumulation
 - [ ] **Sparse tile rasterisation** — replace flat SoA edge table + per-scanline sweep with tile records sorted by (y, x); only non-empty tiles touched; reference: vello_cpu sparse_strips/. Especially high value with 3D V-Cache.
 
 ---
