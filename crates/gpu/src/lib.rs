@@ -38,7 +38,7 @@ pub const GPU_SOFTMASK_THRESHOLD: usize = 500_000;
 /// Minimum fill area (pixels) for GPU supersampled AA to be faster than CPU.
 ///
 /// Below this threshold the H2D/D2H transfer latency for the segment list and
-/// coverage buffer dominates. Calibrated for RTX 5070 + PCIe 5.0 at ~150 DPI.
+/// coverage buffer dominates. Calibrated for RTX 5070 + `PCIe` 5.0 at ~150 DPI.
 pub const GPU_AA_FILL_THRESHOLD: usize = 16_384;
 /// Minimum fill area (pixels) for the tile-parallel analytical fill to be faster
 /// than the GPU warp-ballot AA kernel.
@@ -49,11 +49,11 @@ pub const GPU_TILE_FILL_THRESHOLD: usize = 65_536;
 pub const TILE_W: u32 = 16;
 /// Tile height in pixels (must match `TILE_H` in `tile_fill.cu`).
 pub const TILE_H: u32 = 16;
-/// Minimum pixel count for GPU ICC CMYK→RGB transform to beat CPU + PCIe overhead.
+/// Minimum pixel count for GPU ICC CMYK→RGB transform to beat CPU + `PCIe` overhead.
 ///
 /// Below this threshold H2D/D2H transfer latency dominates; use the CPU fallback.
 /// Conservative default aligned with composite/softmask; calibrate against actual
-/// PCIe 5.0 latency on the target machine once the native path is hot.
+/// `PCIe` 5.0 latency on the target machine once the native path is hot.
 pub const GPU_ICC_CLUT_THRESHOLD: usize = 500_000;
 
 /// One tile record per (segment, tile-row) crossing.
@@ -77,10 +77,16 @@ pub struct TileRecord {
     /// Sign: `+1.0` for an upward-crossing segment, `-1.0` for downward.
     pub sign: f32,
     /// Padding (must be 0).
-    #[allow(clippy::pub_underscore_fields)]
+    #[expect(
+        clippy::pub_underscore_fields,
+        reason = "padding field required for repr(C) alignment to match tile_fill.cu struct layout"
+    )]
     pub _pad: u32,
     /// Padding (must be 0).
-    #[allow(clippy::pub_underscore_fields)]
+    #[expect(
+        clippy::pub_underscore_fields,
+        reason = "padding field required for repr(C) alignment to match tile_fill.cu struct layout"
+    )]
     pub _pad2: u32,
 }
 
@@ -552,8 +558,11 @@ impl GpuCtx {
     ///
     /// # Panics
     ///
+    /// # Panics
+    ///
     /// Panics if `cmyk.len()` is not a multiple of 4, or if `clut` is `Some` and
     /// `table.len() != grid_n^4 * 3`.
+    #[must_use = "the RGB pixel buffer is not written to the caller unless used"]
     pub fn icc_cmyk_to_rgb(
         &self,
         cmyk: &[u8],
@@ -565,15 +574,18 @@ impl GpuCtx {
             cmyk.len()
         );
         if let Some((table, grid_n)) = clut {
+            // grid_n ≤ 255 is enforced by the baking API; checked_pow guards future misuse.
             let expected = (grid_n as usize)
                 .checked_pow(4)
                 .and_then(|n| n.checked_mul(3))
-                .expect("grid_n^4 * 3 overflows usize");
+                .unwrap_or_else(|| {
+                    panic!("grid_n({grid_n})^4*3 overflows usize — grid_n must be ≤ 255")
+                });
             assert_eq!(
                 table.len(),
                 expected,
-                "CLUT table length mismatch: got {}, expected grid_n({grid_n})^4*3={expected}",
-                table.len()
+                "CLUT table length {got} ≠ grid_n({grid_n})^4*3={expected}",
+                got = table.len(),
             );
         }
 
@@ -756,42 +768,70 @@ pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
         None => {
             for (src, dst) in cmyk.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
                 let inv_k = u32::from(255 - src[3]);
+                // Round to nearest: +127 before /255 removes truncation bias.
+                // Maximum numerator: 255*255 + 127 = 65152 < u32::MAX; cast is lossless.
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "(255-ch)*(255-k)/255 ≤ 255"
+                    reason = "(255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
                 )]
                 {
-                    dst[0] = ((u32::from(255 - src[0]) * inv_k) / 255) as u8;
-                    dst[1] = ((u32::from(255 - src[1]) * inv_k) / 255) as u8;
-                    dst[2] = ((u32::from(255 - src[2]) * inv_k) / 255) as u8;
+                    dst[0] = ((u32::from(255 - src[0]) * inv_k + 127) / 255) as u8;
+                    dst[1] = ((u32::from(255 - src[1]) * inv_k + 127) / 255) as u8;
+                    dst[2] = ((u32::from(255 - src[2]) * inv_k + 127) / 255) as u8;
                 }
             }
         }
         Some((table, grid_n)) => {
-            let g = grid_n as usize;
+            let g = grid_n as usize; // grid_n ≤ 255 from caller validation
+            let g2 = g * g;
+            let g3 = g2 * g;
+            // grid_n ≤ 255 → (grid_n - 1) ≤ 254, exact in f32 (needs ≤ 8 mantissa bits).
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "grid_n ≤ 255, fits exactly in f32 (8 bits < 23-bit mantissa)"
+            )]
             let g1 = (grid_n - 1) as f32;
+            let scale = g1 / 255.0;
             for (src, dst) in cmyk.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
-                let fc = f32::from(src[0]) * (g1 / 255.0);
-                let fm = f32::from(src[1]) * (g1 / 255.0);
-                let fy = f32::from(src[2]) * (g1 / 255.0);
-                let fk = f32::from(src[3]) * (g1 / 255.0);
+                let fc = f32::from(src[0]) * scale;
+                let fm = f32::from(src[1]) * scale;
+                let fy = f32::from(src[2]) * scale;
+                let fk = f32::from(src[3]) * scale;
 
-                let ic0 = (fc as usize).min(g - 1);
-                let im0 = (fm as usize).min(g - 1);
-                let iy0 = (fy as usize).min(g - 1);
-                let ik0 = (fk as usize).min(g - 1);
+                // fc ∈ [0.0, g1] ⊂ [0.0, 254.0]; floor is non-negative and ≤ 254.
+                // The sign-loss and truncation lints fire because `as usize` is UB
+                // for negative or >usize::MAX floats; here neither can happen.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "fc/fm/fy/fk are in [0.0, 254.0]; floor is exact and non-negative"
+                )]
+                let (ic0, im0, iy0, ik0) = (
+                    (fc as usize).min(g - 1),
+                    (fm as usize).min(g - 1),
+                    (fy as usize).min(g - 1),
+                    (fk as usize).min(g - 1),
+                );
                 let ic1 = (ic0 + 1).min(g - 1);
                 let im1 = (im0 + 1).min(g - 1);
                 let iy1 = (iy0 + 1).min(g - 1);
                 let ik1 = (ik0 + 1).min(g - 1);
 
-                let wc = fc - ic0 as f32;
-                let wm = fm - im0 as f32;
-                let wy = fy - iy0 as f32;
-                let wk = fk - ik0 as f32;
+                // Fractional weights: difference between float position and floored index.
+                // ic0 ≤ 254 → ic0 as f32 is exact (fits in 8 mantissa bits).
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "ic0/im0/iy0/ik0 ≤ 254, exact in f32"
+                )]
+                let (wc, wm, wy, wk) = (
+                    fc - ic0 as f32,
+                    fm - im0 as f32,
+                    fy - iy0 as f32,
+                    fk - ik0 as f32,
+                );
 
                 let node = |ci: usize, mi: usize, yi: usize, ki: usize| -> [f32; 3] {
-                    let idx = (ki * g * g * g + ci * g * g + mi * g + yi) * 3;
+                    let idx = (ki * g3 + ci * g2 + mi * g + yi) * 3;
                     [
                         f32::from(table[idx]),
                         f32::from(table[idx + 1]),
@@ -799,9 +839,13 @@ pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
                     ]
                 };
 
-                let lerp = |a: f32, b: f32, t: f32| a + t * (b - a);
+                let lerp = |a: f32, b: f32, t: f32| t.mul_add(b - a, a);
                 let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
-                    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
+                    [
+                        lerp(a[0], b[0], t),
+                        lerp(a[1], b[1], t),
+                        lerp(a[2], b[2], t),
+                    ]
                 };
 
                 // K=0 face: lerp Y → M → C
@@ -1084,7 +1128,7 @@ mod tests {
                         let y = (yi * 255) as u8;
                         let k = (ki * 255) as u8;
                         let inv_k = u32::from(255 - k);
-                        table[idx]     = ((u32::from(255 - c) * inv_k) / 255) as u8;
+                        table[idx] = ((u32::from(255 - c) * inv_k) / 255) as u8;
                         table[idx + 1] = ((u32::from(255 - m) * inv_k) / 255) as u8;
                         table[idx + 2] = ((u32::from(255 - y) * inv_k) / 255) as u8;
                     }
@@ -1100,10 +1144,8 @@ mod tests {
     #[test]
     fn aa_fill_cpu_solid_rect_full_coverage() {
         let segs: Vec<f32> = vec![
-            -100.0, -100.0, 100.0, -100.0,
-            100.0, -100.0, 100.0, 100.0,
-            100.0, 100.0, -100.0, 100.0,
-            -100.0, 100.0, -100.0, -100.0,
+            -100.0, -100.0, 100.0, -100.0, 100.0, -100.0, 100.0, 100.0, 100.0, 100.0, -100.0,
+            100.0, -100.0, 100.0, -100.0, -100.0,
         ];
         let cov = super::aa_fill_cpu(&segs, 0.0, 0.0, 1, 1, false);
         assert_eq!(cov.len(), 1);
@@ -1123,7 +1165,10 @@ mod tests {
     fn aa_fill_cpu_empty_segs_zero_coverage() {
         let cov = super::aa_fill_cpu(&[], 0.0, 0.0, 4, 4, false);
         assert_eq!(cov.len(), 16);
-        assert!(cov.iter().all(|&v| v == 0), "empty segs → all zero coverage");
+        assert!(
+            cov.iter().all(|&v| v == 0),
+            "empty segs → all zero coverage"
+        );
     }
 
     #[test]
@@ -1166,10 +1211,7 @@ mod tests {
 
     #[test]
     fn tile_records_sort_order() {
-        let segs = [
-            24.0f32, 0.0, 24.0, 8.0,
-            8.0f32, 16.0, 8.0, 24.0,
-        ];
+        let segs = [24.0f32, 0.0, 24.0, 8.0, 8.0f32, 16.0, 8.0, 24.0];
         let (recs, starts, counts, grid_w) = super::build_tile_records(&segs, 0.0, 0.0, 80, 80);
         assert_eq!(grid_w, 5);
         for w in recs.windows(2) {
@@ -1190,7 +1232,11 @@ mod tests {
         let total: u32 = counts.iter().sum();
         assert_eq!(total as usize, recs.len(), "sum of counts == total records");
         for i in 0..counts.len() - 1 {
-            assert_eq!(starts[i] + counts[i], starts[i + 1], "prefix sum broken at {i}");
+            assert_eq!(
+                starts[i] + counts[i],
+                starts[i + 1],
+                "prefix sum broken at {i}"
+            );
         }
     }
 }

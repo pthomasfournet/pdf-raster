@@ -51,11 +51,13 @@ extern "C" __global__ void icc_cmyk_matrix(
 
     unsigned int inv_k = 255u - k;
 
-    // Integer multiply then divide: (255−ch)*(255−k)/255.
-    // Numerators fit in 16-bit (≤ 65025); intermediate u32.
-    rgb[ri]     = (unsigned char)(((255u - c) * inv_k) / 255u);
-    rgb[ri + 1] = (unsigned char)(((255u - m) * inv_k) / 255u);
-    rgb[ri + 2] = (unsigned char)(((255u - y) * inv_k) / 255u);
+    // Integer multiply-round-divide: (255−ch)*(255−k)/255, rounded to nearest.
+    // Adding 127 before dividing by 255 gives unbiased rounding; without it,
+    // truncation would systematically underestimate mid-range colours.
+    // Maximum numerator: 255*255 + 127 = 65152, safe in u32.
+    rgb[ri]     = (unsigned char)(((255u - c) * inv_k + 127u) / 255u);
+    rgb[ri + 1] = (unsigned char)(((255u - m) * inv_k + 127u) / 255u);
+    rgb[ri + 2] = (unsigned char)(((255u - y) * inv_k + 127u) / 255u);
 }
 
 // ── CLUT kernel ───────────────────────────────────────────────────────────────
@@ -66,6 +68,9 @@ extern "C" __global__ void icc_cmyk_matrix(
 //   index = (k_idx * G^3 + c_idx * G^2 + m_idx * G + y_idx) * 3
 // where G = grid_n (typically 17).
 //
+// K is the outermost (major) axis to match the ICC/PDF CMYK LUT convention and
+// the layout produced by the Rust baking code in pdf_interp/src/resources/icc.rs.
+//
 // Returns the (R, G, B) triple at (ci, mi, yi, ki).
 __device__ __forceinline__ void clut_node(
     const unsigned char* __restrict__ clut,
@@ -73,7 +78,9 @@ __device__ __forceinline__ void clut_node(
     int G,
     float* r, float* g, float* b
 ) {
-    // Clamp to [0, G-1] to guard against floating-point rounding at boundaries.
+    // Clamp to [0, G-1] to prevent out-of-bounds CLUT access.
+    // FP rounding on normalised inputs and extreme channel values can push floor
+    // indices to G, so clamping is a mandatory safety guard, not a soft hint.
     ci = max(0, min(ci, G - 1));
     mi = max(0, min(mi, G - 1));
     yi = max(0, min(yi, G - 1));

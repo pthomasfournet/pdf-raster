@@ -138,9 +138,27 @@ pub fn resolve_image(
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
 
     let mut img = match filter.as_deref() {
-        None => decode_raw(doc, stream.content.as_slice(), w, h, is_mask, &stream.dict, #[cfg(feature = "gpu-icc")] gpu_ctx),
+        None => decode_raw(
+            doc,
+            stream.content.as_slice(),
+            w,
+            h,
+            is_mask,
+            &stream.dict,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+        ),
         Some("FlateDecode") => match stream.decompressed_content() {
-            Ok(data) => decode_raw(doc, &data, w, h, is_mask, &stream.dict, #[cfg(feature = "gpu-icc")] gpu_ctx),
+            Ok(data) => decode_raw(
+                doc,
+                &data,
+                w,
+                h,
+                is_mask,
+                &stream.dict,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+            ),
             Err(e) => {
                 log::warn!("image: FlateDecode decompression failed: {e}");
                 None
@@ -225,13 +243,31 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
     let filter = dict.get(b"Filter").ok().and_then(filter_name);
 
     match filter.as_deref() {
-        None => decode_raw(doc, data, w, h, is_mask, &dict, #[cfg(feature = "gpu-icc")] None),
+        None => decode_raw(
+            doc,
+            data,
+            w,
+            h,
+            is_mask,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        ),
         Some("FlateDecode") => {
             use lopdf::Stream;
             // Use lopdf to run Flate decompression on raw bytes.
             let stream = Stream::new(dict.clone(), data.to_vec());
             match stream.decompressed_content() {
-                Ok(raw) => decode_raw(doc, &raw, w, h, is_mask, &dict, #[cfg(feature = "gpu-icc")] None),
+                Ok(raw) => decode_raw(
+                    doc,
+                    &raw,
+                    w,
+                    h,
+                    is_mask,
+                    &dict,
+                    #[cfg(feature = "gpu-icc")]
+                    None,
+                ),
                 Err(e) => {
                     log::warn!("inline image: FlateDecode failed: {e}");
                     None
@@ -269,7 +305,16 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
         }
         Some("RunLengthDecode") => {
             let raw = decode_run_length(data);
-            decode_raw(doc, &raw, w, h, is_mask, &dict, #[cfg(feature = "gpu-icc")] None)
+            decode_raw(
+                doc,
+                &raw,
+                w,
+                h,
+                is_mask,
+                &dict,
+                #[cfg(feature = "gpu-icc")]
+                None,
+            )
         }
         Some(other) => {
             log::warn!("inline image: unknown filter {other:?}");
@@ -792,7 +837,7 @@ fn decode_raw(
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
-            icc_bytes,
+            icc_bytes.as_deref(),
         ),
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
@@ -810,7 +855,7 @@ fn decode_raw_8bpp(
     height: u32,
     resolved: ResolvedCs,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
-    #[cfg(feature = "gpu-icc")] icc_bytes: Option<Vec<u8>>,
+    #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
 ) -> Option<ImageDescriptor> {
     let components = resolved.components();
     let npixels = (width as usize).checked_mul(height as usize)?;
@@ -833,7 +878,7 @@ fn decode_raw_8bpp(
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
-            icc_bytes.as_deref(),
+            icc_bytes,
         )?;
         Some(ImageDescriptor {
             width,
@@ -919,26 +964,24 @@ fn decode_raw_indexed(
 )]
 #[inline]
 fn cmyk_raw_to_rgb_triple(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
-    // Direct form: 255 = full ink → invert to get reflectance, then attenuate by K.
-    // Both c and k are ink densities; (255-c) and (255-k) are reflectances (0..=255).
-    // Intermediate product fits in u32: 255*255 = 65025.
+    // Reflectance formula: R = (255−C)*(255−K)/255, rounded to nearest.
+    // +127 before /255 removes truncation bias; numerator ≤ 255*255+127 = 65152 < u32::MAX.
     let inv_k = u32::from(255 - k);
-    // Each intermediate x ≤ 255 * 255 = 65025; x / 255 ≤ 255 — cast is lossless.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "(255 - ch) * (255 - k) / 255 ≤ 255"
+        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
     )]
-    let r = ((u32::from(255 - c) * inv_k) / 255) as u8;
+    let r = ((u32::from(255 - c) * inv_k + 127) / 255) as u8;
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "(255 - ch) * (255 - k) / 255 ≤ 255"
+        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
     )]
-    let g = ((u32::from(255 - m) * inv_k) / 255) as u8;
+    let g = ((u32::from(255 - m) * inv_k + 127) / 255) as u8;
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "(255 - ch) * (255 - k) / 255 ≤ 255"
+        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
     )]
-    let b = ((u32::from(255 - y) * inv_k) / 255) as u8;
+    let b = ((u32::from(255 - y) * inv_k + 127) / 255) as u8;
     (r, g, b)
 }
 
@@ -1337,30 +1380,24 @@ fn cmyk_raw_to_rgb(
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
 ) -> Option<Vec<u8>> {
-    // GPU path: delegate to GpuCtx which handles threshold + CPU fallback internally.
+    // GPU path: delegate to GpuCtx which handles the dispatch-threshold check and
+    // CPU fallback internally.  When ICC bytes are present, bake a CLUT for
+    // profile-accurate conversion; fall back to the fast matrix approximation if
+    // baking fails (e.g. corrupt profile or wrong colour space).
     #[cfg(feature = "gpu-icc")]
     if let Some(ctx) = gpu_ctx {
-        // If we have ICC bytes, bake a CLUT for accurate colour conversion.
-        // Fall back to the fast matrix path if baking fails.
         let clut_data: Option<Vec<u8>> = icc_bytes.and_then(|bytes| {
-            match icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N) {
-                Ok(table) => Some(table),
-                Err(e) => {
-                    log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
-                    None
-                }
-            }
+            icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
+                .map_err(|e| log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}"))
+                .ok()
         });
 
-        let clut_arg = clut_data
-            .as_deref()
-            .map(|table| (table, icc::DEFAULT_GRID_N));
-
-        match ctx.icc_cmyk_to_rgb(pixels, clut_arg) {
+        match ctx.icc_cmyk_to_rgb(
+            pixels,
+            clut_data.as_deref().map(|t| (t, icc::DEFAULT_GRID_N)),
+        ) {
             Ok(rgb) => return Some(rgb),
-            Err(e) => {
-                log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}");
-            }
+            Err(e) => log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}"),
         }
     }
 
@@ -1924,7 +1961,17 @@ mod tests {
         dict.set("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         let data = vec![0u8, 128, 255];
-        let desc = decode_raw(&doc, &data, 3, 1, false, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
+        let desc = decode_raw(
+            &doc,
+            &data,
+            3,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Gray);
         assert_eq!(desc.data, &[0, 128, 255]);
     }
@@ -1936,7 +1983,17 @@ mod tests {
         dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         let data = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255];
-        let desc = decode_raw(&doc, &data, 3, 1, false, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
+        let desc = decode_raw(
+            &doc,
+            &data,
+            3,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
         assert_eq!(desc.width, 3);
         assert_eq!(desc.data.len(), 9);
@@ -1948,7 +2005,17 @@ mod tests {
         let mut dict = lopdf::Dictionary::new();
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         let data = vec![0u8, 255];
-        let desc = decode_raw(&doc, &data, 2, 1, true, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
+        let desc = decode_raw(
+            &doc,
+            &data,
+            2,
+            1,
+            true,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Mask);
     }
 
@@ -1960,7 +2027,17 @@ mod tests {
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         // Single pixel: C=0, M=0, Y=0, K=0 → white (255, 255, 255).
         let data = vec![0u8, 0, 0, 0];
-        let desc = decode_raw(&doc, &data, 1, 1, false, &dict, #[cfg(feature = "gpu-icc")] None).unwrap();
+        let desc = decode_raw(
+            &doc,
+            &data,
+            1,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
         assert_eq!(desc.data, &[255, 255, 255]);
     }
@@ -1973,7 +2050,19 @@ mod tests {
         dict.set("BitsPerComponent", lopdf::Object::Integer(8));
         // Claim 2×2 RGB but supply only 3 bytes (need 12).
         let data = vec![0u8, 0, 0];
-        assert!(decode_raw(&doc, &data, 2, 2, false, &dict, #[cfg(feature = "gpu-icc")] None).is_none());
+        assert!(
+            decode_raw(
+                &doc,
+                &data,
+                2,
+                2,
+                false,
+                &dict,
+                #[cfg(feature = "gpu-icc")]
+                None
+            )
+            .is_none()
+        );
     }
 
     // ── scale_smask ───────────────────────────────────────────────────────────
