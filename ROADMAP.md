@@ -48,7 +48,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 - [x] Type 3 paint-procedure fonts
 - [x] JBIG2Decode image filter
-- [ ] Optional content groups (layers / OCG)
+- [x] Optional content groups (layers / OCG)
 - [ ] Annotation rendering
 - [ ] Non-axis-aligned image transforms (currently bounding-box nearest-neighbour approximation)
 

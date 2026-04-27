@@ -207,9 +207,21 @@ pub enum Operator {
     /// own colour; the `BBox` is a hint to the renderer for caching and clipping.
     Type3GlyphWidthBBox(f64, f64, f64, f64, f64, f64),
 
-    // ── Marked content (no rendering effect) ─────────────────────────────────
-    /// `BMC` / `BDC` / `EMC` / `MP` / `DP` — marked-content operators.
+    // ── Marked content ────────────────────────────────────────────────────────
+    /// `BMC` / `MP` / `DP` / `BDC` (non-OC tag) — marked-content operators
+    /// with no rendering effect.
     MarkedContent,
+    /// `BDC /OC /Name` — begin an Optional Content Group region.
+    ///
+    /// `Name` is a key into the page `Properties` resource dictionary; the
+    /// renderer resolves it to an OCG object and skips the enclosed content
+    /// when that group is inactive in the document's default view config.
+    BeginOptionalContent(Vec<u8>),
+    /// `EMC` — end the most recent marked-content or OCG region.
+    ///
+    /// When this closes a `BeginOptionalContent` region, the renderer pops the
+    /// visibility stack.  For non-OCG `EMC` calls it is a no-op.
+    EndOptionalContent,
 
     // ── Compatibility sections ────────────────────────────────────────────────
     /// `BX` / `EX` — begin/end compatibility section (contents ignored).
@@ -408,8 +420,22 @@ pub fn decode(op: &[u8], operands: &mut Vec<Token<'_>>) -> Operator {
             Operator::Type3GlyphWidthBBox(wx, wy, llx, lly, urx, ury)
         }
 
-        // ── Marked content (no rendering effect) ─────────────────────────────
-        b"BMC" | b"BDC" | b"EMC" | b"MP" | b"DP" => Operator::MarkedContent,
+        // ── Marked content ────────────────────────────────────────────────────
+        // BDC with tag /OC begins an Optional Content Group region.
+        // Operands on stack: /Tag (bottom) /PropertiesKey (top), or /Tag <<dict>>.
+        // We only handle the name case (overwhelmingly common in practice).
+        b"BDC" => {
+            let props = operands.pop();
+            let tag = operands.pop();
+            match (&tag, &props) {
+                (Some(Token::Name(t)), Some(Token::Name(k))) if t == b"OC" => {
+                    Operator::BeginOptionalContent(k.to_vec())
+                }
+                _ => Operator::MarkedContent,
+            }
+        }
+        b"EMC" => Operator::EndOptionalContent,
+        b"BMC" | b"MP" | b"DP" => Operator::MarkedContent,
 
         // ── PDF compatibility sections (contents opaque to conforming readers) ─
         b"BX" | b"EX" => Operator::CompatibilitySection,

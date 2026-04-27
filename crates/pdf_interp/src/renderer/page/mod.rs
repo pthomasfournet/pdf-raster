@@ -27,6 +27,9 @@
 //! - `PatternType` 1 tiling patterns via `scn`/`SCN`
 //! - Type 3 paint-procedure fonts — `CharProc` content streams, `d0`/`d1` metrics
 //!
+//! - Optional Content Groups (OCG / layers) — `BDC /OC` respects `OCProperties/D`
+//!   default state; inactive groups are skipped at operator level
+//!
 //! # Not yet implemented
 //!
 //! - Image `XObjects`: `JBIG2Decode` filter
@@ -107,6 +110,12 @@ pub struct PageRenderer<'doc> {
     resources: PageResources<'doc>,
     /// Current Form `XObject` nesting depth (0 = top-level page).
     form_depth: u32,
+    /// Optional Content Group (OCG) visibility stack.
+    ///
+    /// Each `BDC /OC /Name` pushes a `bool` (`true` = visible); `EMC` pops it.
+    /// Non-OCG `BDC`/`EMC` pairs do not touch this stack (they are `MarkedContent`
+    /// no-ops).  Content is skipped whenever any entry is `false`.
+    ocg_stack: Vec<bool>,
     /// GPU-accelerated JPEG decoder, present when the `nvjpeg` feature is enabled
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
@@ -168,6 +177,7 @@ impl<'doc> PageRenderer<'doc> {
             font_cache,
             resources,
             form_depth: 0,
+            ocg_stack: Vec::new(),
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
         }
@@ -208,6 +218,26 @@ impl<'doc> PageRenderer<'doc> {
         reason = "PDF matrix components and PDF spec variable names"
     )]
     fn execute_one(&mut self, op: &Operator) {
+        // ── Optional Content Group (OCG) visibility ───────────────────────────
+        // Always handle OCG stack operators regardless of visibility, then skip
+        // all other rendering when inside an inactive group.
+        match op {
+            Operator::BeginOptionalContent(key) => {
+                let visible = self.resources.ocg_is_visible(key);
+                self.ocg_stack.push(visible);
+                return;
+            }
+            Operator::EndOptionalContent => {
+                self.ocg_stack.pop();
+                return;
+            }
+            _ => {}
+        }
+        // Skip rendering operators when inside an inactive OCG.
+        if self.ocg_stack.iter().any(|&v| !v) {
+            return;
+        }
+
         match op {
             // ── Graphics state ────────────────────────────────────────────────
             Operator::Save => self.gstate.save(),
@@ -458,6 +488,9 @@ impl<'doc> PageRenderer<'doc> {
 
             // ── No-ops ────────────────────────────────────────────────────────
             Operator::MarkedContent | Operator::CompatibilitySection => {}
+
+            // Handled in the OCG pre-pass above; unreachable here.
+            Operator::BeginOptionalContent(_) | Operator::EndOptionalContent => {}
 
             Operator::Unknown(kw) => {
                 log::warn!(

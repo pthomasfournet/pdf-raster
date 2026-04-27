@@ -323,6 +323,96 @@ impl<'doc> PageResources<'doc> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
         shading::resolve_shading(self.doc, ctx_dict, name, ctm, page_h)
     }
+
+    /// Resolve a `Properties` resource entry to an OCG object ID.
+    ///
+    /// `props_key` is the name used in `BDC /OC /props_key` — it indexes the
+    /// `Resources/Properties` sub-dictionary.  Returns `None` if the key is
+    /// absent or the object has no object identity (inline dict OCGs are rare
+    /// and not currently supported).
+    #[must_use]
+    pub fn ocg_object_id(&self, props_key: &[u8]) -> Option<lopdf::ObjectId> {
+        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let res = image::resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
+        let props = image::resolve_dict(self.doc, res.get(b"Properties").ok()?)?;
+        match props.get(props_key).ok()? {
+            Object::Reference(id) => Some(*id),
+            _ => None, // Inline-dict OCGs are not resolved (treat as visible).
+        }
+    }
+
+    /// Check whether an Optional Content Group is visible in the document's
+    /// default view configuration (`OCProperties/D`).
+    ///
+    /// Returns `true` (visible) when:
+    /// - `props_key` cannot be resolved to an OCG object (fail-open),
+    /// - the document has no `OCProperties` (no layers defined), or
+    /// - the default config has no explicit `OFF` list or the group is not in it.
+    ///
+    /// Returns `false` only when the group appears in the default config `OFF`
+    /// array (and that array does not also list the group in `ON`, where `ON`
+    /// takes precedence per PDF §8.11.4.3).
+    #[must_use]
+    pub fn ocg_is_visible(&self, props_key: &[u8]) -> bool {
+        let Some(ocg_id) = self.ocg_object_id(props_key) else {
+            return true; // Cannot resolve → treat as visible.
+        };
+
+        // Locate the default view configuration in the document catalog.
+        let Some(d_dict) = self
+            .doc
+            .catalog()
+            .ok()
+            .and_then(|cat| cat.get(b"OCProperties").ok().and_then(|o| match o {
+                Object::Dictionary(d) => Some(d),
+                Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
+                _ => None,
+            }))
+            .and_then(|ocp| ocp.get(b"D").ok().and_then(|o| match o {
+                Object::Dictionary(d) => Some(d),
+                Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
+                _ => None,
+            }))
+        else {
+            return true; // No OCProperties → all groups visible.
+        };
+
+        // Check the OFF list.  Per PDF §8.11.4.3, if a group appears in ON it
+        // overrides OFF; in practice most documents use only one of the two.
+        let in_off = is_id_in_ref_array(self.doc, d_dict, b"OFF", ocg_id);
+        let in_on = is_id_in_ref_array(self.doc, d_dict, b"ON", ocg_id);
+
+        !in_off || in_on
+    }
+}
+
+/// Return `true` when `target_id` appears in the named array of object
+/// references inside `dict`.
+fn is_id_in_ref_array(
+    doc: &Document,
+    dict: &lopdf::Dictionary,
+    key: &[u8],
+    target_id: lopdf::ObjectId,
+) -> bool {
+    let Ok(arr_obj) = dict.get(key) else {
+        return false;
+    };
+    let arr = match arr_obj {
+        Object::Array(a) => a,
+        Object::Reference(id) => {
+            if let Ok(o) = doc.get_object(*id)
+                && let Ok(a) = o.as_array()
+            {
+                return a
+                    .iter()
+                    .any(|x| matches!(x, Object::Reference(r) if *r == target_id));
+            }
+            return false;
+        }
+        _ => return false,
+    };
+    arr.iter()
+        .any(|x| matches!(x, Object::Reference(r) if *r == target_id))
 }
 
 /// Read a 6-element `Matrix` array from a dictionary, returning `None` if the
