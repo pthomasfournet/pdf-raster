@@ -1488,12 +1488,9 @@ fn decode_jbig2(
         });
 
     // Parse the embedded JBIG2 image (page segments + optional globals).
-    let img = hayro_jbig2::Image::new_embedded(
-        data,
-        globals_bytes.as_deref(),
-    )
-    .map_err(|e| log::warn!("image: JBIG2Decode parse error: {e}"))
-    .ok()?;
+    let img = hayro_jbig2::Image::new_embedded(data, globals_bytes.as_deref())
+        .map_err(|e| log::warn!("image: JBIG2Decode parse error: {e}"))
+        .ok()?;
 
     let jw = img.width();
     let jh = img.height();
@@ -2116,7 +2113,10 @@ mod tests {
     #[test]
     fn jbig2_collector_push_pixel_grayscale() {
         // JBIG2: black=true → Gray 0x00, black=false → Gray 0xFF.
-        let mut c = Jbig2Collector { data: Vec::new(), is_mask: false };
+        let mut c = Jbig2Collector {
+            data: Vec::new(),
+            is_mask: false,
+        };
         Jbig2Decoder::push_pixel(&mut c, true);
         Jbig2Decoder::push_pixel(&mut c, false);
         assert_eq!(c.data, [0x00, 0xFF]);
@@ -2124,7 +2124,10 @@ mod tests {
 
     #[test]
     fn jbig2_collector_push_pixel_chunk() {
-        let mut c = Jbig2Collector { data: Vec::new(), is_mask: false };
+        let mut c = Jbig2Collector {
+            data: Vec::new(),
+            is_mask: false,
+        };
         // chunk_count=2 → 16 pixels of white (0xFF each).
         Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
         assert_eq!(c.data.len(), 16);

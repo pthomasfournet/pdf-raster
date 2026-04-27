@@ -408,16 +408,20 @@ impl<'doc> PageResources<'doc> {
             .doc
             .catalog()
             .ok()
-            .and_then(|cat| cat.get(b"OCProperties").ok().and_then(|o| match o {
-                Object::Dictionary(d) => Some(d),
-                Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
-                _ => None,
-            }))
-            .and_then(|ocp| ocp.get(b"D").ok().and_then(|o| match o {
-                Object::Dictionary(d) => Some(d),
-                Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
-                _ => None,
-            }))
+            .and_then(|cat| {
+                cat.get(b"OCProperties").ok().and_then(|o| match o {
+                    Object::Dictionary(d) => Some(d),
+                    Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
+                    _ => None,
+                })
+            })
+            .and_then(|ocp| {
+                ocp.get(b"D").ok().and_then(|o| match o {
+                    Object::Dictionary(d) => Some(d),
+                    Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
+                    _ => None,
+                })
+            })
         else {
             return true; // No OCProperties → all groups visible.
         };

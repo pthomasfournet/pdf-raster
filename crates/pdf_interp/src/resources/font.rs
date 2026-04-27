@@ -93,10 +93,9 @@ impl CidEncoding {
     #[must_use]
     pub fn code_to_gid(&self, char_code: u32) -> u32 {
         // Step 1: char code → CID via encoding CMap (identity if absent).
-        let cid = self
-            .encoding_cmap
-            .as_ref()
-            .map_or(char_code, |cmap| cmap.map.get(&char_code).copied().unwrap_or(0));
+        let cid = self.encoding_cmap.as_ref().map_or(char_code, |cmap| {
+            cmap.map.get(&char_code).copied().unwrap_or(0)
+        });
 
         // Step 2: CID → GID via table (identity if absent).
         // CIDs are 16-bit values (PDF spec §9.7.4); usize is always ≥ 16 bits.

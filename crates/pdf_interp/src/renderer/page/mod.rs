@@ -224,14 +224,20 @@ impl<'doc> PageRenderer<'doc> {
     /// Call this after [`execute`](Self::execute) and before [`finish`](Self::finish).
     pub fn render_annotations(&mut self, page_id: ObjectId) {
         let doc = self.resources.doc();
-        let Ok(page_dict) = doc.get_dictionary(page_id) else { return };
+        let Ok(page_dict) = doc.get_dictionary(page_id) else {
+            return;
+        };
 
         // Collect annotation refs to avoid borrow conflict.
         let annot_ids: Vec<ObjectId> = {
             let arr = match page_dict.get(b"Annots") {
                 Ok(Object::Array(a)) => a.clone(),
                 Ok(Object::Reference(id)) => {
-                    match doc.get_object(*id).ok().and_then(|o| o.as_array().ok().cloned()) {
+                    match doc
+                        .get_object(*id)
+                        .ok()
+                        .and_then(|o| o.as_array().ok().cloned())
+                    {
                         Some(a) => a,
                         None => return,
                     }
@@ -239,7 +245,13 @@ impl<'doc> PageRenderer<'doc> {
                 _ => return,
             };
             arr.iter()
-                .filter_map(|o| if let Object::Reference(id) = o { Some(*id) } else { None })
+                .filter_map(|o| {
+                    if let Object::Reference(id) = o {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
                 .collect()
         };
 
@@ -251,17 +263,23 @@ impl<'doc> PageRenderer<'doc> {
     fn render_one_annotation(&mut self, annot_id: ObjectId) {
         let doc = self.resources.doc();
 
-        let Ok(annot_dict) = doc.get_dictionary(annot_id) else { return };
+        let Ok(annot_dict) = doc.get_dictionary(annot_id) else {
+            return;
+        };
 
         // Annotation rect in page user space: [llx, lly, urx, ury].
-        let Some(rect) = read_rect(annot_dict) else { return };
+        let Some(rect) = read_rect(annot_dict) else {
+            return;
+        };
 
         // Resolve AP/N appearance stream.
         let Some(ap_dict) = annot_dict.get(b"AP").ok().and_then(|o| match o {
             Object::Dictionary(d) => Some(d),
             Object::Reference(id) => doc.get_dictionary(*id).ok(),
             _ => None,
-        }) else { return };
+        }) else {
+            return;
+        };
 
         // N can be a stream reference or a sub-dict (state-keyed appearances).
         let stream_id: ObjectId = {
@@ -270,10 +288,7 @@ impl<'doc> PageRenderer<'doc> {
                 Object::Reference(id) => *id,
                 Object::Dictionary(_) => {
                     // State-keyed: look up the current appearance state (AS).
-                    let state = annot_dict
-                        .get(b"AS")
-                        .ok()
-                        .and_then(|o| o.as_name().ok());
+                    let state = annot_dict.get(b"AS").ok().and_then(|o| o.as_name().ok());
                     let Some(state_key) = state else { return };
                     match n_obj.as_dict().ok().and_then(|d| d.get(state_key).ok()) {
                         Some(Object::Reference(id)) => *id,
@@ -285,7 +300,9 @@ impl<'doc> PageRenderer<'doc> {
         };
 
         // Build the FormXObject from the appearance stream.
-        let Some(mut form) = self.resources.form_from_stream_id(stream_id) else { return };
+        let Some(mut form) = self.resources.form_from_stream_id(stream_id) else {
+            return;
+        };
 
         // form.bbox was populated by form_from_stream_id; appearance streams carry BBox not Rect.
         let [llx, lly, urx, ury] = rect;
@@ -952,8 +969,7 @@ impl<'doc> PageRenderer<'doc> {
             // width_units are in glyph space; scale by FontMatrix[0] × font_size.
             let glyph_advance = f64::from(glyph.width_units) * t3.font_matrix[0];
             let extra = if byte == b' ' { word_spacing } else { 0.0 };
-            let tx_adv =
-                (glyph_advance.mul_add(font_size, char_spacing) + extra) * horiz_scaling;
+            let tx_adv = (glyph_advance.mul_add(font_size, char_spacing) + extra) * horiz_scaling;
             let [a, b_m, c, d, e, f] = tm;
             tm = [a, b_m, c, d, tx_adv.mul_add(a, e), tx_adv.mul_add(b_m, f)];
         }
@@ -1407,16 +1423,40 @@ impl<'doc> PageRenderer<'doc> {
             // A non-finite BBox or degenerate CTM produces NaN corners; the
             // subsequent as-i32 cast would be UB on some platforms.  Fall back
             // to rendering without a group (paint directly onto the page).
-            if corners.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
-                log::warn!("pdf_interp: transparency group BBox is non-finite — rendering without group");
+            if corners
+                .iter()
+                .any(|(x, y)| !x.is_finite() || !y.is_finite())
+            {
+                log::warn!(
+                    "pdf_interp: transparency group BBox is non-finite — rendering without group"
+                );
                 return None;
             }
-            let left   = corners.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min).floor();
-            let top    = corners.iter().map(|(_, y)| page_h - y).fold(f64::INFINITY, f64::min).floor();
-            let right  = corners.iter().map(|(x, _)| *x).fold(f64::NEG_INFINITY, f64::max).ceil();
-            let bottom = corners.iter().map(|(_, y)| page_h - y).fold(f64::NEG_INFINITY, f64::max).ceil();
+            let left = corners
+                .iter()
+                .map(|(x, _)| *x)
+                .fold(f64::INFINITY, f64::min)
+                .floor();
+            let top = corners
+                .iter()
+                .map(|(_, y)| page_h - y)
+                .fold(f64::INFINITY, f64::min)
+                .floor();
+            let right = corners
+                .iter()
+                .map(|(x, _)| *x)
+                .fold(f64::NEG_INFINITY, f64::max)
+                .ceil();
+            let bottom = corners
+                .iter()
+                .map(|(_, y)| page_h - y)
+                .fold(f64::NEG_INFINITY, f64::max)
+                .ceil();
 
-            #[expect(clippy::cast_possible_truncation, reason = "device coords bounded by page dimensions")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "device coords bounded by page dimensions"
+            )]
             let params = GroupParams {
                 x_min: left as i32,
                 y_min: top as i32,
@@ -1465,7 +1505,10 @@ impl<'doc> PageRenderer<'doc> {
         clippy::cast_sign_loss,
         reason = "device pixel coords are always in page bounds after clamping; safe casts"
     )]
-    #[expect(clippy::many_single_char_names, reason = "PDF CTM components a–f are standard")]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "PDF CTM components a–f are standard"
+    )]
     #[expect(
         clippy::similar_names,
         reason = "dx_rel / dy_rel are the standard names for the per-axis deltas in the inverse CTM formula"
