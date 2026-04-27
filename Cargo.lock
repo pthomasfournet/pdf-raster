@@ -1103,14 +1103,12 @@ dependencies = [
 name = "pdf-raster"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
  "color 0.1.0",
  "encode",
  "env_logger",
  "log",
  "lopdf",
- "pdf_bridge",
  "pdf_interp",
  "raster",
  "rayon",
