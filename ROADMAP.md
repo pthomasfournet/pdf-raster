@@ -58,10 +58,12 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 Do not start until the native CLI path is the default (pdf_bridge deleted). The raster crate is not yet in the hot path — optimising it now is optimising the wrong thing.
 
+**Hardware context (Ryzen 9 9900X3D):** 128 MiB 3D V-Cache means edge tables and scanline sweep structures for most real-world documents fit in L3. Algorithms that are cache-bound on a normal CPU are compute-bound here — this shifts the priority order vs. generic advice. Sparse tile rasterisation has an outsized benefit because it maximises L3 utilisation. AVX-512 (F/BW/VL/VNNI/BF16/VPOPCNTDQ) is fully available; target `avx512f,avx512bw,avx512vl` with `-C target-cpu=native`.
+
 - [ ] **Eliminate per-span heap allocations** — `PipeSrc::Solid` and pattern scratch bufs allocate a `Vec` per span; replace with thread-local grow-never-shrink buffers
-- [ ] **u16×16 compositing inner loop** — process 16 pixels/iter as `[u16; 16]`, replace `div255` with `(x + 255) >> 8`, let LLVM auto-vectorise under `-C target-cpu=native`
+- [ ] **u16×16 compositing inner loop** — process 16 pixels/iter as `[u16; 16]`, replace `div255` with `(x + 255) >> 8`; target AVX-512BW for 32-pixel-wide SIMD under `-C target-cpu=native`
 - [ ] **Fixed-point edge stepping (FDot16)** — add `x_cur: i32` + `dx: i32` (16.16) to `XPathSeg`; hot loop does `x_cur += dx` instead of `x0 + (y−y0)×dxdy` (eliminates f64 multiply per edge per scanline)
-- [ ] **Sparse tile rasterisation** — replace flat SoA edge table + per-scanline sweep with tile records sorted by (y, x); only non-empty tiles touched (large win for sparse paths, à la Vello)
+- [ ] **Sparse tile rasterisation** — replace flat SoA edge table + per-scanline sweep with tile records sorted by (y, x); only non-empty tiles touched; reference: vello_cpu sparse_strips/. Especially high value with 3D V-Cache.
 
 ---
 
@@ -80,10 +82,14 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 
 Unblocked by Phase 1 completion (poppler must be gone first).
 
+**Hardware context (RTX 5070, CC 12.0 Blackwell, 12 GB GDDR7):** cudarc 0.19 is already wired in `crates/gpu` with two kernels (Porter-Duff composite, soft mask) and CPU fallbacks. Target `sm_120` PTX. The GPU dispatch threshold is currently 500k pixels — validate this against actual transfer latency on this machine once the native path is hot. Do **not** use wgpu/Vello's GPU backend — CUDA is strictly better for a batch server pipeline on NVIDIA hardware.
+
+**Corpus note:** if the workload is predominantly scanned pages (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), image decoding throughput will dominate wall-clock time, not rasterisation. Profile first — nvJPEG may be the highest-value GPU target, not tile rasterisation.
+
 | Target | Value | Unblocked by |
 |---|---|---|
 | Tile-parallel rasterisation | High | Phase 2 sparse tiles |
-| Image decoding (nvJPEG / cuvid) | Medium | Phase 1 image pipeline |
+| Image decoding (nvJPEG / cuvid) | High if scan-heavy corpus | Phase 1 image pipeline |
 | ICC colour transforms | Medium | Phase 1 colour spaces |
 | Blend / composite | Low | Phase 2 perf work |
 
