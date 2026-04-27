@@ -20,7 +20,7 @@
 //!
 //! - Image `XObjects`: `JBIG2Decode`
 //! - Shading (`sh`) — requires shading resource lookup
-//! - Extended graphics state (`gs`) — requires `ExtGState` dict lookup
+//! - `ExtGState` blend mode (`BM`) — only `Normal` is currently mapped
 //! - Clip paths (W W*) — stub; page-rect clip used as fallback
 //! - Char-to-glyph Differences encoding (phase 2)
 //! - Type 0 / `CIDFont` composite fonts (phase 2)
@@ -49,7 +49,7 @@ use raster::{
 
 use super::color::RasterColor;
 use super::font_cache::FontCache;
-use super::gstate::{GStateStack, InterpGState, ctm_multiply, ctm_transform, mat2x2_mul};
+use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use crate::content::{Operator, TextArrayElement};
 use crate::resources::{ImageColorSpace, PageResources};
 
@@ -181,9 +181,21 @@ impl<'doc> PageRenderer<'doc> {
             Operator::SetDash { dashes, phase } => {
                 self.gstate.current_mut().dash = (dashes.clone(), *phase);
             }
-            // Rendering intent and ExtGState require resource dict access —
-            // deferred until the resource resolver is wired in.
-            Operator::SetRenderingIntent(_) | Operator::SetExtGState(_) => {}
+            // Rendering intent is an output-intent hint only; no change to rendering.
+            Operator::SetRenderingIntent(_) => {}
+
+            Operator::SetExtGState(name) => {
+                if let Some(params) = self.resources.ext_gstate(name) {
+                    let gs = self.gstate.current_mut();
+                    if let Some(a) = params.fill_alpha   { gs.fill_alpha   = a; }
+                    if let Some(a) = params.stroke_alpha { gs.stroke_alpha = a; }
+                    if let Some(w) = params.line_width   { gs.line_width   = w; }
+                    if let Some(c) = params.line_cap     { gs.line_cap     = int_to_cap(c); }
+                    if let Some(j) = params.line_join    { gs.line_join    = int_to_join(j); }
+                    if let Some(m) = params.miter_limit  { gs.miter_limit  = m; }
+                    if let Some(f) = params.flatness     { gs.flatness     = f; }
+                }
+            }
 
             // ── Colour ────────────────────────────────────────────────────────
             Operator::SetFillGray(g) => self.set_fill(RasterColor::gray(*g)),
@@ -475,7 +487,7 @@ impl<'doc> PageRenderer<'doc> {
         // Phase 2: blit rasterized glyphs — mutable borrow of bitmap only.
         let fill_bytes = self.gstate.current().fill_color.as_slice().to_vec();
         let clip = self.page_clip();
-        let pipe = Self::make_pipe(self.gstate.current());
+        let pipe = Self::make_pipe_with_alpha(self.gstate.current().fill_alpha);
         let src = PipeSrc::Solid(&fill_bytes);
 
         for rec in &records {
@@ -538,13 +550,11 @@ impl<'doc> PageRenderer<'doc> {
         )
     }
 
-    /// Build a [`PipeState`] for Normal-blend, fully-opaque, identity-transfer
-    /// rendering.  Extended graphics state fields (opacity, soft mask, etc.) are
-    /// Phase-2 work; the parameter is reserved for when we read `ExtGState` dicts.
-    fn make_pipe(_gs: &InterpGState) -> PipeState<'static> {
+    /// Build a [`PipeState`] for Normal-blend rendering with the given opacity.
+    fn make_pipe_with_alpha(a_input: u8) -> PipeState<'static> {
         PipeState {
             blend_mode: BlendMode::Normal,
-            a_input: 255,
+            a_input,
             overprint_mask: 0xFFFF_FFFF,
             overprint_additive: false,
             transfer: TransferSet::identity_rgb(),
@@ -586,7 +596,7 @@ impl<'doc> PageRenderer<'doc> {
         let color = gs.fill_color.as_slice().to_vec();
         let clip = self.page_clip();
         let flatness = gs.flatness.max(0.1);
-        let pipe = Self::make_pipe(gs);
+        let pipe = Self::make_pipe_with_alpha(gs.fill_alpha);
         let src = PipeSrc::Solid(&color);
         if even_odd {
             eo_fill(
@@ -617,7 +627,7 @@ impl<'doc> PageRenderer<'doc> {
         let gs = self.gstate.current();
         let color = gs.stroke_color.as_slice().to_vec();
         let clip = self.page_clip();
-        let pipe = Self::make_pipe(gs);
+        let pipe = Self::make_pipe_with_alpha(gs.stroke_alpha);
         let src = PipeSrc::Solid(&color);
         let params = StrokeParams {
             line_width: gs.line_width,

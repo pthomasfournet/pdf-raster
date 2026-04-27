@@ -16,10 +16,73 @@ pub(crate) mod dict_ext;
 pub mod font;
 pub mod image;
 
-use lopdf::{Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, Object, ObjectId};
 
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
+
+/// Selected parameters extracted from a PDF `ExtGState` resource dictionary.
+///
+/// Only the subset needed by the current rasteriser is extracted; unknown keys
+/// are silently ignored so that future additions do not break existing pages.
+#[derive(Debug, Clone)]
+pub struct ExtGStateParams {
+    /// Non-stroking (fill) opacity `ca` in [0, 255].  `None` = unchanged.
+    pub fill_alpha: Option<u8>,
+    /// Stroking opacity `CA` in [0, 255].  `None` = unchanged.
+    pub stroke_alpha: Option<u8>,
+    /// Line width `LW` in user-space units.  `None` = unchanged.
+    pub line_width: Option<f64>,
+    /// Line cap style `LC` (0–2).  `None` = unchanged.
+    pub line_cap: Option<i32>,
+    /// Line join style `LJ` (0–2).  `None` = unchanged.
+    pub line_join: Option<i32>,
+    /// Miter limit `ML`.  `None` = unchanged.
+    pub miter_limit: Option<f64>,
+    /// Flatness `FL`.  `None` = unchanged.
+    pub flatness: Option<f64>,
+}
+
+impl ExtGStateParams {
+    fn from_dict(d: &Dictionary) -> Self {
+        Self {
+            fill_alpha: real_to_u8(d, b"ca"),
+            stroke_alpha: real_to_u8(d, b"CA"),
+            line_width: real_or_int(d, b"LW"),
+            line_cap: int_val(d, b"LC"),
+            line_join: int_val(d, b"LJ"),
+            miter_limit: real_or_int(d, b"ML"),
+            flatness: real_or_int(d, b"FL"),
+        }
+    }
+}
+
+/// Read a real or integer key from a dictionary as `f64`.
+fn real_or_int(d: &Dictionary, key: &[u8]) -> Option<f64> {
+    match d.get(key).ok()? {
+        Object::Real(r) => Some(f64::from(*r)),
+        #[expect(clippy::cast_precision_loss, reason = "ExtGState numeric params are small integers")]
+        Object::Integer(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
+/// Read a real-valued opacity key and convert to u8 in [0, 255].
+fn real_to_u8(d: &Dictionary, key: &[u8]) -> Option<u8> {
+    let v = real_or_int(d, key)?.clamp(0.0, 1.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "v clamped to [0,1], scaled to [0,255]; round() fits in u8"
+    )]
+    Some((v * 255.0).round() as u8)
+}
+
+/// Read an integer key.
+fn int_val(d: &Dictionary, key: &[u8]) -> Option<i32> {
+    #[expect(clippy::cast_possible_truncation, reason = "line cap/join values are 0–2")]
+    d.get(key).ok()?.as_i64().ok().map(|n| n as i32)
+}
 
 /// Parsed Form `XObject` — content bytes and the CTM matrix to apply.
 ///
@@ -101,6 +164,20 @@ impl<'doc> PageResources<'doc> {
     pub fn image(&self, name: &[u8]) -> Option<image::ImageDescriptor> {
         let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
         image::resolve_image(self.doc, page_dict, name)
+    }
+
+    /// Look up a named `ExtGState` resource and return selected parameters.
+    ///
+    /// Returns `None` if the name is absent or the resource dict is unreadable.
+    /// Unknown or unsupported keys in the dict are silently ignored.
+    #[must_use]
+    pub fn ext_gstate(&self, name: &[u8]) -> Option<ExtGStateParams> {
+        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let res = image::resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
+        let eg_dict = image::resolve_dict(self.doc, res.get(b"ExtGState").ok()?)?;
+        let gs_ref_or_dict = eg_dict.get(name).ok()?;
+        let gs = image::resolve_dict(self.doc, gs_ref_or_dict)?;
+        Some(ExtGStateParams::from_dict(gs))
     }
 
     /// Resolve the named `XObject` and return it as a [`FormXObject`] if its

@@ -78,6 +78,10 @@ pub struct InterpGState {
     pub fill_color: RasterColor,
     /// Current stroke colour.
     pub stroke_color: RasterColor,
+    /// Fill opacity (PDF `ca`): 0 = transparent, 255 = opaque.
+    pub fill_alpha: u8,
+    /// Stroke opacity (PDF `CA`): 0 = transparent, 255 = opaque.
+    pub stroke_alpha: u8,
     /// Line width in user-space units.
     pub line_width: f64,
     /// Line cap style.
@@ -101,6 +105,8 @@ impl Default for InterpGState {
             ctm: CTM_IDENTITY,
             fill_color: RasterColor::default(),   // black
             stroke_color: RasterColor::default(), // black
+            fill_alpha: 255,   // fully opaque
+            stroke_alpha: 255, // fully opaque
             line_width: 1.0,
             line_cap: LineCap::Butt,
             line_join: LineJoin::Miter,
