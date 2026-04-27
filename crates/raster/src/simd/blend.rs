@@ -53,6 +53,7 @@ pub(super) fn blend_solid_gray8_scalar(dst: &mut [u8], color: u8, count: usize) 
 /// # Safety
 ///
 /// Must only be called when AVX2 is available (`is_x86_feature_detected!("avx2")`).
+/// `dst.len() >= count * 3` must hold.
 #[target_feature(enable = "avx2")]
 unsafe fn blend_solid_rgb8_avx2(dst: &mut [u8], color: [u8; 3], count: usize) {
     use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
@@ -80,8 +81,8 @@ unsafe fn blend_solid_rgb8_avx2(dst: &mut [u8], color: [u8; 3], count: usize) {
     let tile_ptr = tile.as_ptr();
 
     // Load the three 32-byte vectors once.
-    // SAFETY (entire block): tile is 96 bytes on the stack; pointers are in-bounds.
-    // dst_ptr..dst_ptr + count*3 ≤ dst.len() by construction.
+    // SAFETY: tile is 96 bytes on the stack; all three pointers are in-bounds.
+    // dst_ptr..dst_ptr + count*3 ≤ dst.len() by the debug_assert above.
     let (v0, v1, v2): (__m256i, __m256i, __m256i) = unsafe {
         (
             _mm256_loadu_si256(tile_ptr.cast()),
@@ -118,6 +119,7 @@ unsafe fn blend_solid_rgb8_avx2(dst: &mut [u8], color: [u8; 3], count: usize) {
 /// # Safety
 ///
 /// Must only be called when AVX2 is available (`is_x86_feature_detected!("avx2")`).
+/// `dst.len() >= count` must hold.
 #[target_feature(enable = "avx2")]
 unsafe fn blend_solid_gray8_avx2(dst: &mut [u8], color: u8, count: usize) {
     use std::arch::x86_64::{_mm256_set1_epi8, _mm256_storeu_si256};
@@ -168,41 +170,60 @@ fn has_movdir64b() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        // SAFETY: CPUID is always safe on x86-64; no memory is touched.
         let ecx: u32;
+        // SAFETY: CPUID with leaf 7 / subleaf 0 is always valid on x86-64.
+        // We save and restore rbx manually because it is callee-saved and
+        // CPUID overwrites it; the compiler does not know about this clobber
+        // unless we handle it ourselves.
         unsafe {
             std::arch::asm!(
-                "push rbx",   // rbx is callee-saved; cpuid clobbers it
+                "push rbx",
                 "cpuid",
                 "pop rbx",
                 inout("eax") 7u32 => _,
                 inout("ecx") 0u32 => ecx, // subleaf 0
                 out("edx") _,
+                // preserves_flags: CPUID does not modify EFLAGS.
+                // nostack is intentionally absent: push/pop rbx uses the stack.
+                options(preserves_flags),
             );
         }
-        // ECX bit 28 = MOVDIR64B support (Intel SDM vol. 2A, CPUID.7.0:ECX[28])
+        // ECX bit 28 = MOVDIR64B (Intel SDM vol. 2A, CPUID.07H.00H:ECX[28])
         (ecx >> 28) & 1 != 0
     })
+}
+
+/// Compute how many leading bytes are needed to bring `ptr` to `align`-byte
+/// alignment, capped at `limit`.
+///
+/// `ptr::align_offset` returns `usize::MAX` for null pointers or when
+/// alignment is provably impossible; in both cases we return `limit` so the
+/// caller falls back to its scalar path for the entire span.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn preamble_len(ptr: *const u8, limit: usize, align: usize) -> usize {
+    let off = ptr.align_offset(align);
+    if off == usize::MAX { limit } else { off.min(limit) }
 }
 
 #[cfg(target_arch = "x86_64")]
 /// Fill `count` RGB pixels in `dst` using `movdir64b` non-temporal 64-byte stores.
 ///
-/// The tile is 192 bytes (`LCM(3, 64) = 192`): three 64-byte `movdir64b` stores
-/// advance the destination by 192 bytes (= 64 pixels) while reading from the
-/// same three disjoint 64-byte sections of the tile.  This ensures every store
-/// writes exactly one full RGB pixel at every byte boundary.
+/// The tile is 192 bytes (`LCM(3, 64) = 192`): three consecutive `movdir64b`
+/// stores advance the destination by 192 bytes (64 pixels) while reading from
+/// three disjoint 64-byte sections of the tile.  This ensures every store
+/// writes exactly one full RGB pixel at every byte boundary within the tile.
 ///
 /// A scalar preamble aligns the destination pointer to 64 bytes; a scalar tail
-/// handles the remaining < 64 bytes after the last aligned store.
+/// handles any remaining bytes after the last aligned block.
 ///
 /// # Safety
 ///
-/// Caller must ensure that `movdir64b` is available (CPUID.7.0:ECX[28] = 1).
-/// `dst.len() >= count * 3` must hold.
+/// - `movdir64b` must be available (CPUID.07H.00H:ECX[28] = 1).
+/// - `dst.len() >= count * 3` must hold.
 unsafe fn blend_solid_rgb8_movdir64b(dst: &mut [u8], color: [u8; 3], count: usize) {
-    // Aligned source tile: 192 bytes = LCM(3, 64) so every 64-byte sub-tile ends
-    // on a pixel boundary and all three sub-tiles are themselves 64-byte aligned.
+    // 192 = LCM(3, 64): three 64-byte stores cover exactly 64 RGB pixels
+    // with no partial pixel at any 64-byte boundary.
     #[repr(align(64))]
     struct Tile([u8; 192]);
 
@@ -213,54 +234,48 @@ unsafe fn blend_solid_rgb8_movdir64b(dst: &mut [u8], color: [u8; 3], count: usiz
         count * 3,
     );
 
-    let pixel_bytes = color; // [r, g, b]
-
-    let dst_ptr = dst.as_mut_ptr();
     let byte_count = count * 3;
+    let dst_ptr = dst.as_mut_ptr();
 
-    // Scalar preamble: fill bytes up to the next 64-byte-aligned address.
-    // align_offset returns usize::MAX when alignment is impossible (null/zero-cap
-    // slice); we fall back to filling everything scalarly in that case.
-    let align_off = dst_ptr.align_offset(64);
-    let preamble = if align_off == usize::MAX {
-        byte_count
-    } else {
-        align_off.min(byte_count)
-    };
-    // Fill preamble bytes indexed by their absolute position mod 3 so the
-    // repeating RGB pattern is continuous across the preamble/block boundary.
+    // ── Preamble ──────────────────────────────────────────────────────────────
+    // Fill bytes [0, preamble) so that dst_ptr + preamble is 64-byte aligned.
+    // Each byte is indexed by its absolute position mod 3 so the RGB pattern
+    // remains continuous across the preamble / block boundary.
+    let preamble = preamble_len(dst_ptr.cast_const(), byte_count, 64);
     for i in 0..preamble {
-        dst[i] = pixel_bytes[i % 3];
+        dst[i] = color[i % 3];
     }
 
-    // Build the tile phase-shifted so that tile byte k maps to the correct
-    // channel for absolute destination byte (preamble + k): tile[k] = pixel[( preamble+k)%3].
-    // This ensures MOVDIR64B writes the right channel at every byte position.
+    // ── Aligned blocks ────────────────────────────────────────────────────────
+    // Build a 192-byte tile phase-shifted by `preamble % 3` so that
+    // tile[k] == color[(preamble + k) % 3], i.e. the correct channel for
+    // absolute destination byte (preamble + k).
     let phase = preamble % 3;
     let mut tile = Tile([0u8; 192]);
     for (k, t) in tile.0.iter_mut().enumerate() {
-        *t = pixel_bytes[(phase + k) % 3];
+        *t = color[(phase + k) % 3];
     }
 
-    let blocks_start = preamble; // guaranteed 64-byte aligned
-    let remaining = byte_count.saturating_sub(blocks_start);
-    // Number of complete 192-byte (64-pixel) blocks.
+    let blocks_start = preamble;
+    debug_assert!(blocks_start <= byte_count, "preamble_len exceeded byte_count");
+    let remaining = byte_count - blocks_start;
     let blocks = remaining / 192;
 
     for blk in 0..blocks {
         // SAFETY:
         // - blocks_start + blk*192 + 192 ≤ blocks_start + remaining ≤ byte_count ≤ dst.len().
-        // - dst_ptr + blocks_start is 64-byte aligned (align_offset computed this).
+        // - dst_ptr + blocks_start is 64-byte aligned: preamble_len guarantees this
+        //   (or preamble == byte_count making blocks == 0, so the loop never runs).
         // - blocks_start + blk*192 is also 64-byte aligned (192 is a multiple of 64).
-        // - tile.0 is 64-byte aligned by #[repr(align(64))]; sub-tiles at +64 and +128
-        //   are therefore also 64-byte aligned.
+        // - tile.0 is 64-byte aligned by #[repr(align(64))]; sub-tiles at +64 and
+        //   +128 are therefore also 64-byte aligned.
+        // - MOVDIR64B destination operand is a register holding the aligned address;
+        //   source operand is a memory reference [reg].
         unsafe {
             let dst_base = dst_ptr.add(blocks_start + blk * 192);
             let src0 = tile.0.as_ptr();
             let src1 = src0.add(64);
             let src2 = src0.add(128);
-            // MOVDIR64B encoding: destination is a register holding the aligned address;
-            // source is a memory operand [reg].
             std::arch::asm!(
                 "movdir64b {d0}, [{s0}]",
                 "movdir64b {d1}, [{s1}]",
@@ -271,15 +286,18 @@ unsafe fn blend_solid_rgb8_movdir64b(dst: &mut [u8], color: [u8; 3], count: usiz
                 s0 = in(reg) src0,
                 s1 = in(reg) src1,
                 s2 = in(reg) src2,
+                options(nostack, preserves_flags),
             );
         }
     }
 
-    // Scalar tail: remaining bytes after the last full 192-byte block.
-    // Use absolute byte index mod 3 so the pattern stays continuous.
+    // ── Tail ──────────────────────────────────────────────────────────────────
+    // Bytes after the last complete 192-byte block.  `off - blocks_start` is
+    // the offset from the first block byte, so adding `phase` gives the correct
+    // channel index consistent with the tile.
     let tail_start = blocks_start + blocks * 192;
     for off in tail_start..byte_count {
-        dst[off] = pixel_bytes[(phase + (off - blocks_start)) % 3];
+        dst[off] = color[(phase + (off - blocks_start)) % 3];
     }
 }
 
@@ -287,12 +305,12 @@ unsafe fn blend_solid_rgb8_movdir64b(dst: &mut [u8], color: [u8; 3], count: usiz
 /// Fill `count` grayscale pixels in `dst` using `movdir64b` non-temporal stores.
 ///
 /// Each `movdir64b` writes 64 bytes = 64 pixels.  A scalar preamble aligns the
-/// destination; a scalar tail handles the remainder.
+/// destination to 64 bytes; a scalar tail handles the remainder.
 ///
 /// # Safety
 ///
-/// Caller must ensure that `movdir64b` is available (CPUID.7.0:ECX[28] = 1).
-/// `dst.len() >= count` must hold.
+/// - `movdir64b` must be available (CPUID.07H.00H:ECX[28] = 1).
+/// - `dst.len() >= count` must hold.
 unsafe fn blend_solid_gray8_movdir64b(dst: &mut [u8], color: u8, count: usize) {
     #[repr(align(64))]
     struct Tile([u8; 64]);
@@ -305,38 +323,35 @@ unsafe fn blend_solid_gray8_movdir64b(dst: &mut [u8], color: u8, count: usize) {
     );
 
     let tile = Tile([color; 64]);
-
     let dst_ptr = dst.as_mut_ptr();
 
-    // Scalar preamble to 64-byte alignment.  Cap at count; handle the impossible
-    // case (align_offset returns usize::MAX for null/zero-capacity slices) by
-    // falling back to scalar for the entire span.
-    let align_off = dst_ptr.align_offset(64);
-    let preamble = if align_off == usize::MAX {
-        count
-    } else {
-        align_off.min(count)
-    };
+    // ── Preamble ──────────────────────────────────────────────────────────────
+    let preamble = preamble_len(dst_ptr.cast_const(), count, 64);
     dst[..preamble].fill(color);
 
+    // ── Aligned blocks ────────────────────────────────────────────────────────
+    debug_assert!(preamble <= count, "preamble_len exceeded count");
     let blocks = (count - preamble) / 64;
     for blk in 0..blocks {
-        // SAFETY: preamble + blk*64 + 64 ≤ preamble + (count-preamble) = count ≤ dst.len().
-        // dst_ptr + preamble is 64-byte aligned (align_offset computed this).
-        // tile.0 is 64-byte aligned by #[repr(align(64))].
+        // SAFETY:
+        // - preamble + blk*64 + 64 ≤ preamble + (count - preamble) = count ≤ dst.len().
+        // - dst_ptr + preamble is 64-byte aligned (preamble_len guarantees this,
+        //   or preamble == count making blocks == 0).
+        // - tile.0 is 64-byte aligned by #[repr(align(64))].
+        // - MOVDIR64B destination operand is a register holding the aligned address.
         unsafe {
             let dst_blk = dst_ptr.add(preamble + blk * 64);
             let src = tile.0.as_ptr();
-            // MOVDIR64B: destination operand is a register holding the aligned address.
             std::arch::asm!(
                 "movdir64b {dst}, [{src}]",
                 dst = in(reg) dst_blk,
                 src = in(reg) src,
+                options(nostack, preserves_flags),
             );
         }
     }
 
-    // Scalar tail.
+    // ── Tail ──────────────────────────────────────────────────────────────────
     let tail_start = preamble + blocks * 64;
     dst[tail_start..count].fill(color);
 }
@@ -345,23 +360,34 @@ unsafe fn blend_solid_gray8_movdir64b(dst: &mut [u8], color: u8, count: usize) {
 
 /// Fill `count` RGB pixels in `dst` (starting at byte 0) with `color`.
 ///
-/// Dispatch order (x86-64):
+/// # Panics
+///
+/// Panics if `dst.len() < count * 3`.
+///
+/// # Dispatch order (x86-64)
+///
 /// 1. `movdir64b` non-temporal stores when `count > 256` and the CPU supports it —
 ///    preserves L3 V-Cache residency for the scanner edge table.
 /// 2. AVX2 256-bit stores when `count >= 32`.
 /// 3. Scalar `copy_from_slice` loop.
 pub fn blend_solid_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
+    assert!(
+        dst.len() >= count * 3,
+        "blend_solid_rgb8: dst too short ({} < {})",
+        dst.len(),
+        count * 3,
+    );
+
     #[cfg(target_arch = "x86_64")]
     if count > MOVDIR64B_THRESHOLD_PX && has_movdir64b() {
-        // SAFETY: has_movdir64b() confirmed CPUID.7.0:ECX[28]; dst.len() >= count*3
-        // is the caller's responsibility (debug_assert inside).
+        // SAFETY: movdir64b confirmed by has_movdir64b(); dst.len() >= count*3 asserted above.
         unsafe { blend_solid_rgb8_movdir64b(dst, color, count) };
         return;
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
     if is_x86_feature_detected!("avx2") && count >= 32 {
-        // SAFETY: we just confirmed AVX2 is available.
+        // SAFETY: AVX2 confirmed by is_x86_feature_detected!; dst.len() >= count*3 asserted above.
         unsafe { blend_solid_rgb8_avx2(dst, color, count) };
         return;
     }
@@ -371,22 +397,33 @@ pub fn blend_solid_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
 
 /// Fill `count` grayscale pixels in `dst` (starting at byte 0) with `color`.
 ///
-/// Dispatch order (x86-64):
+/// # Panics
+///
+/// Panics if `dst.len() < count`.
+///
+/// # Dispatch order (x86-64)
+///
 /// 1. `movdir64b` non-temporal stores when `count > 256` and the CPU supports it.
 /// 2. AVX2 256-bit stores when `count >= 32`.
 /// 3. Scalar `fill`.
 pub fn blend_solid_gray8(dst: &mut [u8], color: u8, count: usize) {
+    assert!(
+        dst.len() >= count,
+        "blend_solid_gray8: dst too short ({} < {})",
+        dst.len(),
+        count,
+    );
+
     #[cfg(target_arch = "x86_64")]
     if count > MOVDIR64B_THRESHOLD_PX && has_movdir64b() {
-        // SAFETY: has_movdir64b() confirmed CPUID.7.0:ECX[28]; dst.len() >= count
-        // is the caller's responsibility (debug_assert inside).
+        // SAFETY: movdir64b confirmed by has_movdir64b(); dst.len() >= count asserted above.
         unsafe { blend_solid_gray8_movdir64b(dst, color, count) };
         return;
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
     if is_x86_feature_detected!("avx2") && count >= 32 {
-        // SAFETY: we just confirmed AVX2 is available.
+        // SAFETY: AVX2 confirmed by is_x86_feature_detected!; dst.len() >= count asserted above.
         unsafe { blend_solid_gray8_avx2(dst, color, count) };
         return;
     }
@@ -489,7 +526,7 @@ mod tests {
         blend_solid_rgb8_scalar(&mut expected, color, count);
 
         let mut got = vec![0u8; count * 3];
-        // SAFETY: we just checked AVX2 is available.
+        // SAFETY: is_x86_feature_detected! confirmed AVX2 is available.
         unsafe { blend_solid_rgb8_avx2(&mut got, color, count) };
         assert_eq!(got, expected, "AVX2 RGB path mismatch");
     }
@@ -505,7 +542,7 @@ mod tests {
         blend_solid_gray8_scalar(&mut expected, 200, count);
 
         let mut got = vec![0u8; count];
-        // SAFETY: we just checked AVX2 is available.
+        // SAFETY: is_x86_feature_detected! confirmed AVX2 is available.
         unsafe { blend_solid_gray8_avx2(&mut got, 200, count) };
         assert_eq!(got, expected, "AVX2 gray path mismatch");
     }
@@ -556,7 +593,7 @@ mod tests {
         blend_solid_rgb8_scalar(&mut expected, color, count);
 
         let mut got = vec![0u8; count * 3];
-        // SAFETY: has_movdir64b() confirmed CPUID.7.0:ECX[28].
+        // SAFETY: has_movdir64b() confirmed CPUID.07H.00H:ECX[28] = 1.
         unsafe { blend_solid_rgb8_movdir64b(&mut got, color, count) };
         assert_eq!(got, expected, "movdir64b RGB mismatch");
     }
@@ -572,7 +609,7 @@ mod tests {
         blend_solid_gray8_scalar(&mut expected, 200, count);
 
         let mut got = vec![0u8; count];
-        // SAFETY: has_movdir64b() confirmed CPUID.7.0:ECX[28].
+        // SAFETY: has_movdir64b() confirmed CPUID.07H.00H:ECX[28] = 1.
         unsafe { blend_solid_gray8_movdir64b(&mut got, 200, count) };
         assert_eq!(got, expected, "movdir64b gray mismatch");
     }
@@ -590,6 +627,7 @@ mod tests {
         blend_solid_rgb8_scalar(&mut expected, color, count);
 
         let mut got = vec![0u8; count * 3];
+        // SAFETY: has_movdir64b() confirmed CPUID.07H.00H:ECX[28] = 1.
         unsafe { blend_solid_rgb8_movdir64b(&mut got, color, count) };
         assert_eq!(got, expected, "movdir64b RGB odd-count mismatch");
     }
@@ -605,7 +643,24 @@ mod tests {
         blend_solid_gray8_scalar(&mut expected, 17, count);
 
         let mut got = vec![0u8; count];
+        // SAFETY: has_movdir64b() confirmed CPUID.07H.00H:ECX[28] = 1.
         unsafe { blend_solid_gray8_movdir64b(&mut got, 17, count) };
         assert_eq!(got, expected, "movdir64b gray odd-count mismatch");
+    }
+
+    // ── public API boundary checks ────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "blend_solid_rgb8: dst too short")]
+    fn rgb8_panics_on_short_dst() {
+        let mut dst = vec![0u8; 5];
+        blend_solid_rgb8(&mut dst, [1, 2, 3], 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "blend_solid_gray8: dst too short")]
+    fn gray8_panics_on_short_dst() {
+        let mut dst = vec![0u8; 5];
+        blend_solid_gray8(&mut dst, 42, 10);
     }
 }
