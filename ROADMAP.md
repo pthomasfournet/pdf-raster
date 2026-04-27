@@ -27,24 +27,30 @@ The raster crate is complete at the pixel level. The `pdf_interp` crate is the i
 - [x] JavaScript rejection — hard fail on any JS entry point in the document
 - [x] CLI `--native` flag wired to `pdf_interp` render path
 
-### In progress / next
+### Blocking parity — must land before deleting pdf_bridge
 
-- [ ] **ICCBased / Indexed / Separation colour spaces** — `SetFillColorSpace` is currently a no-op; affects image fidelity and some drawn content
-- [ ] **CCITTFaxDecode Group 3 (K≥0)** — Group 4 (K<0) done; Group 3 stub
-- [ ] **ExtGState blend modes (`BM`)** — only `Normal` mapped; `Multiply`, `Screen`, `Overlay`, etc. pending
-- [ ] **Inline images (`BI ID EI`)** — stub; log only
-- [ ] **Shading (`sh`)** — requires shading resource lookup and gradient rasterisation
-- [ ] **Text render modes 4–7** — text-as-clip (glyph outlines → XPath intersection)
+Ordered by priority. Wire CLI by default is the finish line.
+
+- [ ] **ICCBased / Indexed / Separation colour spaces** — `SetFillColorSpace` is a no-op; silently corrupts colours in ICC-profiled and indexed images
+- [ ] **ExtGState blend modes (`BM`)** — only `Normal` mapped; `Multiply`, `Screen`, `Overlay`, etc. composite wrong
+- [ ] **CCITTFaxDecode Group 3 (K≥0)** — Group 4 (K<0) done; Group 3 stub silently skips fax images
+- [ ] **Inline images (`BI ID EI`)** — stub; some generators use these heavily
+- [ ] **Shading (`sh`)** — gradients visually obvious when missing; needs shading resource lookup + axial/radial rasterisation wired through
 - [ ] **Wire CLI by default** — remove `--native` flag; make native the only path; delete `pdf_bridge`
 
-### Phase 1 parking lot (real-world coverage, not blocking parity)
+### Nice-to-have before default (won't block, but improve coverage)
 
-- [ ] Type 0 / CIDFont composite fonts
+- [ ] **Text render modes 4–7** — text-as-clip (glyph outlines → XPath intersection); rare in practice but used in some graphics-heavy docs
+- [ ] **Type 0 / CIDFont composite fonts** — needed for CJK and other multi-byte encodings
+- [ ] **Tiling patterns** — `scn` with pattern colour space; used for hatching, textures
+
+### Phase 1 parking lot (post-shipping coverage work)
+
 - [ ] Type 3 paint-procedure fonts
 - [ ] JBIG2Decode image filter
-- [ ] Tiling patterns (`scn` with pattern colour space)
 - [ ] Optional content groups (layers / OCG)
 - [ ] Annotation rendering
+- [ ] Non-axis-aligned image transforms (currently bounding-box nearest-neighbour approximation)
 
 ---
 
