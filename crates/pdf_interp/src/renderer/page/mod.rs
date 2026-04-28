@@ -243,6 +243,26 @@ impl<'doc> PageRenderer<'doc> {
         self.nvjpeg2k = dec;
     }
 
+    /// Detach and return the nvJPEG decoder so the caller can reuse it.
+    ///
+    /// Returns `None` if no decoder was attached or if the `nvjpeg` feature is
+    /// disabled.  Used by the CLI to return the decoder to its thread-local slot
+    /// after each page render.
+    #[cfg(feature = "nvjpeg")]
+    pub fn take_nvjpeg(&mut self) -> Option<NvJpegDecoder> {
+        self.nvjpeg.take()
+    }
+
+    /// Detach and return the nvJPEG2000 decoder so the caller can reuse it.
+    ///
+    /// Returns `None` if no decoder was attached or if the `nvjpeg2k` feature is
+    /// disabled.  Used by the CLI to return the decoder to its thread-local slot
+    /// after each page render.
+    #[cfg(feature = "nvjpeg2k")]
+    pub fn take_nvjpeg2k(&mut self) -> Option<NvJpeg2kDecoder> {
+        self.nvjpeg2k.take()
+    }
+
     /// Attach a GPU context for supersampled AA fill dispatch.
     ///
     /// When set, filled paths with a pixel bounding-box area above

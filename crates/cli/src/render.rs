@@ -1,8 +1,10 @@
 //! Per-page rendering: native Rust renderer → pixel buffer → output file.
 
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
-#[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 
 use color::{Gray8, Rgb8};
@@ -11,6 +13,70 @@ use raster::Bitmap;
 
 use crate::args::{Args, OutputFormat};
 use crate::naming::output_path;
+
+// ── Per-thread GPU image decoders ─────────────────────────────────────────────
+//
+// NvJpegDecoder and NvJpeg2kDecoder are Send but not Sync: each rayon worker
+// thread owns exactly one instance, created lazily on its first page render.
+// RefCell<Option<T>> gives interior mutability without a Mutex; the thread_local
+// guarantee ensures no concurrent access from the same thread.
+//
+// Initialisation failure (no GPU, driver error) is logged once per thread and
+// leaves the slot as None, activating the CPU fallback path transparently.
+
+/// Per-thread nvJPEG decoder for `DCTDecode` (JPEG) images.
+#[cfg(feature = "nvjpeg")]
+thread_local! {
+    static NVJPEG_DEC: RefCell<Option<gpu::nvjpeg::NvJpegDecoder>> = const { RefCell::new(None) };
+}
+
+/// Per-thread nvJPEG2000 decoder for `JPXDecode` (JPEG 2000) images.
+#[cfg(feature = "nvjpeg2k")]
+thread_local! {
+    static NVJPEG2K_DEC: RefCell<Option<gpu::nvjpeg2k::NvJpeg2kDecoder>> = const { RefCell::new(None) };
+}
+
+/// Ensure the per-thread nvJPEG decoder is initialised.  No-op after first call.
+#[cfg(feature = "nvjpeg")]
+fn init_nvjpeg() {
+    NVJPEG_DEC.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            match gpu::nvjpeg::NvJpegDecoder::new(0) {
+                Ok(dec) => {
+                    *slot = Some(dec);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "pdf-raster: nvJPEG unavailable on this thread ({e}); \
+                         JPEG images will be decoded on CPU"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Ensure the per-thread nvJPEG2000 decoder is initialised.  No-op after first call.
+#[cfg(feature = "nvjpeg2k")]
+fn init_nvjpeg2k() {
+    NVJPEG2K_DEC.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            match gpu::nvjpeg2k::NvJpeg2kDecoder::new(0) {
+                Ok(dec) => {
+                    *slot = Some(dec);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "pdf-raster: nvJPEG2000 unavailable on this thread ({e}); \
+                         JPEG 2000 images will be decoded on CPU"
+                    );
+                }
+            }
+        }
+    });
+}
 
 /// Maximum pixel dimension (width or height) accepted from a PDF page.
 ///
@@ -108,8 +174,13 @@ impl From<EncodeError> for RenderError {
 /// `page_num` is 1-based.  PPM and PNG output are supported; JPEG and TIFF
 /// are rejected with [`RenderError::UnsupportedFormatCombination`].
 ///
-/// When compiled with `gpu-aa`, `nvjpeg`, or `gpu-icc` features, `gpu_ctx`
-/// is passed to the renderer.  `None` is safe — it reverts to the CPU path.
+/// GPU acceleration is enabled transparently when the relevant feature flags
+/// are compiled in:
+/// - `gpu-aa`, `nvjpeg`, `gpu-icc`: shared [`gpu::GpuCtx`] passed via `gpu_ctx`
+/// - `nvjpeg`: per-thread [`gpu::nvjpeg::NvJpegDecoder`] for `DCTDecode` images
+/// - `nvjpeg2k`: per-thread [`gpu::nvjpeg2k::NvJpeg2kDecoder`] for `JPXDecode` images
+///
+/// All GPU paths degrade gracefully to CPU when the GPU is unavailable.
 ///
 /// `--gray` converts the RGB bitmap to grayscale (BT.709) and writes PGM/gray PNG.
 /// `--mono` additionally thresholds to 1-bit and writes PBM/gray PNG.
@@ -118,9 +189,7 @@ pub fn render_page_native(
     page_num: u32,
     total_pages: u32,
     args: &Args,
-    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))] gpu_ctx: Option<
-        &Arc<gpu::GpuCtx>,
-    >,
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))] gpu_ctx: Option<&Arc<gpu::GpuCtx>>,
 ) -> Result<(), RenderError> {
     let format = args.output_format();
 
@@ -169,10 +238,33 @@ pub fn render_page_native(
     let ops = pdf_interp::parse_page(doc, page_num)?;
     let mut renderer =
         pdf_interp::renderer::PageRenderer::new_scaled(w_px, h_px, scale, doc, page_id);
-    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     renderer.set_gpu_ctx(gpu_ctx.map(Arc::clone));
+
+    // Attach per-thread GPU image decoders.  init_* is a no-op after the first
+    // call on each thread.  borrow_mut() cannot panic: no other borrow of the
+    // same thread-local is live across this call (single-threaded execution model
+    // within each rayon task).
+    #[cfg(feature = "nvjpeg")]
+    {
+        init_nvjpeg();
+        NVJPEG_DEC.with(|cell| renderer.set_nvjpeg(cell.borrow_mut().take()));
+    }
+    #[cfg(feature = "nvjpeg2k")]
+    {
+        init_nvjpeg2k();
+        NVJPEG2K_DEC.with(|cell| renderer.set_nvjpeg2k(cell.borrow_mut().take()));
+    }
+
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
+
+    // Return the decoders to the thread-local slots so they survive across pages.
+    #[cfg(feature = "nvjpeg")]
+    NVJPEG_DEC.with(|cell| *cell.borrow_mut() = renderer.take_nvjpeg());
+    #[cfg(feature = "nvjpeg2k")]
+    NVJPEG2K_DEC.with(|cell| *cell.borrow_mut() = renderer.take_nvjpeg2k());
+
     let rgb: Bitmap<Rgb8> = renderer.finish();
 
     #[expect(

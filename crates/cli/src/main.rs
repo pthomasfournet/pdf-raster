@@ -2,7 +2,7 @@ mod args;
 mod naming;
 mod render;
 
-#[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
@@ -46,7 +46,7 @@ fn main() {
     // the CPU fallback path activates automatically.  A driver-version mismatch
     // after an upgrade will surface here; run `nvidia-smi` to confirm the
     // driver is loaded correctly.
-    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     let gpu_ctx: Option<Arc<gpu::GpuCtx>> = match gpu::GpuCtx::init() {
         Ok(ctx) => Some(Arc::new(ctx)),
         Err(e) => {
@@ -82,7 +82,7 @@ fn main() {
                     page_u32,
                     total_u32,
                     &args,
-                    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+                    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
                     gpu_ctx.as_ref(),
                 );
                 report_progress(&args, &done, n_pages, &start, page_num);
