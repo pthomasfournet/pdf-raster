@@ -52,6 +52,10 @@ Ordered by priority. Wire CLI by default is the finish line.
 - [x] Annotation rendering
 - [x] Non-axis-aligned image transforms (currently bounding-box nearest-neighbour approximation)
 
+### Open: inline images never use GPU decoders
+
+`decode_inline_image` in `pdf_interp/src/resources/image.rs` does not accept GPU decoder parameters — all inline `DCTDecode` and `JPXDecode` images go through the CPU path regardless of image area or enabled features. Most inline images are small (thumbnails, icons) so the threshold would rarely trigger, but the gap means the GPU path is structurally incomplete for inline streams. Fix: add the same `#[cfg]`-gated decoder parameters to `decode_inline_image` as `resolve_image` has.
+
 ---
 
 ## Phase 2 — Raster performance ✓ COMPLETE
@@ -105,7 +109,7 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 ### Still open / lower priority
 
 - [x] Function-based shading (Type 1) — pre-sampled 64×64 grid; bilinear interpolation in fill_span; BBox intersection; full CTM inversion
-- [x] nvJPEG2000 for JPXDecode — GPU fast path via nvjpeg2k feature; planar→interleaved copy; CPU jpeg2k fallback; threshold-gated at 512×512px
+- [x] nvJPEG2000 for JPXDecode — GPU fast path via `nvjpeg2k` feature; planar→interleaved copy (`cudaMemcpy2D` D→H per component); sub-sampling guard + OOM cap + zero-dimension guard; CPU `jpeg2k`/OpenJPEG fallback; threshold-gated at 512×512 px (see Phase 4 item 1 for full audit)
 - [ ] OptiX BVH (evaluate only if profiling shows complex paths as bottleneck)
 
 ---
@@ -134,9 +138,24 @@ For scan-heavy corpora (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), 
 - [x] `cuStreamSynchronize` called on error path from `nvjpegDecode` before dropping `PinnedBuf` — GPU may have enqueued partial work that would write into freed memory
 - [x] Minimum JPEG size: nvJPEG GPU kernels require ≥ one full 8×8 MCU block; 1×1 JPEGs crash inside the driver (test fixture is 16×16)
 - [x] API correctness audit (Apr 2026, CUDA 12.8 headers): `nvjpegCreate` deprecated → replaced with `nvjpegCreateEx(backend, dev_alloc, pinned_alloc, flags, handle)`; CUDA error code 209 corrected (NO_BINARY_FOR_GPU not MAP_FAILED=205); `is_x86_feature_detected!("movdir64b")` does not exist on stable — detection uses `__cpuid_count(7,0).ecx >> 28`; glyph unpack gate was SSE4.1 but all intrinsics are SSE2; `_mm512_popcnt_epi8` stable since Rust 1.89; `cuDevicePrimaryCtxRetain` is the NVIDIA-recommended pattern (not `cuCtxCreate`); `nvjpegDecode` not deprecated (batched pipeline API is optional); `cuStreamCreate(flags=0)` = CU_STREAM_DEFAULT still correct
-- [x] nvJPEG2000 for JPXDecode (JPEG 2000) — implemented (see item 1 above)
+- [x] **nvJPEG2000 for JPXDecode (JPEG 2000)** ✓ COMPLETE
+  - `gpu::nvjpeg2k` module: `DeviceBuf` RAII (`cudaMalloc`/`cudaFree`); `NvJpeg2k` (pub(crate)) inner decoder; `NvJpeg2kDecoder` (pub) safe wrapper with `ManuallyDrop<NvJpeg2k>` for explicit drop order
+  - Output memory is **device** (`cudaMalloc` inside library), not host-pinned; `cudaMemcpy2D` per component after stream sync to copy D→H
+  - Image layout is **planar** (separate device ptr per component); Gray (1 comp) passthrough; RGB (3 comps) interleaved via `chunks_exact_mut(3).zip(r.iter().zip(g.iter().zip(b.iter())))`
+  - Parse step: `nvjpeg2kStreamParse` before `nvjpeg2kDecode`; bitstream handle (`nvjpeg2kStream_t`) distinct from CUDA stream; reused across decodes
+  - **Sub-sampling guard (CRITICAL)**: bare `nvjpeg2kDecode` writes components at their native (reduced) dimensions — it does NOT upsample sub-sampled chroma (unlike `nvjpeg2kDecodeParamsSetRGBOutput`); images where any `component_width/height` differs from `image_width/height` are rejected → CPU OpenJPEG fallback
+  - **OOM guard (CRITICAL)**: corrupt header returning `u32::MAX` for `num_components` would cause `Vec::with_capacity(usize::MAX)` (~68 GB); capped at `nc > 4` → `UnsupportedComponents` error before any allocation
+  - **Zero-dimension guard**: explicit `ZeroDimension { width, height }` error if any component dimension is 0
+  - **Pitch ownership**: caller sets `pitch_in_bytes` in `Nvjpeg2kImage`; library writes at that exact pitch — no mismatch possible since we define it; documented explicitly
+  - Drop order: `nvjpeg2kDecodeStateDestroy` → `nvjpeg2kStreamDestroy` → `nvjpeg2kDestroy` (API contract; reverse creation order); enforced via `ManuallyDrop` in `NvJpeg2kDecoder`
+  - Pure raw CUDA driver API (same rationale as nvJPEG): `cuInit → cuDeviceGet → cuDevicePrimaryCtxRetain → cuCtxSetCurrent → cuStreamCreate → nvjpeg2kCreateSimple`; no cudarc at runtime
+  - `cuStreamSynchronize` called on error path before returning — GPU may have enqueued partial work
+  - Library path: `/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12/` (non-standard; explicit `rustc-link-search` in `build.rs`); `cudart` linked for `cudaMalloc`/`cudaFree`/`cudaMemcpy2D`
+  - Dispatch threshold: `GPU_JPEG2K_THRESHOLD_PX = 262_144` (512×512 px); CPU `jpeg2k`/OpenJPEG fallback for small images and unsupported sub-sampled streams
+  - `NvJpeg2kError`: `Nvjpeg2kStatus`, `CudaError`, `CudartError`, `UnsupportedComponents`, `ZeroDimension`, `Overflow`
+- [x] **CLI wiring for nvJPEG + nvJPEG2K** — `thread_local! DecoderInit<T>` state machine per rayon worker thread in `crates/cli/src/render.rs`; lazy construction on first page; decoder moved into renderer before `execute()` and returned to the slot after `render_annotations()`; `DecoderInit::Failed` prevents retry-and-spam after a one-time init failure; `PageRenderer::take_nvjpeg` / `take_nvjpeg2k` recover the decoder after each page so the CUDA context and stream survive across pages with zero re-init cost
 
-**2. GPU supersampled AA — replaces CPU 4× scanline AA**
+**2. GPU supersampled AA — replaces CPU 4× scanline AA** ✓ COMPLETE
 
 The current `render_aa_line` + nibble-popcount AA is the weakest part of the CPU pipeline. Replace it with a CUDA kernel doing **jittered supersampling** at 64 samples/pixel using warp-level ballot reduction:
 
@@ -179,7 +198,7 @@ DeviceCMYK → DeviceRGB via two paths depending on whether a full ICC CLUT is a
 - [x] `bake_cmyk_clut` (`pdf_interp/src/resources/icc.rs`): bakes a Little CMS ICC profile into a compact `u8` CLUT for upload; `BakeError` with `InvalidGridSize` and `Cms` variants; `DEFAULT_GRID_N = 17`
 - [x] Rounding bias fix in CUDA kernel: `((255u - c) * inv_k + 127u) / 255u` (was missing the `+127` bias)
 - [x] Parity tests: `icc_cmyk_matrix_avx_vs_scalar` asserts AVX-512 and scalar agree byte-for-byte across 16 representative pixels including axis extremes and mid-range sweep
-- [x] nvJPEG2000 for JPXDecode — implemented (see item 1 above)
+- [x] nvJPEG2000 for JPXDecode — implemented (see Phase 4 item 1 above)
 
 **5. OptiX BVH for complex paths — low priority, evaluate later**
 
@@ -202,32 +221,75 @@ FreeType text rendering is **not** a GPU target — hinting is sequential per gl
 
 ## Benchmarking
 
+**Status: baseline benchmarks complete (Apr 2026).** All GPU features live. Machine: Ryzen 9 9900X3D + RTX 5070, 150 DPI, `--features nvjpeg,nvjpeg2k,gpu-aa,gpu-icc`, `RUSTFLAGS="-C target-cpu=native"`, `--warmup 3 --runs 8`.
+
+### Results vs pdftoppm (poppler 24.x)
+
+| Fixture | Size | Character | pdf-raster | pdftoppm | Speedup |
+|---|---|---|---|---|---|
+| `ritual-14th.pdf` | 116 KB | Light vector + text, 41 pp | 213 ms | 262 ms | **1.2×** |
+| `cryptic-rite.pdf` | 281 KB | Mixed vector + images, 7 pp | 109 ms | 291 ms | **2.7×** |
+| `kt-r2000.pdf` | 2.1 MB | Dense vector / complex paths, 34 pp | 495 ms | 1507 ms | **3.0×** |
+| `xxxii-sr.pdf` | 11 MB | Mixed; image-heavy | 5.2 s | 44.4 s | **8.5×** |
+| `scotch-rite-illustrated.pdf` | 50 MB | Scan-heavy JPEG/JPEG2K | 17.2 s | 155.7 s | **9.1×** |
+
+The scan-heavy corpus (JPEG/JPEG2K) shows the largest gap because nvJPEG + nvJPEG2K GPU decode replaces the CPU libjpeg/OpenJPEG path. The vector-only fixture (ritual-14th) shows the smallest gap — that workload is entirely CPU path-fill and text.
+
+### Pixel diff vs poppler
+
+`compare -metric AE` on 3 pages of `ritual-14th` at 150 DPI. Same page dimensions (700×1050 px). AE of 0.9–17% — entirely explained by sub-pixel anti-aliasing differences at glyph edges (amplified diff shows ghosted text, no structural content difference). This is expected for two independent renderers with different AA strategies.
+
+### Known gap: page rotation (`/Rotate`)
+
+`kt-r2000.pdf` page 1 has `/Rotate: 270`. pdf-raster ignores the `/Rotate` key; poppler applies it. The output for that page is portrait where poppler emits landscape. This is tracked as a rendering parity gap — all other pages in the corpus produce correct output. Fix: apply the page rotation in `pdf_interp::page_size_pts` / `PageRenderer` setup.
+
+### Fixture inventory
+
+| File | Size | Character |
+|---|---|---|
+| `ritual-14th.pdf` | 116 KB | Light vector + text |
+| `cryptic-rite.pdf` | 281 KB | Mixed vector + images |
+| `kt-r2000.pdf` | 2.1 MB | Dense vector / complex paths |
+| `xxxii-sr.pdf` | 11 MB | Mixed; image-heavy pages |
+| `scotch-rite-illustrated.pdf` | 50 MB | Scan-heavy; primary JPEG/JPEG2K workload |
+
+### Commands
+
 ```bash
-# Native vs pdftoppm (run after --native is the default)
-hyperfine --warmup 3 \
-  'target/release/pdf-raster -r 150 tests/fixtures/ritual-14th.pdf /tmp/out' \
-  '/usr/bin/pdftoppm -r 150 tests/fixtures/ritual-14th.pdf /tmp/ref'
+# Build with all GPU features
+RUSTFLAGS="-C target-cpu=native" cargo build --release \
+  --manifest-path crates/cli/Cargo.toml \
+  --features nvjpeg,nvjpeg2k,gpu-aa,gpu-icc
 
-# Pixel diff vs reference
-compare -metric AE /tmp/ref-01.ppm /tmp/out-01.ppm /dev/null
+BIN=target/release/pdf-raster
+LD_LIB=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12:/usr/local/cuda-12.8/lib64
 
-# Flamegraph
-CARGO_PROFILE_RELEASE_DEBUG=true flamegraph -o /tmp/flame.svg \
-  -- target/release/pdf-raster -r 150 tests/fixtures/cryptic-rite.pdf /tmp/out
+# Throughput vs pdftoppm
+env $LD_LIB hyperfine --warmup 3 --runs 8 \
+  "$BIN -r 150 tests/fixtures/scotch-rite-illustrated.pdf /tmp/out" \
+  'pdftoppm -r 150 tests/fixtures/scotch-rite-illustrated.pdf /tmp/ref'
 
-# Fill microbenchmark (raster crate only)
+# Pixel diff vs poppler reference (ImageMagick AE metric)
+pdftoppm -r 150 tests/fixtures/ritual-14th.pdf /tmp/ref
+env $LD_LIB $BIN -r 150 tests/fixtures/ritual-14th.pdf /tmp/out
+for i in /tmp/ref-*.ppm; do
+  n=$(basename $i .ppm | sed 's/ref-//')
+  ae=$(compare -metric AE $i /tmp/out-${n}.ppm /dev/null 2>&1)
+  echo "$(basename $i): AE=$ae"
+done
+
+# Flamegraph — find the new bottleneck after GPU image decode is wired
+CARGO_PROFILE_RELEASE_DEBUG=true env $LD_LIB \
+flamegraph -o /tmp/flame.svg -- \
+  $BIN -r 150 tests/fixtures/scotch-rite-illustrated.pdf /tmp/out
+
+# Synthetic fill microbenchmark (raster crate path-fill vs vello_cpu)
 RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --stars 200
 
-# GPU AA benchmark (once Phase 4 item 2 lands)
-RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --stars 200 --aa gpu
+# Threshold bench — recalibrate GPU dispatch crossovers after any kernel change
+cargo run -p gpu --release --bin threshold_bench
 
-# L3 occupancy monitoring via hardware CQM counters (9900X3D specific)
-# Requires kernel resctrl mount: mount -t resctrl resctrl /sys/fs/resctrl
-# Reports per-process L3 occupancy in bytes — use to verify edge table stays
-# resident in the 128 MiB V-Cache across sequential page renders.
+# L3 occupancy monitoring (9900X3D — requires resctrl mount)
+# mount -t resctrl resctrl /sys/fs/resctrl
 # cat /sys/fs/resctrl/mon_data/mon_L3_XX/llc_occupancy
 ```
-
-Current pixel diff vs poppler (--native, 150 dpi):
-- `cryptic-rite` page 1: ~1.8 %
-- `ritual-14th` page 1: ~1.2 %
