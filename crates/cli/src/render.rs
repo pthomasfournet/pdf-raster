@@ -17,24 +17,10 @@ use crate::naming::output_path;
 // ── Per-thread GPU image decoders ─────────────────────────────────────────────
 //
 // NvJpegDecoder and NvJpeg2kDecoder are Send but not Sync: each rayon worker
-// thread owns exactly one instance, created lazily on its first page render.
-// RefCell<Option<T>> gives interior mutability without a Mutex; the thread_local
-// guarantee ensures no concurrent access from the same thread.
-//
-// Initialisation failure (no GPU, driver error) is logged once per thread and
-// leaves the slot as None, activating the CPU fallback path transparently.
-
-/// Per-thread nvJPEG decoder for `DCTDecode` (JPEG) images.
-#[cfg(feature = "nvjpeg")]
-thread_local! {
-    static NVJPEG_DEC: RefCell<Option<gpu::nvjpeg::NvJpegDecoder>> = const { RefCell::new(None) };
-}
-
-/// Per-thread nvJPEG2000 decoder for `JPXDecode` (JPEG 2000) images.
-#[cfg(feature = "nvjpeg2k")]
-thread_local! {
-    static NVJPEG2K_DEC: RefCell<Option<gpu::nvjpeg2k::NvJpeg2kDecoder>> = const { RefCell::new(None) };
-}
+// thread owns exactly one instance, created lazily on first use.  DecoderInit<T>
+// tracks whether construction has been attempted so a one-time failure does not
+// retry (and re-log) on every subsequent page.  RefCell gives interior mutability
+// without a Mutex; the thread_local guarantee prevents concurrent access.
 
 /// Initialisation state for a per-thread GPU decoder.
 ///
