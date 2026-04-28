@@ -247,12 +247,15 @@ impl<'doc> PageResources<'doc> {
     /// decoding fails.
     ///
     /// `gpu` enables GPU-accelerated JPEG decoding for large `DCTDecode` streams
-    /// when the `nvjpeg` feature is active.  Pass `None` for CPU-only behaviour.
+    /// when the `nvjpeg` feature is active.  `gpu_j2k` enables GPU-accelerated
+    /// JPEG 2000 decoding for large `JPXDecode` streams when the `nvjpeg2k`
+    /// feature is active.  Pass `None` for CPU-only behaviour on either path.
     #[must_use]
     pub fn image(
         &self,
         name: &[u8],
         #[cfg(feature = "nvjpeg")] gpu: Option<&mut gpu::nvjpeg::NvJpegDecoder>,
+        #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut gpu::nvjpeg2k::NvJpeg2kDecoder>,
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
     ) -> Option<image::ImageDescriptor> {
         let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
@@ -262,6 +265,8 @@ impl<'doc> PageResources<'doc> {
             name,
             #[cfg(feature = "nvjpeg")]
             gpu,
+            #[cfg(feature = "nvjpeg2k")]
+            gpu_j2k,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
         )

@@ -75,6 +75,8 @@ use crate::resources::{ImageColorSpace, PageResources, image::decode_inline_imag
 use gpu::GpuCtx;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
+#[cfg(feature = "nvjpeg2k")]
+use gpu::nvjpeg2k::NvJpeg2kDecoder;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 
@@ -142,6 +144,10 @@ pub struct PageRenderer<'doc> {
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
     nvjpeg: Option<NvJpegDecoder>,
+    /// GPU-accelerated JPEG 2000 decoder, present when the `nvjpeg2k` feature is
+    /// enabled and a CUDA device is available.  `None` means CPU-only JPX decode.
+    #[cfg(feature = "nvjpeg2k")]
+    nvjpeg2k: Option<NvJpeg2kDecoder>,
     /// Shared GPU context for AA fill dispatch and ICC CMYK→RGB colour conversion.
     /// Present when `gpu-aa` or `gpu-icc` features are enabled.
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
@@ -206,6 +212,8 @@ impl<'doc> PageRenderer<'doc> {
             ocg_stack: Vec::new(),
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
+            #[cfg(feature = "nvjpeg2k")]
+            nvjpeg2k: None,
             #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
             gpu_ctx: None,
         }
@@ -221,6 +229,18 @@ impl<'doc> PageRenderer<'doc> {
     #[cfg(feature = "nvjpeg")]
     pub fn set_nvjpeg(&mut self, dec: Option<NvJpegDecoder>) {
         self.nvjpeg = dec;
+    }
+
+    /// Attach a GPU JPEG 2000 decoder to this renderer.
+    ///
+    /// When set, `JPXDecode` image streams with pixel area ≥
+    /// [`crate::resources::image::GPU_JPEG2K_THRESHOLD_PX`] are decoded on the
+    /// GPU via nvJPEG2000 rather than `jpeg2k`/OpenJPEG.
+    ///
+    /// Call with `None` to revert to CPU-only JPEG 2000 decode.
+    #[cfg(feature = "nvjpeg2k")]
+    pub fn set_nvjpeg2k(&mut self, dec: Option<NvJpeg2kDecoder>) {
+        self.nvjpeg2k = dec;
     }
 
     /// Attach a GPU context for supersampled AA fill dispatch.
@@ -1662,6 +1682,8 @@ impl<'doc> PageRenderer<'doc> {
             name,
             #[cfg(feature = "nvjpeg")]
             self.nvjpeg.as_mut(),
+            #[cfg(feature = "nvjpeg2k")]
+            self.nvjpeg2k.as_mut(),
             #[cfg(feature = "gpu-icc")]
             self.gpu_ctx.as_deref(),
         );

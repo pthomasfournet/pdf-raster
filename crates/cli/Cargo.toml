@@ -12,6 +12,8 @@ path = "src/main.rs"
 gpu-aa  = ["dep:gpu", "pdf_interp/gpu-aa"]
 # Enable GPU-accelerated JPEG decoding via nvJPEG.  Mirrors pdf_interp/nvjpeg.
 nvjpeg  = ["dep:gpu", "pdf_interp/nvjpeg"]
+# Enable GPU-accelerated JPEG 2000 decoding via nvJPEG2000.  Mirrors pdf_interp/nvjpeg2k.
+nvjpeg2k = ["dep:gpu", "pdf_interp/nvjpeg2k"]
 # Enable GPU ICC CMYK→RGB transform.  Mirrors pdf_interp/gpu-icc.
 gpu-icc = ["dep:gpu", "pdf_interp/gpu-icc"]
 

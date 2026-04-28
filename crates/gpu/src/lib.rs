@@ -14,9 +14,14 @@
 //!
 //! - `nvjpeg` — enables [`nvjpeg`] module for GPU-accelerated JPEG decoding
 //!   via NVIDIA nvJPEG.  Requires `libnvjpeg.so` at link time.
+//! - `nvjpeg2k` — enables [`nvjpeg2k`] module for GPU-accelerated JPEG 2000
+//!   decoding via NVIDIA nvJPEG2000.  Requires `libnvjpeg2k.so` at link time.
 
 #[cfg(feature = "nvjpeg")]
 pub mod nvjpeg;
+
+#[cfg(feature = "nvjpeg2k")]
+pub mod nvjpeg2k;
 
 use std::sync::Arc;
 

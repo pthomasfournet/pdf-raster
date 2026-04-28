@@ -105,7 +105,7 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 ### Still open / lower priority
 
 - [x] Function-based shading (Type 1) — pre-sampled 64×64 grid; bilinear interpolation in fill_span; BBox intersection; full CTM inversion
-- [ ] nvJPEG2000 for JPXDecode — deferred, low priority
+- [x] nvJPEG2000 for JPXDecode — GPU fast path via nvjpeg2k feature; planar→interleaved copy; CPU jpeg2k fallback; threshold-gated at 512×512px
 - [ ] OptiX BVH (evaluate only if profiling shows complex paths as bottleneck)
 
 ---
@@ -134,7 +134,7 @@ For scan-heavy corpora (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), 
 - [x] `cuStreamSynchronize` called on error path from `nvjpegDecode` before dropping `PinnedBuf` — GPU may have enqueued partial work that would write into freed memory
 - [x] Minimum JPEG size: nvJPEG GPU kernels require ≥ one full 8×8 MCU block; 1×1 JPEGs crash inside the driver (test fixture is 16×16)
 - [x] API correctness audit (Apr 2026, CUDA 12.8 headers): `nvjpegCreate` deprecated → replaced with `nvjpegCreateEx(backend, dev_alloc, pinned_alloc, flags, handle)`; CUDA error code 209 corrected (NO_BINARY_FOR_GPU not MAP_FAILED=205); `is_x86_feature_detected!("movdir64b")` does not exist on stable — detection uses `__cpuid_count(7,0).ecx >> 28`; glyph unpack gate was SSE4.1 but all intrinsics are SSE2; `_mm512_popcnt_epi8` stable since Rust 1.89; `cuDevicePrimaryCtxRetain` is the NVIDIA-recommended pattern (not `cuCtxCreate`); `nvjpegDecode` not deprecated (batched pipeline API is optional); `cuStreamCreate(flags=0)` = CU_STREAM_DEFAULT still correct
-- [ ] nvJPEG2000 for JPXDecode (JPEG 2000); lower priority than baseline JPEG
+- [x] nvJPEG2000 for JPXDecode (JPEG 2000) — implemented (see item 1 above)
 
 **2. GPU supersampled AA — replaces CPU 4× scanline AA**
 
@@ -179,7 +179,7 @@ DeviceCMYK → DeviceRGB via two paths depending on whether a full ICC CLUT is a
 - [x] `bake_cmyk_clut` (`pdf_interp/src/resources/icc.rs`): bakes a Little CMS ICC profile into a compact `u8` CLUT for upload; `BakeError` with `InvalidGridSize` and `Cms` variants; `DEFAULT_GRID_N = 17`
 - [x] Rounding bias fix in CUDA kernel: `((255u - c) * inv_k + 127u) / 255u` (was missing the `+127` bias)
 - [x] Parity tests: `icc_cmyk_matrix_avx_vs_scalar` asserts AVX-512 and scalar agree byte-for-byte across 16 representative pixels including axis extremes and mid-range sweep
-- [ ] nvJPEG2000 for JPXDecode — lower priority, tracked under item 1
+- [x] nvJPEG2000 for JPXDecode — implemented (see item 1 above)
 
 **5. OptiX BVH for complex paths — low priority, evaluate later**
 

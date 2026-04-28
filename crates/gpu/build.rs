@@ -36,6 +36,51 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 
+    // nvJPEG2000: libnvjpeg2k.so lives in a non-standard path (not in the CUDA
+    // toolkit tree) and requires cudart for cudaMalloc / cudaMemcpy2D.
+    if env::var("CARGO_FEATURE_NVJPEG2K").is_ok() {
+        let nvjpeg2k_dirs = [
+            "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12",
+            "/usr/lib/x86_64-linux-gnu/libnvjpeg2k",
+        ];
+        let mut found_nvjpeg2k = false;
+        for dir in nvjpeg2k_dirs {
+            if std::path::Path::new(dir).exists() {
+                println!("cargo:rustc-link-search=native={dir}");
+                found_nvjpeg2k = true;
+                break;
+            }
+        }
+        if !found_nvjpeg2k {
+            println!(
+                "cargo:warning=nvjpeg2k feature enabled but libnvjpeg2k directory not found; linker will search default paths."
+            );
+        }
+        println!("cargo:rustc-link-lib=dylib=nvjpeg2k");
+
+        // cudart provides cudaMalloc / cudaFree / cudaMemcpy2D (runtime API).
+        let mut found_cudart = false;
+        for dir in [
+            "/usr/local/cuda-12/targets/x86_64-linux/lib",
+            "/usr/local/cuda/targets/x86_64-linux/lib",
+            "/usr/local/cuda/lib64",
+        ] {
+            if std::path::Path::new(dir).exists() {
+                println!("cargo:rustc-link-search=native={dir}");
+                found_cudart = true;
+                break;
+            }
+        }
+        if !found_cudart {
+            println!(
+                "cargo:warning=nvjpeg2k feature enabled but no CUDA lib directory found for cudart; linker will search default paths."
+            );
+        }
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        // cuStreamSynchronize / cuCtxSetCurrent live in libcuda.so (driver).
+        println!("cargo:rustc-link-lib=dylib=cuda");
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let kernels_dir = PathBuf::from("kernels");
 

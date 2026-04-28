@@ -13,7 +13,7 @@
 //! | `FlateDecode` | yes/no | yes |
 //! | none (raw) | yes/no | yes |
 //! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`, or GPU nvJPEG) |
-//! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`) |
+//! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`, or GPU nvJPEG2000) |
 //! | `JBIG2Decode` | yes/no | yes (via `hayro-jbig2`) |
 //! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | — | stub |
 //!
@@ -31,6 +31,15 @@
 //! pixel area ≥ [`GPU_JPEG_THRESHOLD_PX`] are decoded on the GPU via NVIDIA
 //! nvJPEG instead of `zune-jpeg`.  Pass an [`NvJpegDecoder`] to
 //! [`resolve_image`] to enable this path; pass `None` for CPU-only behaviour.
+//!
+//! # nvJPEG2000 acceleration (`nvjpeg2k` feature)
+//!
+//! When the crate is built with `--features nvjpeg2k`, `JPXDecode` streams
+//! with pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`] are decoded on the GPU via
+//! NVIDIA nvJPEG2000 instead of `jpeg2k`/OpenJPEG.  Pass an
+//! [`NvJpeg2kDecoder`] to [`resolve_image`] to enable this path; pass `None`
+//! for CPU-only behaviour.  Only 1- and 3-component images are accelerated;
+//! CMYK and other multi-channel images always fall through to OpenJPEG.
 
 use std::borrow::Cow;
 
@@ -49,6 +58,9 @@ use zune_jpeg::JpegDecoder;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
 
+#[cfg(feature = "nvjpeg2k")]
+use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
+
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
 #[cfg(feature = "gpu-icc")]
@@ -65,6 +77,14 @@ mod icc;
 /// nvJPEG (~10 GB/s) and `zune-jpeg` (~1 GB/s) after `PCIe` DMA latency.
 #[cfg(feature = "nvjpeg")]
 pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
+
+/// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
+///
+/// Below this threshold `PCIe` transfer overhead dominates and CPU
+/// `jpeg2k`/OpenJPEG is faster.  512 × 512 = 262 144 pixels — same crossover
+/// as nvJPEG; JPEG 2000 decode is CPU-bound at similar pixel counts.
+#[cfg(feature = "nvjpeg2k")]
+pub const GPU_JPEG2K_THRESHOLD_PX: u32 = 262_144;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -115,6 +135,7 @@ pub fn resolve_image(
     page_dict: &Dictionary,
     name: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
     let stream_id = xobject_id(doc, page_dict, name)?;
@@ -186,7 +207,16 @@ pub fn resolve_image(
                 decode_dct(stream.content.as_slice(), w, h)
             }
         }
-        Some("JPXDecode") => decode_jpx(stream.content.as_slice(), w, h),
+        Some("JPXDecode") => {
+            #[cfg(feature = "nvjpeg2k")]
+            {
+                decode_jpx(stream.content.as_slice(), w, h, gpu_j2k)
+            }
+            #[cfg(not(feature = "nvjpeg2k"))]
+            {
+                decode_jpx(stream.content.as_slice(), w, h)
+            }
+        }
         Some("JBIG2Decode") => {
             let parms = stream.dict.get(b"DecodeParms").ok();
             decode_jbig2(doc, stream.content.as_slice(), w, h, is_mask, parms)
@@ -298,7 +328,17 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
                 decode_dct(data, w, h)
             }
         }
-        Some("JPXDecode") => decode_jpx(data, w, h),
+        Some("JPXDecode") => {
+            // Inline images are typically small — GPU dispatch is not worthwhile.
+            #[cfg(feature = "nvjpeg2k")]
+            {
+                decode_jpx(data, w, h, None)
+            }
+            #[cfg(not(feature = "nvjpeg2k"))]
+            {
+                decode_jpx(data, w, h)
+            }
+        }
         Some("JBIG2Decode") => {
             // Inline images cannot reference a JBIG2Globals stream (no object identity).
             decode_jbig2(doc, data, w, h, is_mask, None)
@@ -1742,16 +1782,37 @@ fn cmyk_raw_to_rgb(
 
 // ── JPXDecode (JPEG 2000) ─────────────────────────────────────────────────────
 
-/// Decode a `JPXDecode` (JPEG 2000) stream via `jpeg2k` (`OpenJPEG` bindings).
+/// Decode a `JPXDecode` (JPEG 2000) stream.
+///
+/// When the `nvjpeg2k` feature is active and `gpu` is `Some`, large images
+/// (pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`]) are decoded on the GPU via
+/// nvJPEG2000.  All other images, and any image for which the GPU path fails
+/// (unsupported component count, CUDA error, etc.), fall through to the CPU
+/// `jpeg2k`/OpenJPEG path.
 ///
 /// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
-/// format (`.jp2`).  `jpeg2k::Image::from_bytes` auto-detects the format from
-/// the first bytes of the stream.
+/// format (`.jp2`).  Both paths auto-detect the format.
 ///
-/// 16-bit component images are downscaled to 8-bit by taking the high byte
-/// (`v >> 8`), which is lossless for display purposes.  Alpha channels are
-/// dropped — PDF image blitting does not use them.
-fn decode_jpx(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
+/// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
+fn decode_jpx(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    #[cfg(feature = "nvjpeg2k")] gpu: Option<&mut NvJpeg2kDecoder>,
+) -> Option<ImageDescriptor> {
+    // ── GPU fast path (nvjpeg2k feature, large images, 1- or 3-component only) ─
+    #[cfg(feature = "nvjpeg2k")]
+    if let Some(dec) = gpu {
+        let area = pdf_w.saturating_mul(pdf_h);
+        if area >= GPU_JPEG2K_THRESHOLD_PX {
+            if let Some(img) = decode_jpx_gpu(data, pdf_w, pdf_h, dec) {
+                return Some(img);
+            }
+            log::debug!("image: JPXDecode: GPU path failed, retrying on CPU");
+        }
+    }
+
+    // ── CPU path (jpeg2k / OpenJPEG) ─────────────────────────────────────────
     let img = Jp2Image::from_bytes(data)
         .map_err(|e| log::warn!("image: JPXDecode open error: {e}"))
         .ok()?;
@@ -1846,6 +1907,52 @@ fn decode_jpx(data: &[u8], pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
             Some(jpx_rgb(jw, jh, rgb))
         }
     }
+}
+
+/// GPU-accelerated JPEG 2000 decode via nvJPEG2000.
+///
+/// Returns `None` for unsupported component counts (CMYK, LAB, N-channel) or
+/// when any CUDA API call fails; the caller falls back to the CPU path in
+/// both cases.
+#[cfg(feature = "nvjpeg2k")]
+fn decode_jpx_gpu(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    dec: &mut NvJpeg2kDecoder,
+) -> Option<ImageDescriptor> {
+    let img = match dec.decode_sync(data) {
+        Ok(img) => img,
+        Err(gpu::nvjpeg2k::NvJpeg2kError::UnsupportedComponents(_)) => {
+            // CMYK or exotic channel count — expected; fall back to CPU silently.
+            return None;
+        }
+        Err(e) => {
+            log::warn!("image: JPXDecode GPU: nvJPEG2000 error: {e}");
+            return None;
+        }
+    };
+
+    if img.width != pdf_w || img.height != pdf_h {
+        log::debug!(
+            "image: JPXDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG2000 reports {}×{} — using nvJPEG2000 dims",
+            img.width,
+            img.height,
+        );
+    }
+
+    let color_space = match img.color_space {
+        GpuJ2kCs::Gray => ImageColorSpace::Gray,
+        GpuJ2kCs::Rgb => ImageColorSpace::Rgb,
+    };
+
+    Some(ImageDescriptor {
+        width: img.width,
+        height: img.height,
+        color_space,
+        data: img.data,
+        smask: None,
+    })
 }
 
 /// Wrap a decoded grayscale pixel buffer into an [`ImageDescriptor`].
