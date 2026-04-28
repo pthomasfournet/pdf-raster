@@ -570,7 +570,10 @@ fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<
             };
             match bpc {
                 1 => expand_smask_1bpp(&raw, sm_w, sm_h)?,
+                2 => expand_nbpp::<2>(&raw, sm_w, sm_h, 1)?,
+                4 => expand_nbpp::<4>(&raw, sm_w, sm_h, 1)?,
                 8 => raw,
+                16 => downsample_16bpp(&raw, sm_w, sm_h, 1)?,
                 other => {
                     log::debug!("image: SMask {other} bpc not yet supported");
                     return None;
@@ -733,14 +736,18 @@ fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
 
 // ── Raw / FlateDecode image decoding ─────────────────────────────────────────
 
-/// Expand raw (already-decompressed) pixel bytes into a normalised form.
+/// Expand raw (already-decompressed) pixel bytes into a normalised 8-bpp form.
 ///
-/// Handles:
-/// - 1-bit-per-sample images (packed MSB first) → expanded to 1 byte/pixel
-/// - 8-bit images: device colour spaces, `ICCBased`, `Indexed`, CMYK
+/// Supported `BitsPerComponent` values:
+/// - 1 — packed MSB-first, expanded to 0x00/0xFF per pixel
+/// - 2 — 4 levels, scaled to 0x00/0x55/0xAA/0xFF
+/// - 4 — 16 levels, scaled to 0x00…0xFF (value × 17)
+/// - 8 — direct (common case)
+/// - 16 — big-endian, high byte taken (linear 0–65535 → 0–255)
 ///
-/// CMYK images are converted to RGB inline (255=full ink → 0=white convention).
-/// `Indexed` images are expanded through the palette to Gray or RGB.
+/// `Indexed` images with bpc 1/2/4 unpack the sub-byte palette indices first.
+/// CMYK images (bpc 8/16) are converted to RGB inline.
+#[expect(clippy::too_many_lines, reason = "bpc dispatch table + cfg-gated GPU paths — splitting would obscure the decision tree")]
 fn decode_raw(
     doc: &Document,
     data: &[u8],
@@ -793,8 +800,8 @@ fn decode_raw(
     let cs_obj = dict.get(b"ColorSpace").ok();
 
     // Check for Indexed colour space: [/Indexed base hival lookup].
-    // These images carry 1-byte palette indices regardless of the base space's
-    // component count, so they need special handling before the general path.
+    // These images carry palette indices (bpc 1/2/4/8 bits per index) rather
+    // than component samples, so they need special handling before the general path.
     if let Some(Object::Array(arr)) = cs_obj
         && arr
             .first()
@@ -829,8 +836,38 @@ fn decode_raw(
                 smask: None,
             })
         }
+        2 => decode_raw_8bpp(
+            &expand_nbpp::<2>(data, width, height, resolved.components())?,
+            width,
+            height,
+            resolved,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            icc_bytes.as_deref(),
+        ),
+        4 => decode_raw_8bpp(
+            &expand_nbpp::<4>(data, width, height, resolved.components())?,
+            width,
+            height,
+            resolved,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            icc_bytes.as_deref(),
+        ),
         8 => decode_raw_8bpp(
             data,
+            width,
+            height,
+            resolved,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            icc_bytes.as_deref(),
+        ),
+        16 => decode_raw_8bpp(
+            &downsample_16bpp(data, width, height, resolved.components())?,
             width,
             height,
             resolved,
@@ -900,9 +937,9 @@ fn decode_raw_8bpp(
 
 /// Decode a raw `Indexed` colour space image.
 ///
-/// The raw data carries 1-byte palette indices (regardless of `bpc`; only 8-bit
-/// Indexed images are supported here — 1-bpp Indexed is extraordinarily rare
-/// and not worth the complexity).  Each index is expanded through the palette.
+/// For bpc 1, 2, 4: index values are packed MSB-first, N bits per index.
+/// For bpc 8: one byte per index (the common case).
+/// PDF spec §8.6.6.3 allows bpc ∈ {1, 2, 4, 8} for Indexed images.
 fn decode_raw_indexed(
     doc: &Document,
     data: &[u8],
@@ -911,10 +948,24 @@ fn decode_raw_indexed(
     bpc: i64,
     cs_arr: &[Object],
 ) -> Option<ImageDescriptor> {
-    if bpc != 8 {
-        log::debug!("image: Indexed with {bpc} bpc not yet implemented");
-        return None;
-    }
+    // Expand sub-byte index streams to one byte per index before palette lookup.
+    let indices_8bit: Vec<u8>;
+    let indices: &[u8] = match bpc {
+        1 | 2 | 4 => {
+            // For Indexed images, "components" is always 1 (each sample is one palette index).
+            // bpc ∈ {1, 2, 4} verified by the match arm — safe to cast to u32.
+            #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation,
+                reason = "bpc ∈ {1, 2, 4} — positive and fits u32")]
+            let bits = bpc as u32;
+            indices_8bit = expand_nbpp_indexed(data, width, height, bits)?;
+            &indices_8bit
+        }
+        8 => data,
+        other => {
+            log::debug!("image: Indexed with {other} bpc not supported");
+            return None;
+        }
+    };
 
     let (palette, out_cs) = indexed_palette(doc, cs_arr)?;
     let stride = out_cs.components();
@@ -930,17 +981,17 @@ fn decode_raw_indexed(
     }
 
     let npixels = (width as usize).checked_mul(height as usize)?;
-    if data.len() < npixels {
+    if indices.len() < npixels {
         log::warn!(
             "image: Indexed raw data too short ({} bytes, need {npixels})",
-            data.len()
+            indices.len()
         );
         return None;
     }
 
     let n_entries = palette.len() / stride; // ≥ 1 guaranteed by guards above
     let mut out = Vec::with_capacity(npixels.checked_mul(stride)?);
-    for &idx in &data[..npixels] {
+    for &idx in &indices[..npixels] {
         let i = usize::from(idx).min(n_entries - 1);
         out.extend_from_slice(&palette[i * stride..(i + 1) * stride]);
     }
@@ -1009,6 +1060,115 @@ fn expand_1bpp(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
             out.push(if bit == 0 { 0x00 } else { 0xFF });
         }
     }
+    Some(out)
+}
+
+/// Expand N-bits-per-sample packed data (MSB first) to 1 byte per sample, scaled to 0–255.
+///
+/// `BITS` must be 2 or 4.  Samples are scaled to the full 0–255 range:
+/// - bpc 2: 4 levels → 0x00, 0x55, 0xAA, 0xFF  (value × 85)
+/// - bpc 4: 16 levels → 0x00, 0x11, 0x22, …, 0xFF  (value × 17)
+///
+/// `components` is the number of samples per pixel (e.g. 1 for Gray, 3 for RGB).
+/// Each row is padded to a whole number of source bytes (PDF spec §7.4.1).
+///
+/// Returns `None` if `width × height × components` overflows `usize`.
+fn expand_nbpp<const BITS: u32>(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    components: usize,
+) -> Option<Vec<u8>> {
+    debug_assert!(BITS == 2 || BITS == 4, "expand_nbpp: BITS must be 2 or 4");
+    let samples_per_row = (width as usize).checked_mul(components)?;
+    let samples_per_byte = (8 / BITS) as usize;
+    let row_bytes = samples_per_row.div_ceil(samples_per_byte);
+    let total = samples_per_row.checked_mul(height as usize)?;
+    let mut out = Vec::with_capacity(total);
+
+    // Scale factor: maps max sample value to 255.
+    // bpc 2: max = 3,  scale = 85  (3 × 85 = 255)
+    // bpc 4: max = 15, scale = 17  (15 × 17 = 255)
+    let max_val = (1u8 << BITS) - 1;
+    let scale = 255u16 / u16::from(max_val);
+    let mask = max_val;
+
+    for row in 0..height as usize {
+        let row_start = row * row_bytes;
+        let row_data = if row_start < data.len() {
+            &data[row_start..data.len().min(row_start + row_bytes)]
+        } else {
+            &[]
+        };
+        // Walk samples MSB-first within each row.
+        // Within a byte, sample 0 is at the most-significant BITS bits.
+        for s in 0..samples_per_row {
+            let byte_idx = s / samples_per_byte;
+            // Shift so the target sample's bits are in the LSBs.
+            // e.g. BITS=4, byte=[ab cd]: s=0 → shift=4, s=1 → shift=0.
+            let shift = (BITS as usize) * (samples_per_byte - 1 - (s % samples_per_byte));
+            let byte = row_data.get(byte_idx).copied().unwrap_or(0);
+            let val = (byte >> shift) & mask; // u8: mask is u8, result ≤ mask ≤ 15
+            #[expect(clippy::cast_possible_truncation, reason = "val ≤ max_val ≤ 15; val*scale ≤ 255 — fits u8")]
+            out.push((u16::from(val) * scale) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Expand N-bits-per-index packed Indexed-image stream (MSB first) to 1 byte per index.
+///
+/// Unlike `expand_nbpp`, values are NOT scaled — they are raw palette indices in
+/// [0, 2^bits − 1].  `bits` ∈ {1, 2, 4}.  Rows are padded to a byte boundary.
+///
+/// Returns `None` if `width × height` overflows `usize`.
+fn expand_nbpp_indexed(data: &[u8], width: u32, height: u32, bits: u32) -> Option<Vec<u8>> {
+    debug_assert!(bits == 1 || bits == 2 || bits == 4);
+    let samples_per_row = width as usize;
+    let samples_per_byte = (8 / bits) as usize;
+    let row_bytes = samples_per_row.div_ceil(samples_per_byte);
+    let total = samples_per_row.checked_mul(height as usize)?;
+    let mut out = Vec::with_capacity(total);
+
+    let mask: u8 = (1u8 << bits) - 1;
+
+    for row in 0..height as usize {
+        let row_start = row * row_bytes;
+        let row_data = if row_start < data.len() {
+            &data[row_start..data.len().min(row_start + row_bytes)]
+        } else {
+            &[]
+        };
+        for s in 0..samples_per_row {
+            let byte_idx = s / samples_per_byte;
+            let shift = bits as usize * (samples_per_byte - 1 - (s % samples_per_byte));
+            let byte = row_data.get(byte_idx).copied().unwrap_or(0);
+            out.push((byte >> shift) & mask); // u8: mask is u8
+        }
+    }
+    Some(out)
+}
+
+/// Downsample 16-bit-per-sample data (big-endian) to 8 bits per sample.
+///
+/// Takes the high byte of each 16-bit sample (equivalent to dividing by 256,
+/// which is correct for linear light values in the range 0–65535).
+/// `components` is the number of samples per pixel.
+///
+/// Returns `None` if `width × height × components` overflows `usize`.
+fn downsample_16bpp(data: &[u8], width: u32, height: u32, components: usize) -> Option<Vec<u8>> {
+    let npixels = (width as usize).checked_mul(height as usize)?;
+    let n_samples = npixels.checked_mul(components)?;
+    let needed = n_samples.checked_mul(2)?;
+    if data.len() < needed {
+        log::debug!(
+            "image: 16bpp data too short ({} bytes, need {needed} for {width}×{height}×{components}×2)",
+            data.len()
+        );
+        return None;
+    }
+    // Each 16-bit sample is big-endian; take the high byte (bytes 0, 2, 4, …).
+    let out: Vec<u8> = data[..needed].chunks_exact(2).map(|pair| pair[0]).collect();
     Some(out)
 }
 
@@ -2308,5 +2468,105 @@ mod tests {
         let doc = lopdf::Document::new();
         let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
         assert!(result.is_none());
+    }
+
+    // ── expand_nbpp (bpc 2 and 4) ─────────────────────────────────────────────
+
+    #[test]
+    fn expand_2bpp_all_levels() {
+        // One byte = 4 samples × 2 bits, MSB first.
+        // 0b11_10_01_00 = 0xE4 → values [3, 2, 1, 0] → scaled [255, 170, 85, 0]
+        let data = [0b1110_0100u8];
+        let out = expand_nbpp::<2>(&data, 4, 1, 1).unwrap();
+        assert_eq!(out, [255, 170, 85, 0]);
+    }
+
+    #[test]
+    fn expand_2bpp_single_pixel() {
+        // Value 0b01 at bits 7-6 of byte → value 1 → 85.
+        let data = [0b0100_0000u8];
+        let out = expand_nbpp::<2>(&data, 1, 1, 1).unwrap();
+        assert_eq!(out, [85]);
+    }
+
+    #[test]
+    fn expand_4bpp_all_levels_two_pixels() {
+        // Byte 0xFA → upper nibble 0xF=15 → 255; lower nibble 0xA=10 → 170.
+        let data = [0xFAu8];
+        let out = expand_nbpp::<4>(&data, 2, 1, 1).unwrap();
+        assert_eq!(out, [255, 170]);
+    }
+
+    #[test]
+    fn expand_4bpp_row_boundary_padding() {
+        // 3 pixels at bpc=4 → 1.5 bytes → padded to 2 bytes per row.
+        // Byte 0: pixels 0=0xA(170), 1=0x5(85). Byte 1: pixel 2=0x0(0), padding nibble ignored.
+        let data = [0xA5u8, 0x00u8];
+        let out = expand_nbpp::<4>(&data, 3, 1, 1).unwrap();
+        assert_eq!(out, [170, 85, 0]);
+    }
+
+    #[test]
+    fn expand_2bpp_multi_row_padding() {
+        // 3 pixels × 2 bpc = 6 bits → padded to 1 byte per row.
+        // Row 0: byte 0b11_10_01_xx → values [3, 2, 1] → [255, 170, 85], 2 pad bits ignored.
+        // Row 1: byte 0b00_01_10_xx → values [0, 1, 2] → [0, 85, 170].
+        let data = [0b1110_0100u8, 0b0001_1000u8];
+        let out = expand_nbpp::<2>(&data, 3, 2, 1).unwrap();
+        assert_eq!(out, [255, 170, 85, 0, 85, 170]);
+    }
+
+    // ── expand_nbpp_indexed (bpc 1, 2, 4 for Indexed images) ─────────────────
+
+    #[test]
+    fn expand_nbpp_indexed_4bpp() {
+        // Byte 0xAF → upper nibble = index 10, lower nibble = index 15.
+        let out = expand_nbpp_indexed(&[0xAFu8], 2, 1, 4).unwrap();
+        assert_eq!(out, [10, 15]);
+    }
+
+    #[test]
+    fn expand_nbpp_indexed_2bpp() {
+        // Byte 0b11_10_01_00 = 0xE4 → indices [3, 2, 1, 0].
+        let out = expand_nbpp_indexed(&[0xE4u8], 4, 1, 2).unwrap();
+        assert_eq!(out, [3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn expand_nbpp_indexed_1bpp() {
+        // Byte 0b1010_0000 → indices [1, 0, 1, 0, 0, 0, 0, 0] (8 pixels).
+        let out = expand_nbpp_indexed(&[0b1010_0000u8], 8, 1, 1).unwrap();
+        assert_eq!(out, [1, 0, 1, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn expand_nbpp_indexed_short_input_zero_pads() {
+        // Empty data → all zeros (palette index 0 = first entry).
+        let out = expand_nbpp_indexed(&[], 4, 1, 2).unwrap();
+        assert_eq!(out, [0, 0, 0, 0]);
+    }
+
+    // ── downsample_16bpp ──────────────────────────────────────────────────────
+
+    #[test]
+    fn downsample_16bpp_takes_high_byte() {
+        // Two 16-bit big-endian samples: 0xABCD → 0xAB, 0x1234 → 0x12.
+        let data = [0xABu8, 0xCD, 0x12, 0x34];
+        let out = downsample_16bpp(&data, 2, 1, 1).unwrap();
+        assert_eq!(out, [0xAB, 0x12]);
+    }
+
+    #[test]
+    fn downsample_16bpp_max_is_255() {
+        // 0xFFFF → high byte 0xFF; 0x0000 → 0x00.
+        let data = [0xFFu8, 0xFF, 0x00, 0x00];
+        let out = downsample_16bpp(&data, 2, 1, 1).unwrap();
+        assert_eq!(out, [0xFF, 0x00]);
+    }
+
+    #[test]
+    fn downsample_16bpp_short_input_returns_none() {
+        // 1 pixel RGB 16bpp needs 6 bytes; 4 bytes is too short.
+        assert!(downsample_16bpp(&[0u8; 4], 1, 1, 3).is_none());
     }
 }
