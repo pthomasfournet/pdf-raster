@@ -1063,9 +1063,51 @@ fn expand_1bpp(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Unpack MSB-first packed sub-byte data (PDF spec §7.4.1) to one byte per sample.
+///
+/// `bits` ∈ {1, 2, 4}; each row is padded to a whole-byte boundary.
+/// `samples_per_row` is the number of samples to extract per row.
+/// Each raw value [0, 2^bits − 1] is transformed by `map` before being pushed.
+///
+/// Returns `None` if `samples_per_row × height` overflows `usize`.
+fn unpack_packed_bits(
+    data: &[u8],
+    bits: u32,
+    samples_per_row: usize,
+    height: u32,
+    map: impl Fn(u8, u8) -> u8, // (raw_value, mask) → output byte
+) -> Option<Vec<u8>> {
+    debug_assert!(bits == 1 || bits == 2 || bits == 4, "unpack_packed_bits: bits must be 1, 2, or 4");
+    let samples_per_byte = (8 / bits) as usize;
+    let row_bytes = samples_per_row.div_ceil(samples_per_byte);
+    let height_usize = usize::try_from(height).ok()?;
+    let total = samples_per_row.checked_mul(height_usize)?;
+    let mut out = Vec::with_capacity(total);
+    let mask: u8 = (1u8 << bits) - 1; // bits ≤ 4, so 1u8 << bits ≤ 16 — no overflow
+
+    for row in 0..height_usize {
+        let row_start = row.checked_mul(row_bytes)?;
+        let row_data = if row_start < data.len() {
+            &data[row_start..data.len().min(row_start + row_bytes)]
+        } else {
+            &[]
+        };
+        // Walk samples MSB-first: within each byte, sample 0 is at the most-significant
+        // `bits` bits. e.g. bits=4, byte=[ab cd]: s=0 → shift=4, s=1 → shift=0.
+        for s in 0..samples_per_row {
+            let byte_idx = s / samples_per_byte;
+            let shift = bits as usize * (samples_per_byte - 1 - (s % samples_per_byte));
+            let byte = row_data.get(byte_idx).copied().unwrap_or(0);
+            let val = (byte >> shift) & mask;
+            out.push(map(val, mask));
+        }
+    }
+    Some(out)
+}
+
 /// Expand N-bits-per-sample packed data (MSB first) to 1 byte per sample, scaled to 0–255.
 ///
-/// `BITS` must be 2 or 4.  Samples are scaled to the full 0–255 range:
+/// `BITS` must be 2 or 4 (enforced at compile time).  Samples are scaled to the full 0–255 range:
 /// - bpc 2: 4 levels → 0x00, 0x55, 0xAA, 0xFF  (value × 85)
 /// - bpc 4: 16 levels → 0x00, 0x11, 0x22, …, 0xFF  (value × 17)
 ///
@@ -1079,41 +1121,20 @@ fn expand_nbpp<const BITS: u32>(
     height: u32,
     components: usize,
 ) -> Option<Vec<u8>> {
-    debug_assert!(BITS == 2 || BITS == 4, "expand_nbpp: BITS must be 2 or 4");
-    let samples_per_row = (width as usize).checked_mul(components)?;
-    let samples_per_byte = (8 / BITS) as usize;
-    let row_bytes = samples_per_row.div_ceil(samples_per_byte);
-    let total = samples_per_row.checked_mul(height as usize)?;
-    let mut out = Vec::with_capacity(total);
-
+    const { assert!(BITS == 2 || BITS == 4, "expand_nbpp: BITS must be 2 or 4") };
+    // BITS ∈ {2, 4}, so 1u8 << BITS ≤ 16 and (1u8 << BITS) - 1 ≤ 15 — no overflow.
+    let max_val = (1u8 << BITS) - 1;
     // Scale factor: maps max sample value to 255.
     // bpc 2: max = 3,  scale = 85  (3 × 85 = 255)
     // bpc 4: max = 15, scale = 17  (15 × 17 = 255)
-    let max_val = (1u8 << BITS) - 1;
     let scale = 255u16 / u16::from(max_val);
-    let mask = max_val;
-
-    for row in 0..height as usize {
-        let row_start = row * row_bytes;
-        let row_data = if row_start < data.len() {
-            &data[row_start..data.len().min(row_start + row_bytes)]
-        } else {
-            &[]
-        };
-        // Walk samples MSB-first within each row.
-        // Within a byte, sample 0 is at the most-significant BITS bits.
-        for s in 0..samples_per_row {
-            let byte_idx = s / samples_per_byte;
-            // Shift so the target sample's bits are in the LSBs.
-            // e.g. BITS=4, byte=[ab cd]: s=0 → shift=4, s=1 → shift=0.
-            let shift = (BITS as usize) * (samples_per_byte - 1 - (s % samples_per_byte));
-            let byte = row_data.get(byte_idx).copied().unwrap_or(0);
-            let val = (byte >> shift) & mask; // u8: mask is u8, result ≤ mask ≤ 15
-            #[expect(clippy::cast_possible_truncation, reason = "val ≤ max_val ≤ 15; val*scale ≤ 255 — fits u8")]
-            out.push((u16::from(val) * scale) as u8);
-        }
-    }
-    Some(out)
+    let width_usize = usize::try_from(width).ok()?;
+    let samples_per_row = width_usize.checked_mul(components)?;
+    unpack_packed_bits(data, BITS, samples_per_row, height, |val, _mask| {
+        // val ≤ max_val ≤ 15; val * scale ≤ 255 — fits u8.
+        #[expect(clippy::cast_possible_truncation, reason = "val ≤ 15; val*scale ≤ 255 — fits u8")]
+        { (u16::from(val) * scale) as u8 }
+    })
 }
 
 /// Expand N-bits-per-index packed Indexed-image stream (MSB first) to 1 byte per index.
@@ -1123,41 +1144,27 @@ fn expand_nbpp<const BITS: u32>(
 ///
 /// Returns `None` if `width × height` overflows `usize`.
 fn expand_nbpp_indexed(data: &[u8], width: u32, height: u32, bits: u32) -> Option<Vec<u8>> {
-    debug_assert!(bits == 1 || bits == 2 || bits == 4);
-    let samples_per_row = width as usize;
-    let samples_per_byte = (8 / bits) as usize;
-    let row_bytes = samples_per_row.div_ceil(samples_per_byte);
-    let total = samples_per_row.checked_mul(height as usize)?;
-    let mut out = Vec::with_capacity(total);
-
-    let mask: u8 = (1u8 << bits) - 1;
-
-    for row in 0..height as usize {
-        let row_start = row * row_bytes;
-        let row_data = if row_start < data.len() {
-            &data[row_start..data.len().min(row_start + row_bytes)]
-        } else {
-            &[]
-        };
-        for s in 0..samples_per_row {
-            let byte_idx = s / samples_per_byte;
-            let shift = bits as usize * (samples_per_byte - 1 - (s % samples_per_byte));
-            let byte = row_data.get(byte_idx).copied().unwrap_or(0);
-            out.push((byte >> shift) & mask); // u8: mask is u8
-        }
-    }
-    Some(out)
+    debug_assert!(bits == 1 || bits == 2 || bits == 4,
+        "expand_nbpp_indexed: bits must be 1, 2, or 4");
+    let width_usize = usize::try_from(width).ok()?;
+    unpack_packed_bits(data, bits, width_usize, height, |val, _mask| val)
 }
 
 /// Downsample 16-bit-per-sample data (big-endian) to 8 bits per sample.
 ///
-/// Takes the high byte of each 16-bit sample (equivalent to dividing by 256,
-/// which is correct for linear light values in the range 0–65535).
+/// Takes the high byte of each 16-bit sample (i.e. `sample >> 8`, discarding
+/// the low byte).  This is a linear truncation: a 16-bit value of 0xFFFF maps to
+/// 0xFF, 0x0100 maps to 0x01, and 0x00FF maps to 0x00.  PDF sample values are
+/// in the range [0, 2^bits − 1]; dividing by 256 preserves the relative scale
+/// for the common case where source data spans the full 0–65535 range.
 /// `components` is the number of samples per pixel.
 ///
-/// Returns `None` if `width × height × components` overflows `usize`.
+/// Returns `None` if `width × height × components` overflows `usize`, or if
+/// `data` is too short for the declared image dimensions.
 fn downsample_16bpp(data: &[u8], width: u32, height: u32, components: usize) -> Option<Vec<u8>> {
-    let npixels = (width as usize).checked_mul(height as usize)?;
+    let width_usize = usize::try_from(width).ok()?;
+    let height_usize = usize::try_from(height).ok()?;
+    let npixels = width_usize.checked_mul(height_usize)?;
     let n_samples = npixels.checked_mul(components)?;
     let needed = n_samples.checked_mul(2)?;
     if data.len() < needed {
