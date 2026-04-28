@@ -80,5 +80,6 @@ Workspace enforces `unsafe_code = "deny"` on all crates except `gpu`. Use `#[exp
 ## Roadmap status
 
 See `ROADMAP.md`. Phases 1–3 complete. Phase 4 (GPU) active:
-- nvJPEG ✓, tile fill ✓, ICC CMYK→RGB ✓, GPU AA kernel ✓
-- **Open:** GPU AA quality validation (pixel-diff vs CPU AA), avx512vnni ICC matrix, threshold tuning
+- nvJPEG ✓, tile fill ✓, ICC CMYK→RGB ✓ (GPU CLUT + AVX-512 CPU matrix), GPU AA kernel ✓
+- Phase 2.5 AVX-512 CPU specialisation ✓ COMPLETE (avx512bw mullo replaces VNNI — VNNI rejected because formula has two runtime operands)
+- **Open:** GPU AA quality validation (pixel-diff vs CPU AA), threshold tuning

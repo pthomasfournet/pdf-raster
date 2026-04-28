@@ -69,7 +69,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 ---
 
-## Phase 2.5 — CPU-side AVX-512 specialisation ✓ COMPLETE (except ICC item)
+## Phase 2.5 — CPU-side AVX-512 specialisation ✓ COMPLETE
 
 Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to. All paths use runtime detection (`is_x86_feature_detected!` / CPUID) with scalar fallbacks; binary runs on non-AVX-512 machines.
 
@@ -81,7 +81,7 @@ Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to. All pat
 
 - [x] **`avx2` blend / glyph unpack** (`simd/blend.rs`, `simd/glyph_unpack.rs`) — `blend_solid_rgb8` and `blend_solid_gray8` use AVX2 for 32-px solid fill chunks; `unpack_mono_row` uses SSE4.1 `_mm_blendv_epi8` for 1-bpp → 8-bpp glyph expansion.
 
-- [ ] **`avx512vnni` ICC colour matrix** — when ICC CMYK→RGB lands (Phase 4 item 4), use `_mm512_dpbusds_epi32` for the 3×4 matrix per pixel. Blocked on Phase 4 ICC work.
+- [x] **`avx512bw` ICC CMYK→RGB matrix** (`gpu/src/lib.rs`, `cmyk_to_rgb_avx512`) — processes 16 pixels per call using `_mm256_mullo_epi16` u16 arithmetic. VNNI (`_mm512_dpbusds_epi32`) was ruled out: it requires one operand to be compile-time constant weights, but the subtractive formula `(255−C)*(255−K)/255` has both operands as runtime pixel data. AoS→SoA via `_mm512_shuffle_epi8` gather + `permute4x64` + `shuffle_epi8` compact; exact `⌊(x+127)/255⌋` divide via `(n+(n>>8)+1)>>8`. Scalar fallback for tail and non-AVX-512 targets.
 
 - [ ] **`cat_l3` / `cdp_l3` cache partitioning** — deployment note: Linux `resctrl` to reserve a fixed L3 partition for edge tables in batch/server context.
 
@@ -155,12 +155,16 @@ CUB radix sort was evaluated and rejected for this use case: typical PDF pages h
 - [x] `GpuCtx::tile_fill()` Rust API: uploads records/starts/counts via `stream.clone_htod`, launches kernel, synchronises, copies coverage bytes back; threshold `GPU_TILE_FILL_THRESHOLD = 65536 px`
 - [x] Wire into `PageRenderer` fill dispatch: `try_gpu_tile_fill` (area ≥ `GPU_TILE_FILL_THRESHOLD`) tried first, then `try_gpu_aa_fill` (area ≥ `GPU_AA_FILL_THRESHOLD`), then CPU scanline AA; shared `gpu_fill_segs` + `gpu_coverage_to_bitmap` helpers eliminate duplication
 
-**4. ICC colour transforms (cuBLAS / custom kernel)**
+**4. ICC colour transforms** ✓ COMPLETE (CPU AVX-512 + GPU CLUT kernel)
 
-ICC profile evaluation is a per-pixel matrix multiply. For DeviceCMYK → DeviceRGB conversion on large images, a CUDA kernel with cuBLAS GEMM can saturate memory bandwidth. Medium priority — only visible on CMYK-heavy documents.
+DeviceCMYK → DeviceRGB via two paths depending on whether a full ICC CLUT is available:
 
-- [ ] Kernel: 4→3 channel matrix multiply per pixel, fused with image decode
-- [ ] Unblocked by: Phase 1 colour spaces (complete)
+- [x] **CPU matrix path** (`icc_cmyk_to_rgb_cpu`, clut=None): subtractive formula `(255−ch)*(255−K)/255` vectorised with `avx512bw` + `avx2` — 16 pixels/call via `_mm256_mullo_epi16`. VNNI was evaluated and rejected: `_mm512_dpbusds_epi32` requires compile-time constant weights; both operands are runtime pixel data here. Exact `⌊(x+127)/255⌋` divide matches scalar to the bit. Scalar fallback for non-AVX-512 targets and tail pixels.
+- [x] **GPU CLUT kernel** (`kernels/icc_clut.cu`): 4D quadrilinear interpolation over a baked `grid_n⁴ × 3` byte table; one thread per pixel; threshold `GPU_ICC_CLUT_THRESHOLD = 500 000 px`
+- [x] `bake_cmyk_clut` (`pdf_interp/src/resources/icc.rs`): bakes a Little CMS ICC profile into a compact `u8` CLUT for upload; `BakeError` with `InvalidGridSize` and `Cms` variants; `DEFAULT_GRID_N = 17`
+- [x] Rounding bias fix in CUDA kernel: `((255u - c) * inv_k + 127u) / 255u` (was missing the `+127` bias)
+- [x] Parity tests: `icc_cmyk_matrix_avx_vs_scalar` asserts AVX-512 and scalar agree byte-for-byte across 16 representative pixels including axis extremes and mid-range sweep
+- [ ] nvJPEG2000 for JPXDecode — lower priority, tracked under item 1
 
 **5. OptiX BVH for complex paths — low priority, evaluate later**
 
@@ -173,7 +177,7 @@ RT cores on Blackwell provide hardware BVH traversal. For pages with thousands o
 | nvJPEG image decoding | **Highest** — scan-heavy corpora | Phase 1 image pipeline ✓ |
 | GPU supersampled AA (warp ballot) | High — quality + speed | GPU segment upload |
 | Tile-parallel fill rasterisation | High — sparse/complex paths | GPU segment upload |
-| ICC colour transforms | Medium — CMYK docs | Phase 1 colour spaces ✓ |
+| ICC colour transforms | Medium — CMYK docs | Phase 1 colour spaces ✓ | ✓ COMPLETE |
 | OptiX BVH winding test | Low — only extreme geometry | Tile rasteriser |
 | Blend / composite | Low — already fast on CPU | Phase 2 perf work ✓ |
 
