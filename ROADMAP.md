@@ -104,7 +104,7 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 
 ### Still open / lower priority
 
-- [ ] Function-based shading (Type 1) — stub, logged + skipped
+- [x] Function-based shading (Type 1) — pre-sampled 64×64 grid; bilinear interpolation in fill_span; BBox intersection; full CTM inversion
 - [ ] nvJPEG2000 for JPXDecode — deferred, low priority
 - [ ] OptiX BVH (evaluate only if profiling shows complex paths as bottleneck)
 
