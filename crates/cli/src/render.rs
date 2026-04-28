@@ -5,7 +5,8 @@ use std::io::{BufWriter, Write as _};
 #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
 use std::sync::Arc;
 
-use encode::{EncodeError, write_png, write_ppm};
+use color::{Gray8, Rgb8};
+use encode::{EncodeError, write_pbm, write_pgm, write_png, write_ppm};
 use raster::Bitmap;
 
 use crate::args::{Args, OutputFormat};
@@ -110,8 +111,8 @@ impl From<EncodeError> for RenderError {
 /// When compiled with `gpu-aa`, `nvjpeg`, or `gpu-icc` features, `gpu_ctx`
 /// is passed to the renderer.  `None` is safe — it reverts to the CPU path.
 ///
-/// `--gray`/`--mono` are not yet implemented by the native renderer; a
-/// warning is printed at startup and the bitmap is always RGB.
+/// `--gray` converts the RGB bitmap to grayscale (BT.709) and writes PGM/gray PNG.
+/// `--mono` additionally thresholds to 1-bit and writes PBM/gray PNG.
 pub fn render_page_native(
     doc: &lopdf::Document,
     page_num: u32,
@@ -171,7 +172,7 @@ pub fn render_page_native(
     renderer.set_gpu_ctx(gpu_ctx.map(Arc::clone));
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
-    let bitmap: Bitmap<color::Rgb8> = renderer.finish();
+    let rgb: Bitmap<Rgb8> = renderer.finish();
 
     #[expect(
         clippy::cast_possible_wrap,
@@ -180,14 +181,71 @@ pub fn render_page_native(
     let out_path = output_path(args, page_num as i32, total_pages as i32, format);
     let mut out = BufWriter::new(File::create(&out_path)?);
 
-    match format {
-        OutputFormat::Ppm => write_ppm(&bitmap, &mut out)?,
-        OutputFormat::Png => write_png(&bitmap, &mut out)?,
-        OutputFormat::Jpeg | OutputFormat::Tiff => {
-            unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+    if args.mono {
+        let gray = rgb_to_gray(&rgb);
+        let mono = gray_to_mono(&gray);
+        match format {
+            OutputFormat::Ppm => write_pbm::<Gray8, _>(&mono, &mut out)?,
+            OutputFormat::Png => write_png::<Gray8, _>(&mono, &mut out)?,
+            OutputFormat::Jpeg | OutputFormat::Tiff => {
+                unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+            }
+        }
+    } else if args.gray {
+        let gray = rgb_to_gray(&rgb);
+        match format {
+            OutputFormat::Ppm => write_pgm::<Gray8, _>(&gray, &mut out)?,
+            OutputFormat::Png => write_png::<Gray8, _>(&gray, &mut out)?,
+            OutputFormat::Jpeg | OutputFormat::Tiff => {
+                unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+            }
+        }
+    } else {
+        match format {
+            OutputFormat::Ppm => write_ppm(&rgb, &mut out)?,
+            OutputFormat::Png => write_png(&rgb, &mut out)?,
+            OutputFormat::Jpeg | OutputFormat::Tiff => {
+                unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+            }
         }
     }
 
     out.flush()?;
     Ok(())
+}
+
+/// Convert an RGB bitmap to grayscale using BT.709 luminance coefficients.
+fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
+    let mut dst: Bitmap<Gray8> = Bitmap::new(src.width, src.height, 1, false);
+    for y in 0..src.height {
+        let src_row = src.row_bytes(y);
+        let dst_row = dst.row_bytes_mut(y);
+        for x in 0..src.width as usize {
+            // BT.709: Y = 0.2126·R + 0.7152·G + 0.0722·B, rounded to nearest.
+            // Integer approximation: (2126·R + 7152·G + 722·B + 5000) / 10000.
+            // Coefficients sum to 10000; max numerator = 10000·255 + 5000 = 2 555 000 < u32::MAX.
+            let r = u32::from(src_row[x * 3]);
+            let g = u32::from(src_row[x * 3 + 1]);
+            let b = u32::from(src_row[x * 3 + 2]);
+            #[expect(clippy::cast_possible_truncation, reason = "result ≤ 255 by BT.709 coefficient sum")]
+            { dst_row[x] = ((2126 * r + 7152 * g + 722 * b + 5000) / 10000) as u8; }
+        }
+    }
+    dst
+}
+
+/// Threshold a grayscale bitmap to monochrome: < 128 → black (255), ≥ 128 → white (0).
+///
+/// Matches pdftoppm's `--mono` convention: black ink on white paper.
+fn gray_to_mono(src: &Bitmap<Gray8>) -> Bitmap<Gray8> {
+    let mut dst: Bitmap<Gray8> = Bitmap::new(src.width, src.height, 1, false);
+    for y in 0..src.height {
+        let src_row = src.row_bytes(y);
+        let dst_row = dst.row_bytes_mut(y);
+        for x in 0..src.width as usize {
+            // < 128 is dark → black (255); ≥ 128 is light → white (0).
+            dst_row[x] = if src_row[x] < 128 { 255 } else { 0 };
+        }
+    }
+    dst
 }

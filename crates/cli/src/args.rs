@@ -223,13 +223,21 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// File extension for this format.
-    pub const fn extension(self) -> &'static str {
-        match self {
-            Self::Ppm => "ppm",
-            Self::Png => "png",
-            Self::Jpeg => "jpg",
-            Self::Tiff => "tif",
+    /// File extension for this format, taking `--gray` / `--mono` into account.
+    ///
+    /// - PPM + mono → `.pbm` (P4 binary Netpbm, 1-bit)
+    /// - PPM + gray → `.pgm` (P5 grayscale Netpbm, 8-bit)
+    /// - PNG + gray/mono → `.png` (grayscale PNG)
+    /// - All other combinations use the format's natural extension.
+    pub const fn extension_with_mode(self, gray: bool, mono: bool) -> &'static str {
+        match (self, mono, gray) {
+            (Self::Ppm, true, _) => "pbm",
+            (Self::Ppm, false, true) => "pgm",
+            (Self::Ppm, false, false) => "ppm",
+            (Self::Png, _, _) => "png",
+            (Self::Jpeg, _, _) => "jpg",
+            (Self::Tiff, _, _) => "tif",
         }
     }
+
 }

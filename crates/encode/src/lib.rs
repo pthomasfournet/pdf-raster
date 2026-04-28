@@ -1,4 +1,4 @@
-//! Image encoding — write [`Bitmap<P>`] to PPM, PGM, and PNG.
+//! Image encoding — write [`Bitmap<P>`] to PPM, PGM, PBM, and PNG.
 //!
 //! # Supported formats
 //!
@@ -6,6 +6,7 @@
 //! |----------|--------|--------------------|
 //! | [`write_ppm`] | Netpbm P6 binary | `Rgb8`, `Bgr8`, `Rgba8` (`Xbgr8`), `Cmyk8`, `DeviceN8` |
 //! | [`write_pgm`] | Netpbm P5 binary | `Gray8` |
+//! | [`write_pbm`] | Netpbm P4 binary | `Gray8` (0 = white, non-zero = black) |
 //! | [`write_png`] | PNG | `Rgb8`, `Gray8`, `Rgba8` |
 //!
 //! All functions consume the output sink (`W: Write`).  Wrap in
@@ -18,10 +19,12 @@
 //! `R = 255 − C − K` (matching poppler's `pdftoppm` output).
 //! For ICC-accurate colour, convert to `Rgb8` before encoding.
 
+pub mod pbm;
 pub mod pgm;
 pub mod png;
 pub mod ppm;
 
+pub use pbm::write_pbm;
 pub use pgm::write_pgm;
 pub use png::write_png;
 pub use ppm::write_ppm;

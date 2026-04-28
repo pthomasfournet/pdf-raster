@@ -24,13 +24,6 @@ fn main() {
         .build()
         .expect("failed to build thread pool");
 
-    if args.gray || args.mono {
-        eprintln!(
-            "pdf-raster: warning: --gray/--mono are not yet supported by the native \
-             renderer and will be ignored"
-        );
-    }
-
     let doc = pdf_interp::open(&args.input).unwrap_or_else(|e| {
         eprintln!("pdf-raster: failed to open PDF: {e}");
         std::process::exit(1);

@@ -13,7 +13,7 @@ pub fn output_path(args: &Args, page_num: i32, total_pages: i32, format: OutputF
         .unwrap_or_else(|| digit_width(total_pages));
 
     let sep = args.separator;
-    let ext = format.extension();
+    let ext = format.extension_with_mode(args.gray, args.mono);
     format!("{}{sep}{page_num:0digits$}.{ext}", args.output_prefix)
 }
 
