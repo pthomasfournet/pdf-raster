@@ -31,6 +31,13 @@ pub enum RenderError {
         /// The output format requested by the user.
         output: OutputFormat,
     },
+    /// The page `MediaBox` resolved to zero width or height — malformed document.
+    PageDegenerate {
+        /// Width in pixels (0 when degenerate).
+        width: u32,
+        /// Height in pixels (0 when degenerate).
+        height: u32,
+    },
     /// The computed pixel dimensions exceed the safety limit.
     PageTooLarge {
         /// Width in pixels.
@@ -52,6 +59,11 @@ impl std::fmt::Display for RenderError {
                     "output format {output:?} is not yet supported by the native renderer"
                 )
             }
+            Self::PageDegenerate { width, height } => write!(
+                f,
+                "page has degenerate pixel dimensions {width}×{height} — \
+                 the PDF MediaBox may be malformed"
+            ),
             Self::PageTooLarge { width, height } => write!(
                 f,
                 "page pixel dimensions {width}×{height} exceed the safety limit \
@@ -67,7 +79,9 @@ impl std::error::Error for RenderError {
             Self::Io(e) => Some(e),
             Self::Native(e) => Some(e),
             Self::Encode(e) => Some(e),
-            _ => None,
+            Self::UnsupportedFormatCombination { .. }
+            | Self::PageDegenerate { .. }
+            | Self::PageTooLarge { .. } => None,
         }
     }
 }
@@ -92,6 +106,9 @@ impl From<EncodeError> for RenderError {
 ///
 /// `page_num` is 1-based.  PPM and PNG output are supported; JPEG and TIFF
 /// are rejected with [`RenderError::UnsupportedFormatCombination`].
+///
+/// When compiled with `gpu-aa`, `nvjpeg`, or `gpu-icc` features, `gpu_ctx`
+/// is passed to the renderer.  `None` is safe — it reverts to the CPU path.
 ///
 /// `--gray`/`--mono` are not yet implemented by the native renderer; a
 /// warning is printed at startup and the bitmap is always RGB.
@@ -127,7 +144,7 @@ pub fn render_page_native(
     );
 
     if w_px == 0 || h_px == 0 {
-        return Err(RenderError::PageTooLarge {
+        return Err(RenderError::PageDegenerate {
             width: w_px,
             height: h_px,
         });

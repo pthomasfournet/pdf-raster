@@ -18,19 +18,6 @@ fn main() {
 
     let args = Args::parse();
 
-    // Initialise the GPU context once; each page render receives a clone of the
-    // Arc so they can issue independent streams without re-init overhead.
-    // A warning (not a hard error) is emitted when the feature is compiled in but
-    // the GPU is unavailable — the CPU fallback path activates automatically.
-    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
-    let gpu_ctx: Option<Arc<gpu::GpuCtx>> = match gpu::GpuCtx::init() {
-        Ok(ctx) => Some(Arc::new(ctx)),
-        Err(e) => {
-            eprintln!("pdf-raster: GPU unavailable ({e}); falling back to CPU");
-            None
-        }
-    };
-
     // Build rayon thread pool.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)
@@ -61,6 +48,23 @@ fn main() {
 
     let pages = build_page_list(total, &args);
 
+    // Initialise the GPU context after confirming the document is valid and
+    // there are pages to render.  Init failure is a warning, not a hard error —
+    // the CPU fallback path activates automatically.  A driver-version mismatch
+    // after an upgrade will surface here; run `nvidia-smi` to confirm the
+    // driver is loaded correctly.
+    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+    let gpu_ctx: Option<Arc<gpu::GpuCtx>> = match gpu::GpuCtx::init() {
+        Ok(ctx) => Some(Arc::new(ctx)),
+        Err(e) => {
+            eprintln!(
+                "pdf-raster: GPU initialisation failed ({e}); falling back to CPU. \
+                 Run `nvidia-smi` to verify the driver is loaded."
+            );
+            None
+        }
+    };
+
     let n_pages = pages.len();
     let done = AtomicU32::new(0);
     let start = Instant::now();
@@ -80,10 +84,14 @@ fn main() {
                     reason = "page_num ≥ 1, enforced by build_page_list"
                 )]
                 let page_u32 = page_num as u32;
-                #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
-                let result = render::render_page_native(&doc, page_u32, total_u32, &args, gpu_ctx.as_ref());
-                #[cfg(not(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc")))]
-                let result = render::render_page_native(&doc, page_u32, total_u32, &args);
+                let result = render::render_page_native(
+                    &doc,
+                    page_u32,
+                    total_u32,
+                    &args,
+                    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+                    gpu_ctx.as_ref(),
+                );
                 report_progress(&args, &done, n_pages, &start, page_num);
                 result.err().map(|e| (page_num, e))
             })
