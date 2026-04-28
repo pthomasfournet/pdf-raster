@@ -85,7 +85,11 @@ mod tests {
         let bmp = make_gray_bitmap(8, 1);
         let mut out = Vec::new();
         write_pbm::<Gray8, _>(&bmp, &mut out).unwrap();
-        assert!(out.starts_with(b"P4\n8 1\n"), "header: {:?}", &out[..12.min(out.len())]);
+        assert!(
+            out.starts_with(b"P4\n8 1\n"),
+            "header: {:?}",
+            &out[..12.min(out.len())]
+        );
     }
 
     #[test]
@@ -129,7 +133,11 @@ mod tests {
         let header_len = b"P4\n3 1\n".len();
         // 3 black pixels → top 3 bits set: 1110_0000 = 0xE0
         assert_eq!(out[header_len], 0xE0, "3 black pixels must pack to 0xE0");
-        assert_eq!(out.len(), header_len + 1, "3-pixel row occupies 1 packed byte");
+        assert_eq!(
+            out.len(),
+            header_len + 1,
+            "3-pixel row occupies 1 packed byte"
+        );
     }
 
     #[test]

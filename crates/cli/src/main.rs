@@ -2,9 +2,9 @@ mod args;
 mod naming;
 mod render;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use clap::Parser;

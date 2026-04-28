@@ -1,7 +1,10 @@
 //! GPU dispatch threshold calibration.
 // All timing values are display-only; f64 precision loss on u64 nanosecond
 // counts (ratios, formatted durations) is intentional and inconsequential.
-#![expect(clippy::cast_precision_loss, reason = "display-only timing ratios and ns→µs/ms conversions")]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "display-only timing ratios and ns→µs/ms conversions"
+)]
 //!
 //! Measures the breakeven pixel count where GPU dispatch becomes faster than
 //! the CPU fallback for each kernel, accounting for actual `PCIe` 5.0 H2D/D2H
@@ -39,7 +42,10 @@ struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { iters: 20, warmup: 5 }
+        Self {
+            iters: 20,
+            warmup: 5,
+        }
     }
 }
 
@@ -81,10 +87,7 @@ fn dims(n: usize) -> (u32, u32) {
         reason = "n ≤ 4_194_304 (22-bit); exact in f64 (52-bit mantissa); sqrt ≤ 2049 — fits u32"
     )]
     let w = (n as f64).sqrt().ceil() as u32;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "n ≤ 4_194_304 — fits u32"
-    )]
+    #[expect(clippy::cast_possible_truncation, reason = "n ≤ 4_194_304 — fits u32")]
     let h = (n as u32).div_ceil(w);
     (w, h)
 }
@@ -102,7 +105,10 @@ fn time_ns<F: FnMut()>(mut f: F, warmup: u32, iters: u32) -> u64 {
         f();
     }
     // as_nanos() → u128; truncation to u64 is safe: u64::MAX ns ≈ 584 years.
-    #[expect(clippy::cast_possible_truncation, reason = "u64::MAX ns ≈ 584 years; no benchmark runs that long")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "u64::MAX ns ≈ 584 years; no benchmark runs that long"
+    )]
     let samples: Vec<u64> = (0..iters)
         .map(|_| {
             let t = Instant::now();
@@ -119,14 +125,14 @@ fn time_ns<F: FnMut()>(mut f: F, warmup: u32, iters: u32) -> u64 {
 /// starting at (0,0), representing the 4 edges in CCW order.
 fn square_segs(w: u32, h: u32) -> Vec<f32> {
     // w/h ≤ 2049 px; f32 has 23-bit mantissa (exact for integers ≤ 2^24).
-    #[expect(clippy::cast_precision_loss, reason = "w/h ≤ 2049; exact in f32 (mantissa covers integers to 2^24)")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "w/h ≤ 2049; exact in f32 (mantissa covers integers to 2^24)"
+    )]
     let (w, h) = (w as f32, h as f32);
     // bottom, right, top, left — 4 segments
     vec![
-        0.0, 0.0, w, 0.0,
-        w,   0.0, w, h,
-        w,   h,   0.0, h,
-        0.0, h,   0.0, 0.0,
+        0.0, 0.0, w, 0.0, w, 0.0, w, h, w, h, 0.0, h, 0.0, h, 0.0, 0.0,
     ]
 }
 
@@ -134,7 +140,10 @@ fn square_segs(w: u32, h: u32) -> Vec<f32> {
 
 fn bench_aa_fill(ctx: &GpuCtx, cfg: &Config) {
     println!("\n══ aa_fill: GPU warp-ballot vs CPU 64-sample ══");
-    println!("{:>10}  {:>12}  {:>12}  {:>8}  winner", "pixels", "cpu_ns", "gpu_ns", "ratio");
+    println!(
+        "{:>10}  {:>12}  {:>12}  {:>8}  winner",
+        "pixels", "cpu_ns", "gpu_ns", "ratio"
+    );
     println!("{}", "─".repeat(60));
 
     let mut crossover: Option<usize> = None;
@@ -144,20 +153,32 @@ fn bench_aa_fill(ctx: &GpuCtx, cfg: &Config) {
         let segs = square_segs(w, h);
 
         let cpu_ns = time_ns(
-            || { let _ = aa_fill_cpu(&segs, 0.0, 0.0, w, h, false); },
-            cfg.warmup, cfg.iters,
+            || {
+                let _ = aa_fill_cpu(&segs, 0.0, 0.0, w, h, false);
+            },
+            cfg.warmup,
+            cfg.iters,
         );
 
         let gpu_ns = time_ns(
-            || { let _ = gpu_unwrap(ctx.aa_fill_gpu(&segs, 0.0, 0.0, w, h, false), "aa_fill_gpu"); },
-            cfg.warmup, cfg.iters,
+            || {
+                let _ = gpu_unwrap(ctx.aa_fill_gpu(&segs, 0.0, 0.0, w, h, false), "aa_fill_gpu");
+            },
+            cfg.warmup,
+            cfg.iters,
         );
 
         let ratio = cpu_ns as f64 / gpu_ns as f64;
         let winner = if gpu_ns < cpu_ns { "GPU ✓" } else { "CPU" };
 
-        println!("{:>10}  {:>12}  {:>12}  {:>7.2}x  {}",
-            n, fmt_ns(cpu_ns), fmt_ns(gpu_ns), ratio, winner);
+        println!(
+            "{:>10}  {:>12}  {:>12}  {:>7.2}x  {}",
+            n,
+            fmt_ns(cpu_ns),
+            fmt_ns(gpu_ns),
+            ratio,
+            winner
+        );
 
         if crossover.is_none() && gpu_ns < cpu_ns {
             crossover = Some(n);
@@ -166,8 +187,11 @@ fn bench_aa_fill(ctx: &GpuCtx, cfg: &Config) {
 
     println!();
     match crossover {
-        Some(px) => println!("  → Recommended GPU_AA_FILL_THRESHOLD: {px} px  (current: {})", gpu::GPU_AA_FILL_THRESHOLD),
-        None      => println!("  → GPU never faster in this sweep — keep CPU or raise threshold"),
+        Some(px) => println!(
+            "  → Recommended GPU_AA_FILL_THRESHOLD: {px} px  (current: {})",
+            gpu::GPU_AA_FILL_THRESHOLD
+        ),
+        None => println!("  → GPU never faster in this sweep — keep CPU or raise threshold"),
     }
 }
 
@@ -175,7 +199,10 @@ fn bench_aa_fill(ctx: &GpuCtx, cfg: &Config) {
 
 fn bench_tile_fill(ctx: &GpuCtx, cfg: &Config) {
     println!("\n══ tile_fill: GPU analytical vs aa_fill_cpu ══");
-    println!("{:>10}  {:>12}  {:>12}  {:>8}  winner", "pixels", "aa_cpu_ns", "tile_gpu_ns", "ratio");
+    println!(
+        "{:>10}  {:>12}  {:>12}  {:>8}  winner",
+        "pixels", "aa_cpu_ns", "tile_gpu_ns", "ratio"
+    );
     println!("{}", "─".repeat(60));
 
     let mut crossover: Option<usize> = None;
@@ -186,25 +213,37 @@ fn bench_tile_fill(ctx: &GpuCtx, cfg: &Config) {
 
         // CPU baseline: aa_fill_cpu (what the dispatch falls back to)
         let cpu_ns = time_ns(
-            || { let _ = aa_fill_cpu(&segs, 0.0, 0.0, w, h, false); },
-            cfg.warmup, cfg.iters,
+            || {
+                let _ = aa_fill_cpu(&segs, 0.0, 0.0, w, h, false);
+            },
+            cfg.warmup,
+            cfg.iters,
         );
 
         // GPU: build tile records (CPU sort) + tile_fill kernel
         let gpu_ns = time_ns(
             || {
-                let (records, starts, counts, grid_w) =
-                    build_tile_records(&segs, 0.0, 0.0, w, h);
-                let _ = gpu_unwrap(ctx.tile_fill(&records, &starts, &counts, grid_w, w, h, false), "tile_fill");
+                let (records, starts, counts, grid_w) = build_tile_records(&segs, 0.0, 0.0, w, h);
+                let _ = gpu_unwrap(
+                    ctx.tile_fill(&records, &starts, &counts, grid_w, w, h, false),
+                    "tile_fill",
+                );
             },
-            cfg.warmup, cfg.iters,
+            cfg.warmup,
+            cfg.iters,
         );
 
         let ratio = cpu_ns as f64 / gpu_ns as f64;
         let winner = if gpu_ns < cpu_ns { "GPU ✓" } else { "CPU" };
 
-        println!("{:>10}  {:>12}  {:>12}  {:>7.2}x  {}",
-            n, fmt_ns(cpu_ns), fmt_ns(gpu_ns), ratio, winner);
+        println!(
+            "{:>10}  {:>12}  {:>12}  {:>7.2}x  {}",
+            n,
+            fmt_ns(cpu_ns),
+            fmt_ns(gpu_ns),
+            ratio,
+            winner
+        );
 
         if crossover.is_none() && gpu_ns < cpu_ns {
             crossover = Some(n);
@@ -213,8 +252,11 @@ fn bench_tile_fill(ctx: &GpuCtx, cfg: &Config) {
 
     println!();
     match crossover {
-        Some(px) => println!("  → Recommended GPU_TILE_FILL_THRESHOLD: {px} px  (current: {})", gpu::GPU_TILE_FILL_THRESHOLD),
-        None      => println!("  → GPU never faster in this sweep — keep CPU or raise threshold"),
+        Some(px) => println!(
+            "  → Recommended GPU_TILE_FILL_THRESHOLD: {px} px  (current: {})",
+            gpu::GPU_TILE_FILL_THRESHOLD
+        ),
+        None => println!("  → GPU never faster in this sweep — keep CPU or raise threshold"),
     }
 }
 
@@ -226,7 +268,10 @@ fn bench_icc_cmyk(ctx: &GpuCtx, cfg: &Config) {
     // for clut=None regardless of pixel count, so the crossover below is informational
     // only.  To calibrate GPU_ICC_CLUT_THRESHOLD, re-run with a real CLUT workload.
     println!("\n══ icc_cmyk: GPU matrix kernel vs CPU AVX-512 (matrix path, informational) ══");
-    println!("{:>10}  {:>12}  {:>12}  {:>8}  winner", "pixels", "cpu_ns", "gpu_ns", "ratio");
+    println!(
+        "{:>10}  {:>12}  {:>12}  {:>8}  winner",
+        "pixels", "cpu_ns", "gpu_ns", "ratio"
+    );
     println!("{}", "─".repeat(60));
 
     let mut crossover: Option<usize> = None;
@@ -235,27 +280,37 @@ fn bench_icc_cmyk(ctx: &GpuCtx, cfg: &Config) {
         // CMYK input: alternating test values covering full range
         // i % 256 is in 0..=255 — truncation to u8 is exact by construction.
         #[expect(clippy::cast_possible_truncation, reason = "i % 256 is in 0..=255")]
-        let cmyk: Vec<u8> = (0..n * 4)
-            .map(|i| (i % 256) as u8)
-            .collect();
+        let cmyk: Vec<u8> = (0..n * 4).map(|i| (i % 256) as u8).collect();
 
         let cpu_ns = time_ns(
-            || { let _ = icc_cmyk_to_rgb_cpu(&cmyk, None); },
-            cfg.warmup, cfg.iters,
+            || {
+                let _ = icc_cmyk_to_rgb_cpu(&cmyk, None);
+            },
+            cfg.warmup,
+            cfg.iters,
         );
 
         // Use the unconditional GPU path to measure actual dispatch cost at
         // all sizes, not just those above the current threshold.
         let gpu_ns = time_ns(
-            || { let _ = gpu_unwrap(ctx.icc_cmyk_to_rgb_gpu(&cmyk, None), "icc_cmyk_to_rgb_gpu"); },
-            cfg.warmup, cfg.iters,
+            || {
+                let _ = gpu_unwrap(ctx.icc_cmyk_to_rgb_gpu(&cmyk, None), "icc_cmyk_to_rgb_gpu");
+            },
+            cfg.warmup,
+            cfg.iters,
         );
 
         let ratio = cpu_ns as f64 / gpu_ns as f64;
         let winner = if gpu_ns < cpu_ns { "GPU ✓" } else { "CPU" };
 
-        println!("{:>10}  {:>12}  {:>12}  {:>7.2}x  {}",
-            n, fmt_ns(cpu_ns), fmt_ns(gpu_ns), ratio, winner);
+        println!(
+            "{:>10}  {:>12}  {:>12}  {:>7.2}x  {}",
+            n,
+            fmt_ns(cpu_ns),
+            fmt_ns(gpu_ns),
+            ratio,
+            winner
+        );
 
         if crossover.is_none() && gpu_ns < cpu_ns {
             crossover = Some(n);

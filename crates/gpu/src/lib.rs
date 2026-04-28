@@ -112,9 +112,15 @@ unsafe impl DeviceRepr for TileRecord {}
 /// f32 aliases for tile dimensions — values are 16.0, exact in f32.
 /// Avoids repeated `TILE_W/H as f32` casts inside `build_tile_records` that
 /// would fire `cast_precision_loss` despite being trivially safe.
-#[expect(clippy::cast_precision_loss, reason = "TILE_W/H = 16, exact in f32 (24-bit mantissa)")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "TILE_W/H = 16, exact in f32 (24-bit mantissa)"
+)]
 const TILE_W_F: f32 = TILE_W as f32;
-#[expect(clippy::cast_precision_loss, reason = "TILE_W/H = 16, exact in f32 (24-bit mantissa)")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "TILE_W/H = 16, exact in f32 (24-bit mantissa)"
+)]
 const TILE_H_F: f32 = TILE_H as f32;
 
 /// Build a sorted list of [`TileRecord`]s from a flat segment list, plus the
@@ -184,7 +190,10 @@ pub fn build_tile_records(
         let ey0 = sy0.max(0.0);
         // height ≤ u32::MAX px; page heights are always ≤ 32768 at supported DPIs —
         // exact in f32 (which has a 24-bit mantissa, covering integers to 16M).
-        #[expect(clippy::cast_precision_loss, reason = "height ≤ 32768 px in practice; exact in f32 (24-bit mantissa)")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "height ≤ 32768 px in practice; exact in f32 (24-bit mantissa)"
+        )]
         let ey1 = sy1.min(height as f32);
         if ey0 >= ey1 {
             continue;
@@ -194,14 +203,25 @@ pub fn build_tile_records(
         // Subtract a small epsilon from ey1 so a segment ending exactly on a
         // tile boundary doesn't bleed into the next tile row.
         // ey0/ey1 are non-negative and floored ≤ height/TILE_H_F ≤ grid_h ≤ 0xFFFF — fits u32.
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "floor(non-negative / TILE_H_F) is ≥ 0 and ≤ grid_h ≤ 0xFFFF — fits u32")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "floor(non-negative / TILE_H_F) is ≥ 0 and ≤ grid_h ≤ 0xFFFF — fits u32"
+        )]
         let ty0 = (ey0 / TILE_H_F).floor() as u32;
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "floor(non-negative / TILE_H_F) is ≥ 0 and ≤ grid_h ≤ 0xFFFF — fits u32")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "floor(non-negative / TILE_H_F) is ≥ 0 and ≤ grid_h ≤ 0xFFFF — fits u32"
+        )]
         let ty1 = ((ey1 - 1e-6).max(0.0) / TILE_H_F).floor() as u32;
 
         for ty in ty0..=ty1.min(grid_h - 1) {
             // ty ≤ 0xFFFF, TILE_H_F = 16.0; product ≤ ~1M — exact in f32 (24-bit mantissa).
-            #[expect(clippy::cast_precision_loss, reason = "ty * TILE_H ≤ 0xFFFF*16 ≈ 1M; exact in f32")]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "ty * TILE_H ≤ 0xFFFF*16 ≈ 1M; exact in f32"
+            )]
             let tile_top = (ty * TILE_H) as f32;
             let tile_bot = tile_top + TILE_H_F;
 
@@ -225,9 +245,15 @@ pub fn build_tile_records(
             // clamp to [0, grid_w-1].  A negative tx1 means the segment is
             // entirely left of the raster — skip the whole tile row.
             // xl/xr are f32 page coordinates; floor→i32 is safe for any realistic page width.
-            #[expect(clippy::cast_possible_truncation, reason = "floor(f32) for page-coordinate x; realistic page widths fit comfortably in i32")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "floor(f32) for page-coordinate x; realistic page widths fit comfortably in i32"
+            )]
             let tx0_i = (xl / TILE_W_F).floor() as i32;
-            #[expect(clippy::cast_possible_truncation, reason = "floor(f32) for page-coordinate x; realistic page widths fit comfortably in i32")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "floor(f32) for page-coordinate x; realistic page widths fit comfortably in i32"
+            )]
             let tx1_i = (xr / TILE_W_F).floor() as i32;
             if tx1_i < 0 {
                 continue;
@@ -236,12 +262,18 @@ pub fn build_tile_records(
             #[expect(clippy::cast_sign_loss, reason = "tx0_i.max(0) ≥ 0 by construction")]
             let tx0 = tx0_i.max(0) as u32;
             // tx1_i ≥ 0 checked above (continue if < 0) — safe to cast to u32.
-            #[expect(clippy::cast_sign_loss, reason = "tx1_i ≥ 0 verified by the guard above")]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "tx1_i ≥ 0 verified by the guard above"
+            )]
             let tx1 = (tx1_i as u32).min(grid_w - 1);
 
             for tx in tx0..=tx1 {
                 // tx ≤ grid_w-1 ≤ 0xFFFE, TILE_W_F = 16.0; product ≤ ~1M — exact in f32.
-                #[expect(clippy::cast_precision_loss, reason = "tx * TILE_W ≤ 0xFFFE*16 ≈ 1M; exact in f32")]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "tx * TILE_W ≤ 0xFFFE*16 ≈ 1M; exact in f32"
+                )]
                 records.push(TileRecord {
                     key: (ty << 16) | tx,
                     // tile-local x: subtract this tile column's left edge.
@@ -525,7 +557,10 @@ impl GpuCtx {
     /// # Panics
     ///
     /// Panics if `tile_starts.len() != tile_counts.len()`.
-    #[expect(clippy::too_many_arguments, reason = "all 7 args are required: records + index arrays + grid/pixel dims + fill rule; no grouping is natural here")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all 7 args are required: records + index arrays + grid/pixel dims + fill rule; no grouping is natural here"
+    )]
     pub fn tile_fill(
         &self,
         records: &[TileRecord],

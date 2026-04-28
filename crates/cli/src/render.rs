@@ -118,8 +118,9 @@ pub fn render_page_native(
     page_num: u32,
     total_pages: u32,
     args: &Args,
-    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
-    gpu_ctx: Option<&Arc<gpu::GpuCtx>>,
+    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))] gpu_ctx: Option<
+        &Arc<gpu::GpuCtx>,
+    >,
 ) -> Result<(), RenderError> {
     let format = args.output_format();
 
@@ -227,8 +228,13 @@ fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
             let r = u32::from(src_row[x * 3]);
             let g = u32::from(src_row[x * 3 + 1]);
             let b = u32::from(src_row[x * 3 + 2]);
-            #[expect(clippy::cast_possible_truncation, reason = "result ≤ 255 by BT.709 coefficient sum")]
-            { dst_row[x] = ((2126 * r + 7152 * g + 722 * b + 5000) / 10000) as u8; }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "result ≤ 255 by BT.709 coefficient sum"
+            )]
+            {
+                dst_row[x] = ((2126 * r + 7152 * g + 722 * b + 5000) / 10000) as u8;
+            }
         }
     }
     dst

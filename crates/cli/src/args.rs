@@ -239,5 +239,4 @@ impl OutputFormat {
             (Self::Tiff, _, _) => "tif",
         }
     }
-
 }
