@@ -747,7 +747,10 @@ fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
 ///
 /// `Indexed` images with bpc 1/2/4 unpack the sub-byte palette indices first.
 /// CMYK images (bpc 8/16) are converted to RGB inline.
-#[expect(clippy::too_many_lines, reason = "bpc dispatch table + cfg-gated GPU paths — splitting would obscure the decision tree")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "bpc dispatch table + cfg-gated GPU paths — splitting would obscure the decision tree"
+)]
 fn decode_raw(
     doc: &Document,
     data: &[u8],
@@ -954,8 +957,11 @@ fn decode_raw_indexed(
         1 | 2 | 4 => {
             // For Indexed images, "components" is always 1 (each sample is one palette index).
             // bpc ∈ {1, 2, 4} verified by the match arm — safe to cast to u32.
-            #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation,
-                reason = "bpc ∈ {1, 2, 4} — positive and fits u32")]
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "bpc ∈ {1, 2, 4} — positive and fits u32"
+            )]
             let bits = bpc as u32;
             indices_8bit = expand_nbpp_indexed(data, width, height, bits)?;
             &indices_8bit
@@ -1077,7 +1083,10 @@ fn unpack_packed_bits(
     height: u32,
     map: impl Fn(u8, u8) -> u8, // (raw_value, mask) → output byte
 ) -> Option<Vec<u8>> {
-    debug_assert!(bits == 1 || bits == 2 || bits == 4, "unpack_packed_bits: bits must be 1, 2, or 4");
+    debug_assert!(
+        bits == 1 || bits == 2 || bits == 4,
+        "unpack_packed_bits: bits must be 1, 2, or 4"
+    );
     let samples_per_byte = (8 / bits) as usize;
     let row_bytes = samples_per_row.div_ceil(samples_per_byte);
     let height_usize = usize::try_from(height).ok()?;
@@ -1132,8 +1141,13 @@ fn expand_nbpp<const BITS: u32>(
     let samples_per_row = width_usize.checked_mul(components)?;
     unpack_packed_bits(data, BITS, samples_per_row, height, |val, _mask| {
         // val ≤ max_val ≤ 15; val * scale ≤ 255 — fits u8.
-        #[expect(clippy::cast_possible_truncation, reason = "val ≤ 15; val*scale ≤ 255 — fits u8")]
-        { (u16::from(val) * scale) as u8 }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "val ≤ 15; val*scale ≤ 255 — fits u8"
+        )]
+        {
+            (u16::from(val) * scale) as u8
+        }
     })
 }
 
@@ -1144,8 +1158,10 @@ fn expand_nbpp<const BITS: u32>(
 ///
 /// Returns `None` if `width × height` overflows `usize`.
 fn expand_nbpp_indexed(data: &[u8], width: u32, height: u32, bits: u32) -> Option<Vec<u8>> {
-    debug_assert!(bits == 1 || bits == 2 || bits == 4,
-        "expand_nbpp_indexed: bits must be 1, 2, or 4");
+    debug_assert!(
+        bits == 1 || bits == 2 || bits == 4,
+        "expand_nbpp_indexed: bits must be 1, 2, or 4"
+    );
     let width_usize = usize::try_from(width).ok()?;
     unpack_packed_bits(data, bits, width_usize, height, |val, _mask| val)
 }
@@ -1230,8 +1246,10 @@ fn decode_ccitt(
         std::cmp::Ordering::Less => decode_ccitt_g4(data, &p),
         std::cmp::Ordering::Equal => decode_ccitt_g3_1d(data, &p, rows_limit),
         std::cmp::Ordering::Greater => {
-            log::debug!("image: CCITTFaxDecode K={k} (Group 3 mixed 2D) not yet implemented");
-            None
+            // K > 0: Group 3 mixed 1D/2D (T.4 2D, "MR").
+            // The fax 0.2.x crate only decodes 1D; use hayro-ccitt for the mixed path.
+            let k_u32 = u32::try_from(k).ok()?;
+            decode_ccitt_g3_2d(data, &p, rows_limit, k_u32)
         }
     }
 }
@@ -1326,6 +1344,136 @@ fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<I
         data: data_out,
         smask: None,
     })
+}
+
+/// Decode a Group 3 mixed 1D/2D (K>0, T.4 2D / "MR") CCITT fax stream.
+///
+/// Uses `hayro-ccitt` which natively supports `EncodingMode::Group3_2D { k }`.
+/// `rows_limit` caps the number of rows to emit (from `DecodeParms/Rows` or `height`).
+fn decode_ccitt_g3_2d(
+    data: &[u8],
+    p: &CcittParams,
+    rows_limit: u32,
+    k: u32,
+) -> Option<ImageDescriptor> {
+    use hayro_ccitt::{DecodeSettings, DecoderContext, EncodingMode};
+
+    // EncodingMode::Group3_1D/Group3_2D expect `end_of_line = true` for T.4.
+    // `end_of_block` tells the decoder it may encounter a 6-EOL RTC marker.
+    // `rows_are_byte_aligned` = false: T.4 mixed streams are NOT byte-aligned
+    // between rows (only the EOL acts as a row separator).
+    let settings = DecodeSettings {
+        columns: p.width,
+        rows: rows_limit,
+        end_of_block: true,
+        end_of_line: true,
+        rows_are_byte_aligned: false,
+        encoding: EncodingMode::Group3_2D { k },
+        invert_black: p.black_is_1,
+    };
+    let mut ctx = DecoderContext::new(settings);
+    let mut collector = HayroCcittCollector::new(p.capacity, p.width);
+
+    match hayro_ccitt::decode(data, &mut collector, &mut ctx) {
+        Ok(_) => {}
+        Err(e) => {
+            if collector.rows_decoded() == 0 {
+                log::warn!("image: CCITTFaxDecode Group3 2D decode failed: {e}");
+                return None;
+            }
+            log::debug!(
+                "image: CCITTFaxDecode Group3 2D partial decode ({}/{} rows): {e}",
+                collector.rows_decoded(),
+                p.height
+            );
+        }
+    }
+
+    let rows_decoded = collector.rows_decoded();
+    let mut data_out = collector.finish();
+    if data_out.len() < p.capacity {
+        log::debug!(
+            "image: CCITTFaxDecode Group3 2D: got {rows_decoded}/{} rows — padding remainder",
+            p.height
+        );
+        data_out.resize(p.capacity, 0xFF);
+    }
+
+    let cs = if p.is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: p.width,
+        height: p.height,
+        color_space: cs,
+        data: data_out,
+        smask: None,
+    })
+}
+
+/// Accumulates `hayro-ccitt` decoded pixels into a `Vec<u8>` (one byte per pixel,
+/// 0x00 = black, 0xFF = white).  Incomplete final rows are padded to `width`.
+struct HayroCcittCollector {
+    out: Vec<u8>,
+    width: u32,
+    col: u32,
+    rows: u32,
+}
+
+impl HayroCcittCollector {
+    fn new(capacity: usize, width: u32) -> Self {
+        Self {
+            out: Vec::with_capacity(capacity),
+            width,
+            col: 0,
+            rows: 0,
+        }
+    }
+
+    const fn rows_decoded(&self) -> u32 {
+        self.rows
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        // Pad any partial final row (shouldn't happen on well-formed streams).
+        if self.col > 0 {
+            let remaining = (self.width - self.col) as usize;
+            self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
+        }
+        self.out
+    }
+}
+
+impl hayro_ccitt::Decoder for HayroCcittCollector {
+    fn push_pixel(&mut self, white: bool) {
+        // Guard against over-wide rows from malformed bitstreams.
+        if self.col < self.width {
+            self.out.push(if white { 0xFF } else { 0x00 });
+            self.col += 1;
+        }
+    }
+
+    fn push_pixel_chunk(&mut self, white: bool, chunk_count: u32) {
+        // chunk_count × 8 pixels, all the same colour.
+        let total = chunk_count.saturating_mul(8);
+        let available = self.width.saturating_sub(self.col);
+        let n = total.min(available);
+        let byte = if white { 0xFFu8 } else { 0x00u8 };
+        self.out.extend(std::iter::repeat_n(byte, n as usize));
+        self.col += n;
+    }
+
+    fn next_line(&mut self) {
+        // Pad any short row (malformed stream).
+        if self.col < self.width {
+            let remaining = (self.width - self.col) as usize;
+            self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
+        }
+        self.col = 0;
+        self.rows += 1;
+    }
 }
 
 /// Expand one row of CCITT transitions into bytes and append to `out`.

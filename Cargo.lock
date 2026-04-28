@@ -1152,6 +1152,7 @@ dependencies = [
  "fax",
  "font",
  "gpu",
+ "hayro-ccitt",
  "hayro-jbig2",
  "jpeg2k",
  "log",

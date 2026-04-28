@@ -26,6 +26,7 @@ gpu    = { path = "../gpu", optional = true }
 lopdf  = "0.40"
 log    = { workspace = true }
 fax = "0.2.6"
+hayro-ccitt = "0.3.0"
 zune-jpeg = "0.5.15"
 zune-core = "0.5.1"
 jpeg2k      = { version = "0.10.1", default-features = false, features = ["image", "openjpeg-sys"] }
