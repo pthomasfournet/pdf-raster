@@ -58,7 +58,7 @@ fn main() {
                 "/usr/lib/x86_64-linux-gnu/libnvjpeg2k",
             ],
             "nvjpeg2k",
-            "nvjpeg2k feature enabled but libnvjpeg2k",
+            "nvjpeg2k feature enabled but libnvjpeg2k not found",
         );
         // cudart provides cudaMalloc / cudaFree / cudaMemcpy2D (runtime API).
         link_lib_in_dir(

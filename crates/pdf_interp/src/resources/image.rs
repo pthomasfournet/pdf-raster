@@ -1924,10 +1924,14 @@ fn decode_jpx_gpu(
 ) -> Option<ImageDescriptor> {
     let img = match dec.decode_sync(data) {
         Ok(img) => img,
-        Err(gpu::nvjpeg2k::NvJpeg2kError::UnsupportedComponents(_)) => {
-            // CMYK or exotic channel count — expected; fall back to CPU silently.
-            return None;
-        }
+        // Unsupported component count (CMYK, Gray+Alpha, N-channel), sub-sampled
+        // chroma, or a codestream type not supported by this nvJPEG2000 build
+        // (HTJ2K, status 4) — all are expected; fall through to CPU silently.
+        Err(
+            gpu::nvjpeg2k::NvJpeg2kError::UnsupportedComponents(_)
+            | gpu::nvjpeg2k::NvJpeg2kError::SubSampledComponents
+            | gpu::nvjpeg2k::NvJpeg2kError::Nvjpeg2kStatus(4),
+        ) => return None,
         Err(e) => {
             log::warn!("image: JPXDecode GPU: nvJPEG2000 error: {e}");
             return None;
