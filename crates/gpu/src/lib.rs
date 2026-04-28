@@ -37,23 +37,34 @@ pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
 pub const GPU_SOFTMASK_THRESHOLD: usize = 500_000;
 /// Minimum fill area (pixels) for GPU supersampled AA to be faster than CPU.
 ///
-/// Below this threshold the H2D/D2H transfer latency for the segment list and
-/// coverage buffer dominates. Calibrated for RTX 5070 + `PCIe` 5.0 at ~150 DPI.
-pub const GPU_AA_FILL_THRESHOLD: usize = 16_384;
-/// Minimum fill area (pixels) for the tile-parallel analytical fill to be faster
-/// than the GPU warp-ballot AA kernel.
+/// Calibrated on RTX 5070 + `PCIe` 5.0 via `threshold_bench`: GPU wins at ≥ 256 px
+/// (4.7× faster) and exceeds 95× at 16 384 px.  The old default of 16 384 left
+/// ~90× speedup on the table for fills in the 256–16 383 px range.
 ///
-/// Tile fill incurs sorting overhead; below this threshold the AA kernel is faster.
-pub const GPU_TILE_FILL_THRESHOLD: usize = 65_536;
+/// The absolute floor is one full CUDA warp (32 threads = 2 warps × 16 pixels each),
+/// so 256 is both the measured crossover and a natural hardware-aligned minimum.
+pub const GPU_AA_FILL_THRESHOLD: usize = 256;
+/// Minimum fill area (pixels) for the tile-parallel analytical fill to be faster
+/// than the CPU 64-sample AA path.
+///
+/// Calibrated on RTX 5070 + `PCIe` 5.0 via `threshold_bench`: GPU wins at ≥ 256 px
+/// (2.5× faster despite CPU-side sort overhead) and exceeds 100× at 16 384 px.
+/// The tile fill is used in preference to AA fill above this threshold; both are
+/// well below the `PCIe` saturation point for typical PDF page fills.
+pub const GPU_TILE_FILL_THRESHOLD: usize = 256;
 /// Tile width in pixels (must match `TILE_W` in `tile_fill.cu`).
 pub const TILE_W: u32 = 16;
 /// Tile height in pixels (must match `TILE_H` in `tile_fill.cu`).
 pub const TILE_H: u32 = 16;
-/// Minimum pixel count for GPU ICC CMYK→RGB transform to beat CPU + `PCIe` overhead.
+/// Minimum pixel count for GPU ICC CMYK→RGB CLUT transform to beat CPU + `PCIe` overhead.
 ///
-/// Below this threshold H2D/D2H transfer latency dominates; use the CPU fallback.
-/// Conservative default aligned with composite/softmask; calibrate against actual
-/// `PCIe` 5.0 latency on the target machine once the native path is hot.
+/// Applies only when a full ICC CLUT is available (clut=Some).  The matrix path
+/// (clut=None) always uses the CPU AVX-512 fallback — `threshold_bench` showed the GPU
+/// matrix kernel never beats AVX-512 across 256–4M pixels on this machine (`PCIe`
+/// round-trip cost exceeds the cheap per-pixel computation at all measured sizes).
+///
+/// The CLUT path is not yet benchmarked; 500 000 px is a conservative placeholder.
+/// Run `threshold_bench` with a CLUT workload to calibrate once baking is in the hot path.
 pub const GPU_ICC_CLUT_THRESHOLD: usize = 500_000;
 
 /// One tile record per (segment, tile-row) crossing.
@@ -402,7 +413,19 @@ impl GpuCtx {
     }
 
     /// Unconditional GPU dispatch for `aa_fill` (skips threshold check).
-    pub(crate) fn aa_fill_gpu(
+    ///
+    /// Use this when the caller has already decided GPU is appropriate
+    /// (e.g. benchmarking or when the area is known to be large).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU data transfer or kernel launch fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `segs.len()` is not a multiple of 4 or if `width * height`
+    /// overflows `u32::MAX`.
+    pub fn aa_fill_gpu(
         &self,
         segs: &[f32],
         x_min: f32,
@@ -593,6 +616,12 @@ impl GpuCtx {
         if n == 0 {
             return Ok(Vec::new());
         }
+        // Matrix path (clut=None): CPU AVX-512 always beats GPU on this machine —
+        // threshold_bench showed the PCIe round-trip cost exceeds the compute cost
+        // at all measured sizes (256–4M pixels).  Always use the CPU path here.
+        if clut.is_none() {
+            return Ok(icc_cmyk_to_rgb_cpu(cmyk, None));
+        }
         if n < GPU_ICC_CLUT_THRESHOLD {
             return Ok(icc_cmyk_to_rgb_cpu(cmyk, clut));
         }
@@ -600,7 +629,20 @@ impl GpuCtx {
         self.icc_cmyk_to_rgb_gpu(cmyk, clut)
     }
 
-    fn icc_cmyk_to_rgb_gpu(
+    /// Unconditional GPU dispatch for CMYK→RGB (skips threshold check).
+    ///
+    /// Use this when the caller has already decided GPU is appropriate
+    /// (e.g. benchmarking or when the pixel count is known to be large).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU data transfer or kernel launch fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cmyk.len()` is not a multiple of 4 or if the pixel count
+    /// overflows `u32::MAX`.
+    pub fn icc_cmyk_to_rgb_gpu(
         &self,
         cmyk: &[u8],
         clut: Option<(&[u8], u32)>,

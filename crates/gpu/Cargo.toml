@@ -3,6 +3,10 @@ name    = "gpu"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "threshold_bench"
+path = "src/bin/threshold_bench.rs"
+
 [features]
 # Enable GPU-accelerated JPEG decoding via NVIDIA nvJPEG.
 # Requires libnvjpeg.so to be present at link time (ships with CUDA 12).
