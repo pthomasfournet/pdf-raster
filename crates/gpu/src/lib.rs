@@ -758,35 +758,33 @@ pub fn apply_soft_mask_cpu(pixels: &mut [u8], mask: &[u8]) {
 fn cmyk_to_rgb_pixel_scalar(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), 4);
     debug_assert_eq!(dst.len(), 3);
-    // All arithmetic in u16 to avoid overflow (max product = 255*255 = 65025 < 65536).
+    // u16 arithmetic: max product = 255*255 = 65025, fits without overflow.
+    // (255*255 + 127)/255 = 255 exactly — the as u8 cast cannot truncate.
     let inv_k = u16::from(255 - src[3]);
-    // max value = (255*255 + 127)/255 = 255; truncation cannot occur.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "value ≤ 255 by construction"
     )]
-    let (r, g, b) = (
-        ((u16::from(255 - src[0]) * inv_k + 127) / 255) as u8,
-        ((u16::from(255 - src[1]) * inv_k + 127) / 255) as u8,
-        ((u16::from(255 - src[2]) * inv_k + 127) / 255) as u8,
-    );
-    dst[0] = r;
-    dst[1] = g;
-    dst[2] = b;
+    {
+        dst[0] = ((u16::from(255 - src[0]) * inv_k + 127) / 255) as u8;
+        dst[1] = ((u16::from(255 - src[1]) * inv_k + 127) / 255) as u8;
+        dst[2] = ((u16::from(255 - src[2]) * inv_k + 127) / 255) as u8;
+    }
 }
 
-// ── AVX-512 CMYK→RGB matrix path ─────────────────────────────────────────────
+// ── AVX-512 CMYK→RGB ──────────────────────────────────────────────────────────
 //
 // Vectorised subtractive complement: R=(255−C)*(255−K)/255 (rounded).
-// Processes 16 pixels per iteration using u16 arithmetic throughout.
+// Processes 16 pixels per call using u16 arithmetic throughout.
 //
-// Fast rounded u16÷255: for x ∈ [0, 65025], round(x/255) = (x+127+((x+127)>>8))>>8.
-// Proof: let q = x/255 exactly. The expression equals floor((x+127.5)/255) = round(q).
-// All intermediates fit in u16: max(x+127) = 65152 < 65535; max after +>>8 = 65407 < 65535.
+// AoS→SoA: shuffle_epi8 gathers one channel from each 4-pixel 128-bit lane
+// to bytes 0..3 of that lane (zeros elsewhere).  permute4x64(x, 0x88) selects
+// epi64-lanes 0 and 2, giving [ch0..3 0000 ch4..7 0000] in 128 bits.  A final
+// shuffle_epi8 compacts to [ch0..7 0×8]; unpacklo_epi64 joins two such halves
+// (pixels 0..7 and 8..15) into 16 contiguous u8; cvtepu8_epi16 widens to u16.
 //
-// Lane layout after the channel scatter:
-//   c_u16 / m_u16 / y_u16 / k_u16: 32 × u16 = 32 pixels, but we process 16 at a time
-//   (two independent halves of the 512-bit register).
+// Division: exact ⌊(x+127)/255⌋ = (n + (n>>8) + 1) >> 8, n = x+127.
+// Valid for n ∈ [0, 65152] (max n = 255²+127 = 65152 < 65280 = 255×256).
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -809,18 +807,16 @@ fn cmyk_to_rgb_pixel_scalar(src: &[u8], dst: &mut [u8]) {
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
     use std::arch::x86_64::{
-        __m256i, __m512i, _mm_storeu_si128, _mm_unpacklo_epi64, _mm256_add_epi16,
-        _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_loadu_si256, _mm256_mullo_epi16,
-        _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_shuffle_epi8,
-        _mm256_srli_epi16, _mm256_sub_epi16, _mm512_castsi512_si256, _mm512_extracti64x4_epi64,
-        _mm512_loadu_si512, _mm512_shuffle_epi8,
+        __m256i, __m512i, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi16, _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_mullo_epi16,
+        _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_srli_epi16,
+        _mm256_sub_epi16, _mm512_castsi512_si256, _mm512_extracti64x4_epi64, _mm512_loadu_si512,
+        _mm512_shuffle_epi8,
     };
 
-    // SAFETY: caller guarantees avx512f+avx512bw are available (via #[target_feature]).
-    unsafe {
-        debug_assert_eq!(cmyk.len(), 64);
-        debug_assert!(rgb.len() >= 48);
+    debug_assert!(rgb.len() >= 48);
 
+    unsafe {
         // Load all 16 CMYK pixels (64 bytes) into one 512-bit register.
         let raw: __m512i = _mm512_loadu_si512(cmyk.as_ptr().cast());
 
@@ -866,57 +862,35 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
         let y_bytes: __m512i = _mm512_shuffle_epi8(raw, shuf_y);
         let k_bytes: __m512i = _mm512_shuffle_epi8(raw, shuf_k);
 
-        // After shuffle each channel is at bytes 0..3 within each 128-bit lane (12 zeros follow).
-        // Compact to 16 contiguous bytes then widen to 16 × u16:
-        //   - split 512-bit into two 256-bit halves (each covers 8 pixels)
-        //   - shuffle_epi8 is a no-op on the real bytes (already at 0..3), zeros the rest
-        //   - permute4x64(x, 0x88): copies lane0 and lane2 → packs both 4-byte groups
-        //     to the low 128 bits of the result
-        //   - unpacklo_epi64 joins the two low 128-bit halves into one 128-bit = 16 u8
-        //   - cvtepu8_epi16 widens to 16 u16
+        // After shuffle: each 128-bit lane has [ch0 ch1 ch2 ch3  0×12].
+        // permute4x64(x, 0x88) selects epi64-lanes 0 and 2:
+        //   low 128 = [ch0..3  0×4  ch4..7  0×4]  (two 4-byte groups, gaps between)
+        // compact2 shuffle closes the gaps: bytes 0..3 and 8..11 → bytes 0..7.
+        // unpacklo_epi64 joins the lo and hi halves → 16 contiguous u8.
+        // cvtepu8_epi16 zero-extends to 16 u16.
         #[rustfmt::skip]
-    let compact_shuf: [u8; 32] = [
-        0,1,2,3, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-        0,1,2,3, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-    ];
-        let compact_shuf256: __m256i = _mm256_loadu_si256(compact_shuf.as_ptr().cast());
-
-        // Second-stage compact mask: within a 128-bit lane, moves bytes 0..3 and
-        // 8..11 (the two 4-byte groups after permute4x64) to bytes 0..7.
-        #[rustfmt::skip]
-    let compact2: [u8; 16] = [0,1,2,3, 8,9,10,11, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80];
-        let compact2_128: std::arch::x86_64::__m128i =
-            std::arch::x86_64::_mm_loadu_si128(compact2.as_ptr().cast());
+        let compact2: [u8; 16] = [
+            0,1,2,3, 8,9,10,11, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        ];
+        let compact2_128 = _mm_loadu_si128(compact2.as_ptr().cast());
 
         macro_rules! compact_to_u16 {
             ($v512:expr) => {{
-                // Each 256-bit half of the channel vector covers 8 pixels, with 4
-                // real bytes at positions 0..3 within each 128-bit SSE lane.
-                //
-                // permute4x64(x, 0x88) = [epi64_lane0 epi64_lane2 ...] of x:
-                //   → low 128 bits = [B0..3  0000  B4..7  0000]  (still has gaps)
-                //
-                // A second shuffle_epi8 on the low 128 compacts [0..3, 8..11] → [0..7].
-                let lo256: __m256i = _mm512_castsi512_si256($v512);
-                let hi256: __m256i = _mm512_extracti64x4_epi64($v512, 1);
-                let lo128 = std::arch::x86_64::_mm_shuffle_epi8(
+                let lo128 = _mm_shuffle_epi8(
                     _mm256_castsi256_si128(_mm256_permute4x64_epi64(
-                        _mm256_shuffle_epi8(lo256, compact_shuf256),
+                        _mm512_castsi512_si256($v512),
                         0x88_i32,
                     )),
                     compact2_128,
                 );
-                let hi128 = std::arch::x86_64::_mm_shuffle_epi8(
+                let hi128 = _mm_shuffle_epi8(
                     _mm256_castsi256_si128(_mm256_permute4x64_epi64(
-                        _mm256_shuffle_epi8(hi256, compact_shuf256),
+                        _mm512_extracti64x4_epi64($v512, 1),
                         0x88_i32,
                     )),
                     compact2_128,
                 );
-                // lo128 = [B0..7  0×8],  hi128 = [B8..15  0×8]
-                // unpacklo_epi64 takes low 64 bits of each → [B0..7 B8..15] = 16 u8
-                let c16 = _mm_unpacklo_epi64(lo128, hi128);
-                _mm256_cvtepu8_epi16(c16)
+                _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(lo128, hi128))
             }};
         }
 
@@ -989,7 +963,7 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
             rgb[i * 3 + 1] = g_arr[i];
             rgb[i * 3 + 2] = b_arr[i];
         }
-    } // end unsafe
+    }
 }
 
 /// CPU fallback for [`GpuCtx::icc_cmyk_to_rgb`].
@@ -1390,51 +1364,43 @@ mod tests {
         assert_eq!(&rgb[3..6], &[0, 0, 0]);
     }
 
-    /// Exhaustive parity check: AVX-512 path vs scalar reference.
+    /// Parity: AVX-512 path must match `cmyk_to_rgb_pixel_scalar` byte-for-byte.
     ///
-    /// Compares 16-pixel blocks covering all four axis-extreme pixels (all-0,
-    /// all-255, pure key=255, pure cyan=255) plus a sweep of mid-range values
-    /// to catch any rounding divergence.  Requires -C target-cpu=native so the
-    /// avx512f+avx512bw cfg gates match at compile time.
+    /// Covers axis extremes (all-0, all-255, pure K, pure C) and a mid-range
+    /// sweep.  Requires `-C target-cpu=native` so the avx512f+avx512bw cfg
+    /// gates activate at compile time — on non-AVX machines both paths go
+    /// scalar and the test degenerates to a no-op tautology (still passes).
     #[test]
     fn icc_cmyk_matrix_avx_vs_scalar() {
-        // Build a 16-pixel CMYK buffer containing representative values.
         #[rustfmt::skip]
-        let cmyk: Vec<u8> = [
+        let cmyk: Vec<u8> = vec![
             // white, black, cyan, magenta
-            0,   0,   0,   0,
-            0,   0,   0, 255,
-            255, 0,   0,   0,
-            0, 255,   0,   0,
+              0,   0,   0,   0,
+              0,   0,   0, 255,
+            255,   0,   0,   0,
+              0, 255,   0,   0,
             // yellow, key-only mid, all-max, all-mid
-            0,   0, 255,   0,
-            0,   0,   0, 128,
+              0,   0, 255,   0,
+              0,   0,   0, 128,
             255, 255, 255, 255,
             128, 128, 128, 128,
-            // arbitrary mid-range values
-            64,  32,  16,   8,
+            // mid-range sweep
+             64,  32,  16,   8,
             200, 100,  50,  25,
-            10,  20,  30,  40,
-            50,  60,  70,  80,
-            90, 100, 110, 120,
+             10,  20,  30,  40,
+             50,  60,  70,  80,
+             90, 100, 110, 120,
             130, 140, 150, 160,
             170, 180, 190, 200,
             210, 220, 230, 240,
-        ].to_vec();
-        assert_eq!(cmyk.len(), 64);
+        ];
+        assert_eq!(cmyk.len(), 64, "test vector must be exactly 16 pixels");
 
-        // Reference: always scalar (no cfg gate on the reference).
-        let scalar_rgb: Vec<u8> = cmyk
-            .chunks_exact(4)
-            .flat_map(|src| {
-                let inv_k = u16::from(255 - src[3]);
-                [
-                    ((u16::from(255 - src[0]) * inv_k + 127) / 255) as u8,
-                    ((u16::from(255 - src[1]) * inv_k + 127) / 255) as u8,
-                    ((u16::from(255 - src[2]) * inv_k + 127) / 255) as u8,
-                ]
-            })
-            .collect();
+        // Reference via the extracted scalar helper — not an inline reimplementation.
+        let mut scalar_rgb = vec![0u8; 48];
+        for (src, dst) in cmyk.chunks_exact(4).zip(scalar_rgb.chunks_exact_mut(3)) {
+            super::cmyk_to_rgb_pixel_scalar(src, dst);
+        }
 
         let avx_rgb = icc_cmyk_to_rgb_cpu(&cmyk, None);
 
@@ -1444,7 +1410,7 @@ mod tests {
                 a,
                 "RGB byte {i} (pixel {}, channel {}): scalar={s} avx={a}",
                 i / 3,
-                i % 3
+                i % 3,
             );
         }
     }
