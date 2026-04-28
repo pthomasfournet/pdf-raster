@@ -451,9 +451,14 @@ impl NvJpeg2k {
     /// Rejects images with component counts other than 1 (Gray) or 3 (RGB) —
     /// CMYK, LAB, and N-channel images fall through to the CPU path.
     ///
-    /// 16-bit precision images are downscaled to 8-bit (high byte extraction
-    /// for unsigned; signed samples get the two's-complement offset applied
-    /// before the shift).
+    /// Sub-sampled images (chroma components narrower/shorter than the image)
+    /// are also rejected — bare `nvjpeg2kDecode` writes each component at its
+    /// native dimensions without upsampling, which would break the planar→RGB
+    /// interleave.  Call-site falls back to CPU for these.
+    ///
+    /// 16-bit precision images are downscaled to 8-bit **by the nvJPEG2000
+    /// library** (`NVJPEG2K_UINT8` output mode); no post-processing is needed
+    /// here.
     ///
     /// # Errors
     ///
@@ -505,6 +510,15 @@ impl NvJpeg2k {
             });
         }
 
+        // Cap component count before any allocation.  Legitimate JPEG 2000
+        // images have at most a handful of components (≤ 16 per standard, ≤ 4
+        // in practice for Gray / RGB / CMYK).  A corrupted header returning
+        // u32::MAX would otherwise cause Vec::with_capacity to attempt a ~68 GB
+        // allocation.
+        if nc > 4 {
+            return Err(NvJpeg2kError::UnsupportedComponents(nc));
+        }
+
         // Only Gray (1) and RGB (3) are supported.  CMYK (4), LAB (3, but
         // typically with a different ICC profile), and other multi-channel
         // images fall through to the CPU decoder which handles them correctly.
@@ -515,6 +529,10 @@ impl NvJpeg2k {
         };
 
         // ── Phase 3: per-component info + device allocation ───────────────────
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "nc <= 3 after the color_space match above; usize::from is not available for u32"
+        )]
         let mut comp_infos: Vec<Nvjpeg2kImageComponentInfo> = Vec::with_capacity(nc as usize);
         for i in 0..nc {
             let mut ci = Nvjpeg2kImageComponentInfo {
@@ -530,39 +548,73 @@ impl NvJpeg2k {
             if status != NVJPEG2K_STATUS_SUCCESS {
                 return Err(NvJpeg2kError::Nvjpeg2kStatus(status));
             }
+            // Guard degenerate component dimensions — a zero-width or zero-height
+            // component would cause empty device allocations and then panic on
+            // RGB interleave indexing.
+            if ci.component_width == 0 || ci.component_height == 0 {
+                return Err(NvJpeg2kError::ZeroDimension {
+                    width: ci.component_width,
+                    height: ci.component_height,
+                });
+            }
+            // nvjpeg2kDecode (without nvjpeg2kDecodeParamsSetRGBOutput) writes each
+            // component at its native dimensions — sub-sampled chroma components are
+            // NOT upsampled to the full image size.  Attempting to interleave
+            // mis-sized planes would index out of bounds.  Fall through to the CPU
+            // OpenJPEG path which handles sub-sampling correctly.
+            if ci.component_width != w || ci.component_height != h {
+                return Err(NvJpeg2kError::UnsupportedComponents(nc));
+            }
             comp_infos.push(ci);
         }
 
         // Allocate one device buffer per component.
-        // pitch = component_width × bytes_per_sample (1 for 8-bit, 2 for 9–16-bit).
-        // We always request NVJPEG2K_UINT8 output so bytes_per_sample is always 1
-        // for all precisions; the library handles the downscale internally for
-        // 8-bit output mode.
+        // pitch = component_width (= image width, validated above) since we always
+        // use NVJPEG2K_UINT8 (1 byte/sample).  The caller sets the pitch in the
+        // Nvjpeg2kImage struct; the library writes exactly at the pitch we specify.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "nc <= 3; usize::from not available for u32"
+        )]
         let mut dev_bufs: Vec<DeviceBuf> = Vec::with_capacity(nc as usize);
         for ci in &comp_infos {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "component_width == image_width (guarded above); u32 always fits usize on supported targets"
+            )]
             let cw = ci.component_width as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "component_height == image_height (guarded above); u32 always fits usize"
+            )]
             let ch = ci.component_height as usize;
             let size = cw.checked_mul(ch).ok_or(NvJpeg2kError::Overflow)?;
             dev_bufs.push(DeviceBuf::alloc(size)?);
         }
 
         // ── Phase 4: build Nvjpeg2kImage and decode ───────────────────────────
-        // These Vecs hold the pointer/pitch arrays that Nvjpeg2kImage references.
-        // They must remain live for the duration of nvjpeg2kDecode.
+        // pixel_ptrs and pitches are stack-allocated Vecs whose raw pointers are
+        // embedded in `img`.  They must not be moved, resized, or dropped until
+        // after nvjpeg2kDecode returns.  They are never pushed or truncated between
+        // construction and the call, so Vec::as_mut_ptr() remains stable.
         let mut pixel_ptrs: Vec<*mut c_void> = dev_bufs.iter().map(|b| b.ptr).collect();
         let mut pitches: Vec<usize> = comp_infos
             .iter()
-            .map(|ci| ci.component_width as usize)
+            .map(|ci| {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "component_width == image_width, validated in Phase 3; u32 fits usize"
+                )]
+                { ci.component_width as usize }
+            })
             .collect();
 
+        // nc is u32; validated ≤ 3 in Phase 2.  u32 → u32 cast is a no-op but
+        // the field type matches the C ABI declaration.
         let mut img = Nvjpeg2kImage {
             pixel_data: pixel_ptrs.as_mut_ptr(),
             pitch_in_bytes: pitches.as_mut_ptr(),
             pixel_type: NVJPEG2K_UINT8,
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "nc <= 3 (guarded by the UnsupportedComponents check above); fits u32"
-            )]
             num_components: nc,
         };
 
@@ -610,28 +662,44 @@ impl NvJpeg2k {
         color_space: Jpeg2kColorSpace,
     ) -> Result<DecodedJpeg2k> {
         let nc = comp_infos.len();
-        let w_us = w as usize;
-        let h_us = h as usize;
+        // w and h are u32; both fit in usize on all supported 32-/64-bit targets.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "image dimensions are u32; usize is at least 32 bits on all supported targets"
+        )]
+        let (w_us, h_us) = (w as usize, h as usize);
 
-        // Allocate host planes (one per component).
+        // Allocate host planes (one per component) and copy device → host.
+        // All components have the same dimensions as the image (validated in Phase 3).
+        // The pitch we passed to nvjpeg2kDecode equals component_width, so the
+        // device layout is tightly packed: pitch == width in bytes.
         let mut host_planes: Vec<Vec<u8>> = Vec::with_capacity(nc);
         for (ci, buf) in comp_infos.iter().zip(dev_bufs.iter()) {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "component_width == image_width (validated in Phase 3)"
+            )]
             let cw = ci.component_width as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "component_height == image_height (validated in Phase 3)"
+            )]
             let ch = ci.component_height as usize;
             let plane_size = cw.checked_mul(ch).ok_or(NvJpeg2kError::Overflow)?;
             let mut host = vec![0u8; plane_size];
 
-            // SAFETY: buf.ptr is valid device memory; host.as_mut_ptr() is valid
-            // host memory; stream was synchronised before this call.
-            // width = component_width (tight packing — pitch == width).
+            // SAFETY: buf.ptr is valid device memory written by nvjpeg2kDecode;
+            // host.as_mut_ptr() is valid host memory; cu_stream was synchronised
+            // by the caller before this function is entered.
+            // Source pitch matches the pitch we set in Nvjpeg2kImage (= cw).
             let code = unsafe {
                 cudaMemcpy2D(
                     host.as_mut_ptr().cast::<c_void>(),
-                    cw,             // destination pitch (host, tightly packed)
+                    cw, // destination pitch (host, tightly packed)
                     buf.ptr.cast::<c_void>(),
-                    cw,             // source pitch (device, tightly packed by nvjpeg2kDecode)
-                    cw,             // width in bytes
-                    ch,             // height in rows
+                    cw, // source pitch (= cw; the pitch we told nvjpeg2k to use)
+                    cw, // width in bytes to copy per row
+                    ch, // number of rows
                     CUDAMEMCPY_D2H,
                 )
             };
@@ -644,10 +712,8 @@ impl NvJpeg2k {
         let data = match color_space {
             Jpeg2kColorSpace::Gray => host_planes.remove(0),
             Jpeg2kColorSpace::Rgb => {
-                // Interleave three planar Gray buffers into packed RGB.
-                // Component dimensions may differ from image dimensions for
-                // sub-sampled JPEG 2000, but the decode is always to the full
-                // image size in NVJPEG2K_UINT8 mode.
+                // Interleave three planar buffers (R, G, B) into packed RGBRGB…
+                // All three planes are exactly w×h bytes (validated in Phase 3).
                 let total = w_us
                     .checked_mul(h_us)
                     .and_then(|n| n.checked_mul(3))
@@ -656,11 +722,13 @@ impl NvJpeg2k {
                 let r = &host_planes[0];
                 let g = &host_planes[1];
                 let b = &host_planes[2];
-                for px in 0..w_us * h_us {
-                    rgb[3 * px] = r[px];
-                    rgb[3 * px + 1] = g[px];
-                    rgb[3 * px + 2] = b[px];
-                }
+                rgb.chunks_exact_mut(3)
+                    .zip(r.iter().zip(g.iter().zip(b.iter())))
+                    .for_each(|(chunk, (rv, (gv, bv)))| {
+                        chunk[0] = *rv;
+                        chunk[1] = *gv;
+                        chunk[2] = *bv;
+                    });
                 rgb
             }
         };
@@ -676,11 +744,19 @@ impl NvJpeg2k {
 
 impl Drop for NvJpeg2k {
     fn drop(&mut self) {
-        // Destroy in reverse creation order.  Null-check each handle in case
-        // `new` failed mid-way and left the struct in a partial state (though
-        // the current `new` only returns Ok with all three valid).
+        // Destroy in reverse creation order:
+        //   1. decode_state — per-decode scratch buffers (created last, freed first)
+        //   2. j2k_stream   — bitstream handle (holds parsed tile/header data)
+        //   3. handle       — top-level library handle (must outlive both above)
         //
-        // SAFETY: non-null handles are valid and exclusively owned.
+        // nvJPEG2000 documentation requires nvjpeg2kDecodeStateDestroy before
+        // nvjpeg2kDestroy.  nvjpeg2kStreamDestroy is independent but follows the
+        // same reverse-creation convention for clarity.
+        //
+        // Null-check each pointer: `new` always stores all three before returning
+        // Ok, so nulls only appear if the struct is ever constructed unsafely.
+        //
+        // SAFETY: non-null handles are valid and exclusively owned; no aliases.
         unsafe {
             if !self.decode_state.is_null() {
                 let _ = nvjpeg2kDecodeStateDestroy(self.decode_state);

@@ -4,6 +4,28 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Emit a `cargo:rustc-link-search` directive for the first of `dirs` that
+/// exists on the filesystem, then emit `cargo:rustc-link-lib=dylib={lib}`.
+///
+/// If none of the directories exist, emit a build warning and let the linker
+/// search its default paths (handles non-standard install locations).
+fn link_lib_in_dir(dirs: &[&str], lib: &str, warn_context: &str) {
+    let found = dirs.iter().any(|dir| {
+        if std::path::Path::new(dir).exists() {
+            println!("cargo:rustc-link-search=native={dir}");
+            true
+        } else {
+            false
+        }
+    });
+    if !found {
+        println!(
+            "cargo:warning={warn_context} directory not found; linker will search default paths."
+        );
+    }
+    println!("cargo:rustc-link-lib=dylib={lib}");
+}
+
 fn main() {
     // When the nvjpeg feature is enabled, emit the linker directive so that
     // rustc links against libnvjpeg.so from the CUDA toolkit.  The library is
@@ -12,24 +34,15 @@ fn main() {
     if env::var("CARGO_FEATURE_NVJPEG").is_ok() {
         // Prefer the versioned CUDA 12 install directory so the exact .so is
         // found even when /usr/local/cuda is a symlink to a different version.
-        let mut found = false;
-        for dir in [
-            "/usr/local/cuda-12/targets/x86_64-linux/lib",
-            "/usr/local/cuda/targets/x86_64-linux/lib",
-            "/usr/local/cuda/lib64",
-        ] {
-            if std::path::Path::new(dir).exists() {
-                println!("cargo:rustc-link-search=native={dir}");
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            println!(
-                "cargo:warning=nvjpeg feature enabled but no CUDA lib directory found; linker will search default paths. Set CUDA_LIB_DIR or install CUDA 12."
-            );
-        }
-        println!("cargo:rustc-link-lib=dylib=nvjpeg");
+        link_lib_in_dir(
+            &[
+                "/usr/local/cuda-12/targets/x86_64-linux/lib",
+                "/usr/local/cuda/targets/x86_64-linux/lib",
+                "/usr/local/cuda/lib64",
+            ],
+            "nvjpeg",
+            "nvjpeg feature enabled but no CUDA lib",
+        );
         // cuStreamSynchronize lives in the CUDA driver library (libcuda.so).
         // On Linux this is provided by the NVIDIA driver, typically at
         // /usr/lib/x86_64-linux-gnu/libcuda.so.1 (driver-managed symlink).
@@ -39,44 +52,24 @@ fn main() {
     // nvJPEG2000: libnvjpeg2k.so lives in a non-standard path (not in the CUDA
     // toolkit tree) and requires cudart for cudaMalloc / cudaMemcpy2D.
     if env::var("CARGO_FEATURE_NVJPEG2K").is_ok() {
-        let nvjpeg2k_dirs = [
-            "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12",
-            "/usr/lib/x86_64-linux-gnu/libnvjpeg2k",
-        ];
-        let mut found_nvjpeg2k = false;
-        for dir in nvjpeg2k_dirs {
-            if std::path::Path::new(dir).exists() {
-                println!("cargo:rustc-link-search=native={dir}");
-                found_nvjpeg2k = true;
-                break;
-            }
-        }
-        if !found_nvjpeg2k {
-            println!(
-                "cargo:warning=nvjpeg2k feature enabled but libnvjpeg2k directory not found; linker will search default paths."
-            );
-        }
-        println!("cargo:rustc-link-lib=dylib=nvjpeg2k");
-
+        link_lib_in_dir(
+            &[
+                "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12",
+                "/usr/lib/x86_64-linux-gnu/libnvjpeg2k",
+            ],
+            "nvjpeg2k",
+            "nvjpeg2k feature enabled but libnvjpeg2k",
+        );
         // cudart provides cudaMalloc / cudaFree / cudaMemcpy2D (runtime API).
-        let mut found_cudart = false;
-        for dir in [
-            "/usr/local/cuda-12/targets/x86_64-linux/lib",
-            "/usr/local/cuda/targets/x86_64-linux/lib",
-            "/usr/local/cuda/lib64",
-        ] {
-            if std::path::Path::new(dir).exists() {
-                println!("cargo:rustc-link-search=native={dir}");
-                found_cudart = true;
-                break;
-            }
-        }
-        if !found_cudart {
-            println!(
-                "cargo:warning=nvjpeg2k feature enabled but no CUDA lib directory found for cudart; linker will search default paths."
-            );
-        }
-        println!("cargo:rustc-link-lib=dylib=cudart");
+        link_lib_in_dir(
+            &[
+                "/usr/local/cuda-12/targets/x86_64-linux/lib",
+                "/usr/local/cuda/targets/x86_64-linux/lib",
+                "/usr/local/cuda/lib64",
+            ],
+            "cudart",
+            "nvjpeg2k feature enabled but no CUDA lib for cudart",
+        );
         // cuStreamSynchronize / cuCtxSetCurrent live in libcuda.so (driver).
         println!("cargo:rustc-link-lib=dylib=cuda");
     }

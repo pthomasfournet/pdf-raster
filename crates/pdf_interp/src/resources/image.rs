@@ -1791,7 +1791,8 @@ fn cmyk_raw_to_rgb(
 /// `jpeg2k`/OpenJPEG path.
 ///
 /// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
-/// format (`.jp2`).  Both paths auto-detect the format.
+/// format (`.jp2`).  Both the GPU path (nvJPEG2000 via `nvjpeg2kStreamParse`)
+/// and the CPU path (`jpeg2k`/OpenJPEG) auto-detect the format from the stream.
 ///
 /// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
 fn decode_jpx(
