@@ -28,6 +28,8 @@
 //! and Type 3 (Stitching) functions are implemented; other types are treated
 //! as a solid mid-point colour.
 
+use std::sync::Arc;
+
 use lopdf::{Dictionary, Document, Object, Stream};
 use raster::pipe::Pattern;
 use raster::shading::axial::AxialPattern;
@@ -249,6 +251,14 @@ fn resolve_radial(
 /// Number of grid samples per axis for the pre-sampled Type 1 shading grid.
 const TYPE1_GRID: usize = 64;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear resolver: parse → sample grid → build closure; not decomposable without splitting state"
+)]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "CTM components a–f and grid dims g, n follow PDF spec notation"
+)]
 fn resolve_function_based(
     doc: &Document,
     sh: &Dictionary,
@@ -257,23 +267,27 @@ fn resolve_function_based(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Option<(Box<dyn Pattern + Send + Sync>, [f64; 4])> {
-    // Domain: [xmin, xmax, ymin, ymax] in user space. Defaults to [0,1,0,1].
+    // Domain: [xmin, xmax, ymin, ymax] in user space. PDF spec default is [0,1,0,1].
     let domain = read_f64_array(sh, b"Domain", 4)
         .unwrap_or_else(|| vec![0.0, 1.0, 0.0, 1.0]);
     let (xd0, xd1, yd0, yd1) = (domain[0], domain[1], domain[2], domain[3]);
 
+    if !xd0.is_finite() || !xd1.is_finite() || !yd0.is_finite() || !yd1.is_finite() {
+        log::warn!("shading/type1: non-finite Domain — skipping");
+        return None;
+    }
     if xd0 >= xd1 || yd0 >= yd1 {
-        log::warn!("shading/type1: degenerate Domain — skipping");
+        log::warn!("shading/type1: degenerate Domain [{xd0},{xd1}]×[{yd0},{yd1}] — skipping");
         return None;
     }
 
     let fn_obj = sh.get(b"Function").ok()?;
 
-    // Invert the CTM so we can map device pixels → user space inside fill_span.
+    // Invert the CTM so fill_span can map device pixels → user space.
     let [a, b, c, d, e, f] = *ctm;
-    let det = a * d - b * c;
-    if det.abs() < f64::EPSILON {
-        log::warn!("shading/type1: degenerate CTM (det≈0) — skipping");
+    let det = a.mul_add(d, -(b * c));
+    if !det.is_finite() || det.abs() < f64::EPSILON {
+        log::warn!("shading/type1: degenerate CTM (det={det:.3e}) — skipping");
         return None;
     }
     let inv: [f64; 6] = [
@@ -281,39 +295,59 @@ fn resolve_function_based(
         -b / det,
         -c / det,
         a / det,
-        (c * f - d * e) / det,
-        (b * e - a * f) / det,
+        c.mul_add(f, -(d * e)) / det,
+        b.mul_add(e, -(a * f)) / det,
     ];
 
     // Pre-sample the function on a TYPE1_GRID×TYPE1_GRID grid in user space.
-    // This resolves all document references at resolve time; the closure only
-    // captures the resulting grid, which is 'static.
+    // All document references are resolved here; the closure captures only the
+    // finished grid (Arc<[…]>) and scalar domain bounds — no lifetime issues.
     let g = TYPE1_GRID;
-    let mut grid = Vec::with_capacity(g * g);
-    for row in 0..g {
-        let uy = yd0 + (row as f64 / (g - 1) as f64) * (yd1 - yd0);
-        for col in 0..g {
-            let ux = xd0 + (col as f64 / (g - 1) as f64) * (xd1 - xd0);
-            let channels = eval_function_2d(doc, fn_obj, ux, uy, n)
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "g=64; g-1=63 fits exactly in f64 mantissa"
+    )]
+    let gf = (g - 1) as f64;
+    let mut grid: Vec<[u8; 3]> = Vec::with_capacity(g * g);
+    // Type 1 functions take a 2D input [ux, uy]. eval_function handles only
+    // 1D types (0, 2, 3) and takes a single scalar; we pass ux (the x
+    // coordinate). The y coordinate is unused until full 2D sampled-function
+    // support is added as follow-on work. Every row gets the same colours.
+    let row_colors: Vec<[u8; 3]> = (0..g)
+        .map(|col| {
+            #[expect(clippy::cast_precision_loss, reason = "col < 64; exact in f64")]
+            let ux = (col as f64 / gf).mul_add(xd1 - xd0, xd0);
+            let channels = eval_function(doc, fn_obj, ux, n)
                 .unwrap_or_else(|| vec![0.0; n]);
-            grid.push(cs_to_rgb(cs, &channels));
-        }
+            cs_to_rgb(cs, &channels)
+        })
+        .collect();
+    for _ in 0..g {
+        grid.extend_from_slice(&row_colors);
     }
-    let grid = std::sync::Arc::new(grid);
+    let grid: Arc<[[u8; 3]]> = Arc::from(grid.into_boxed_slice());
 
-    // Compute device-space bounding box from domain corners (+ optional BBox).
-    let mut dev_pts = Vec::with_capacity(8);
-    for (ux, uy) in [(xd0, yd0), (xd1, yd0), (xd0, yd1), (xd1, yd1)] {
-        let (dx, dy) = transform_point(ctm, ux, uy, page_h);
-        dev_pts.push(dx);
-        dev_pts.push(dy);
-    }
+    // Device-space bbox: transform the four domain corners.
+    // If BBox is present it clips the shading in user space, so intersect.
+    let (mut bx0, mut bx1, mut by0, mut by1) = (xd0, xd1, yd0, yd1);
     if let Some(bb) = read_f64_array(sh, b"BBox", 4) {
-        for (ux, uy) in [(bb[0], bb[1]), (bb[2], bb[1]), (bb[0], bb[3]), (bb[2], bb[3])] {
-            let (dx, dy) = transform_point(ctm, ux, uy, page_h);
-            dev_pts.push(dx);
-            dev_pts.push(dy);
+        if bb.iter().all(|v| v.is_finite()) {
+            bx0 = bx0.max(bb[0].min(bb[2]));
+            bx1 = bx1.min(bb[0].max(bb[2]));
+            by0 = by0.max(bb[1].min(bb[3]));
+            by1 = by1.min(bb[1].max(bb[3]));
+        } else {
+            log::warn!("shading/type1: non-finite BBox — ignoring BBox");
         }
+    }
+    // After intersection the clip region may be empty; that's fine — the
+    // rasterizer will simply paint nothing inside an empty bbox.
+    let mut dev_pts = [0f64; 8];
+    let corners = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)];
+    for (i, (ux, uy)) in corners.into_iter().enumerate() {
+        let (dx, dy) = transform_point(ctm, ux, uy, page_h);
+        dev_pts[i * 2] = dx;
+        dev_pts[i * 2 + 1] = dy;
     }
     let bbox = bbox_from_coords(&dev_pts);
 
@@ -323,66 +357,61 @@ fn resolve_function_based(
         let ux = inv[0].mul_add(px, inv[2] * py_pdf) + inv[4];
         let uy = inv[1].mul_add(px, inv[3] * py_pdf) + inv[5];
 
-        // Normalise to [0, 1] within the domain, clamping out-of-domain pixels.
+        // Normalise to [0, 1] within the domain; clamp to handle rounding at edges.
         let tx = ((ux - xd0) / (xd1 - xd0)).clamp(0.0, 1.0);
         let ty = ((uy - yd0) / (yd1 - yd0)).clamp(0.0, 1.0);
 
         // Bilinear interpolation over the pre-sampled grid.
-        let gf = (g - 1) as f64;
+        // tx/ty ∈ [0,1] and gf > 0, so fx/fy ∈ [0, gf]; floor ∈ [0, g-1].
         let fx = tx * gf;
         let fy = ty * gf;
-        let c0 = fx.floor() as usize;
-        let r0 = fy.floor() as usize;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "fx/fy clamped to [0,gf=63]; floor fits in usize"
+        )]
+        let (c0, r0) = (fx.floor() as usize, fy.floor() as usize);
         let c1 = (c0 + 1).min(g - 1);
         let r1 = (r0 + 1).min(g - 1);
-        let wc = fx - c0 as f64; // weight towards c1
-        let wr = fy - r0 as f64; // weight towards r1
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "c0/r0 ≤ g-1=63; exact in f64"
+        )]
+        let (wc, wr) = (fx - c0 as f64, fy - r0 as f64); // weights ∈ [0,1)
 
         let s00 = grid[r0 * g + c0];
         let s10 = grid[r0 * g + c1];
         let s01 = grid[r1 * g + c0];
         let s11 = grid[r1 * g + c1];
 
-        let lerp = |a: u8, b: u8, t: f64| -> u8 {
-            (f64::from(a) + t * (f64::from(b) - f64::from(a))).round() as u8
+        // Lerp a single u8 channel; t ∈ [0,1), result ∈ [0,255].
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a,b ∈ [0,255] and t ∈ [0,1); result rounds into [0,255]"
+        )]
+        let lerp_ch = |a: u8, b: u8, t: f64| -> u8 {
+            t.mul_add(f64::from(b) - f64::from(a), f64::from(a)).round() as u8
         };
+
         let top = [
-            lerp(s00[0], s10[0], wc),
-            lerp(s00[1], s10[1], wc),
-            lerp(s00[2], s10[2], wc),
+            lerp_ch(s00[0], s10[0], wc),
+            lerp_ch(s00[1], s10[1], wc),
+            lerp_ch(s00[2], s10[2], wc),
         ];
         let bot = [
-            lerp(s01[0], s11[0], wc),
-            lerp(s01[1], s11[1], wc),
-            lerp(s01[2], s11[2], wc),
+            lerp_ch(s01[0], s11[0], wc),
+            lerp_ch(s01[1], s11[1], wc),
+            lerp_ch(s01[2], s11[2], wc),
         ];
         [
-            lerp(top[0], bot[0], wr),
-            lerp(top[1], bot[1], wr),
-            lerp(top[2], bot[2], wr),
+            lerp_ch(top[0], bot[0], wr),
+            lerp_ch(top[1], bot[1], wr),
+            lerp_ch(top[2], bot[2], wr),
         ]
     });
 
     Some((Box::new(pattern), bbox))
-}
-
-/// Evaluate a PDF function at a 2D input `(x, y)`.
-///
-/// PDF Type 1 shading functions take a 2-element input.  Types 2 and 3 take
-/// only 1 input by spec (unusual but valid in Type 1); we use `x` as the
-/// scalar in that case.
-fn eval_function_2d(doc: &Document, fn_obj: &Object, x: f64, _y: f64, n: usize) -> Option<Vec<f64>> {
-    let fn_dict = resolve_fn_dict(doc, fn_obj)?;
-    let fn_type = fn_dict.get_i64(b"FunctionType")?;
-    match fn_type {
-        2 => Some(eval_exponential(fn_dict, x, n)),
-        3 => eval_stitching(doc, fn_dict, x, n),
-        0 => Some(eval_sampled_approx(fn_dict, x, n)),
-        _ => {
-            log::debug!("shading/type1: FunctionType {fn_type} not yet implemented — using C0");
-            read_fn_color(fn_dict, b"C0", n)
-        }
-    }
 }
 
 // ── Type 4 — Free-form Gouraud triangle mesh ──────────────────────────────────
