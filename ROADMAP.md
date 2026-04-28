@@ -139,8 +139,9 @@ output[py * width + px] = (uint8_t)((coverage * 255) / 32);
 
 - [x] CUDA kernel: jittered 64-sample winding test per pixel (`kernels/aa_fill.cu`; Halton(2,3) sample table; winding-number + EO rule; scales 0..64 → 0..255 via `(total*255+32)>>6`)
 - [x] Warp-ballot reduction: `__ballot_sync` + `__popc` per warp (2 warps/pixel = 64 samples); warp counts aggregated via shared memory; thread 0 writes final byte
-- [x] Wire into fill dispatch: `PageRenderer::try_gpu_aa_fill` (gated on `pdf_interp/gpu-aa` feature); CPU fallback below `GPU_AA_FILL_THRESHOLD = 16384 px`; pattern fills always CPU
+- [x] Wire into fill dispatch: `PageRenderer::try_gpu_aa_fill` (gated on `pdf_interp/gpu-aa` feature); CPU fallback below `GPU_AA_FILL_THRESHOLD`; pattern fills always CPU
 - [x] Validate quality vs CPU AA on pixel-diff benchmark — pixel-identical (RMSE=0) across 41 pages / 98 GPU-dispatched fills at 600 DPI; CLI `gpu-aa` feature wires `GpuCtx` into renderer
+- [x] **Dispatch threshold calibration** (`src/bin/threshold_bench.rs`): geometric sweep 256–4M px on RTX 5070 + `PCIe` 5.0; `GPU_AA_FILL_THRESHOLD` 16 384 → **256 px** (GPU wins immediately; 2.5× at 256 px, 100× at 16 384 px)
 
 **3. Tile-parallel fill rasterisation — GPU path only** ✓ COMPLETE (kernel + Rust API; PageRenderer integration pending)
 
@@ -152,7 +153,8 @@ CUB radix sort was evaluated and rejected for this use case: typical PDF pages h
 - [x] CPU record builder: `build_tile_records(segs, x_min, y_min, width, height)` — one record per (segment, tile-row) crossing; sorted CPU-side by `key = (tile_y << 16) | tile_x`; prefix-sum `tile_starts`/`tile_counts` index built inline; `bytemuck::Pod` + `cudarc::DeviceRepr` for zero-copy upload
 - [~] CUB radix sort: replaced with CPU `sort_unstable_by_key` (see rationale above; CUB left as a future micro-optimisation if segment counts exceed ~50k)
 - [x] Fill kernel (`kernels/tile_fill.cu`): grid `(grid_w, grid_h, 1)`, block `(TILE_W=16, TILE_H=16, 1)`; each thread accumulates signed trapezoidal area for its pixel column across all segments crossing its tile row; NZ rule: `min(|area|, 1) × 255.5`; EO rule: folded-fraction formula
-- [x] `GpuCtx::tile_fill()` Rust API: uploads records/starts/counts via `stream.clone_htod`, launches kernel, synchronises, copies coverage bytes back; threshold `GPU_TILE_FILL_THRESHOLD = 65536 px`
+- [x] `GpuCtx::tile_fill()` Rust API: uploads records/starts/counts via `stream.clone_htod`, launches kernel, synchronises, copies coverage bytes back; threshold `GPU_TILE_FILL_THRESHOLD`
+- [x] **Dispatch threshold calibration**: `GPU_TILE_FILL_THRESHOLD` 65 536 → **256 px** (same crossover as AA fill; tile records + CPU sort overhead is still faster than pure CPU AA at all sizes above 256 px)
 - [x] Wire into `PageRenderer` fill dispatch: `try_gpu_tile_fill` (area ≥ `GPU_TILE_FILL_THRESHOLD`) tried first, then `try_gpu_aa_fill` (area ≥ `GPU_AA_FILL_THRESHOLD`), then CPU scanline AA; shared `gpu_fill_segs` + `gpu_coverage_to_bitmap` helpers eliminate duplication
 
 **4. ICC colour transforms** ✓ COMPLETE (CPU AVX-512 + GPU CLUT kernel)
@@ -160,7 +162,8 @@ CUB radix sort was evaluated and rejected for this use case: typical PDF pages h
 DeviceCMYK → DeviceRGB via two paths depending on whether a full ICC CLUT is available:
 
 - [x] **CPU matrix path** (`icc_cmyk_to_rgb_cpu`, clut=None): subtractive formula `(255−ch)*(255−K)/255` vectorised with `avx512bw` + `avx2` — 16 pixels/call via `_mm256_mullo_epi16`. VNNI was evaluated and rejected: `_mm512_dpbusds_epi32` requires compile-time constant weights; both operands are runtime pixel data here. Exact `⌊(x+127)/255⌋` divide matches scalar to the bit. Scalar fallback for non-AVX-512 targets and tail pixels.
-- [x] **GPU CLUT kernel** (`kernels/icc_clut.cu`): 4D quadrilinear interpolation over a baked `grid_n⁴ × 3` byte table; one thread per pixel; threshold `GPU_ICC_CLUT_THRESHOLD = 500 000 px`
+- [x] **GPU CLUT kernel** (`kernels/icc_clut.cu`): 4D quadrilinear interpolation over a baked `grid_n⁴ × 3` byte table; one thread per pixel; threshold `GPU_ICC_CLUT_THRESHOLD = 500 000 px` (conservative placeholder; CLUT path not yet in the hot path)
+- [x] **ICC matrix dispatch fix**: `icc_cmyk_to_rgb` short-circuits to `icc_cmyk_to_rgb_cpu` before the threshold check when `clut=None` — `threshold_bench` showed GPU matrix kernel never beats AVX-512 across all measured sizes (256–4M px); `PCIe` round-trip cost exceeds the cheap per-pixel computation
 - [x] `bake_cmyk_clut` (`pdf_interp/src/resources/icc.rs`): bakes a Little CMS ICC profile into a compact `u8` CLUT for upload; `BakeError` with `InvalidGridSize` and `Cms` variants; `DEFAULT_GRID_N = 17`
 - [x] Rounding bias fix in CUDA kernel: `((255u - c) * inv_k + 127u) / 255u` (was missing the `+127` bias)
 - [x] Parity tests: `icc_cmyk_matrix_avx_vs_scalar` asserts AVX-512 and scalar agree byte-for-byte across 16 representative pixels including axis extremes and mid-range sweep

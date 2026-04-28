@@ -67,9 +67,10 @@ RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --st
 | Path | Threshold | Constant |
 |---|---|---|
 | nvJPEG | ≥ 512×512 px | `GPU_JPEG_THRESHOLD_PX` |
-| GPU AA fill | ≥ 16 384 px | `GPU_AA_FILL_THRESHOLD` |
-| Tile fill | ≥ 65 536 px | `GPU_TILE_FILL_THRESHOLD` |
-| ICC CMYK→RGB | ≥ 500 000 px | `GPU_ICC_CLUT_THRESHOLD` |
+| GPU AA fill | ≥ 256 px | `GPU_AA_FILL_THRESHOLD` |
+| Tile fill | ≥ 256 px | `GPU_TILE_FILL_THRESHOLD` |
+| ICC CMYK→RGB (CLUT) | ≥ 500 000 px | `GPU_ICC_CLUT_THRESHOLD` |
+| ICC CMYK→RGB (matrix) | never GPU | short-circuits to CPU AVX-512 |
 
 `fill_path` dispatch order: tile fill → AA fill → CPU scanline AA.
 
@@ -83,4 +84,4 @@ See `ROADMAP.md`. Phases 1–3 complete. Phase 4 (GPU) active:
 - nvJPEG ✓, tile fill ✓, ICC CMYK→RGB ✓ (GPU CLUT + AVX-512 CPU matrix), GPU AA kernel ✓
 - Phase 2.5 AVX-512 CPU specialisation ✓ COMPLETE (avx512bw mullo replaces VNNI — VNNI rejected because formula has two runtime operands)
 - GPU AA quality validated ✓ — pixel-identical (RMSE=0) vs CPU AA across 41 pages / 98 GPU-dispatched fills at 600 DPI; CLI `--features gpu-aa` wires `GpuCtx`
-- **Open:** dispatch threshold tuning (measure H2D/D2H latency on RTX 5070 to calibrate `GPU_AA_FILL_THRESHOLD`)
+- Dispatch thresholds calibrated ✓ via `threshold_bench` (RTX 5070 + PCIe 5.0): AA fill 256 px, tile fill 256 px; matrix ICC always CPU; CLUT ICC threshold placeholder 500 000 px (CLUT path not yet hot)
