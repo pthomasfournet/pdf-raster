@@ -36,42 +36,76 @@ thread_local! {
     static NVJPEG2K_DEC: RefCell<Option<gpu::nvjpeg2k::NvJpeg2kDecoder>> = const { RefCell::new(None) };
 }
 
-/// Ensure the per-thread nvJPEG decoder is initialised.  No-op after first call.
+/// Initialisation state for a per-thread GPU decoder.
+///
+/// Tracks whether initialisation has been attempted so that a failed attempt
+/// does not retry (and re-log) on every subsequent page render.
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+#[derive(Default)]
+enum DecoderInit<T> {
+    /// `new()` has not been called yet on this thread.
+    #[default]
+    Uninitialised,
+    /// `new()` succeeded; the decoder is ready (or temporarily moved out).
+    Ready(Option<T>),
+    /// `new()` failed; do not retry.
+    Failed,
+}
+
+#[cfg(feature = "nvjpeg")]
+thread_local! {
+    static NVJPEG_DEC: RefCell<DecoderInit<gpu::nvjpeg::NvJpegDecoder>> =
+        const { RefCell::new(DecoderInit::Uninitialised) };
+}
+
+#[cfg(feature = "nvjpeg2k")]
+thread_local! {
+    static NVJPEG2K_DEC: RefCell<DecoderInit<gpu::nvjpeg2k::NvJpeg2kDecoder>> =
+        const { RefCell::new(DecoderInit::Uninitialised) };
+}
+
+/// Ensure the per-thread nvJPEG decoder is initialised.
+///
+/// On first call: attempts `NvJpegDecoder::new(0)`.  On success, stores the
+/// decoder.  On failure, logs once to stderr and marks the slot `Failed` so
+/// subsequent pages skip the attempt silently.
 #[cfg(feature = "nvjpeg")]
 fn init_nvjpeg() {
     NVJPEG_DEC.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_none() {
+        if matches!(*slot, DecoderInit::Uninitialised) {
             match gpu::nvjpeg::NvJpegDecoder::new(0) {
-                Ok(dec) => {
-                    *slot = Some(dec);
-                }
+                Ok(dec) => *slot = DecoderInit::Ready(Some(dec)),
                 Err(e) => {
                     eprintln!(
-                        "pdf-raster: nvJPEG unavailable on this thread ({e}); \
-                         JPEG images will be decoded on CPU"
+                        "pdf-raster: nvJPEG unavailable ({e}); \
+                         JPEG images will be decoded on CPU for this thread"
                     );
+                    *slot = DecoderInit::Failed;
                 }
             }
         }
     });
 }
 
-/// Ensure the per-thread nvJPEG2000 decoder is initialised.  No-op after first call.
+/// Ensure the per-thread nvJPEG2000 decoder is initialised.
+///
+/// On first call: attempts `NvJpeg2kDecoder::new(0)`.  On success, stores the
+/// decoder.  On failure, logs once to stderr and marks the slot `Failed` so
+/// subsequent pages skip the attempt silently.
 #[cfg(feature = "nvjpeg2k")]
 fn init_nvjpeg2k() {
     NVJPEG2K_DEC.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_none() {
+        if matches!(*slot, DecoderInit::Uninitialised) {
             match gpu::nvjpeg2k::NvJpeg2kDecoder::new(0) {
-                Ok(dec) => {
-                    *slot = Some(dec);
-                }
+                Ok(dec) => *slot = DecoderInit::Ready(Some(dec)),
                 Err(e) => {
                     eprintln!(
-                        "pdf-raster: nvJPEG2000 unavailable on this thread ({e}); \
-                         JPEG 2000 images will be decoded on CPU"
+                        "pdf-raster: nvJPEG2000 unavailable ({e}); \
+                         JPEG 2000 images will be decoded on CPU for this thread"
                     );
+                    *slot = DecoderInit::Failed;
                 }
             }
         }
@@ -176,7 +210,7 @@ impl From<EncodeError> for RenderError {
 ///
 /// GPU acceleration is enabled transparently when the relevant feature flags
 /// are compiled in:
-/// - `gpu-aa`, `nvjpeg`, `gpu-icc`: shared [`gpu::GpuCtx`] passed via `gpu_ctx`
+/// - `gpu-aa`, `gpu-icc`: shared [`gpu::GpuCtx`] passed via `gpu_ctx`
 /// - `nvjpeg`: per-thread [`gpu::nvjpeg::NvJpegDecoder`] for `DCTDecode` images
 /// - `nvjpeg2k`: per-thread [`gpu::nvjpeg2k::NvJpeg2kDecoder`] for `JPXDecode` images
 ///
@@ -241,29 +275,47 @@ pub fn render_page_native(
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     renderer.set_gpu_ctx(gpu_ctx.map(Arc::clone));
 
-    // Attach per-thread GPU image decoders.  init_* is a no-op after the first
-    // call on each thread.  borrow_mut() cannot panic: no other borrow of the
-    // same thread-local is live across this call (single-threaded execution model
-    // within each rayon task).
+    // Attach per-thread GPU image decoders.  init_* attempts construction once
+    // per thread; subsequent calls are no-ops.  borrow_mut() cannot panic: rayon
+    // tasks are single-threaded — no concurrent borrow of the same thread-local
+    // is possible within one task invocation.
     #[cfg(feature = "nvjpeg")]
     {
         init_nvjpeg();
-        NVJPEG_DEC.with(|cell| renderer.set_nvjpeg(cell.borrow_mut().take()));
+        NVJPEG_DEC.with(|cell| {
+            if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+                renderer.set_nvjpeg(slot.take());
+            }
+        });
     }
     #[cfg(feature = "nvjpeg2k")]
     {
         init_nvjpeg2k();
-        NVJPEG2K_DEC.with(|cell| renderer.set_nvjpeg2k(cell.borrow_mut().take()));
+        NVJPEG2K_DEC.with(|cell| {
+            if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+                renderer.set_nvjpeg2k(slot.take());
+            }
+        });
     }
 
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
 
-    // Return the decoders to the thread-local slots so they survive across pages.
+    // Return decoders to the thread-local slots so they survive across pages.
+    // take_nvjpeg / take_nvjpeg2k return None if the decoder was never attached
+    // (e.g. init failed); in that case the slot stays Failed and is not touched.
     #[cfg(feature = "nvjpeg")]
-    NVJPEG_DEC.with(|cell| *cell.borrow_mut() = renderer.take_nvjpeg());
+    NVJPEG_DEC.with(|cell| {
+        if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+            *slot = renderer.take_nvjpeg();
+        }
+    });
     #[cfg(feature = "nvjpeg2k")]
-    NVJPEG2K_DEC.with(|cell| *cell.borrow_mut() = renderer.take_nvjpeg2k());
+    NVJPEG2K_DEC.with(|cell| {
+        if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+            *slot = renderer.take_nvjpeg2k();
+        }
+    });
 
     let rgb: Bitmap<Rgb8> = renderer.finish();
 

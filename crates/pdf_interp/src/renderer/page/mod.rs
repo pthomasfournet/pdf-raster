@@ -245,9 +245,9 @@ impl<'doc> PageRenderer<'doc> {
 
     /// Detach and return the nvJPEG decoder so the caller can reuse it.
     ///
-    /// Returns `None` if no decoder was attached or if the `nvjpeg` feature is
-    /// disabled.  Used by the CLI to return the decoder to its thread-local slot
-    /// after each page render.
+    /// Returns `None` if no decoder was attached (e.g. GPU init failed).
+    /// Used by the CLI to return the decoder to its thread-local slot
+    /// after each page render so it survives across pages.
     #[cfg(feature = "nvjpeg")]
     pub fn take_nvjpeg(&mut self) -> Option<NvJpegDecoder> {
         self.nvjpeg.take()
@@ -255,9 +255,9 @@ impl<'doc> PageRenderer<'doc> {
 
     /// Detach and return the nvJPEG2000 decoder so the caller can reuse it.
     ///
-    /// Returns `None` if no decoder was attached or if the `nvjpeg2k` feature is
-    /// disabled.  Used by the CLI to return the decoder to its thread-local slot
-    /// after each page render.
+    /// Returns `None` if no decoder was attached (e.g. GPU init failed).
+    /// Used by the CLI to return the decoder to its thread-local slot
+    /// after each page render so it survives across pages.
     #[cfg(feature = "nvjpeg2k")]
     pub fn take_nvjpeg2k(&mut self) -> Option<NvJpeg2kDecoder> {
         self.nvjpeg2k.take()
