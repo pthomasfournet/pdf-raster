@@ -109,6 +109,14 @@ unsafe impl bytemuck::Zeroable for TileRecord {}
 // all fields are plain u32/f32 with repr(C) alignment.
 unsafe impl DeviceRepr for TileRecord {}
 
+/// f32 aliases for tile dimensions — values are 16.0, exact in f32.
+/// Avoids repeated `TILE_W/H as f32` casts inside `build_tile_records` that
+/// would fire `cast_precision_loss` despite being trivially safe.
+#[expect(clippy::cast_precision_loss, reason = "TILE_W/H = 16, exact in f32 (24-bit mantissa)")]
+const TILE_W_F: f32 = TILE_W as f32;
+#[expect(clippy::cast_precision_loss, reason = "TILE_W/H = 16, exact in f32 (24-bit mantissa)")]
+const TILE_H_F: f32 = TILE_H as f32;
+
 /// Build a sorted list of [`TileRecord`]s from a flat segment list, plus the
 /// `tile_starts` / `tile_counts` index arrays required by [`GpuCtx::tile_fill`].
 ///
@@ -124,12 +132,6 @@ unsafe impl DeviceRepr for TileRecord {}
 /// require more than 65535 tiles in either dimension (i.e. exceed `65535 × TILE_W`
 /// or `65535 × TILE_H` pixels) — the sort key packs tile coordinates into 16 bits each.
 #[must_use]
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "tile indices are bounds-checked to fit u16; f32 precision sufficient for tile geometry at realistic page sizes"
-)]
 pub fn build_tile_records(
     segs: &[f32],
     x_min: f32,
@@ -149,6 +151,7 @@ pub fn build_tile_records(
         grid_w <= 0xFFFF && grid_h <= 0xFFFF,
         "raster too large: grid {grid_w}×{grid_h} tiles exceeds 16-bit tile key range",
     );
+    // grid_w, grid_h ≤ 0xFFFF; product ≤ 65535² = 4_294_836_225 < u32::MAX — no overflow.
     let n_tiles = (grid_w * grid_h) as usize;
 
     let mut records: Vec<TileRecord> = Vec::new();
@@ -179,6 +182,9 @@ pub fn build_tile_records(
 
         // Clamp to output bounds.
         let ey0 = sy0.max(0.0);
+        // height ≤ u32::MAX px; page heights are always ≤ 32768 at supported DPIs —
+        // exact in f32 (which has a 24-bit mantissa, covering integers to 16M).
+        #[expect(clippy::cast_precision_loss, reason = "height ≤ 32768 px in practice; exact in f32 (24-bit mantissa)")]
         let ey1 = sy1.min(height as f32);
         if ey0 >= ey1 {
             continue;
@@ -187,12 +193,17 @@ pub fn build_tile_records(
         // First and last tile rows the segment (after clamping) crosses.
         // Subtract a small epsilon from ey1 so a segment ending exactly on a
         // tile boundary doesn't bleed into the next tile row.
-        let ty0 = (ey0 / TILE_H as f32).floor() as u32;
-        let ty1 = ((ey1 - 1e-6).max(0.0) / TILE_H as f32).floor() as u32;
+        // ey0/ey1 are non-negative and floored ≤ height/TILE_H_F ≤ grid_h ≤ 0xFFFF — fits u32.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "floor(non-negative / TILE_H_F) is ≥ 0 and ≤ grid_h ≤ 0xFFFF — fits u32")]
+        let ty0 = (ey0 / TILE_H_F).floor() as u32;
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "floor(non-negative / TILE_H_F) is ≥ 0 and ≤ grid_h ≤ 0xFFFF — fits u32")]
+        let ty1 = ((ey1 - 1e-6).max(0.0) / TILE_H_F).floor() as u32;
 
         for ty in ty0..=ty1.min(grid_h - 1) {
+            // ty ≤ 0xFFFF, TILE_H_F = 16.0; product ≤ ~1M — exact in f32 (24-bit mantissa).
+            #[expect(clippy::cast_precision_loss, reason = "ty * TILE_H ≤ 0xFFFF*16 ≈ 1M; exact in f32")]
             let tile_top = (ty * TILE_H) as f32;
-            let tile_bot = tile_top + TILE_H as f32;
+            let tile_bot = tile_top + TILE_H_F;
 
             // Segment y-extent clipped to this tile row, in tile-local coords.
             let seg_y0_tile = ey0.max(tile_top) - tile_top;
@@ -213,15 +224,24 @@ pub fn build_tile_records(
             // Compute tx0/tx1 as i32 first to handle negative x safely, then
             // clamp to [0, grid_w-1].  A negative tx1 means the segment is
             // entirely left of the raster — skip the whole tile row.
-            let tx0_i = (xl / TILE_W as f32).floor() as i32;
-            let tx1_i = (xr / TILE_W as f32).floor() as i32;
+            // xl/xr are f32 page coordinates; floor→i32 is safe for any realistic page width.
+            #[expect(clippy::cast_possible_truncation, reason = "floor(f32) for page-coordinate x; realistic page widths fit comfortably in i32")]
+            let tx0_i = (xl / TILE_W_F).floor() as i32;
+            #[expect(clippy::cast_possible_truncation, reason = "floor(f32) for page-coordinate x; realistic page widths fit comfortably in i32")]
+            let tx1_i = (xr / TILE_W_F).floor() as i32;
             if tx1_i < 0 {
                 continue;
             }
+            // tx0_i.max(0) is non-negative — safe to cast to u32.
+            #[expect(clippy::cast_sign_loss, reason = "tx0_i.max(0) ≥ 0 by construction")]
             let tx0 = tx0_i.max(0) as u32;
+            // tx1_i ≥ 0 checked above (continue if < 0) — safe to cast to u32.
+            #[expect(clippy::cast_sign_loss, reason = "tx1_i ≥ 0 verified by the guard above")]
             let tx1 = (tx1_i as u32).min(grid_w - 1);
 
             for tx in tx0..=tx1 {
+                // tx ≤ grid_w-1 ≤ 0xFFFE, TILE_W_F = 16.0; product ≤ ~1M — exact in f32.
+                #[expect(clippy::cast_precision_loss, reason = "tx * TILE_W ≤ 0xFFFE*16 ≈ 1M; exact in f32")]
                 records.push(TileRecord {
                     key: (ty << 16) | tx,
                     // tile-local x: subtract this tile column's left edge.
@@ -434,6 +454,11 @@ impl GpuCtx {
         height: u32,
         eo: bool,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        assert!(
+            segs.len().is_multiple_of(4),
+            "segs.len() must be a multiple of 4 (got {})",
+            segs.len()
+        );
         let n_pixels = width as usize * height as usize;
         let n_segs = u32::try_from(segs.len() / 4).expect("segment count exceeds u32::MAX");
         let n_pixels_u32 = u32::try_from(n_pixels).expect("pixel count exceeds u32::MAX");
@@ -454,7 +479,6 @@ impl GpuCtx {
 
         let eo_int: i32 = i32::from(eo);
         let mut builder = stream.launch_builder(&self.kernels.aa_fill);
-        // PushKernelArg::arg returns &mut Self; chain results are intentionally unused.
         let _ = builder.arg(&d_segs);
         let _ = builder.arg(&n_segs);
         let _ = builder.arg(&x_min);
@@ -501,7 +525,7 @@ impl GpuCtx {
     /// # Panics
     ///
     /// Panics if `tile_starts.len() != tile_counts.len()`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "all 7 args are required: records + index arrays + grid/pixel dims + fill rule; no grouping is natural here")]
     pub fn tile_fill(
         &self,
         records: &[TileRecord],
@@ -581,11 +605,8 @@ impl GpuCtx {
     ///
     /// # Panics
     ///
-    /// # Panics
-    ///
     /// Panics if `cmyk.len()` is not a multiple of 4, or if `clut` is `Some` and
     /// `table.len() != grid_n^4 * 3`.
-    #[must_use = "the RGB pixel buffer is not written to the caller unless used"]
     pub fn icc_cmyk_to_rgb(
         &self,
         cmyk: &[u8],
@@ -647,6 +668,11 @@ impl GpuCtx {
         cmyk: &[u8],
         clut: Option<(&[u8], u32)>,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        assert!(
+            cmyk.len().is_multiple_of(4),
+            "cmyk.len() must be a multiple of 4 (got {})",
+            cmyk.len()
+        );
         let n = cmyk.len() / 4;
         let n_u32 = u32::try_from(n).expect("pixel count exceeds u32::MAX");
         let stream = &self.stream;
@@ -699,12 +725,10 @@ impl GpuCtx {
 
         let cfg = launch_cfg(n);
         let mut builder = stream.launch_builder(&self.kernels.composite_rgba8);
-        // PushKernelArg::arg returns &mut Self (builder pattern); chain results are intentionally unused.
         let _ = builder.arg(&d_src);
         let _ = builder.arg(&mut d_dst);
         let _ = builder.arg(&n_u32);
-        // SAFETY: kernel arguments match the PTX signature; n_u32 bounds are verified above.
-        // launch returns Option<timing events> on success; we don't need timing, so discard it.
+        // SAFETY: 3 args match composite_rgba8 PTX signature; n_u32 verified above.
         let _ = unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
@@ -726,12 +750,10 @@ impl GpuCtx {
 
         let cfg = launch_cfg(n);
         let mut builder = stream.launch_builder(&self.kernels.apply_soft_mask);
-        // PushKernelArg::arg returns &mut Self (builder pattern); chain results are intentionally unused.
         let _ = builder.arg(&mut d_pixels);
         let _ = builder.arg(&d_mask);
         let _ = builder.arg(&n_u32);
-        // SAFETY: kernel arguments match the PTX signature; n_u32 bounds are verified above.
-        // launch returns Option<timing events> on success; we don't need timing, so discard it.
+        // SAFETY: 3 args match apply_soft_mask PTX signature; n_u32 verified above.
         let _ = unsafe { builder.launch(cfg) }?;
 
         stream.synchronize()?;
@@ -742,7 +764,7 @@ impl GpuCtx {
 
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "n.div_ceil(256) ≤ u32::MAX for any practical pixel count (≤ 4B pixels)"
+    reason = "callers validate n ≤ u32::MAX via u32::try_from before calling this; n.div_ceil(256) is therefore also ≤ u32::MAX"
 )]
 const fn launch_cfg(n: usize) -> LaunchConfig {
     LaunchConfig {

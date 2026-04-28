@@ -19,6 +19,15 @@ use std::time::Instant;
 
 use gpu::{GpuCtx, aa_fill_cpu, build_tile_records, icc_cmyk_to_rgb_cpu};
 
+/// Unwrap a GPU `Result`, printing the error with context and exiting with
+/// status 1.  Used inside timing closures where `?` is not available.
+fn gpu_unwrap<T>(res: Result<T, Box<dyn std::error::Error>>, ctx: &str) -> T {
+    res.unwrap_or_else(|e| {
+        eprintln!("threshold_bench: GPU error in {ctx}: {e}");
+        std::process::exit(1);
+    })
+}
+
 // ── Config ─────────────────────────────────────────────────────────────────
 
 struct Config {
@@ -140,7 +149,7 @@ fn bench_aa_fill(ctx: &GpuCtx, cfg: &Config) {
         );
 
         let gpu_ns = time_ns(
-            || { let _ = ctx.aa_fill_gpu(&segs, 0.0, 0.0, w, h, false).unwrap(); },
+            || { let _ = gpu_unwrap(ctx.aa_fill_gpu(&segs, 0.0, 0.0, w, h, false), "aa_fill_gpu"); },
             cfg.warmup, cfg.iters,
         );
 
@@ -186,7 +195,7 @@ fn bench_tile_fill(ctx: &GpuCtx, cfg: &Config) {
             || {
                 let (records, starts, counts, grid_w) =
                     build_tile_records(&segs, 0.0, 0.0, w, h);
-                let _ = ctx.tile_fill(&records, &starts, &counts, grid_w, w, h, false).unwrap();
+                let _ = gpu_unwrap(ctx.tile_fill(&records, &starts, &counts, grid_w, w, h, false), "tile_fill");
             },
             cfg.warmup, cfg.iters,
         );
@@ -212,7 +221,11 @@ fn bench_tile_fill(ctx: &GpuCtx, cfg: &Config) {
 // ── ICC CMYK→RGB benchmark ──────────────────────────────────────────────────
 
 fn bench_icc_cmyk(ctx: &GpuCtx, cfg: &Config) {
-    println!("\n══ icc_cmyk: GPU matrix kernel vs CPU AVX-512 ══");
+    // NOTE: this bench measures the raw GPU matrix kernel (clut=None) against
+    // CPU AVX-512.  The dispatch in icc_cmyk_to_rgb() always short-circuits to CPU
+    // for clut=None regardless of pixel count, so the crossover below is informational
+    // only.  To calibrate GPU_ICC_CLUT_THRESHOLD, re-run with a real CLUT workload.
+    println!("\n══ icc_cmyk: GPU matrix kernel vs CPU AVX-512 (matrix path, informational) ══");
     println!("{:>10}  {:>12}  {:>12}  {:>8}  winner", "pixels", "cpu_ns", "gpu_ns", "ratio");
     println!("{}", "─".repeat(60));
 
@@ -234,7 +247,7 @@ fn bench_icc_cmyk(ctx: &GpuCtx, cfg: &Config) {
         // Use the unconditional GPU path to measure actual dispatch cost at
         // all sizes, not just those above the current threshold.
         let gpu_ns = time_ns(
-            || { let _ = ctx.icc_cmyk_to_rgb_gpu(&cmyk, None).unwrap(); },
+            || { let _ = gpu_unwrap(ctx.icc_cmyk_to_rgb_gpu(&cmyk, None), "icc_cmyk_to_rgb_gpu"); },
             cfg.warmup, cfg.iters,
         );
 
@@ -251,8 +264,15 @@ fn bench_icc_cmyk(ctx: &GpuCtx, cfg: &Config) {
 
     println!();
     match crossover {
-        Some(px) => println!("  → Recommended GPU_ICC_CLUT_THRESHOLD: {px} px  (current: {})", gpu::GPU_ICC_CLUT_THRESHOLD),
-        None      => println!("  → GPU never faster in this sweep — keep current threshold"),
+        Some(px) => println!(
+            "  → Matrix kernel crossover at {px} px — but dispatch always uses CPU for \
+             clut=None; GPU_ICC_CLUT_THRESHOLD={} applies to CLUT path only",
+            gpu::GPU_ICC_CLUT_THRESHOLD,
+        ),
+        None => println!(
+            "  → GPU matrix kernel never faster — CPU AVX-512 dominates at all sizes. \
+             Dispatch short-circuits to CPU for clut=None (expected)."
+        ),
     }
 }
 
