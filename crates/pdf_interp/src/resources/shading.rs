@@ -1,20 +1,20 @@
-//! PDF shading resource resolution (Types 2–7).
+//! PDF shading resource resolution (Types 1–7).
 //!
 //! [`resolve_shading`] looks up a named `Shading` resource and returns a
 //! [`ShadingResult`] which is either a [`raster::pipe::Pattern`] (for smooth
-//! gradient types 2–3) or a pre-decoded triangle mesh (for mesh types 4–7).
+//! gradient types 1–3) or a pre-decoded triangle mesh (for mesh types 4–7).
 //!
 //! # Supported shading types
 //!
 //! | PDF type | Name | Support |
 //! |---|---|---|
+//! | 1 | Function-based | yes (pre-sampled 64×64 grid) |
 //! | 2 | Axial (linear) | yes |
 //! | 3 | Radial | yes |
 //! | 4 | Free-form Gouraud triangle mesh | yes |
 //! | 5 | Lattice-form Gouraud mesh | yes |
 //! | 6 | Coons patch mesh | yes |
 //! | 7 | Tensor-product patch mesh | yes |
-//! | 1 | Function-based | stub (logged + skipped) |
 //!
 //! # Colour spaces
 //!
@@ -31,6 +31,7 @@
 use lopdf::{Dictionary, Document, Object, Stream};
 use raster::pipe::Pattern;
 use raster::shading::axial::AxialPattern;
+use raster::shading::function::FunctionPattern;
 use raster::shading::gouraud::GouraudVertex;
 use raster::shading::radial::RadialPattern;
 
@@ -90,6 +91,8 @@ pub fn resolve_shading(
     let n_channels = cs_channel_count(cs);
 
     match shading_type {
+        1 => resolve_function_based(doc, sh_dict, cs, n_channels, ctm, page_h)
+            .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
         2 => resolve_axial(doc, sh_dict, cs, n_channels, ctm, page_h)
             .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
         3 => resolve_radial(doc, sh_dict, cs, n_channels, ctm, page_h)
@@ -239,6 +242,147 @@ fn resolve_radial(
         rgb0, rgb1, dx0, dy0, dr0, dx1, dy1, dr1, t0, t1, ext_s, ext_e,
     );
     Some((Box::new(pattern), bbox))
+}
+
+// ── Function-based (Type 1) ───────────────────────────────────────────────────
+
+/// Number of grid samples per axis for the pre-sampled Type 1 shading grid.
+const TYPE1_GRID: usize = 64;
+
+fn resolve_function_based(
+    doc: &Document,
+    sh: &Dictionary,
+    cs: ImageColorSpace,
+    n: usize,
+    ctm: &[f64; 6],
+    page_h: f64,
+) -> Option<(Box<dyn Pattern + Send + Sync>, [f64; 4])> {
+    // Domain: [xmin, xmax, ymin, ymax] in user space. Defaults to [0,1,0,1].
+    let domain = read_f64_array(sh, b"Domain", 4)
+        .unwrap_or_else(|| vec![0.0, 1.0, 0.0, 1.0]);
+    let (xd0, xd1, yd0, yd1) = (domain[0], domain[1], domain[2], domain[3]);
+
+    if xd0 >= xd1 || yd0 >= yd1 {
+        log::warn!("shading/type1: degenerate Domain — skipping");
+        return None;
+    }
+
+    let fn_obj = sh.get(b"Function").ok()?;
+
+    // Invert the CTM so we can map device pixels → user space inside fill_span.
+    let [a, b, c, d, e, f] = *ctm;
+    let det = a * d - b * c;
+    if det.abs() < f64::EPSILON {
+        log::warn!("shading/type1: degenerate CTM (det≈0) — skipping");
+        return None;
+    }
+    let inv: [f64; 6] = [
+        d / det,
+        -b / det,
+        -c / det,
+        a / det,
+        (c * f - d * e) / det,
+        (b * e - a * f) / det,
+    ];
+
+    // Pre-sample the function on a TYPE1_GRID×TYPE1_GRID grid in user space.
+    // This resolves all document references at resolve time; the closure only
+    // captures the resulting grid, which is 'static.
+    let g = TYPE1_GRID;
+    let mut grid = Vec::with_capacity(g * g);
+    for row in 0..g {
+        let uy = yd0 + (row as f64 / (g - 1) as f64) * (yd1 - yd0);
+        for col in 0..g {
+            let ux = xd0 + (col as f64 / (g - 1) as f64) * (xd1 - xd0);
+            let channels = eval_function_2d(doc, fn_obj, ux, uy, n)
+                .unwrap_or_else(|| vec![0.0; n]);
+            grid.push(cs_to_rgb(cs, &channels));
+        }
+    }
+    let grid = std::sync::Arc::new(grid);
+
+    // Compute device-space bounding box from domain corners (+ optional BBox).
+    let mut dev_pts = Vec::with_capacity(8);
+    for (ux, uy) in [(xd0, yd0), (xd1, yd0), (xd0, yd1), (xd1, yd1)] {
+        let (dx, dy) = transform_point(ctm, ux, uy, page_h);
+        dev_pts.push(dx);
+        dev_pts.push(dy);
+    }
+    if let Some(bb) = read_f64_array(sh, b"BBox", 4) {
+        for (ux, uy) in [(bb[0], bb[1]), (bb[2], bb[1]), (bb[0], bb[3]), (bb[2], bb[3])] {
+            let (dx, dy) = transform_point(ctm, ux, uy, page_h);
+            dev_pts.push(dx);
+            dev_pts.push(dy);
+        }
+    }
+    let bbox = bbox_from_coords(&dev_pts);
+
+    let pattern = FunctionPattern::new(move |px, py| {
+        // Undo the y-flip applied by transform_point, then apply inverse CTM.
+        let py_pdf = page_h - py;
+        let ux = inv[0].mul_add(px, inv[2] * py_pdf) + inv[4];
+        let uy = inv[1].mul_add(px, inv[3] * py_pdf) + inv[5];
+
+        // Normalise to [0, 1] within the domain, clamping out-of-domain pixels.
+        let tx = ((ux - xd0) / (xd1 - xd0)).clamp(0.0, 1.0);
+        let ty = ((uy - yd0) / (yd1 - yd0)).clamp(0.0, 1.0);
+
+        // Bilinear interpolation over the pre-sampled grid.
+        let gf = (g - 1) as f64;
+        let fx = tx * gf;
+        let fy = ty * gf;
+        let c0 = fx.floor() as usize;
+        let r0 = fy.floor() as usize;
+        let c1 = (c0 + 1).min(g - 1);
+        let r1 = (r0 + 1).min(g - 1);
+        let wc = fx - c0 as f64; // weight towards c1
+        let wr = fy - r0 as f64; // weight towards r1
+
+        let s00 = grid[r0 * g + c0];
+        let s10 = grid[r0 * g + c1];
+        let s01 = grid[r1 * g + c0];
+        let s11 = grid[r1 * g + c1];
+
+        let lerp = |a: u8, b: u8, t: f64| -> u8 {
+            (f64::from(a) + t * (f64::from(b) - f64::from(a))).round() as u8
+        };
+        let top = [
+            lerp(s00[0], s10[0], wc),
+            lerp(s00[1], s10[1], wc),
+            lerp(s00[2], s10[2], wc),
+        ];
+        let bot = [
+            lerp(s01[0], s11[0], wc),
+            lerp(s01[1], s11[1], wc),
+            lerp(s01[2], s11[2], wc),
+        ];
+        [
+            lerp(top[0], bot[0], wr),
+            lerp(top[1], bot[1], wr),
+            lerp(top[2], bot[2], wr),
+        ]
+    });
+
+    Some((Box::new(pattern), bbox))
+}
+
+/// Evaluate a PDF function at a 2D input `(x, y)`.
+///
+/// PDF Type 1 shading functions take a 2-element input.  Types 2 and 3 take
+/// only 1 input by spec (unusual but valid in Type 1); we use `x` as the
+/// scalar in that case.
+fn eval_function_2d(doc: &Document, fn_obj: &Object, x: f64, _y: f64, n: usize) -> Option<Vec<f64>> {
+    let fn_dict = resolve_fn_dict(doc, fn_obj)?;
+    let fn_type = fn_dict.get_i64(b"FunctionType")?;
+    match fn_type {
+        2 => Some(eval_exponential(fn_dict, x, n)),
+        3 => eval_stitching(doc, fn_dict, x, n),
+        0 => Some(eval_sampled_approx(fn_dict, x, n)),
+        _ => {
+            log::debug!("shading/type1: FunctionType {fn_type} not yet implemented — using C0");
+            read_fn_color(fn_dict, b"C0", n)
+        }
+    }
 }
 
 // ── Type 4 — Free-form Gouraud triangle mesh ──────────────────────────────────
