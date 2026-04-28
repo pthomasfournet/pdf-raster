@@ -21,7 +21,7 @@ The raster crate is complete at the pixel level. The `pdf_interp` crate is the n
 - [x] Font encoding `Differences` array → Adobe Glyph List → GID
 - [x] `ExtGState` (`gs`): fill/stroke opacity, line width, cap, join, miter, flatness
 - [x] Form XObjects: recursive execution, resource isolation, depth limit
-- [x] Image XObjects: FlateDecode, DCTDecode (JPEG), JPXDecode (JPEG 2000), CCITTFaxDecode Group 4, raw
+- [x] Image XObjects: FlateDecode, DCTDecode (JPEG), JPXDecode (JPEG 2000), CCITTFaxDecode Group 3 (K=0, K>0) + Group 4, raw
 - [x] Image colour spaces: DeviceRGB, DeviceGray, mask (stencil)
 - [x] Soft mask (SMask) compositing on images
 - [x] JavaScript rejection — hard fail on any JS entry point in the document
@@ -33,7 +33,7 @@ Ordered by priority. Wire CLI by default is the finish line.
 
 - [x] **ICCBased / Indexed / Separation colour spaces** — resolve_cs inspects ICC `N`, expands Indexed palettes, converts CMYK inline; Separation/DeviceN fall back to Gray
 - [x] **ExtGState blend modes (`BM`)** — all 16 PDF modes parsed + threaded through make_pipe to raster compositor
-- [x] **CCITTFaxDecode Group 3 (K=0)** — 1D T.4 supported via fax::decoder::decode_g3; K>0 (mixed 2D) stub
+- [x] **CCITTFaxDecode Group 3** — K=0 (1D T.4) via fax::decoder::decode_g3; K>0 (mixed 1D/2D "MR") via hayro-ccitt EncodingMode::Group3_2D
 - [x] **Inline images (`BI ID EI`)** — decode_inline_image: abbreviated key/name expansion, FlateDecode/DCT/CCITT/RL/raw dispatch, wired to blit_image
 - [x] **Shading (`sh`)** — Types 2 (axial) and 3 (radial) resolved; Function Types 2 (Exponential) and 3 (Stitching) evaluated; wired to shaded_fill
 - [x] **Wire CLI by default** — `--native` flag removed; native is the only path; pdf_bridge dep removed from cli (crate retained for reference)
@@ -87,7 +87,7 @@ Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to. All pat
 
 ---
 
-## Phase 3 — Coverage completeness
+## Phase 3 — Coverage completeness ✓ COMPLETE
 
 Track and close fidelity gaps against pdftoppm once the native path is default.
 
@@ -95,6 +95,18 @@ Track and close fidelity gaps against pdftoppm once the native path is default.
 - [x] Non-axis-aligned image transforms — exact inverse-CTM nearest-neighbour sampling for arbitrary rotated/sheared images; row-constant hoisting eliminates redundant multiplies per inner loop
 - [~] Halftone screens for CMYK separation output — out of scope for a screen rasterizer; PDF viewers intentionally ignore `HT` and render continuous tone; only relevant to print RIPs
 - [x] PDF transparency groups (isolated / non-isolated / knockout) at the page level
+
+### Phase 3 follow-on (post-Phase-4 coverage work, Apr 2026)
+
+- [x] **bpc 2, 4, 16 image decoding** — `expand_nbpp<const BITS>` (MSB-first, scaled to 0–255), `expand_nbpp_indexed` (raw palette indices, bpc 1/2/4), `downsample_16bpp` (high-byte truncation); shared `unpack_packed_bits` helper eliminates loop duplication; all three applied in `decode_raw`, SMask decoder, and `decode_raw_indexed`
+- [x] **CCITTFaxDecode K>0 (Group 3 mixed 2D / T.4 MR)** — `decode_ccitt_g3_2d` via hayro-ccitt 0.3.0 `EncodingMode::Group3_2D { k }`; `HayroCcittCollector` implements the `Decoder` trait; per-row and final-row white padding for truncated/malformed streams
+- [x] **`--gray` / `--mono` CLI flags** — post-render RGB→Gray8 conversion (BT.709 integer coefficients) and 50%-midpoint threshold; `--gray` writes PGM/gray PNG, `--mono` writes PBM (P4)/gray PNG; new `encode::write_pbm` (P4 encoder)
+
+### Still open / lower priority
+
+- [ ] Function-based shading (Type 1) — stub, logged + skipped
+- [ ] nvJPEG2000 for JPXDecode — deferred, low priority
+- [ ] OptiX BVH (evaluate only if profiling shows complex paths as bottleneck)
 
 ---
 

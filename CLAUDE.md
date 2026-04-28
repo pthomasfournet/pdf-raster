@@ -80,8 +80,10 @@ Workspace enforces `unsafe_code = "deny"` on all crates except `gpu`. Use `#[exp
 
 ## Roadmap status
 
-See `ROADMAP.md`. Phases 1–3 complete. Phase 4 (GPU) active:
+See `ROADMAP.md`. Phases 1–4 substantially complete. Phase 3 follow-on coverage work also complete:
 - nvJPEG ✓, tile fill ✓, ICC CMYK→RGB ✓ (GPU CLUT + AVX-512 CPU matrix), GPU AA kernel ✓
-- Phase 2.5 AVX-512 CPU specialisation ✓ COMPLETE (avx512bw mullo replaces VNNI — VNNI rejected because formula has two runtime operands)
-- GPU AA quality validated ✓ — pixel-identical (RMSE=0) vs CPU AA across 41 pages / 98 GPU-dispatched fills at 600 DPI; CLI `--features gpu-aa` wires `GpuCtx`
-- Dispatch thresholds calibrated ✓ via `threshold_bench` (RTX 5070 + PCIe 5.0): AA fill 256 px, tile fill 256 px; matrix ICC always CPU; CLUT ICC threshold placeholder 500 000 px (CLUT path not yet hot)
+- Phase 2.5 AVX-512 CPU specialisation ✓ COMPLETE
+- Dispatch thresholds calibrated ✓ via `threshold_bench`: AA fill 256 px, tile fill 256 px; matrix ICC always CPU
+- bpc 2/4/16 image decoding ✓ (expand_nbpp, expand_nbpp_indexed, downsample_16bpp)
+- CCITTFaxDecode K>0 (Group 3 mixed 2D) ✓ via hayro-ccitt
+- `--gray` / `--mono` CLI flags ✓ (BT.709, 50%-threshold, PGM/PBM/gray PNG output)
