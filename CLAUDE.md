@@ -82,4 +82,5 @@ Workspace enforces `unsafe_code = "deny"` on all crates except `gpu`. Use `#[exp
 See `ROADMAP.md`. Phases 1–3 complete. Phase 4 (GPU) active:
 - nvJPEG ✓, tile fill ✓, ICC CMYK→RGB ✓ (GPU CLUT + AVX-512 CPU matrix), GPU AA kernel ✓
 - Phase 2.5 AVX-512 CPU specialisation ✓ COMPLETE (avx512bw mullo replaces VNNI — VNNI rejected because formula has two runtime operands)
-- **Open:** GPU AA quality validation (pixel-diff vs CPU AA), threshold tuning
+- GPU AA quality validated ✓ — pixel-identical (RMSE=0) vs CPU AA across 41 pages / 98 GPU-dispatched fills at 600 DPI; CLI `--features gpu-aa` wires `GpuCtx`
+- **Open:** dispatch threshold tuning (measure H2D/D2H latency on RTX 5070 to calibrate `GPU_AA_FILL_THRESHOLD`)

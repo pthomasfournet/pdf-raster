@@ -2,6 +2,8 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
+#[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+use std::sync::Arc;
 
 use encode::{EncodeError, write_png, write_ppm};
 use raster::Bitmap;
@@ -98,6 +100,8 @@ pub fn render_page_native(
     page_num: u32,
     total_pages: u32,
     args: &Args,
+    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+    gpu_ctx: Option<&Arc<gpu::GpuCtx>>,
 ) -> Result<(), RenderError> {
     let format = args.output_format();
 
@@ -146,6 +150,8 @@ pub fn render_page_native(
     let ops = pdf_interp::parse_page(doc, page_num)?;
     let mut renderer =
         pdf_interp::renderer::PageRenderer::new_scaled(w_px, h_px, scale, doc, page_id);
+    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+    renderer.set_gpu_ctx(gpu_ctx.map(Arc::clone));
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
     let bitmap: Bitmap<color::Rgb8> = renderer.finish();

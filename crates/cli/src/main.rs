@@ -3,6 +3,8 @@ mod naming;
 mod render;
 
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
@@ -15,6 +17,19 @@ fn main() {
     let _ = env_logger::try_init();
 
     let args = Args::parse();
+
+    // Initialise the GPU context once; each page render receives a clone of the
+    // Arc so they can issue independent streams without re-init overhead.
+    // A warning (not a hard error) is emitted when the feature is compiled in but
+    // the GPU is unavailable — the CPU fallback path activates automatically.
+    #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+    let gpu_ctx: Option<Arc<gpu::GpuCtx>> = match gpu::GpuCtx::init() {
+        Ok(ctx) => Some(Arc::new(ctx)),
+        Err(e) => {
+            eprintln!("pdf-raster: GPU unavailable ({e}); falling back to CPU");
+            None
+        }
+    };
 
     // Build rayon thread pool.
     let pool = rayon::ThreadPoolBuilder::new()
@@ -65,6 +80,9 @@ fn main() {
                     reason = "page_num ≥ 1, enforced by build_page_list"
                 )]
                 let page_u32 = page_num as u32;
+                #[cfg(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc"))]
+                let result = render::render_page_native(&doc, page_u32, total_u32, &args, gpu_ctx.as_ref());
+                #[cfg(not(any(feature = "gpu-aa", feature = "nvjpeg", feature = "gpu-icc")))]
                 let result = render::render_page_native(&doc, page_u32, total_u32, &args);
                 report_progress(&args, &done, n_pages, &start, page_num);
                 result.err().map(|e| (page_num, e))

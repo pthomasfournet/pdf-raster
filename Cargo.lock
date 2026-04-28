@@ -1124,6 +1124,7 @@ dependencies = [
  "color 0.1.0",
  "encode",
  "env_logger",
+ "gpu",
  "log",
  "lopdf",
  "pdf_interp",

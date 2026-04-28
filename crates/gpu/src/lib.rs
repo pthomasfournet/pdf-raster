@@ -981,10 +981,6 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
     clippy::too_many_lines,
     reason = "CLUT quadrilinear interpolation + AVX dispatch — cohesion outweighs length"
 )]
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "the expect() guards an internal invariant (chunk size) that cannot fire"
-)]
 pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
     let n = cmyk.len() / 4;
     let mut rgb = vec![0u8; n * 3];

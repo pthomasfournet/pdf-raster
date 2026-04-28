@@ -7,8 +7,17 @@ edition = "2024"
 name = "pdf-raster"
 path = "src/main.rs"
 
+[features]
+# Enable GPU-accelerated AA fill and tile fill via CUDA.  Mirrors pdf_interp/gpu-aa.
+gpu-aa  = ["dep:gpu", "pdf_interp/gpu-aa"]
+# Enable GPU-accelerated JPEG decoding via nvJPEG.  Mirrors pdf_interp/nvjpeg.
+nvjpeg  = ["dep:gpu", "pdf_interp/nvjpeg"]
+# Enable GPU ICC CMYK→RGB transform.  Mirrors pdf_interp/gpu-icc.
+gpu-icc = ["dep:gpu", "pdf_interp/gpu-icc"]
+
 [dependencies]
 pdf_interp  = { path = "../pdf_interp" }
+gpu         = { path = "../gpu", optional = true }
 lopdf       = "0.40"
 encode      = { path = "../encode" }
 color       = { path = "../color" }
