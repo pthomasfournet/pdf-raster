@@ -1391,7 +1391,16 @@ fn decode_ccitt_g3_2d(
 
     let rows_decoded = collector.rows_decoded();
     let mut data_out = collector.finish();
-    if data_out.len() < p.capacity {
+    // Truncate overlong output (malformed stream that emitted too many pixels)
+    // then pad short output (truncated stream); both produce exactly p.capacity bytes.
+    if data_out.len() > p.capacity {
+        log::debug!(
+            "image: CCITTFaxDecode Group3 2D: output too long ({} > {}), truncating",
+            data_out.len(),
+            p.capacity
+        );
+        data_out.truncate(p.capacity);
+    } else if data_out.len() < p.capacity {
         log::debug!(
             "image: CCITTFaxDecode Group3 2D: got {rows_decoded}/{} rows — padding remainder",
             p.height
@@ -1437,9 +1446,11 @@ impl HayroCcittCollector {
     }
 
     fn finish(mut self) -> Vec<u8> {
-        // Pad any partial final row (shouldn't happen on well-formed streams).
+        // Pad any partial final row (malformed stream that ended mid-row).
         if self.col > 0 {
-            let remaining = (self.width - self.col) as usize;
+            // self.col < self.width is the invariant maintained by push_pixel /
+            // push_pixel_chunk; subtraction is therefore safe.
+            let remaining = usize::try_from(self.width - self.col).unwrap_or(0);
             self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
         }
         self.out
@@ -1466,9 +1477,9 @@ impl hayro_ccitt::Decoder for HayroCcittCollector {
     }
 
     fn next_line(&mut self) {
-        // Pad any short row (malformed stream).
+        // Pad any short row produced by a malformed or truncated bitstream.
         if self.col < self.width {
-            let remaining = (self.width - self.col) as usize;
+            let remaining = usize::try_from(self.width - self.col).unwrap_or(0);
             self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
         }
         self.col = 0;

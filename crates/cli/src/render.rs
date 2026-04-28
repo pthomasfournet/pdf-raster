@@ -182,14 +182,15 @@ pub fn render_page_native(
     let out_path = output_path(args, page_num as i32, total_pages as i32, format);
     let mut out = BufWriter::new(File::create(&out_path)?);
 
+    // JPEG/TIFF are rejected before reaching this point; the arms below are
+    // exhaustive but the Jpeg/Tiff variants cannot be reached.
     if args.mono {
-        let gray = rgb_to_gray(&rgb);
-        let mono = gray_to_mono(&gray);
+        let mono = gray_to_mono(&rgb_to_gray(&rgb));
         match format {
             OutputFormat::Ppm => write_pbm::<Gray8, _>(&mono, &mut out)?,
             OutputFormat::Png => write_png::<Gray8, _>(&mono, &mut out)?,
             OutputFormat::Jpeg | OutputFormat::Tiff => {
-                unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+                unreachable!("JPEG/TIFF rejected above")
             }
         }
     } else if args.gray {
@@ -198,7 +199,7 @@ pub fn render_page_native(
             OutputFormat::Ppm => write_pgm::<Gray8, _>(&gray, &mut out)?,
             OutputFormat::Png => write_png::<Gray8, _>(&gray, &mut out)?,
             OutputFormat::Jpeg | OutputFormat::Tiff => {
-                unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+                unreachable!("JPEG/TIFF rejected above")
             }
         }
     } else {
@@ -206,7 +207,7 @@ pub fn render_page_native(
             OutputFormat::Ppm => write_ppm(&rgb, &mut out)?,
             OutputFormat::Png => write_png(&rgb, &mut out)?,
             OutputFormat::Jpeg | OutputFormat::Tiff => {
-                unreachable!("JPEG/TIFF rejected above; this arm cannot be reached")
+                unreachable!("JPEG/TIFF rejected above")
             }
         }
     }
@@ -216,41 +217,44 @@ pub fn render_page_native(
 }
 
 /// Convert an RGB bitmap to grayscale using BT.709 luminance coefficients.
+///
+/// Output uses the same 0 = black, 255 = white convention as the input.
 fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
     let mut dst: Bitmap<Gray8> = Bitmap::new(src.width, src.height, 1, false);
+    let w = src.width as usize; // width ≤ MAX_PX_DIMENSION (32 768) — fits usize on all targets
     for y in 0..src.height {
-        let src_row = src.row_bytes(y);
+        // row_bytes() returns the full stride; take only the live pixels (width × 3 bytes).
+        let src_pixels = &src.row_bytes(y)[..w * 3];
         let dst_row = dst.row_bytes_mut(y);
-        for x in 0..src.width as usize {
+        for (dst_px, rgb) in dst_row[..w].iter_mut().zip(src_pixels.chunks_exact(3)) {
             // BT.709: Y = 0.2126·R + 0.7152·G + 0.0722·B, rounded to nearest.
-            // Integer approximation: (2126·R + 7152·G + 722·B + 5000) / 10000.
+            // Integer: (2126·R + 7152·G + 722·B + 5000) / 10000.
             // Coefficients sum to 10000; max numerator = 10000·255 + 5000 = 2 555 000 < u32::MAX.
-            let r = u32::from(src_row[x * 3]);
-            let g = u32::from(src_row[x * 3 + 1]);
-            let b = u32::from(src_row[x * 3 + 2]);
+            let (r, g, b) = (u32::from(rgb[0]), u32::from(rgb[1]), u32::from(rgb[2]));
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "result ≤ 255 by BT.709 coefficient sum"
+                reason = "sum ≤ 255 by BT.709 coefficient identity"
             )]
             {
-                dst_row[x] = ((2126 * r + 7152 * g + 722 * b + 5000) / 10000) as u8;
+                *dst_px = ((2126 * r + 7152 * g + 722 * b + 5000) / 10000) as u8;
             }
         }
     }
     dst
 }
 
-/// Threshold a grayscale bitmap to monochrome: < 128 → black (255), ≥ 128 → white (0).
+/// Threshold a grayscale bitmap to 2-level monochrome at the 50% midpoint.
 ///
-/// Matches pdftoppm's `--mono` convention: black ink on white paper.
+/// Values < 128 (dark) → 255 (black ink); values ≥ 128 (light) → 0 (white paper).
+/// This matches pdftoppm's `--mono` output convention.
 fn gray_to_mono(src: &Bitmap<Gray8>) -> Bitmap<Gray8> {
     let mut dst: Bitmap<Gray8> = Bitmap::new(src.width, src.height, 1, false);
+    let w = src.width as usize; // width ≤ MAX_PX_DIMENSION — fits usize
     for y in 0..src.height {
-        let src_row = src.row_bytes(y);
-        let dst_row = dst.row_bytes_mut(y);
-        for x in 0..src.width as usize {
-            // < 128 is dark → black (255); ≥ 128 is light → white (0).
-            dst_row[x] = if src_row[x] < 128 { 255 } else { 0 };
+        let src_row = &src.row_bytes(y)[..w];
+        let dst_row = &mut dst.row_bytes_mut(y)[..w];
+        for (dst_px, &luma) in dst_row.iter_mut().zip(src_row.iter()) {
+            *dst_px = if luma < 128 { 255 } else { 0 };
         }
     }
     dst

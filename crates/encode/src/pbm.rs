@@ -37,8 +37,8 @@ pub fn write_pbm<P: Pixel, W: Write>(bitmap: &Bitmap<P>, mut out: W) -> Result<(
 
     write_pbm_header(&mut out, bitmap.width, bitmap.height)?;
 
-    let w = bitmap.width as usize;
-    let row_bytes_out = w.div_ceil(8); // packed byte count per output row
+    let w = bitmap.width as usize; // u32 → usize: lossless on all ≥32-bit targets
+    let row_bytes_out = w.div_ceil(8); // packed byte count per output row (MSB first, P4 spec)
     let mut packed = vec![0u8; row_bytes_out];
 
     for y in 0..bitmap.height {
