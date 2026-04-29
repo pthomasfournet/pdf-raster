@@ -197,11 +197,15 @@ impl RasterSession {
     }
 }
 
-// Compile-time assertion: RasterSession must be Sync (shared across rayon threads).
-// If lopdf::Document ever becomes !Sync this will fail here rather than silently misbehave.
+// Compile-time assertions: RasterSession must be Sync (shared across rayon threads) and
+// Send (moved into the rayon::spawn closure in render_channel).
+// If lopdf::Document ever becomes !Sync / !Send this will fail here rather than at a
+// confusing downstream call site.
 const _: fn() = || {
     const fn assert_sync<T: Sync>() {}
+    const fn assert_send<T: Send>() {}
     assert_sync::<RasterSession>();
+    assert_send::<RasterSession>();
 };
 
 /// Open a PDF and create a [`RasterSession`] for rendering.
@@ -388,34 +392,37 @@ struct RenderState {
     current_page: u32,
 }
 
+/// Validate [`RasterOptions`], returning the first violated constraint as an error.
+///
+/// Returns `None` when all constraints are satisfied.  Used by both
+/// [`render_pages`] and [`render_channel`] to share identical validation logic.
+fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
+    if opts.dpi <= 0.0 || !opts.dpi.is_finite() {
+        return Some(RasterError::InvalidOptions(format!(
+            "dpi must be a positive finite number, got {}",
+            opts.dpi
+        )));
+    }
+    if opts.first_page == 0 {
+        return Some(RasterError::InvalidOptions(
+            "first_page must be ≥ 1 (pages are 1-based)".to_owned(),
+        ));
+    }
+    if opts.first_page > opts.last_page {
+        return Some(RasterError::InvalidOptions(format!(
+            "first_page ({}) > last_page ({})",
+            opts.first_page, opts.last_page
+        )));
+    }
+    None
+}
+
 pub fn render_pages(
     path: &std::path::Path,
     opts: &RasterOptions,
 ) -> impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)> {
-    // Validate options early so the caller gets a clear error rather than silent
-    // empty output or a confusing downstream panic.
-    if opts.dpi <= 0.0 || !opts.dpi.is_finite() {
-        return PageIter {
-            state: Some(Err(RasterError::InvalidOptions(format!(
-                "dpi must be a positive finite number, got {}",
-                opts.dpi
-            )))),
-        };
-    }
-    if opts.first_page == 0 {
-        return PageIter {
-            state: Some(Err(RasterError::InvalidOptions(
-                "first_page must be ≥ 1 (pages are 1-based)".to_owned(),
-            ))),
-        };
-    }
-    if opts.first_page > opts.last_page {
-        return PageIter {
-            state: Some(Err(RasterError::InvalidOptions(format!(
-                "first_page ({}) > last_page ({})",
-                opts.first_page, opts.last_page
-            )))),
-        };
+    if let Some(e) = validate_opts(opts) {
+        return PageIter { state: Some(Err(e)) };
     }
 
     let state = open_session(path).map(|session| RenderState {
@@ -461,6 +468,87 @@ impl Iterator for PageIter {
             }
         }
     }
+}
+
+// ── Channel-based render (bounded, backpressure, Rayon-spawned producer) ─────
+
+/// Render pages in the background and stream them through a bounded sync channel.
+///
+/// Spawns one Rayon task that renders pages in ascending order and sends each
+/// `(page_num, Result<RenderedPage, RasterError>)` to the returned
+/// [`Receiver`](std::sync::mpsc::Receiver) as it completes.  The channel is
+/// bounded to `capacity` items (minimum 1): if the consumer falls behind, the
+/// producer blocks on [`SyncSender::send`](std::sync::mpsc::SyncSender::send),
+/// providing natural backpressure.
+///
+/// # Error contract
+///
+/// - Options validation failure: sent as `(1, Err(e))` synchronously before
+///   the Rayon task is spawned; channel closes immediately.
+/// - Session-open failure: sent as `(1, Err(e))` from the producer; channel
+///   closes immediately.
+/// - Per-page render errors: sent as `(page_num, Err(e))`; subsequent pages
+///   continue rendering (same contract as [`render_pages`]).
+///
+/// # Disconnect
+///
+/// If the [`Receiver`](std::sync::mpsc::Receiver) is dropped before the
+/// producer finishes, the producer exits cleanly on its next `send`.
+#[must_use]
+pub fn render_channel(
+    path: &std::path::Path,
+    opts: &RasterOptions,
+    capacity: usize,
+) -> std::sync::mpsc::Receiver<(u32, Result<RenderedPage, RasterError>)> {
+    use std::sync::mpsc;
+
+    // sync_channel(0) is a rendezvous channel: the first send blocks until someone
+    // calls recv().  Sending an error in the fast-path below (before the caller can
+    // call recv()) would deadlock.  Clamp to 1 to guarantee at least one buffered slot.
+    let capacity = capacity.max(1);
+    let (tx, rx) = mpsc::sync_channel(capacity);
+
+    // Validate synchronously on the calling thread — the error is available
+    // immediately without waiting for Rayon scheduling.
+    if let Some(e) = validate_opts(opts) {
+        drop(tx.send((1, Err(e))));
+        return rx;
+    }
+
+    // rayon::spawn requires 'static closures, so both path and opts must be owned.
+    let path_owned: std::path::PathBuf = path.to_owned();
+    let opts_owned: RasterOptions = opts.clone();
+
+    rayon::spawn(move || {
+        let session = match open_session(&path_owned) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(tx.send((1, Err(e))));
+                return;
+            }
+        };
+
+        let state = RenderState {
+            current_page: opts_owned.first_page,
+            session,
+            opts: opts_owned,
+        };
+
+        // Clamp last_page to actual document length (mirrors the iterator).
+        let last = state.opts.last_page.min(state.session.total_pages);
+
+        for page_num in state.opts.first_page..=last {
+            let result = render_one(&state, page_num);
+            // SyncSender::send blocks when the channel is full (backpressure).
+            // Returns Err when the Receiver has been dropped — exit cleanly.
+            if tx.send((page_num, result)).is_err() {
+                return;
+            }
+        }
+        // tx drops here → channel closes → Receiver::recv returns Err(RecvError).
+    });
+
+    rx
 }
 
 // ── Single-page render (gray + deskew) ───────────────────────────────────────
@@ -543,4 +631,73 @@ fn bitmap_to_vec(bmp: &Bitmap<Gray8>) -> Vec<u8> {
         out.extend_from_slice(&bmp.row_bytes(y)[..w]);
     }
     out
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn valid_opts() -> RasterOptions {
+        RasterOptions { dpi: 150.0, first_page: 1, last_page: 1, deskew: false }
+    }
+
+    #[test]
+    fn validation_error_delivered_and_channel_closes() {
+        let bad = RasterOptions { dpi: 0.0, ..valid_opts() };
+        let rx = render_channel(Path::new("/irrelevant"), &bad, 4);
+        let (page, res) = rx.recv().expect("first item must arrive");
+        assert_eq!(page, 1);
+        assert!(
+            matches!(res, Err(RasterError::InvalidOptions(_))),
+            "expected InvalidOptions, got {res:?}"
+        );
+        assert!(rx.recv().is_err(), "channel must be closed after validation error");
+    }
+
+    #[test]
+    fn session_open_failure_delivered_and_channel_closes() {
+        let rx = render_channel(Path::new("/no_such_file_xyz.pdf"), &valid_opts(), 4);
+        let (page, res) = rx.recv().expect("first item must arrive");
+        assert_eq!(page, 1);
+        assert!(res.is_err(), "expected Err from session open, got Ok");
+        assert!(rx.recv().is_err(), "channel must be closed after session error");
+    }
+
+    #[test]
+    fn receiver_drop_does_not_panic() {
+        let rx = render_channel(Path::new("/no_such_file_xyz.pdf"), &valid_opts(), 1);
+        drop(rx);
+        // Give the Rayon task time to detect the disconnect and exit cleanly.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Pass = no panic.
+    }
+
+    #[test]
+    fn capacity_zero_raised_to_one_no_deadlock() {
+        // capacity=0 would be a rendezvous; the error fast-path must not deadlock.
+        let bad = RasterOptions { dpi: 0.0, ..valid_opts() };
+        let rx = render_channel(Path::new("/irrelevant"), &bad, 0);
+        // Must receive the error item without blocking forever.
+        assert!(rx.recv().is_ok(), "error item must be delivered even with capacity=0");
+        assert!(rx.recv().is_err(), "channel must be closed after error");
+    }
+
+    #[test]
+    fn validation_errors_match_between_iterator_and_channel() {
+        let bad = RasterOptions { dpi: -1.0, ..valid_opts() };
+        let (_, iter_err) = render_pages(Path::new("/irrelevant"), &bad)
+            .next()
+            .expect("iterator must yield one item");
+        let rx = render_channel(Path::new("/irrelevant"), &bad, 1);
+        let (_, chan_err) = rx.recv().expect("channel must yield one item");
+        let Err(RasterError::InvalidOptions(i)) = iter_err else {
+            panic!("iterator returned wrong variant: {iter_err:?}")
+        };
+        let Err(RasterError::InvalidOptions(c)) = chan_err else {
+            panic!("channel returned wrong variant: {chan_err:?}")
+        };
+        assert_eq!(i, c, "validation error messages must be identical");
+    }
 }

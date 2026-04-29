@@ -136,10 +136,13 @@ impl PageDiagnostics {
     /// Typical call: `diag.suggested_dpi(150.0, 300.0)` — never render below
     /// 150 DPI (Tesseract minimum for acceptable accuracy), never above 300 DPI.
     #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "STEPS is a non-empty literal; .last().expect() can never panic"
+    )]
     pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32> {
-        let ppi = self.source_ppi_hint?;
-        // Round up to the nearest standard step so we don't land on an odd value.
         const STEPS: &[f32] = &[72.0, 96.0, 150.0, 200.0, 300.0, 400.0, 600.0];
+        let ppi = self.source_ppi_hint?;
         let stepped = STEPS
             .iter()
             .copied()

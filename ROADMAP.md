@@ -509,13 +509,17 @@ Phase 6 closes the remaining gaps before the first production integration.
   resolves `dominant_filter` from counts.  `ImageFilter` and `PageDiagnostics`
   are re-exported from `pdf_raster` (commit 199d13a).
 
-- [ ] **Pipelined render + OCR** — `raster_pdf` returns an iterator but mss-pdf
-  collects it into `Vec` before OCR starts, keeping the sequential bottleneck.
-  Add a `render_channel` API: `fn render_channel(path, opts, capacity) ->
-  Receiver<(u32, Result<RenderedPage>)>` backed by a Rayon-spawned producer.
-  The consumer (Tesseract) processes pages as they arrive; the producer renders
-  ahead up to `capacity` pages.  Halves peak memory on large books; hides GPU
-  decode latency behind Tesseract inference on the previous page.
+- [x] **Pipelined render + OCR** — `pdf_raster::render_channel(path, opts, capacity)`
+  returns a `std::sync::mpsc::Receiver<(u32, Result<RenderedPage>)>`.  A
+  Rayon-spawned producer renders pages in ascending order and sends them as they
+  complete; the consumer (Tesseract) processes each page immediately.  The channel
+  is bounded to `capacity` slots (min 1): producer blocks when consumer falls
+  behind, capping peak memory at `capacity × page_size`.  Options validation runs
+  synchronously before spawn; session-open and per-page errors are delivered
+  through the channel (same non-fatal contract as the iterator).  Zero new
+  dependencies — `rayon` was already present; `std::sync::mpsc` is stdlib.
+  `validate_opts` extracted from `render_pages` so both paths share identical
+  validation.  5 unit tests cover all error paths and backpressure.
 
 - [x] **DPI auto-selection hint** — `PageDiagnostics::suggested_dpi(min, max)`
   rounds `source_ppi_hint` up to the nearest standard DPI step

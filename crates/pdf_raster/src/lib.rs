@@ -175,3 +175,48 @@ pub fn raster_pdf(
 ) -> impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)> {
     render::render_pages(path, opts)
 }
+
+/// Render a range of pages concurrently using a bounded sync channel.
+///
+/// Spawns a background Rayon task that renders pages in ascending order and
+/// sends each `(page_num, Result<RenderedPage, RasterError>)` to the returned
+/// [`Receiver`](std::sync::mpsc::Receiver) as it completes.
+///
+/// `capacity` is the maximum number of rendered pages buffered before the
+/// producer blocks.  Use `2`–`8` for typical OCR pipelines (one page rendering
+/// while the previous is being OCR-processed).  `capacity = 0` is silently
+/// raised to `1`.
+///
+/// # Usage
+///
+/// ```rust,no_run
+/// # use std::path::Path;
+/// # use pdf_raster::{RasterOptions, render_channel};
+/// let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 100, deskew: true };
+/// let rx = render_channel(Path::new("scan.pdf"), &opts, 4);
+///
+/// for (page_num, result) in rx {
+///     match result {
+///         Ok(page) => { /* pass page.pixels to Tesseract */ }
+///         Err(e)   => eprintln!("page {page_num}: {e}"),
+///     }
+/// }
+/// ```
+///
+/// # Errors delivered through the channel
+///
+/// - Invalid options → `(1, Err(RasterError::InvalidOptions(...)))`, channel closes.
+/// - File open failure → `(1, Err(RasterError::Pdf(...)))`, channel closes.
+/// - Per-page failures → `(page_num, Err(...))`, rendering of subsequent pages continues.
+///
+/// # Panics
+///
+/// Same conditions as [`raster_pdf`].
+#[must_use]
+pub fn render_channel(
+    path: &Path,
+    opts: &RasterOptions,
+    capacity: usize,
+) -> std::sync::mpsc::Receiver<(u32, Result<RenderedPage, RasterError>)> {
+    render::render_channel(path, opts, capacity)
+}
