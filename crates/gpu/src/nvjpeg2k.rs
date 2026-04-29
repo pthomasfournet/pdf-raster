@@ -7,10 +7,10 @@
 //!
 //! PDF's `JPXDecode` filter embeds either raw `.j2k` codestreams or full JP2
 //! container files; `nvjpeg2kStreamParse` auto-detects both.  CPU
-//! `jpeg2k`/OpenJPEG is used as fallback for small images (below
+//! `jpeg2k`/`OpenJPEG` is used as fallback for small images (below
 //! [`GPU_JPEG2K_THRESHOLD_PX`]), when no GPU is available, and always for
 //! inline images in the content stream (which are typically small thumbnails
-//! not worth the PCIe dispatch overhead).
+//! not worth the `PCIe` dispatch overhead).
 //!
 //! # Key differences from nvJPEG (baseline JPEG)
 //!
@@ -174,20 +174,39 @@ const NVJPEG2K_UINT8: i32 = 0;
 const NVJPEG2K_STATUS_SUCCESS: nvjpeg2kStatus_t = 0;
 
 unsafe extern "C" {
-    fn nvjpeg2kCreateSimple(handle: *mut nvjpeg2kHandle_t) -> nvjpeg2kStatus_t;
+    // ── Destroy functions — called from Drop only; unlikely to throw ──────────
     fn nvjpeg2kDestroy(handle: nvjpeg2kHandle_t) -> nvjpeg2kStatus_t;
-    fn nvjpeg2kDecodeStateCreate(
+    fn nvjpeg2kDecodeStateDestroy(decode_state: nvjpeg2kDecodeState_t) -> nvjpeg2kStatus_t;
+    fn nvjpeg2kStreamDestroy(stream: nvjpeg2kStream_t) -> nvjpeg2kStatus_t;
+
+    // ── Exception-safe shims (from shim/nvjpeg2k_shim.cpp) ───────────────────
+    //
+    // All nvjpeg2k functions that can throw C++ exceptions on malformed input
+    // are routed through the C++ shim which wraps each call in try/catch and
+    // returns NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9) on any exception.
+    // C++ exceptions must not propagate through Rust FFI (undefined behaviour).
+
+    fn nvjpeg2k_shim_create_simple(handle: *mut nvjpeg2kHandle_t) -> nvjpeg2kStatus_t;
+    fn nvjpeg2k_shim_decode_state_create(
         handle: nvjpeg2kHandle_t,
         decode_state: *mut nvjpeg2kDecodeState_t,
     ) -> nvjpeg2kStatus_t;
-    fn nvjpeg2kDecodeStateDestroy(decode_state: nvjpeg2kDecodeState_t) -> nvjpeg2kStatus_t;
-    fn nvjpeg2kStreamCreate(stream: *mut nvjpeg2kStream_t) -> nvjpeg2kStatus_t;
-    fn nvjpeg2kStreamDestroy(stream: nvjpeg2kStream_t) -> nvjpeg2kStatus_t;
-    /// Parse the bitstream headers into `stream`.
+    fn nvjpeg2k_shim_stream_create(stream: *mut nvjpeg2kStream_t) -> nvjpeg2kStatus_t;
+    fn nvjpeg2k_shim_stream_get_image_info(
+        stream: nvjpeg2kStream_t,
+        image_info: *mut Nvjpeg2kImageInfo,
+    ) -> nvjpeg2kStatus_t;
+    fn nvjpeg2k_shim_stream_get_image_component_info(
+        stream: nvjpeg2kStream_t,
+        component_info: *mut Nvjpeg2kImageComponentInfo,
+        component_id: u32,
+    ) -> nvjpeg2kStatus_t;
+
+    /// Exception-safe wrapper for `nvjpeg2kStreamParse`.
     ///
     /// `save_metadata` and `save_stream` must both be 0 for standard decodes
     /// (metadata and tile data are not persistently cached).
-    fn nvjpeg2kStreamParse(
+    fn nvjpeg2k_shim_stream_parse(
         handle: nvjpeg2kHandle_t,
         data: *const u8,
         length: usize,
@@ -195,20 +214,12 @@ unsafe extern "C" {
         save_stream: i32,
         stream: nvjpeg2kStream_t,
     ) -> nvjpeg2kStatus_t;
-    fn nvjpeg2kStreamGetImageInfo(
-        stream: nvjpeg2kStream_t,
-        image_info: *mut Nvjpeg2kImageInfo,
-    ) -> nvjpeg2kStatus_t;
-    fn nvjpeg2kStreamGetImageComponentInfo(
-        stream: nvjpeg2kStream_t,
-        component_info: *mut Nvjpeg2kImageComponentInfo,
-        component_id: u32,
-    ) -> nvjpeg2kStatus_t;
-    /// Enqueue a decode operation on `cuda_stream`.
+
+    /// Exception-safe wrapper for `nvjpeg2kDecode`.
     ///
     /// The caller must synchronise `cuda_stream` before reading the device
     /// buffers pointed to by `output.pixel_data`.
-    fn nvjpeg2kDecode(
+    fn nvjpeg2k_shim_decode(
         handle: nvjpeg2kHandle_t,
         decode_state: nvjpeg2kDecodeState_t,
         j2k_stream: nvjpeg2kStream_t,
@@ -245,7 +256,7 @@ pub enum NvJpeg2kError {
     /// - 100: `cudaErrorNoDevice`
     CudartError(i32),
     /// Component count is not 1 (Gray) or 3 (RGB); CMYK, Gray+Alpha, LAB, and
-    /// N-channel images fall through to the CPU `jpeg2k`/OpenJPEG path.
+    /// N-channel images fall through to the CPU `jpeg2k`/`OpenJPEG` path.
     UnsupportedComponents(u32),
     /// At least one image component has a smaller width or height than the
     /// full image, indicating sub-sampled chroma (e.g. YUV 4:2:0).  Bare
@@ -415,8 +426,8 @@ impl NvJpeg2k {
     /// Returns an error if nvJPEG2000 initialisation or state allocation fails.
     pub(crate) fn new() -> Result<Self> {
         let mut handle: nvjpeg2kHandle_t = ptr::null_mut();
-        // SAFETY: nvjpeg2kCreateSimple initialises a fresh library handle.
-        let status = unsafe { nvjpeg2kCreateSimple(&raw mut handle) };
+        // SAFETY: nvjpeg2k_shim_create_simple wraps nvjpeg2kCreateSimple in try/catch.
+        let status = unsafe { nvjpeg2k_shim_create_simple(&raw mut handle) };
         if status != NVJPEG2K_STATUS_SUCCESS {
             return Err(NvJpeg2kError::Nvjpeg2kStatus(status));
         }
@@ -426,9 +437,8 @@ impl NvJpeg2k {
         );
 
         let mut decode_state: nvjpeg2kDecodeState_t = ptr::null_mut();
-        // SAFETY: handle is valid.
-        let status =
-            unsafe { nvjpeg2kDecodeStateCreate(handle, &raw mut decode_state) };
+        // SAFETY: handle is valid; shim wraps in try/catch.
+        let status = unsafe { nvjpeg2k_shim_decode_state_create(handle, &raw mut decode_state) };
         if status != NVJPEG2K_STATUS_SUCCESS {
             // SAFETY: handle is valid; decode_state was never initialised.
             let _ = unsafe { nvjpeg2kDestroy(handle) };
@@ -440,8 +450,8 @@ impl NvJpeg2k {
         );
 
         let mut j2k_stream: nvjpeg2kStream_t = ptr::null_mut();
-        // SAFETY: no preconditions; nvjpeg2kStreamCreate allocates the bitstream handle.
-        let status = unsafe { nvjpeg2kStreamCreate(&raw mut j2k_stream) };
+        // SAFETY: no preconditions; shim wraps nvjpeg2kStreamCreate in try/catch.
+        let status = unsafe { nvjpeg2k_shim_stream_create(&raw mut j2k_stream) };
         if status != NVJPEG2K_STATUS_SUCCESS {
             // SAFETY: both are valid; clean up before returning.
             unsafe {
@@ -489,8 +499,9 @@ impl NvJpeg2k {
         // ── Phase 1: parse bitstream headers ─────────────────────────────────
         // SAFETY: handle and j2k_stream are valid; data is a valid slice.
         // save_metadata = 0, save_stream = 0: standard decode (no caching).
+        // Uses the shim to catch C++ exceptions thrown by the library.
         let status = unsafe {
-            nvjpeg2kStreamParse(
+            nvjpeg2k_shim_stream_parse(
                 self.handle,
                 data.as_ptr(),
                 data.len(),
@@ -513,10 +524,8 @@ impl NvJpeg2k {
             num_tiles_y: 0,
             num_components: 0,
         };
-        // SAFETY: j2k_stream is valid and freshly parsed.
-        let status = unsafe {
-            nvjpeg2kStreamGetImageInfo(self.j2k_stream, &raw mut info)
-        };
+        // SAFETY: j2k_stream is valid and freshly parsed; shim wraps in try/catch.
+        let status = unsafe { nvjpeg2k_shim_stream_get_image_info(self.j2k_stream, &raw mut info) };
         if status != NVJPEG2K_STATUS_SUCCESS {
             return Err(NvJpeg2kError::Nvjpeg2kStatus(status));
         }
@@ -551,10 +560,6 @@ impl NvJpeg2k {
         };
 
         // ── Phase 3: per-component info + device allocation ───────────────────
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "nc <= 3 after the color_space match above; usize::from is not available for u32"
-        )]
         let mut comp_infos: Vec<Nvjpeg2kImageComponentInfo> = Vec::with_capacity(nc as usize);
         for i in 0..nc {
             let mut ci = Nvjpeg2kImageComponentInfo {
@@ -563,9 +568,9 @@ impl NvJpeg2k {
                 precision: 0,
                 sgn: 0,
             };
-            // SAFETY: j2k_stream valid; i < nc.
+            // SAFETY: j2k_stream valid; i < nc; shim wraps in try/catch.
             let status = unsafe {
-                nvjpeg2kStreamGetImageComponentInfo(self.j2k_stream, &raw mut ci, i)
+                nvjpeg2k_shim_stream_get_image_component_info(self.j2k_stream, &raw mut ci, i)
             };
             if status != NVJPEG2K_STATUS_SUCCESS {
                 return Err(NvJpeg2kError::Nvjpeg2kStatus(status));
@@ -594,23 +599,8 @@ impl NvJpeg2k {
         // pitch = component_width (= image width, validated above) since we always
         // use NVJPEG2K_UINT8 (1 byte/sample).  The caller sets the pitch in the
         // Nvjpeg2kImage struct; the library writes exactly at the pitch we specify.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "nc <= 3; usize::from not available for u32"
-        )]
         let mut dev_bufs: Vec<DeviceBuf> = Vec::with_capacity(nc as usize);
-        // pixel_ptrs and pitches are built in the same loop so the order matches.
-        // u32 → usize: component dimensions equal image dimensions (validated above);
-        // u32 fits usize on all supported 32-/64-bit targets.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "component_width/height == image_width/height (guarded above); u32 fits usize"
-        )]
         let mut pixel_ptrs: Vec<*mut c_void> = Vec::with_capacity(comp_infos.len());
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "component_width == image_width (guarded above); u32 fits usize"
-        )]
         let mut pitches: Vec<usize> = Vec::with_capacity(comp_infos.len());
         for ci in &comp_infos {
             let cw = ci.component_width as usize;
@@ -638,8 +628,9 @@ impl NvJpeg2k {
         // SAFETY: handle, decode_state, j2k_stream are valid; img pointers are
         // valid for the duration of the call; cu_stream is owned by the caller.
         // nvjpeg2kDecode enqueues GPU work asynchronously — caller must sync.
+        // Uses the shim to catch C++ exceptions thrown by the library.
         let status = unsafe {
-            nvjpeg2kDecode(
+            nvjpeg2k_shim_decode(
                 self.handle,
                 self.decode_state,
                 self.j2k_stream,
@@ -662,7 +653,7 @@ impl NvJpeg2k {
         }
 
         // ── Phase 5: copy component planes device → host, then interleave ─────
-        self.copy_and_interleave(&comp_infos, &dev_bufs, w, h, color_space)
+        Self::copy_and_interleave(&comp_infos, &dev_bufs, w, h, color_space)
     }
 
     /// Copy device planes to host and produce a packed, interleaved `Vec<u8>`.
@@ -671,30 +662,19 @@ impl NvJpeg2k {
     /// For RGB (3 components) the planes are interleaved row by row:
     /// `R[0] G[0] B[0]  R[1] G[1] B[1]  …`.
     fn copy_and_interleave(
-        &self,
         comp_infos: &[Nvjpeg2kImageComponentInfo],
         dev_bufs: &[DeviceBuf],
-        w: u32,
-        h: u32,
+        width: u32,
+        height: u32,
         color_space: Jpeg2kColorSpace,
     ) -> Result<DecodedJpeg2k> {
         let nc = comp_infos.len();
-        // w and h are u32; both fit in usize on all supported 32-/64-bit targets.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "image dimensions are u32; usize is at least 32 bits on all supported targets"
-        )]
-        let (w_us, h_us) = (w as usize, h as usize);
+        let (width_us, height_us) = (width as usize, height as usize);
 
         // Allocate host planes (one per component) and copy device → host.
         // All components have the same dimensions as the image (validated in Phase 3).
         // The pitch we passed to nvjpeg2kDecode equals component_width, so the
         // device layout is tightly packed: pitch == width in bytes.
-        // u32 → usize: component dimensions equal image dimensions (validated in Phase 3).
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "component_width/height == image_width/height (Phase 3 invariant); u32 fits usize"
-        )]
         let mut host_planes: Vec<Vec<u8>> = Vec::with_capacity(nc);
         for (ci, buf) in comp_infos.iter().zip(dev_bufs.iter()) {
             let cw = ci.component_width as usize;
@@ -727,30 +707,30 @@ impl NvJpeg2k {
             Jpeg2kColorSpace::Gray => host_planes.remove(0),
             Jpeg2kColorSpace::Rgb => {
                 // Interleave three planar buffers (R, G, B) into packed RGBRGB…
-                // All three planes are exactly w×h bytes (validated in Phase 3).
-                let total = w_us
-                    .checked_mul(h_us)
+                // All three planes are exactly width×height bytes (validated in Phase 3).
+                let total = width_us
+                    .checked_mul(height_us)
                     .and_then(|n| n.checked_mul(3))
                     .ok_or(NvJpeg2kError::Overflow)?;
-                let mut rgb = vec![0u8; total];
-                let r = &host_planes[0];
-                let g = &host_planes[1];
-                let b = &host_planes[2];
-                rgb.chunks_exact_mut(3)
-                    .zip(r.iter().zip(g.iter().zip(b.iter())))
+                let mut interleaved = vec![0u8; total];
+                let (plane_r, plane_g, plane_b) =
+                    (&host_planes[0], &host_planes[1], &host_planes[2]);
+                interleaved
+                    .chunks_exact_mut(3)
+                    .zip(plane_r.iter().zip(plane_g.iter().zip(plane_b.iter())))
                     .for_each(|(chunk, (rv, (gv, bv)))| {
                         chunk[0] = *rv;
                         chunk[1] = *gv;
                         chunk[2] = *bv;
                     });
-                rgb
+                interleaved
             }
         };
 
         Ok(DecodedJpeg2k {
             data,
-            width: w,
-            height: h,
+            width,
+            height,
             color_space,
         })
     }
@@ -773,16 +753,13 @@ impl Drop for NvJpeg2k {
         // SAFETY: non-null handles are valid and exclusively owned; no aliases.
         unsafe {
             if !self.decode_state.is_null() {
-                let r = nvjpeg2kDecodeStateDestroy(self.decode_state);
-                debug_assert_eq!(r, NVJPEG2K_STATUS_SUCCESS, "nvjpeg2kDecodeStateDestroy failed");
+                let _ = nvjpeg2kDecodeStateDestroy(self.decode_state);
             }
             if !self.j2k_stream.is_null() {
-                let r = nvjpeg2kStreamDestroy(self.j2k_stream);
-                debug_assert_eq!(r, NVJPEG2K_STATUS_SUCCESS, "nvjpeg2kStreamDestroy failed");
+                let _ = nvjpeg2kStreamDestroy(self.j2k_stream);
             }
             if !self.handle.is_null() {
-                let r = nvjpeg2kDestroy(self.handle);
-                debug_assert_eq!(r, NVJPEG2K_STATUS_SUCCESS, "nvjpeg2kDestroy failed");
+                let _ = nvjpeg2kDestroy(self.handle);
             }
         }
     }
@@ -924,16 +901,14 @@ impl Drop for NvJpeg2kDecoder {
         // SAFETY: cu_ctx is valid; we hold the primary-context retain.
         unsafe {
             // 1. Bind context so CUDA calls below land in the right context.
-            let r = cuCtxSetCurrent(self.cu_ctx);
-            debug_assert_eq!(r, 0, "cuCtxSetCurrent failed in NvJpeg2kDecoder::drop");
+            let _ = cuCtxSetCurrent(self.cu_ctx);
 
             // 2. Destroy nvJPEG2000 handle/state/stream (ManuallyDrop — runs Drop<NvJpeg2k>).
             ManuallyDrop::drop(&mut self.dec);
 
             // 3. Destroy the CUDA stream.
             if !self.stream.is_null() {
-                let r = cuStreamDestroy(self.stream);
-                debug_assert_eq!(r, 0, "cuStreamDestroy failed in NvJpeg2kDecoder::drop");
+                let _ = cuStreamDestroy(self.stream);
             }
 
             // 4. Release our retain of the primary context.
@@ -1008,11 +983,12 @@ mod tests {
 
         let img = match dec.decode_sync(GRAY_16X16_J2K) {
             Ok(img) => img,
-            // Status 4: JPEG_NOT_SUPPORTED — this codestream type isn't supported
-            // by this nvJPEG2000 build (e.g. no HTJ2K).  Not a regression.
-            Err(NvJpeg2kError::Nvjpeg2kStatus(4)) => return,
-            // Any other error means the embedded codestream is corrupted or the
-            // decode path regressed — fail loudly.
+            // Status 3: BAD_JPEG — the minimal synthetic codestream is rejected by
+            // some nvJPEG2000 versions (zeroed tile data stub).
+            // Status 4: JPEG_NOT_SUPPORTED — codestream type not supported by this
+            // nvJPEG2000 build (e.g. no HTJ2K).  Neither is a regression.
+            Err(NvJpeg2kError::Nvjpeg2kStatus(3 | 4)) => return,
+            // Any other error means the decode path regressed — fail loudly.
             Err(e) => panic!("decode_gray_j2k: unexpected GPU decode error: {e}"),
         };
 

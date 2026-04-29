@@ -1,7 +1,7 @@
 //! Build script: compiles CUDA kernels to PTX via nvcc and places them in `OUT_DIR`.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Emit a `cargo:rustc-link-search` directive for the first of `dirs` that
@@ -27,6 +27,24 @@ fn link_lib_in_dir(dirs: &[&str], lib: &str, warn_context: &str) {
 }
 
 fn main() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let kernels_dir = PathBuf::from("kernels");
+
+    println!("cargo:rerun-if-changed=kernels/");
+    println!("cargo:rerun-if-changed=shim/");
+    println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+
+    let nvcc_path = env::var("NVCC").unwrap_or_else(|_| {
+        for path in ["/usr/local/cuda-12.8/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
+            if PathBuf::from(path).exists() {
+                return path.to_owned();
+            }
+        }
+        "nvcc".to_owned()
+    });
+    let nvcc = &nvcc_path;
+
     // When the nvjpeg feature is enabled, emit the linker directive so that
     // rustc links against libnvjpeg.so from the CUDA toolkit.  The library is
     // available on any machine with CUDA 12 installed; it ships at
@@ -72,24 +90,17 @@ fn main() {
         );
         // cuStreamSynchronize / cuCtxSetCurrent live in libcuda.so (driver).
         println!("cargo:rustc-link-lib=dylib=cuda");
+
+        // Compile the C++ exception-boundary shim.  nvjpeg2k throws C++
+        // exceptions on malformed codestreams; those cannot propagate through
+        // Rust extern "C" FFI (undefined behaviour).  The shim wraps the two
+        // throwing entry points in try/catch and maps any exception to
+        // NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9).
+        compile_nvjpeg2k_shim(&out_dir, nvcc);
+        println!("cargo:rustc-link-lib=static=nvjpeg2k_shim");
+        // The shim uses C++ exception handling; link the C++ runtime.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let kernels_dir = PathBuf::from("kernels");
-
-    // Tell cargo to rerun if kernels or CUDA_ARCH env changes.
-    println!("cargo:rerun-if-changed=kernels/");
-    println!("cargo:rerun-if-env-changed=NVCC");
-    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
-
-    let nvcc = env::var("NVCC").unwrap_or_else(|_| {
-        for path in ["/usr/local/cuda-12.8/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
-            if PathBuf::from(path).exists() {
-                return path.to_owned();
-            }
-        }
-        "nvcc".to_owned()
-    });
 
     // Allow overriding the PTX target arch (e.g. CUDA_ARCH=sm_86 for Ampere).
     // Default is sm_80 which runs on Ampere, Ada, Hopper, and Blackwell.
@@ -105,7 +116,7 @@ fn main() {
         let src = kernels_dir.join(format!("{kernel}.cu"));
         let ptx = out_dir.join(format!("{kernel}.ptx"));
 
-        let status = Command::new(&nvcc)
+        let status = Command::new(nvcc)
             .args([
                 "--ptx",
                 &format!("-arch={arch}"),
@@ -123,4 +134,45 @@ fn main() {
             "nvcc failed for {kernel}.cu (arch={arch})"
         );
     }
+}
+
+/// Compile `shim/nvjpeg2k_shim.cpp` into a static library `libnvjpeg2k_shim.a`
+/// placed in `OUT_DIR`.  Uses nvcc as the C++ compiler so the include path for
+/// nvjpeg2k headers is automatically available, and links with -lstdc++.
+fn compile_nvjpeg2k_shim(out_dir: &Path, nvcc: &str) {
+    let shim_src = PathBuf::from("shim/nvjpeg2k_shim.cpp");
+    let shim_obj = out_dir.join("nvjpeg2k_shim.o");
+    let shim_lib = out_dir.join("libnvjpeg2k_shim.a");
+
+    // Compile the C++ source to an object file.
+    let status = Command::new(nvcc)
+        .args([
+            "-x",
+            "c++", // treat as C++ (nvcc default for .cpp)
+            "-O2",
+            "-I/usr/include/libnvjpeg2k/12",
+            "-c",
+            "-o",
+            shim_obj.to_str().expect("OUT_DIR path non-UTF-8"),
+            shim_src.to_str().expect("shim source path non-UTF-8"),
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run nvcc for nvjpeg2k shim ({nvcc}): {e}"));
+    assert!(status.success(), "nvcc failed to compile nvjpeg2k_shim.cpp");
+
+    // Archive into a static library so cargo can link it.
+    let status = Command::new("ar")
+        .args([
+            "rcs",
+            shim_lib.to_str().expect("OUT_DIR path non-UTF-8"),
+            shim_obj.to_str().expect("OUT_DIR path non-UTF-8"),
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run ar for nvjpeg2k shim: {e}"));
+    assert!(status.success(), "ar failed to archive nvjpeg2k_shim.o");
+
+    println!(
+        "cargo:rustc-link-search=native={}",
+        out_dir.to_str().expect("OUT_DIR path non-UTF-8")
+    );
 }
