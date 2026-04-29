@@ -303,16 +303,13 @@ applies the matching CTM so all four rotation values produce correctly-oriented
 output.  `kt-r2000.pdf` page 1 (was `/Rotate: 270` portrait) now renders as
 landscape, matching poppler.
 
-### Known gap: `UserUnit` scaling (PDF 1.6+)
+### ~~Known gap: `UserUnit` scaling~~ — RESOLVED (commits 4aa17b5 / ce10242)
 
-`UserUnit` is a Page dictionary key that scales the default user-space unit
-from 1/72 inch to `UserUnit/72` inches.  `page_size_pts` does not read it; a
-`UserUnit: 2.0` page renders at half the intended physical size and
-`RenderedPage.dpi` is wrong (actual resolution = `opts.dpi × user_unit`).
-Rare in practice — affects some large-format and engineering PDFs.  Fix:
-multiply `w_pts`/`h_pts` by `UserUnit` in `page_size_pts`, expose
-`effective_dpi` on `RenderedPage` or `PageGeometry`.  Return an error (not a
-silent clamp) for `UserUnit` values outside the valid range defined by the spec.
+`page_size_pts` now reads `UserUnit`, validates to `[0.1, 10.0]`, multiplies
+`w_pts`/`h_pts` by it, and returns `user_unit` on `PageGeometry`.
+`RenderedPage.effective_dpi` = `opts.dpi × UserUnit` is the correct value for
+`tesseract::set_source_resolution`.  Non-numeric and NaN/Inf values are
+rejected with `RasterError::InvalidPageGeometry`.
 
 ### Fixture inventory
 
@@ -493,24 +490,24 @@ Phase 6 closes the remaining gaps before the first production integration.
 
 ### Open work items
 
-- [ ] **`UserUnit` support** — `page_size_pts` does not read the `UserUnit` Page
-  dictionary key (PDF 1.6+, scales user-space from 1/72 in to `UserUnit/72` in).
-  Fix: multiply `w_pts`/`h_pts` by `UserUnit`; expose `effective_dpi` on
-  `RenderedPage` (= `opts.dpi × user_unit`) so callers pass the right value to
-  `tesseract::set_source_resolution`.  Reject `UserUnit` outside [0.1, 10.0]
-  with `RasterError::InvalidPageGeometry` rather than silently producing a
-  wrong-scale bitmap.  Affects large-format and engineering PDFs; rare in the
-  Gallica/GODF corpus but a latent correctness bug.
+- [x] **`UserUnit` support** — `page_size_pts` now reads `UserUnit`, validates
+  it to `[0.1, 10.0]` (returning `RasterError::InvalidPageGeometry` for
+  out-of-range values), multiplies `w_pts`/`h_pts` by `user_unit`, and exposes
+  `PageGeometry.user_unit`.  `RenderedPage.effective_dpi` = `opts.dpi × UserUnit`
+  is the correct value to pass to `tesseract::set_source_resolution`.
+  Non-numeric or NaN/Inf `UserUnit` values are also rejected with a descriptive
+  error.  The double `get_pages()` call in `page_size_pts` and `parse_page` was
+  eliminated via a shared `resolve_page_id` helper (commits 4aa17b5 / ce10242 /
+  cf3b3a7).
 
-- [ ] **`RenderDiagnostics` on `RenderedPage`** — add a lightweight metadata
-  struct exposing information the renderer already has at decode time:
-  `{ is_scan: bool, dominant_filter: ImageFilter, has_vector_text: bool }`.
-  `is_scan`: true when all image XObjects use `DCTDecode` or `CCITTFaxDecode`
-  and no text operators are present.  `dominant_filter`: most-used image
-  compression type on the page (`DCT`, `JBIG2`, `JPX`, `Raw`, `Mixed`).
-  `has_vector_text`: any `Tj`/`TJ`/`'`/`"` operators executed.
-  This lets the OCR caller make better routing decisions (force_ocr, PSM, DPI)
-  without a separate post-hoc page analysis pass.
+- [x] **`RenderDiagnostics` on `RenderedPage`** — `RenderedPage.diagnostics`
+  (`PageDiagnostics`) exposes: `has_images`, `has_vector_text`,
+  `dominant_filter` (most-used `ImageFilter` variant: `Dct / Jpx / CcittFax /
+  Jbig2 / Flate / Raw`), and `source_ppi_hint` (estimated source PPI of the
+  dominant image).  Collected at zero extra cost during rendering: `blit_image`
+  increments per-filter counts; `show_text` sets `has_vector_text`; `finish()`
+  resolves `dominant_filter` from counts.  `ImageFilter` and `PageDiagnostics`
+  are re-exported from `pdf_raster` (commit 199d13a).
 
 - [ ] **Pipelined render + OCR** — `raster_pdf` returns an iterator but mss-pdf
   collects it into `Vec` before OCR starts, keeping the sequential bottleneck.
