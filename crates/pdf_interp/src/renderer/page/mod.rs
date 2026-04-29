@@ -70,7 +70,9 @@ use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use super::text::TextState;
 use crate::content::{Operator, TextArrayElement};
-use crate::resources::{ImageColorSpace, ImageFilter, PageResources, image::decode_inline_image};
+use crate::resources::{
+    IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageResources, image::decode_inline_image,
+};
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use gpu::GpuCtx;
 #[cfg(feature = "nvjpeg")]
@@ -79,6 +81,11 @@ use gpu::nvjpeg::NvJpegDecoder;
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
+
+const _: () = assert!(
+    IMAGE_FILTER_COUNT == 6,
+    "ImageFilter variant count changed — update filter_counts array size and FILTERS in finish()"
+);
 
 /// Lightweight page metadata collected at zero extra cost during rendering.
 ///
@@ -95,7 +102,8 @@ pub struct PageDiagnostics {
     /// The image filter seen most often on this page.
     ///
     /// `None` when no images were decoded (e.g. a pure-vector page).  When
-    /// multiple filters are equally frequent the one that appeared first wins —
+    /// multiple filters are equally frequent the last one in [`ImageFilter`]
+    /// discriminant order wins (Rust's `max_by_key` is last-wins on ties) —
     /// stable across identical pages.
     pub dominant_filter: Option<ImageFilter>,
     /// Estimated source pixels-per-inch of the dominant image, if any.
@@ -165,7 +173,7 @@ pub struct PageRenderer<'doc> {
     /// Accumulated page diagnostics, populated during rendering.
     diag: PageDiagnostics,
     /// Per-filter blit counts used to compute `diag.dominant_filter`.
-    filter_counts: [u32; 6],
+    filter_counts: [u32; IMAGE_FILTER_COUNT],
     /// Optional Content Group (OCG) visibility stack.
     ///
     /// Each `BDC /OC /Name` pushes a `bool` (`true` = visible); `EMC` pops it.
@@ -259,7 +267,7 @@ impl<'doc> PageRenderer<'doc> {
             resources,
             form_depth: 0,
             diag: PageDiagnostics::default(),
-            filter_counts: [0u32; 6],
+            filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
@@ -2004,9 +2012,12 @@ impl<'doc> PageRenderer<'doc> {
         // Update source_ppi_hint: take the widest image seen (best resolution proxy).
         // ppi = (image_px_width / page_pts_width) × 72.
         let page_pts_w = f64::from(self.width) / {
-            // Extract scale from CTM[0] — valid only for axis-aligned pages.
-            // If scale is not available fall back gracefully.
-            let ctm_scale = self.gstate.current().ctm[0].abs();
+            // For unrotated pages CTM[0] carries the scale; for 90°/270° rotations
+            // CTM[0] is 0 and CTM[1] carries it.  Take the larger of the two to
+            // handle all axis-aligned cases.  Falls back to 1.0 for a degenerate CTM
+            // (page_pts_w would be width in pixels — wrong, but finite).
+            let ctm = self.gstate.current().ctm;
+            let ctm_scale = ctm[0].abs().max(ctm[1].abs());
             if ctm_scale > 0.0 { ctm_scale } else { 1.0 }
         };
         #[expect(

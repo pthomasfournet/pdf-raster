@@ -101,23 +101,28 @@ pub enum ImageColorSpace {
 
 /// The compression filter used to store an image in the PDF stream.
 ///
-/// Used by [`RenderDiagnostics`](crate::renderer::page::PageDiagnostics) to
+/// Used by [`PageDiagnostics`](crate::renderer::page::PageDiagnostics) to
 /// classify image content without re-reading the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 pub enum ImageFilter {
     /// `DCTDecode` — JPEG baseline or progressive.
-    Dct,
+    Dct = 0,
     /// `JPXDecode` — JPEG 2000.
-    Jpx,
+    Jpx = 1,
     /// `CCITTFaxDecode` — Group 3 (T.4) or Group 4 (T.6) fax compression.
-    CcittFax,
+    CcittFax = 2,
     /// `JBIG2Decode` — JBIG2 bilevel compression.
-    Jbig2,
+    Jbig2 = 3,
     /// `FlateDecode` — zlib/deflate.
-    Flate,
+    Flate = 4,
     /// No filter — raw uncompressed pixels.
-    Raw,
+    Raw = 5,
 }
+
+/// Number of [`ImageFilter`] variants — must match `filter_counts` array size in
+/// `PageRenderer`.  The const assert in that module enforces this at compile time.
+pub const IMAGE_FILTER_COUNT: usize = 6;
 
 /// Decoded image data, ready for blitting onto the page bitmap.
 ///
