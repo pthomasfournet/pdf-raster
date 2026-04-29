@@ -103,6 +103,23 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 
+    // GPU deskew: CUDA NPP geometry library (nppiRotate_8u_C1R_Ctx lives in
+    // libnppig; the stream context helpers nppSetStream/nppGetStreamContext live
+    // in libnppc).  cudart and the driver are also required for cudaMalloc /
+    // cudaMemcpy / cuStreamSynchronize.
+    if env::var("CARGO_FEATURE_GPU_DESKEW").is_ok() {
+        let cuda_lib_dirs = &[
+            "/usr/local/cuda-12.8/targets/x86_64-linux/lib",
+            "/usr/local/cuda-12/targets/x86_64-linux/lib",
+            "/usr/local/cuda/targets/x86_64-linux/lib",
+            "/usr/local/cuda/lib64",
+        ];
+        link_lib_in_dir(cuda_lib_dirs, "nppig", "gpu-deskew: libnppig not found");
+        link_lib_in_dir(cuda_lib_dirs, "nppc", "gpu-deskew: libnppc not found");
+        link_lib_in_dir(cuda_lib_dirs, "cudart", "gpu-deskew: libcudart not found");
+        println!("cargo:rustc-link-lib=dylib=cuda");
+    }
+
     // Allow overriding the PTX target arch (e.g. CUDA_ARCH=sm_86 for Ampere).
     // Default is sm_80 which runs on Ampere, Ada, Hopper, and Blackwell.
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_owned());

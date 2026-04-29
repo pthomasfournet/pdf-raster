@@ -25,16 +25,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    let session = pdf_raster::open_session(std::path::Path::new(&args.input))
-        .unwrap_or_else(|e| {
-            eprintln!("pdf-raster: failed to open PDF: {e}");
-            let mut src = std::error::Error::source(&e);
-            while let Some(cause) = src {
-                eprintln!("  caused by: {cause}");
-                src = cause.source();
-            }
-            std::process::exit(1);
-        });
+    let session = pdf_raster::open_session(std::path::Path::new(&args.input)).unwrap_or_else(|e| {
+        eprintln!("pdf-raster: failed to open PDF: {e}");
+        let mut src = std::error::Error::source(&e);
+        while let Some(cause) = src {
+            eprintln!("  caused by: {cause}");
+            src = cause.source();
+        }
+        std::process::exit(1);
+    });
 
     let n = session.total_pages();
     if n == 0 {

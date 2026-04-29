@@ -23,6 +23,9 @@ pub mod nvjpeg;
 #[cfg(feature = "nvjpeg2k")]
 pub mod nvjpeg2k;
 
+#[cfg(feature = "gpu-deskew")]
+pub mod npp_rotate;
+
 use std::sync::Arc;
 
 use cudarc::driver::{

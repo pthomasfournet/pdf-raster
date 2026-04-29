@@ -14,7 +14,9 @@ nvjpeg2k = ["dep:gpu", "pdf_interp/nvjpeg2k"]
 gpu-icc = ["dep:gpu", "pdf_interp/gpu-icc"]
 # GPU-accelerated deskew rotation via CUDA NPP (nppiRotate).
 # Falls back to CPU bilinear when disabled.
-gpu-deskew = ["dep:gpu"]
+gpu-deskew = ["dep:gpu", "gpu/gpu-deskew"]
+# Enable GPU vs CPU parity tests (requires a CUDA device at test time).
+gpu-validation = ["gpu/gpu-validation"]
 
 [dependencies]
 pdf_interp  = { path = "../pdf_interp" }

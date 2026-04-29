@@ -4,7 +4,9 @@ use clap::Parser;
 
 /// Parser that rejects non-positive or non-finite DPI values at the CLI boundary.
 fn parse_positive_dpi(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a valid number"))?;
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number"))?;
     if v.is_finite() && v > 0.0 {
         Ok(v)
     } else {
@@ -15,7 +17,10 @@ fn parse_positive_dpi(s: &str) -> Result<f64, String> {
 /// Rust replacement for pdftoppm — renders PDF pages to images.
 #[derive(Parser, Debug)]
 #[command(name = "pdf-raster", about, long_about = None)]
-#[expect(clippy::struct_excessive_bools, reason = "CLI mirrors all pdftoppm flags; each bool maps to a distinct flag")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI mirrors all pdftoppm flags; each bool maps to a distinct flag"
+)]
 pub struct Args {
     /// Input PDF file ("-" for stdin).
     pub input: String,

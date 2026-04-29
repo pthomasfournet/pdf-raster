@@ -119,18 +119,18 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     dst
 }
 
-/// GPU rotation via CUDA NPP (stub — enabled by `gpu-deskew` feature).
+/// GPU rotation via CUDA NPP (`nppiRotate_8u_C1R_Ctx`).
 #[cfg(feature = "gpu-deskew")]
 fn rotate_gpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Result<Bitmap<Gray8>, DeskewError> {
-    // TODO: implement via nppiRotate_8u_C1R_Ctx.
-    // Steps:
-    //   1. cudaMalloc source/dest device buffers (or reuse from decode pipeline).
-    //   2. cudaMemcpy2D H→D for source.
-    //   3. nppiRotate_8u_C1R_Ctx with NPPI_INTER_LINEAR and centre-of-image pivot.
-    //   4. cudaMemcpy2D D→H for result.
-    //   5. cudaFree.
-    let _ = (src, angle_deg);
-    Err(DeskewError("gpu-deskew not yet implemented".into()))
+    let pixels =
+        gpu::npp_rotate::rotate_gray8(src.data(), src.stride, src.width, src.height, angle_deg)
+            .map_err(|e| DeskewError(e.to_string()))?;
+
+    // Reconstruct a tightly-packed Bitmap from the returned pixel Vec.
+    // rotate_gray8 returns width*height bytes with no stride padding.
+    let mut dst = Bitmap::<Gray8>::new(src.width, src.height, 1, false);
+    dst.data_mut().copy_from_slice(&pixels);
+    Ok(dst)
 }
 
 #[cfg(test)]
@@ -183,5 +183,62 @@ mod tests {
             }
         }
         assert!(max_diff <= 2, "360° rotation max diff {max_diff} > 2");
+    }
+
+    /// GPU and CPU bilinear rotation agree to within 2 grey levels at any
+    /// interior pixel for a typical deskew angle (2°).
+    ///
+    /// Gated on `gpu-validation` so it only runs when a CUDA device is
+    /// available (same gate as the other GPU-vs-CPU parity tests).
+    #[test]
+    #[cfg(all(feature = "gpu-deskew", feature = "gpu-validation"))]
+    fn gpu_vs_cpu_rotation_parity() {
+        let mut src = Bitmap::<Gray8>::new(128, 128, 1, false);
+        for y in 0..128u32 {
+            let row = src.row_bytes_mut(y);
+            for x in 0..128usize {
+                row[x] = ((x * 2 + y as usize * 3) % 256) as u8;
+            }
+        }
+
+        let angle = 2.0_f32;
+        let cpu = rotate_cpu(&src, angle);
+        let gpu = rotate_gpu(&src, angle).expect("GPU rotate failed");
+
+        let mut max_diff = 0i32;
+        // Skip a 4-pixel border where bilinear vs NPP edge treatment may differ.
+        for y in 4..124u32 {
+            let cr = &cpu.row_bytes(y)[4..124];
+            let gr = &gpu.row_bytes(y)[4..124];
+            for (&a, &b) in cr.iter().zip(gr.iter()) {
+                max_diff = max_diff.max((a as i32 - b as i32).abs());
+            }
+        }
+        assert!(
+            max_diff <= 2,
+            "GPU vs CPU rotation max diff {max_diff} > 2 at 2°"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "gpu-deskew", feature = "gpu-validation"))]
+    fn gpu_rotate_zero_is_near_identity() {
+        let mut src = Bitmap::<Gray8>::new(64, 64, 1, false);
+        for y in 0..64u32 {
+            let row = src.row_bytes_mut(y);
+            for x in 0..64usize {
+                row[x] = ((x * 4 + y as usize * 2) % 256) as u8;
+            }
+        }
+        let gpu = rotate_gpu(&src, 0.0).expect("GPU rotate 0° failed");
+        let mut max_diff = 0i32;
+        for y in 4..60u32 {
+            let sr = &src.row_bytes(y)[4..60];
+            let gr = &gpu.row_bytes(y)[4..60];
+            for (&a, &b) in sr.iter().zip(gr.iter()) {
+                max_diff = max_diff.max((a as i32 - b as i32).abs());
+            }
+        }
+        assert!(max_diff <= 2, "GPU 0° rotation max diff {max_diff} > 2");
     }
 }

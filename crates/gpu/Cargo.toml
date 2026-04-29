@@ -15,6 +15,9 @@ nvjpeg = []
 # Requires libnvjpeg2k.so at link time (installed at
 # /usr/lib/x86_64-linux-gnu/libnvjpeg2k/12/ on this system).
 nvjpeg2k = []
+# Enable GPU rotation via CUDA NPP nppiRotate_8u_C1R_Ctx.
+# Requires libnppig.so + libnppc.so + libcudart.so (all ship with CUDA 12).
+gpu-deskew = []
 # Enable GPU vs CPU parity tests (requires a CUDA device at test time).
 # cargo test -p gpu --lib --features gpu-validation -- aa_fill_gpu_vs_cpu
 gpu-validation = []

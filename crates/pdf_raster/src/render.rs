@@ -213,7 +213,7 @@ pub fn open_session(path: &std::path::Path) -> Result<RasterSession, RasterError
     let total_pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
-    let gpu_ctx = match gpu::GpuCtx::new() {
+    let gpu_ctx = match gpu::GpuCtx::init() {
         Ok(ctx) => Some(Arc::new(ctx)),
         Err(e) => {
             eprintln!(
@@ -406,9 +406,7 @@ pub(crate) fn render_pages(
         opts: opts.clone(),
     });
 
-    PageIter {
-        state: Some(state),
-    }
+    PageIter { state: Some(state) }
 }
 
 struct PageIter {

@@ -16,6 +16,8 @@ nvjpeg   = ["pdf_raster/nvjpeg"]
 nvjpeg2k = ["pdf_raster/nvjpeg2k"]
 # Enable GPU ICC CMYK→RGB transform.
 gpu-icc  = ["pdf_raster/gpu-icc"]
+# Enable GPU-accelerated deskew rotation via CUDA NPP.
+gpu-deskew = ["pdf_raster/gpu-deskew"]
 
 [dependencies]
 pdf_raster  = { path = "../pdf_raster" }
