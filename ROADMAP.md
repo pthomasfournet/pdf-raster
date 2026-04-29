@@ -351,7 +351,7 @@ cargo run -p gpu --release --bin threshold_bench
 
 ---
 
-## Phase 5 — Public library API (IN PROGRESS — library shipped, review pass done)
+## Phase 5 — Public library API (IN PROGRESS — library shipped, two review passes done)
 
 Extract the render pipeline into a reusable library crate. The caller gets 8-bit grayscale pixels in memory and passes them directly to Tesseract — no subprocess, no files, no Leptonica.
 
@@ -460,5 +460,6 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 - [x] `crates/pdf_raster/src/deskew/rotate.rs` — CPU bilinear fallback; GPU stub (`nppiRotate` TODO)
 - [x] Review pass: sentinel hack → `Option<Result>`, pages map O(n²) → O(n), `InvalidOptions` validation, `debug_assert` → `assert`, `NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED` constant, `remove(0)` → `swap_remove(0)`, bilinear inlined into rotate loop, `downsample` factor=0 guard
 - [x] Make CLI a thin wrapper over `crates/pdf_raster` (RasterSession, render_page_rgb, open_session)
+- [x] Second review pass (Apr 2026): scale validation guard in `render_page_rgb`; GPU init failure `eprintln!`; `PageIter::next` Err arm cleaned; dead variable removed from `bitmap_to_vec`; `# Panics` doc corrected in lib.rs; `MONO_THRESHOLD` const extracted in CLI; atomic temp-file rename in CLI `render_page` (no partial files on encode failure)
 - [ ] GPU rotation: implement `rotate_gpu` via `nppiRotate_8u_C1R_Ctx`
 - [ ] Integration tests: round-trip a fixture PDF, assert pixel dimensions and grayscale range; deskew unit tests with synthetic skewed images at known angles

@@ -28,7 +28,7 @@
 //! # use std::path::Path;
 //! # let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 1, deskew: true };
 //! for (_, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
-//!     let page = result.unwrap();
+//!     let page = result.expect("page render failed");
 //!     // tesseract crate (v0.15+):
 //!     // let text = tesseract::ocr_from_frame(
 //!     //     &page.pixels,
@@ -126,8 +126,9 @@ pub struct RenderedPage {
 ///
 /// # Panics
 ///
-/// Does not panic.  Driver bugs that return null handles after a success status
-/// are caught by assertions in the GPU layer and converted to errors.
+/// Panics only on GPU driver bugs where a CUDA or nvJPEG function reports
+/// success but returns a null handle — this cannot be triggered by valid input
+/// or malformed PDFs, only by a faulty driver.
 pub fn raster_pdf(
     path: &Path,
     opts: &RasterOptions,

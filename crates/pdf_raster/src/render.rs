@@ -205,7 +205,16 @@ pub fn open_session(path: &std::path::Path) -> Result<RasterSession, RasterError
     let pages = doc.get_pages();
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
-    let gpu_ctx = gpu::GpuCtx::new().ok().map(Arc::new);
+    let gpu_ctx = match gpu::GpuCtx::new() {
+        Ok(ctx) => Some(Arc::new(ctx)),
+        Err(e) => {
+            eprintln!(
+                "pdf_raster: GPU initialisation failed ({e}); \
+                 falling back to CPU. Run `nvidia-smi` to verify the driver is loaded."
+            );
+            None
+        }
+    };
 
     Ok(RasterSession {
         doc,
@@ -223,17 +232,30 @@ pub fn open_session(path: &std::path::Path) -> Result<RasterSession, RasterError
 /// thread and reused across pages — safe to call from multiple rayon threads
 /// concurrently.
 ///
-/// `scale` is `dpi / 72.0` (both axes equal for square-pixel rendering).
+/// `scale` is the pixel-per-point multiplier: `dpi / 72.0` for square-pixel
+/// rendering, or `(x_dpi/72 · y_dpi/72).sqrt()` for the geometric-mean when
+/// horizontal and vertical DPI differ.  Must be a positive finite number;
+/// zero or NaN produces [`RasterError::PageDegenerate`].
 ///
 /// # Errors
 ///
-/// Returns [`RasterError`] if the page geometry is invalid or the PDF cannot
-/// be interpreted.
+/// - [`RasterError::PageDegenerate`] if `scale` is ≤ 0, NaN, or the page
+///   `MediaBox` has zero area.
+/// - [`RasterError::PageTooLarge`] if the computed pixel dimensions exceed
+///   [`MAX_PX_DIMENSION`].
+/// - [`RasterError::PageOutOfRange`] if `page_num` is not in the document.
+/// - [`RasterError::Pdf`] if the page content stream cannot be parsed.
 pub fn render_page_rgb(
     session: &RasterSession,
     page_num: u32,
     scale: f64,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
+    // A non-positive or non-finite scale is a caller error; catch it explicitly
+    // so the error message names the real cause rather than "degenerate dimensions".
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(RasterError::PageDegenerate { width: 0, height: 0 });
+    }
+
     let doc = &session.doc;
 
     let geom = pdf_interp::page_size_pts(doc, page_num)?;
@@ -389,14 +411,10 @@ impl Iterator for PageIter {
     fn next(&mut self) -> Option<Self::Item> {
         match self.state.as_mut()? {
             Err(_) => {
-                // Document-open error: take it out, yield once, then stop (state → None).
-                let err = self
-                    .state
-                    .take()
-                    .expect("state was Some(_) one line above")
-                    .map(|_| unreachable!());
-                // first_page is not available when the document failed to open; use 1
-                // as a placeholder — the caller only cares about the Err payload.
+                // Document-open error: take it out (sets state → None), yield once.
+                // first_page is unknown here — use 1 as a placeholder.
+                // The caller only cares about the Err payload, not the page number.
+                let err = self.state.take()?.map(|_| unreachable!());
                 Some((1, err))
             }
             Ok(state) => {
@@ -475,8 +493,7 @@ pub fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
 /// so the returned buffer has exactly `width * height` bytes.
 fn bitmap_to_vec(bmp: &Bitmap<Gray8>) -> Vec<u8> {
     let w = bmp.width as usize;
-    let h = bmp.height as usize;
-    let mut out = Vec::with_capacity(w * h);
+    let mut out = Vec::with_capacity(w * bmp.height as usize);
     for y in 0..bmp.height {
         out.extend_from_slice(&bmp.row_bytes(y)[..w]);
     }

@@ -1,6 +1,6 @@
 //! Per-page rendering: call `pdf_raster` library → apply colour mode → write file.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufWriter, Write as _};
 
 use color::{Gray8, Rgb8};
@@ -36,10 +36,7 @@ impl std::fmt::Display for RenderError {
             Self::Raster(e) => write!(f, "render error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
             Self::UnsupportedFormatCombination { output } => {
-                write!(
-                    f,
-                    "output format {output:?} is not yet supported by the native renderer"
-                )
+                write!(f, "output format {output:?} is not yet supported")
             }
         }
     }
@@ -105,40 +102,60 @@ pub fn render_page(
         reason = "total_pages ≤ i32::MAX; validated in main before calling this function"
     )]
     let out_path = output_path(args, page_num as i32, total_pages as i32, format);
-    let mut out = BufWriter::new(File::create(&out_path)?);
 
-    if args.mono {
-        let mono = gray_to_mono(&rgb_to_gray(&rgb));
-        match format {
-            OutputFormat::Ppm => write_pbm::<Gray8, _>(&mono, &mut out)?,
-            OutputFormat::Png => write_png::<Gray8, _>(&mono, &mut out)?,
-            OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+    // Write to a sibling temp file then rename atomically so a failed encode
+    // never leaves a partial output file at the final path.
+    let tmp_path = format!("{out_path}.tmp");
+    let encode_result = (|| -> Result<(), RenderError> {
+        let mut out = BufWriter::new(File::create(&tmp_path)?);
+        if args.mono {
+            let mono = gray_to_mono(&rgb_to_gray(&rgb));
+            match format {
+                OutputFormat::Ppm => write_pbm::<Gray8, _>(&mono, &mut out)?,
+                OutputFormat::Png => write_png::<Gray8, _>(&mono, &mut out)?,
+                OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+            }
+        } else if args.gray {
+            let gray = rgb_to_gray(&rgb);
+            match format {
+                OutputFormat::Ppm => write_pgm::<Gray8, _>(&gray, &mut out)?,
+                OutputFormat::Png => write_png::<Gray8, _>(&gray, &mut out)?,
+                OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+            }
+        } else {
+            match format {
+                OutputFormat::Ppm => write_ppm(&rgb, &mut out)?,
+                OutputFormat::Png => write_png(&rgb, &mut out)?,
+                OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+            }
         }
-    } else if args.gray {
-        let gray = rgb_to_gray(&rgb);
-        match format {
-            OutputFormat::Ppm => write_pgm::<Gray8, _>(&gray, &mut out)?,
-            OutputFormat::Png => write_png::<Gray8, _>(&gray, &mut out)?,
-            OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
-        }
-    } else {
-        match format {
-            OutputFormat::Ppm => write_ppm(&rgb, &mut out)?,
-            OutputFormat::Png => write_png(&rgb, &mut out)?,
-            OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
-        }
+        out.flush()?;
+        Ok(())
+    })();
+
+    if encode_result.is_err() {
+        // Best-effort cleanup; ignore the error since we're about to surface the
+        // encode failure and a lingering .tmp is less harmful than masking it.
+        let _ = fs::remove_file(&tmp_path);
+        return encode_result;
     }
 
-    out.flush()?;
+    fs::rename(&tmp_path, &out_path)?;
     Ok(())
 }
 
 // ── Pixel helpers ─────────────────────────────────────────────────────────────
 
+/// Luma threshold separating dark ink from light paper (inclusive on the light side).
+///
+/// Matches pdftoppm `--mono`: values below this → 255 (black ink);
+/// values at or above → 0 (white paper).
+const MONO_THRESHOLD: u8 = 128;
+
 /// Threshold a grayscale bitmap to 2-level monochrome at the 50% midpoint.
 ///
-/// Values < 128 (dark) → 255 (black ink); values ≥ 128 (light) → 0 (white paper).
-/// Matches pdftoppm's `--mono` output convention.
+/// Values < [`MONO_THRESHOLD`] (dark) → 255 (black ink);
+/// values ≥ [`MONO_THRESHOLD`] (light) → 0 (white paper).
 fn gray_to_mono(src: &Bitmap<Gray8>) -> Bitmap<Gray8> {
     let mut dst: Bitmap<Gray8> = Bitmap::new(src.width, src.height, 1, false);
     let w = src.width as usize;
@@ -146,7 +163,7 @@ fn gray_to_mono(src: &Bitmap<Gray8>) -> Bitmap<Gray8> {
         let src_row = &src.row_bytes(y)[..w];
         let dst_row = &mut dst.row_bytes_mut(y)[..w];
         for (dst_px, &luma) in dst_row.iter_mut().zip(src_row.iter()) {
-            *dst_px = if luma < 128 { 255 } else { 0 };
+            *dst_px = if luma < MONO_THRESHOLD { 255 } else { 0 };
         }
     }
     dst
