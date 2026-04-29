@@ -294,9 +294,25 @@ The scan-heavy corpus (JPEG/JPEG2K) shows the largest gap because nvJPEG + nvJPE
 
 `compare -metric AE` on 3 pages of `ritual-14th` at 150 DPI. Same page dimensions (700×1050 px). AE of 0.9–17% — entirely explained by sub-pixel anti-aliasing differences at glyph edges (amplified diff shows ghosted text, no structural content difference). This is expected for two independent renderers with different AA strategies.
 
-### Known gap: page rotation (`/Rotate`)
+### ~~Known gap: page rotation (`/Rotate`)~~ — RESOLVED (commit `82efbe5`)
 
-`kt-r2000.pdf` page 1 has `/Rotate: 270`. pdf-raster ignores the `/Rotate` key; poppler applies it. The output for that page is portrait where poppler emits landscape. This is tracked as a rendering parity gap — all other pages in the corpus produce correct output. Fix: apply the page rotation in `pdf_interp::page_size_pts` / `PageRenderer` setup.
+`/Rotate` and `CropBox` are fully handled: `pdf_interp::page_size_pts` reads
+`CropBox` (falling back to `MediaBox`), normalises `/Rotate` to 0/90/180/270,
+and swaps dimensions for 90°/270° rotations.  `PageRenderer::new_scaled`
+applies the matching CTM so all four rotation values produce correctly-oriented
+output.  `kt-r2000.pdf` page 1 (was `/Rotate: 270` portrait) now renders as
+landscape, matching poppler.
+
+### Known gap: `UserUnit` scaling (PDF 1.6+)
+
+`UserUnit` is a Page dictionary key that scales the default user-space unit
+from 1/72 inch to `UserUnit/72` inches.  `page_size_pts` does not read it; a
+`UserUnit: 2.0` page renders at half the intended physical size and
+`RenderedPage.dpi` is wrong (actual resolution = `opts.dpi × user_unit`).
+Rare in practice — affects some large-format and engineering PDFs.  Fix:
+multiply `w_pts`/`h_pts` by `UserUnit` in `page_size_pts`, expose
+`effective_dpi` on `RenderedPage` or `PageGeometry`.  Return an error (not a
+silent clamp) for `UserUnit` values outside the valid range defined by the spec.
 
 ### Fixture inventory
 
