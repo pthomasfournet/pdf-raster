@@ -459,6 +459,6 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 - [x] `crates/pdf_raster/src/deskew/detect.rs` — intensity-weighted projection profile, AVX-512 row sums, Rayon sweep parallelism
 - [x] `crates/pdf_raster/src/deskew/rotate.rs` — CPU bilinear fallback; GPU stub (`nppiRotate` TODO)
 - [x] Review pass: sentinel hack → `Option<Result>`, pages map O(n²) → O(n), `InvalidOptions` validation, `debug_assert` → `assert`, `NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED` constant, `remove(0)` → `swap_remove(0)`, bilinear inlined into rotate loop, `downsample` factor=0 guard
-- [ ] Make CLI a thin wrapper over `crates/pdf_raster`
+- [x] Make CLI a thin wrapper over `crates/pdf_raster` (RasterSession, render_page_rgb, open_session)
 - [ ] GPU rotation: implement `rotate_gpu` via `nppiRotate_8u_C1R_Ctx`
 - [ ] Integration tests: round-trip a fixture PDF, assert pixel dimensions and grayscale range; deskew unit tests with synthetic skewed images at known angles
