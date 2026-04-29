@@ -321,7 +321,7 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
                 }
             }
             let v = to_f64(obj);
-            if !v.is_finite() || v < 0.1 || v > 10.0 {
+            if !v.is_finite() || !(0.1..=10.0).contains(&v) {
                 return Err(InterpError::InvalidPageGeometry(format!(
                     "UserUnit {v} on page {page_num} is outside the valid range [0.1, 10.0]"
                 )));
