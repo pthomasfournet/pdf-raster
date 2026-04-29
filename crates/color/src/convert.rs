@@ -266,6 +266,18 @@ pub const fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
     (v, v, v)
 }
 
+/// Blend one ink channel against the key: `((255−ink) × (255−k) + 127) / 255`.
+///
+/// Max product is `255 × 255 + 127 = 65 152`, which divides to 255 — fits `u8`.
+#[inline]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "((255-ink)*(255-k)+127)/255 ≤ 255, always fits u8"
+)]
+fn reflectance_blend(ink: u8, inv_k: u32) -> u8 {
+    ((u32::from(255 - ink) * inv_k + 127) / 255) as u8
+}
+
 /// CMYK → RGB via the reflectance formula: `R = (255−C)×(255−K)/255` (rounded).
 ///
 /// Used for raw JPEG/CMYK pixel data where channels represent ink density.
@@ -276,40 +288,18 @@ pub const fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
 ///
 /// - [`cmyk_to_rgb`]: simple saturating-subtract `R = 255−(C+K)`, matching
 ///   poppler's matrix multiply path.  Faster but less accurate for mid-tones.
-/// - `pdf_interp::renderer::color::cmyk_to_rgb_bytes`: takes normalised f64
-///   inputs per PDF §10.3.3 (`R = 1−min(1, C+K)`), for PDF colour operators.
+/// - [`cmyk_to_rgb_bytes`]: takes normalised `f64` inputs per PDF §10.3.3.
 ///
-/// # Arguments
-///
-/// All inputs in \[0, 255\].
-///
-/// # Output range
-///
-/// Each output channel is in \[0, 255\].
+/// All inputs and outputs in \[0, 255\].
 #[inline]
 #[must_use]
-#[expect(
-    clippy::many_single_char_names,
-    reason = "CMYK and RGB are conventional single-letter colour channel names"
-)]
 pub fn cmyk_to_rgb_reflectance(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
     let inv_k = u32::from(255 - k);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
-    )]
-    let r = ((u32::from(255 - c) * inv_k + 127) / 255) as u8;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
-    )]
-    let g = ((u32::from(255 - m) * inv_k + 127) / 255) as u8;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
-    )]
-    let b = ((u32::from(255 - y) * inv_k + 127) / 255) as u8;
-    (r, g, b)
+    (
+        reflectance_blend(c, inv_k),
+        reflectance_blend(m, inv_k),
+        reflectance_blend(y, inv_k),
+    )
 }
 
 // ── f64 → u8 conversions ─────────────────────────────────────────────────────
@@ -320,14 +310,13 @@ pub fn cmyk_to_rgb_reflectance(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
 /// Used for PDF colour operators where channel components are normalised floats.
 #[inline]
 #[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "value is clamped to [0, 1] and scaled to [0.0, 255.0]; round() output fits u8"
+)]
 pub fn gray_to_u8(v: f64) -> u8 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "value is clamped to [0, 1] and scaled to [0.0, 255.0]; round() output fits u8"
-    )]
-    let out = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    out
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// Convert three normalised PDF RGB components to `[r, g, b]` bytes.
@@ -355,9 +344,10 @@ pub fn rgb_to_bytes(r: f64, g: f64, b: f64) -> [u8; 3] {
     reason = "CMYK and RGB are conventional single-letter colour channel names"
 )]
 pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
-    let r = 1.0 - (c.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
-    let g = 1.0 - (m.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
-    let b = 1.0 - (y.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
+    let k = k.clamp(0.0, 1.0);
+    let r = 1.0 - (c.clamp(0.0, 1.0) + k).min(1.0);
+    let g = 1.0 - (m.clamp(0.0, 1.0) + k).min(1.0);
+    let b = 1.0 - (y.clamp(0.0, 1.0) + k).min(1.0);
     rgb_to_bytes(r, g, b)
 }
 
