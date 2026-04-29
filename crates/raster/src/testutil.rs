@@ -27,6 +27,22 @@ pub(crate) fn simple_pipe() -> PipeState<'static> {
     }
 }
 
+/// Parametric pipe with configurable `a_input` and `blend_mode`.
+pub(crate) fn make_pipe(a_input: u8, blend_mode: BlendMode) -> PipeState<'static> {
+    PipeState {
+        blend_mode,
+        a_input,
+        overprint_mask: 0xFFFF_FFFF,
+        overprint_additive: false,
+        transfer: TransferSet::identity_rgb(),
+        soft_mask: None,
+        alpha0: None,
+        knockout: false,
+        knockout_opacity: 255,
+        non_isolated_group: false,
+    }
+}
+
 pub(crate) fn make_clip(w: u32, h: u32) -> Clip {
     Clip::new(0.0, 0.0, f64::from(w) - 0.001, f64::from(h) - 0.001, false)
 }

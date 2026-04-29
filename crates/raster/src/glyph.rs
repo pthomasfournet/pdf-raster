@@ -481,30 +481,9 @@ pub fn fill_glyph<P: Pixel>(
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::clip::Clip;
     use crate::pipe::{PipeSrc, PipeState};
-    use crate::state::TransferSet;
-    use crate::types::BlendMode;
+    use crate::testutil::{make_clip, simple_pipe};
     use color::Rgb8;
-
-    fn simple_pipe() -> PipeState<'static> {
-        PipeState {
-            blend_mode: BlendMode::Normal,
-            a_input: 255,
-            overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
-            transfer: TransferSet::identity_rgb(),
-            soft_mask: None,
-            alpha0: None,
-            knockout: false,
-            knockout_opacity: 255,
-            non_isolated_group: false,
-        }
-    }
-
-    fn make_clip(w: u32, h: u32) -> Clip {
-        Clip::new(0.0, 0.0, w as f64 - 0.001, h as f64 - 0.001, false)
-    }
 
     #[test]
     fn blit_aa_glyph_paints_pixels() {

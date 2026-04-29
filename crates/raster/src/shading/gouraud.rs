@@ -377,30 +377,9 @@ pub fn gouraud_triangle_fill<P: Pixel>(
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::clip::Clip;
     use crate::pipe::PipeState;
-    use crate::state::TransferSet;
-    use crate::types::BlendMode;
+    use crate::testutil::{make_clip, simple_pipe};
     use color::Rgb8;
-
-    fn simple_pipe() -> PipeState<'static> {
-        PipeState {
-            blend_mode: BlendMode::Normal,
-            a_input: 255,
-            overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
-            transfer: TransferSet::identity_rgb(),
-            soft_mask: None,
-            alpha0: None,
-            knockout: false,
-            knockout_opacity: 255,
-            non_isolated_group: false,
-        }
-    }
-
-    fn make_clip(w: u32, h: u32) -> Clip {
-        Clip::new(0.0, 0.0, f64::from(w) - 0.001, f64::from(h) - 0.001, false)
-    }
 
     /// All-white vertices: every painted pixel must be white.
     #[test]

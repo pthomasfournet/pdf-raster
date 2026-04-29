@@ -250,24 +250,9 @@ pub(crate) fn apply_transfer_in_place(pipe: &PipeState<'_>, px: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::TransferSet;
+    use crate::testutil::make_pipe;
     use crate::types::BlendMode;
     use color::Rgb8;
-
-    fn make_pipe(a_input: u8, blend: BlendMode) -> PipeState<'static> {
-        PipeState {
-            blend_mode: blend,
-            a_input,
-            overprint_mask: 0xFFFF_FFFF,
-            overprint_additive: false,
-            transfer: TransferSet::identity_rgb(),
-            soft_mask: None,
-            alpha0: None,
-            knockout: false,
-            knockout_opacity: 255,
-            non_isolated_group: false,
-        }
-    }
 
     #[test]
     fn no_transparency_opaque_normal() {
