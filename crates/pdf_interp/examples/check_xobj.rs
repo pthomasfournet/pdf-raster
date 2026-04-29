@@ -11,6 +11,7 @@ fn main() {
     let page_id = *pages.get(&page).unwrap();
     let page_dict = doc.get_dictionary(page_id).unwrap();
 
+    // Canonical: pdf_interp::resources::resolve_dict (pub(crate), not accessible here).
     use lopdf::{Document, Object};
     fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a lopdf::Dictionary> {
         match obj {

@@ -128,7 +128,7 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
 
     // 3. Document JS name tree (/Names/JavaScript)
     if let Ok(names_obj) = catalog.get(b"Names")
-        && let Some(names_dict) = resolve_dict_obj(doc, names_obj)
+        && let Some(names_dict) = resources::resolve_dict(doc, names_obj)
         && names_dict.get(b"JavaScript").is_ok()
     {
         return Err(InterpError::JavaScript {
@@ -138,7 +138,7 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
 
     // 4. AcroForm additional actions
     if let Ok(acroform_obj) = catalog.get(b"AcroForm")
-        && let Some(acroform) = resolve_dict_obj(doc, acroform_obj)
+        && let Some(acroform) = resources::resolve_dict(doc, acroform_obj)
         && acroform.get(b"AA").is_ok()
     {
         return Err(InterpError::JavaScript {
@@ -151,22 +151,10 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
 
 /// Return `true` if `obj` (or the dict it resolves to) has `/S /JavaScript`.
 fn action_is_js(doc: &Document, obj: &lopdf::Object) -> bool {
-    resolve_dict_obj(doc, obj)
+    resources::resolve_dict(doc, obj)
         .and_then(|d| d.get(b"S").ok())
         .and_then(|s| s.as_name().ok())
         .is_some_and(|name| name == b"JavaScript")
-}
-
-/// Dereference a `Dictionary` or `Reference → Dictionary`.
-fn resolve_dict_obj<'a>(
-    doc: &'a Document,
-    obj: &'a lopdf::Object,
-) -> Option<&'a lopdf::Dictionary> {
-    match obj {
-        lopdf::Object::Dictionary(d) => Some(d),
-        lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
-        _ => None,
-    }
 }
 
 /// Return the number of pages in `doc`.

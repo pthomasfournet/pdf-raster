@@ -20,8 +20,7 @@
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use super::image::resolve_dict;
-use super::{read_bbox, read_matrix};
+use super::{read_bbox, read_matrix, resolve_dict};
 
 /// Parameters extracted from a PDF Type 1 (tiling) pattern stream.
 ///

@@ -39,7 +39,7 @@ use raster::shading::radial::RadialPattern;
 
 use super::dict_ext::DictExt;
 use super::image::{ImageColorSpace, cs_to_image_color_space};
-use super::obj_to_f64;
+use super::{obj_to_f64, resolve_dict};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -72,8 +72,8 @@ pub fn resolve_shading(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Option<ShadingResult> {
-    let res = super::image::resolve_dict(doc, resource_context_dict.get(b"Resources").ok()?)?;
-    let sh_res = super::image::resolve_dict(doc, res.get(b"Shading").ok()?)?;
+    let res = resolve_dict(doc, resource_context_dict.get(b"Resources").ok()?)?;
+    let sh_res = resolve_dict(doc, res.get(b"Shading").ok()?)?;
     let sh_obj = sh_res.get(name).ok()?;
 
     // Shading types 2–3 are plain dicts; types 4–7 are streams.
@@ -82,9 +82,9 @@ pub fn resolve_shading(
         Object::Stream(s) => (&s.dict, stream_content(s)),
         Object::Reference(id) => match doc.get_object(*id).ok()? {
             Object::Stream(s) => (&s.dict, stream_content(s)),
-            obj => (super::image::resolve_dict(doc, obj)?, None),
+            obj => (resolve_dict(doc, obj)?, None),
         },
-        obj => (super::image::resolve_dict(doc, obj)?, None),
+        obj => (resolve_dict(doc, obj)?, None),
     };
 
     let shading_type = sh_dict.get_i64(b"ShadingType")?;

@@ -279,10 +279,10 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn ext_gstate(&self, name: &[u8]) -> Option<ExtGStateParams> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        let res = image::resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
-        let eg_dict = image::resolve_dict(self.doc, res.get(b"ExtGState").ok()?)?;
+        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
+        let eg_dict = resolve_dict(self.doc, res.get(b"ExtGState").ok()?)?;
         let gs_ref_or_dict = eg_dict.get(name).ok()?;
-        let gs = image::resolve_dict(self.doc, gs_ref_or_dict)?;
+        let gs = resolve_dict(self.doc, gs_ref_or_dict)?;
         Some(ExtGStateParams::from_dict(gs))
     }
 
@@ -292,8 +292,8 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn form_xobject(&self, name: &[u8]) -> Option<FormXObject> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        let res = image::resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
-        let xobj_dict = image::resolve_dict(self.doc, res.get(b"XObject").ok()?)?;
+        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
+        let xobj_dict = resolve_dict(self.doc, res.get(b"XObject").ok()?)?;
         let stream_id = match xobj_dict.get(name).ok()? {
             Object::Reference(id) => *id,
             _ => return None,
@@ -386,8 +386,8 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn ocg_object_id(&self, props_key: &[u8]) -> Option<lopdf::ObjectId> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        let res = image::resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
-        let props = image::resolve_dict(self.doc, res.get(b"Properties").ok()?)?;
+        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
+        let props = resolve_dict(self.doc, res.get(b"Properties").ok()?)?;
         match props.get(props_key).ok()? {
             Object::Reference(id) => Some(*id),
             _ => None, // Inline-dict OCGs are not resolved (treat as visible).
@@ -561,6 +561,37 @@ fn read_transparency_group(
 /// key is absent or has fewer than 6 numeric entries.
 pub(crate) fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
     read_f64_n::<6>(dict, b"Matrix")
+}
+
+/// Dereference a PDF `Object` to a `&Dictionary`.
+///
+/// Accepts `Dictionary` (returned as-is) or `Reference` (dereferenced via `doc`).
+/// Use [`resolve_stream_dict`] when the referent may be a stream object.
+pub(crate) fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
+    match obj {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    }
+}
+
+/// Like [`resolve_dict`] but also handles `Reference → Stream → &stream.dict`.
+///
+/// Needed for `ICCBased` colour spaces where the second array element is a
+/// `Reference` to a stream whose dictionary carries the ICC metadata.
+pub(crate) fn resolve_stream_dict<'a>(
+    doc: &'a Document,
+    obj: &'a Object,
+) -> Option<&'a Dictionary> {
+    match obj {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(id) => match doc.get_object(*id).ok()? {
+            Object::Dictionary(d) => Some(d),
+            Object::Stream(s) => Some(&s.dict),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]

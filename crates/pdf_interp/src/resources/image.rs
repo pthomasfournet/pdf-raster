@@ -770,19 +770,10 @@ const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)> {
 
 /// Resolve the `XObject` resource named `name` to its stream `ObjectId`.
 fn xobject_id(doc: &Document, page_dict: &Dictionary, name: &[u8]) -> Option<ObjectId> {
-    let res = resolve_dict(doc, page_dict.get(b"Resources").ok()?)?;
-    let xobj = resolve_dict(doc, res.get(b"XObject").ok()?)?;
+    let res = super::resolve_dict(doc, page_dict.get(b"Resources").ok()?)?;
+    let xobj = super::resolve_dict(doc, res.get(b"XObject").ok()?)?;
     match xobj.get(name).ok()? {
         Object::Reference(id) => Some(*id),
-        _ => None,
-    }
-}
-
-/// Dereference a `Dictionary` or `Reference → Dictionary`.
-pub(crate) fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
-    match obj {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
         _ => None,
     }
 }
@@ -2214,7 +2205,7 @@ fn resolve_cs<'a>(doc: &'a Document, cs_obj: &'a Object) -> ResolvedCs {
                 b"DeviceCMYK" => ResolvedCs::Cmyk,
                 b"ICCBased" => {
                     // Second element is a reference to the ICC stream.
-                    let stream_dict = arr.get(1).and_then(|o| resolve_obj_dict(doc, o));
+                    let stream_dict = arr.get(1).and_then(|o| super::resolve_stream_dict(doc, o));
                     icc_based_cs(stream_dict)
                 }
                 b"Indexed" => {
@@ -2285,26 +2276,6 @@ fn extract_icc_bytes(doc: &Document, cs_obj: &Object) -> Option<Vec<u8>> {
         .decompressed_content()
         .map_err(|e| log::debug!("image: ICCBased stream decompression failed: {e}"))
         .ok()
-}
-
-/// Dereference a direct or indirect object to a `&Dictionary`.
-///
-/// For `ICCBased`, the second element of the array is a reference to a stream;
-/// we need the stream's dictionary, not the stream body.
-fn resolve_obj_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
-    match obj {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => {
-            // get_object borrows from `doc` with lifetime 'a, so the returned
-            // reference outlives this function.
-            match doc.get_object(*id).ok()? {
-                Object::Stream(s) => Some(&s.dict),
-                Object::Dictionary(d) => Some(d),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
 }
 
 /// Try to decode an `Indexed` colour space lookup table into a flat RGB/Gray

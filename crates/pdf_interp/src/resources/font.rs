@@ -601,7 +601,7 @@ fn extract_descendant<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a
                 .as_array()
                 .ok()?
                 .first()
-                .and_then(|o| resolve_obj_to_dict(doc, o));
+                .and_then(|o| super::resolve_dict(doc, o));
         }
         _ => return None,
     };
@@ -611,16 +611,7 @@ fn extract_descendant<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a
         return None;
     }
 
-    resolve_obj_to_dict(doc, &arr[0])
-}
-
-/// Dereference an `Object` (possibly a `Reference`) to a `&Dictionary`.
-fn resolve_obj_to_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
-    match obj {
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
-        Object::Dictionary(d) => Some(d),
-        _ => None,
-    }
+    super::resolve_dict(doc, &arr[0])
 }
 
 /// Extract embedded font bytes from the `FontDescriptor` of a `CIDFont` dict.
