@@ -43,23 +43,17 @@
 
 use std::borrow::Cow;
 
-use hayro_jbig2::Decoder as Jbig2Decoder;
-use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::resources::dict_ext::DictExt;
-use zune_core::bytestream::ZCursor;
-use zune_core::colorspace::ColorSpace as ZColorSpace;
-use zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
 
 // ── nvJPEG GPU acceleration ───────────────────────────────────────────────────
 
 #[cfg(feature = "nvjpeg")]
-use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
+use gpu::nvjpeg::NvJpegDecoder;
 
 #[cfg(feature = "nvjpeg2k")]
-use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
+use gpu::nvjpeg2k::NvJpeg2kDecoder;
 
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
@@ -67,8 +61,8 @@ use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
 use gpu::GpuCtx;
 
 #[cfg(feature = "gpu-icc")]
-#[path = "icc.rs"]
-mod icc;
+#[path = "../icc.rs"]
+pub(crate) mod icc;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
@@ -85,6 +79,13 @@ pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
 /// as nvJPEG; JPEG 2000 decode is CPU-bound at similar pixel counts.
 #[cfg(feature = "nvjpeg2k")]
 pub const GPU_JPEG2K_THRESHOLD_PX: u32 = 262_144;
+
+// ── Sub-modules ───────────────────────────────────────────────────────────────
+
+pub(crate) mod codecs;
+pub(crate) mod inline;
+
+pub use inline::decode_inline_image;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -157,6 +158,10 @@ pub struct ImageDescriptor {
 /// - the filter is unsupported (a warning is logged), or
 /// - any decoding error occurs.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per supported filter plus GPU cfg variants — splitting would obscure the dispatch table"
+)]
 pub fn resolve_image(
     doc: &Document,
     page_dict: &Dictionary,
@@ -165,6 +170,8 @@ pub fn resolve_image(
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
+    use codecs::{decode_ccitt, decode_dct, decode_jbig2, decode_jpx};
+
     let stream_id = xobject_id(doc, page_dict, name)?;
     let obj = doc.get_object(stream_id).ok()?;
     let stream = obj.as_stream().ok()?;
@@ -281,324 +288,6 @@ pub fn resolve_image(
     Some(img)
 }
 
-// ── Inline image decoding (BI … ID … EI) ─────────────────────────────────────
-
-/// Decode an inline image (`BI … ID … EI`) from raw parameter and data bytes.
-///
-/// `params` is the raw content between `BI` and `ID`; it contains key/value
-/// pairs using either the full PDF names (`/Width`, `/ColorSpace`, …) or the
-/// abbreviated forms defined in PDF §8.9.7 Table 89 (`/W`, `/CS`, …).
-/// `data` is the raw content between `ID` and `EI` (compressed or raw pixels).
-///
-/// Inline images cannot carry an `SMask` stream (they have no object identity),
-/// so the returned descriptor always has `smask: None`.
-///
-/// Returns `None` if the parameter block is unparseable, dimensions are
-/// degenerate, or the filter is unsupported.
-#[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match arm per supported filter; each arm is small but the set is large"
-)]
-pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option<ImageDescriptor> {
-    let dict = parse_inline_params(params);
-
-    let w_raw = dict.get_i64(b"Width")?;
-    let h_raw = dict.get_i64(b"Height")?;
-    let Some((w, h)) = validated_dims(w_raw, h_raw) else {
-        log::warn!("inline image: degenerate dimensions {w_raw}×{h_raw}, skipping");
-        return None;
-    };
-
-    let is_mask = dict.get_bool(b"ImageMask").unwrap_or(false);
-    let filter = dict.get(b"Filter").ok().and_then(filter_name);
-
-    let img_filter = match filter.as_deref() {
-        Some("DCTDecode") => ImageFilter::Dct,
-        Some("JPXDecode") => ImageFilter::Jpx,
-        Some("CCITTFaxDecode") => ImageFilter::CcittFax,
-        Some("JBIG2Decode") => ImageFilter::Jbig2,
-        Some("FlateDecode") => ImageFilter::Flate,
-        _ => ImageFilter::Raw,
-    };
-
-    let mut img = match filter.as_deref() {
-        None => decode_raw(
-            doc,
-            data,
-            w,
-            h,
-            is_mask,
-            &dict,
-            #[cfg(feature = "gpu-icc")]
-            None,
-        ),
-        Some("FlateDecode") => {
-            use lopdf::Stream;
-            // Use lopdf to run Flate decompression on raw bytes.
-            let stream = Stream::new(dict.clone(), data.to_vec());
-            match stream.decompressed_content() {
-                Ok(raw) => decode_raw(
-                    doc,
-                    &raw,
-                    w,
-                    h,
-                    is_mask,
-                    &dict,
-                    #[cfg(feature = "gpu-icc")]
-                    None,
-                ),
-                Err(e) => {
-                    log::warn!("inline image: FlateDecode failed: {e}");
-                    None
-                }
-            }
-        }
-        Some("CCITTFaxDecode") => {
-            let decode_parms = dict.get(b"DecodeParms").ok();
-            decode_ccitt(data, w, h, is_mask, decode_parms)
-        }
-        Some("DCTDecode") => {
-            // Inline images are typically small (embedded in the content stream).
-            // GPU dispatch for inline images is not worthwhile — use CPU always.
-            #[cfg(all(feature = "nvjpeg", feature = "gpu-icc"))]
-            {
-                decode_dct(data, w, h, None, None)
-            }
-            #[cfg(all(feature = "nvjpeg", not(feature = "gpu-icc")))]
-            {
-                decode_dct(data, w, h, None)
-            }
-            #[cfg(all(not(feature = "nvjpeg"), feature = "gpu-icc"))]
-            {
-                decode_dct(data, w, h, None)
-            }
-            #[cfg(all(not(feature = "nvjpeg"), not(feature = "gpu-icc")))]
-            {
-                decode_dct(data, w, h)
-            }
-        }
-        Some("JPXDecode") => {
-            // Inline images are typically small — GPU dispatch is not worthwhile.
-            #[cfg(feature = "nvjpeg2k")]
-            {
-                decode_jpx(data, w, h, None)
-            }
-            #[cfg(not(feature = "nvjpeg2k"))]
-            {
-                decode_jpx(data, w, h)
-            }
-        }
-        Some("JBIG2Decode") => {
-            // Inline images cannot reference a JBIG2Globals stream (no object identity).
-            decode_jbig2(doc, data, w, h, is_mask, None)
-        }
-        Some("RunLengthDecode") => {
-            let raw = decode_run_length(data);
-            decode_raw(
-                doc,
-                &raw,
-                w,
-                h,
-                is_mask,
-                &dict,
-                #[cfg(feature = "gpu-icc")]
-                None,
-            )
-        }
-        Some(other) => {
-            log::warn!("inline image: unknown filter {other:?}");
-            None
-        }
-    }?;
-    img.filter = img_filter;
-    Some(img)
-}
-
-/// Decode a `RunLengthDecode` stream (PDF §7.4.5).
-///
-/// The encoding is a simple run-length scheme:
-/// - Byte `n` in [0, 127] → copy the next `n + 1` literal bytes.
-/// - Byte `n` in [129, 255] → repeat the next byte `257 − n` times.
-/// - Byte `128` → end-of-data marker.
-///
-/// Output is capped at 256 MiB to prevent adversarial OOM from a crafted stream.
-fn decode_run_length(data: &[u8]) -> Vec<u8> {
-    // 256 MiB: enough for a 65536×65536 single-channel image, hard limit against
-    // adversarial run-length streams that encode billions of bytes from a few bytes.
-    decode_run_length_capped(data, 256 * 1024 * 1024)
-}
-
-fn decode_run_length_capped(data: &[u8], max_output: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        let run_byte = data[i];
-        i += 1;
-        match run_byte {
-            128 => break, // EOD
-            0..=127 => {
-                let count = run_byte as usize + 1;
-                let end = i.saturating_add(count).min(data.len());
-                if out.len() + (end - i) > max_output {
-                    log::warn!("inline image: RunLengthDecode output exceeds limit — truncating");
-                    break;
-                }
-                out.extend_from_slice(&data[i..end]);
-                i = end;
-            }
-            _ => {
-                // 129..=255: repeat = 257 - run_byte
-                let repeat = 257usize.saturating_sub(run_byte as usize);
-                if let Some(&b) = data.get(i) {
-                    if out.len() + repeat > max_output {
-                        log::warn!(
-                            "inline image: RunLengthDecode output exceeds limit — truncating"
-                        );
-                        break;
-                    }
-                    out.extend(std::iter::repeat_n(b, repeat));
-                    i += 1;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Parse the raw inline-image parameter block into a `lopdf::Dictionary`.
-///
-/// Keys and values are in PDF syntax but may use the abbreviated forms from
-/// PDF §8.9.7 Table 89 (e.g., `/W` → `/Width`, `/Fl` → `/FlateDecode`).
-/// Unknown keys are passed through unchanged; unrecognised values are passed
-/// through unchanged — the caller's `DictExt` helpers return `None` for
-/// malformed entries, so no validation is needed here.
-fn parse_inline_params(params: &[u8]) -> Dictionary {
-    // Tokenise the parameter block with the content-stream tokenizer and
-    // collect alternating key/value pairs.
-    use crate::content::tokenizer::{Token, Tokenizer};
-
-    let mut dict = Dictionary::new();
-    let tokens: Vec<Token<'_>> = Tokenizer::new(params).collect();
-    let mut i = 0;
-
-    while i + 1 < tokens.len() {
-        let Token::Name(key_bytes) = &tokens[i] else {
-            i += 1;
-            continue;
-        };
-        // Expand abbreviated key name → canonical PDF key.
-        let canonical_key: &[u8] = expand_inline_key(key_bytes);
-        let canonical_key_vec = canonical_key.to_vec();
-
-        let value_obj = inline_token_to_object(&tokens[i + 1]);
-        // Expand abbreviated filter/cs names inside the value.
-        let value_obj = expand_inline_value(value_obj);
-
-        dict.set(canonical_key_vec, value_obj);
-        i += 2;
-    }
-
-    dict
-}
-
-/// Map an abbreviated inline-image key to its canonical PDF name.
-///
-/// Abbreviations are defined in PDF §8.9.7 Table 89.  Unknown keys are
-/// returned unchanged (as a byte slice borrow).
-const fn expand_inline_key(key: &[u8]) -> &[u8] {
-    match key {
-        b"W" => b"Width",
-        b"H" => b"Height",
-        b"CS" => b"ColorSpace",
-        b"BPC" => b"BitsPerComponent",
-        b"F" => b"Filter",
-        b"DP" => b"DecodeParms",
-        b"IM" => b"ImageMask",
-        b"D" => b"Decode",
-        b"I" => b"Interpolate",
-        b"Intent" => b"Intent",
-        other => other,
-    }
-}
-
-/// Convert a content-stream [`Token`] to a `lopdf::Object`.
-fn inline_token_to_object(tok: &crate::content::tokenizer::Token<'_>) -> Object {
-    use crate::content::tokenizer::Token;
-    match tok {
-        Token::Name(n) => Object::Name(n.to_vec()),
-        Token::Number(f) => {
-            // Store as Integer when the value is a whole number, Real otherwise.
-            // Upper bound 1e15 safely fits in i64 without f64 precision issues.
-            let rounded = f.round();
-            if (f - rounded).abs() < f64::EPSILON && rounded.abs() < 1e15 {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "checked: value is a whole number with abs < 1e15; fits in i64"
-                )]
-                Object::Integer(rounded as i64)
-            } else {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "f64 → f32: PDF numeric params are small; precision loss is acceptable"
-                )]
-                Object::Real(*f as f32)
-            }
-        }
-        Token::Bool(b) => Object::Boolean(*b),
-        Token::String(s) => Object::String(s.clone(), lopdf::StringFormat::Literal),
-        Token::Array(items) => Object::Array(items.iter().map(inline_token_to_object).collect()),
-        _ => Object::Null,
-    }
-}
-
-/// Expand abbreviated filter or colour-space names inside an `Object`.
-///
-/// Affects `Name` objects and arrays of names (filter arrays).  The canonical
-/// names are the full PDF spelling; abbreviations come from PDF §8.9.7 Table 89
-/// (for filters) and the colour-space name list.
-fn expand_inline_value(obj: Object) -> Object {
-    match obj {
-        Object::Name(ref n) => {
-            let expanded = expand_inline_name(n);
-            if expanded == n.as_slice() {
-                obj
-            } else {
-                Object::Name(expanded.to_vec())
-            }
-        }
-        Object::Array(arr) => Object::Array(
-            arr.into_iter()
-                .map(|o| match o {
-                    Object::Name(n) => Object::Name(expand_inline_name(&n).to_vec()),
-                    other => other,
-                })
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
-/// Expand an abbreviated inline-image name (filter or colour-space).
-const fn expand_inline_name(name: &[u8]) -> &[u8] {
-    match name {
-        // Filter abbreviations (PDF §8.9.7 Table 89).
-        b"AHx" => b"ASCIIHexDecode",
-        b"A85" => b"ASCII85Decode",
-        b"LZW" => b"LZWDecode",
-        b"Fl" => b"FlateDecode",
-        b"RL" => b"RunLengthDecode",
-        b"CCF" => b"CCITTFaxDecode",
-        b"DCT" => b"DCTDecode",
-        // Colour-space abbreviations.
-        b"G" => b"DeviceGray",
-        b"RGB" => b"DeviceRGB",
-        b"CMYK" => b"DeviceCMYK",
-        b"I" => b"Indexed",
-        other => other,
-    }
-}
-
 // ── SMask decoding ────────────────────────────────────────────────────────────
 
 /// Decode a soft-mask (`SMask`) image stream into a flat alpha buffer.
@@ -612,6 +301,8 @@ const fn expand_inline_name(name: &[u8]) -> &[u8] {
 /// or its dimensions are degenerate.  The caller must skip the image in that
 /// case rather than blit it without a mask.
 fn decode_smask(doc: &Document, id: ObjectId, img_w: u32, img_h: u32) -> Option<Vec<u8>> {
+    use codecs::{decode_ccitt, decode_jbig2};
+
     let obj = doc.get_object(id).ok()?;
     let stream = obj.as_stream().ok()?;
 
@@ -761,7 +452,7 @@ fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     clippy::cast_possible_truncation,
     reason = "value range validated to [1, 65536] — fits in u32 without loss"
 )]
-const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)> {
+pub(super) const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)> {
     if w_raw <= 0 || h_raw <= 0 || w_raw > 65536 || h_raw > 65536 {
         return None;
     }
@@ -798,7 +489,7 @@ pub(crate) fn cs_to_image_color_space(doc: &Document, cs_obj: &Object) -> ImageC
 /// chained filters as a multi-element array; chained filters are not supported
 /// here — a warning is emitted and `None` is returned so the caller can skip
 /// the image gracefully rather than trying to decode garbled data.
-fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
+pub(super) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
     match obj {
         Object::Name(n) => Some(String::from_utf8_lossy(n)),
         Object::Array(arr) => {
@@ -834,7 +525,7 @@ fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
     clippy::too_many_lines,
     reason = "bpc dispatch table + cfg-gated GPU paths — splitting would obscure the decision tree"
 )]
-fn decode_raw(
+pub(super) fn decode_raw(
     doc: &Document,
     data: &[u8],
     width: u32,
@@ -983,6 +674,8 @@ fn decode_raw_8bpp(
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
 ) -> Option<ImageDescriptor> {
+    use codecs::cmyk_raw_to_rgb;
+
     let components = resolved.components();
     let npixels = (width as usize).checked_mul(height as usize)?;
     let expected = npixels.checked_mul(components)?;
@@ -1253,884 +946,11 @@ fn downsample_16bpp(data: &[u8], width: u32, height: u32, components: usize) -> 
     Some(out)
 }
 
-// ── CCITTFaxDecode ─────────────────────────────────────────────────────────────
-
-/// Decode a `CCITTFaxDecode` stream.
-///
-/// `K` in `DecodeParms` (PDF §7.4.6):
-/// - `K < 0` → Group 4 (T.6, 2D) — fully supported.
-/// - `K = 0` → Group 3 1D (T.4 1D) — supported.
-/// - `K > 0` → Group 3 mixed 1D/2D (T.4 2D) — not yet implemented.
-///
-/// `Rows` (if present) caps the number of rows decoded; otherwise decodes
-/// until the bitstream signals end-of-data.
-fn decode_ccitt(
-    data: &[u8],
-    width: u32,
-    height: u32,
-    is_mask: bool,
-    parms: Option<&Object>,
-) -> Option<ImageDescriptor> {
-    // Resolve DecodeParms once; all CCITT params live in the same dict.
-    let parms_dict = parms.and_then(|o| o.as_dict().ok());
-
-    let k = parms_dict.and_then(|d| d.get_i64(b"K")).unwrap_or(0);
-
-    // BlackIs1: when true, 1-bits encode black (reversed from the T.4/T.6 default).
-    let black_is_1 = parms_dict
-        .and_then(|d| d.get_bool(b"BlackIs1"))
-        .unwrap_or(false);
-
-    // Rows: optional override for the number of rows in the stream.  When present
-    // and smaller than height, we stop early; when absent we decode until EOD and
-    // pad any missing rows with white.
-    let rows_limit = parms_dict
-        .and_then(|d| d.get_i64(b"Rows"))
-        .and_then(|r| u32::try_from(r).ok())
-        .unwrap_or(height);
-
-    let w_u16 = u16::try_from(width).ok()?;
-    let capacity = (width as usize).checked_mul(height as usize)?;
-    let p = CcittParams {
-        w_u16,
-        capacity,
-        width,
-        height,
-        is_mask,
-        black_is_1,
-    };
-
-    match k.cmp(&0) {
-        std::cmp::Ordering::Less => decode_ccitt_g4(data, &p),
-        std::cmp::Ordering::Equal => decode_ccitt_g3_1d(data, &p, rows_limit),
-        std::cmp::Ordering::Greater => {
-            // K > 0: Group 3 mixed 1D/2D (T.4 2D, "MR").
-            // The fax 0.2.x crate only decodes 1D; use hayro-ccitt for the mixed path.
-            let k_u32 = u32::try_from(k).ok()?;
-            decode_ccitt_g3_2d(data, &p, rows_limit, k_u32)
-        }
-    }
-}
-
-/// Shared parameters for the CCITT decode helpers.
-struct CcittParams {
-    w_u16: u16,
-    capacity: usize,
-    width: u32,
-    height: u32,
-    is_mask: bool,
-    black_is_1: bool,
-}
-
-/// Decode a Group 4 (K<0, T.6) CCITT fax stream.
-fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
-    let h_u16 = u16::try_from(p.height).ok()?;
-    let mut data_out: Vec<u8> = Vec::with_capacity(p.capacity);
-    let mut rows_decoded: u32 = 0;
-
-    let completed =
-        fax::decoder::decode_g4(data.iter().copied(), p.w_u16, Some(h_u16), |transitions| {
-            append_ccitt_row(&mut data_out, transitions, p.w_u16, p.width, p.black_is_1);
-            rows_decoded += 1;
-        });
-
-    if completed.is_none() {
-        log::warn!(
-            "image: CCITTFaxDecode Group4 decode incomplete — got {rows_decoded}/{} rows",
-            p.height
-        );
-        if rows_decoded == 0 {
-            return None;
-        }
-        data_out.resize(p.capacity, 0xFF);
-    }
-
-    let cs = if p.is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: p.width,
-        height: p.height,
-        color_space: cs,
-        data: data_out,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
-}
-
-/// Decode a Group 3 1D (K=0, T.4) CCITT fax stream.
-///
-/// `rows_limit` is the maximum number of rows to emit (from `DecodeParms/Rows`
-/// or `height` when absent).  Extra rows in the stream are discarded; missing
-/// rows are padded with white.
-fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<ImageDescriptor> {
-    let mut data_out: Vec<u8> = Vec::with_capacity(p.capacity);
-    let mut rows_decoded: u32 = 0;
-
-    // decode_g3 fires the callback once per decoded row (after each EOL).
-    // It returns Some(()) on clean EOD, None on bitstream error.
-    let result = fax::decoder::decode_g3(data.iter().copied(), |transitions| {
-        if rows_decoded >= rows_limit {
-            return; // discard extra rows beyond the declared height
-        }
-        append_ccitt_row(&mut data_out, transitions, p.w_u16, p.width, p.black_is_1);
-        rows_decoded += 1;
-    });
-
-    if result.is_none() && rows_decoded == 0 {
-        log::warn!("image: CCITTFaxDecode Group3 1D decode failed with no rows");
-        return None;
-    }
-    if rows_decoded < p.height {
-        log::debug!(
-            "image: CCITTFaxDecode Group3 1D: got {rows_decoded}/{} rows — padding remainder",
-            p.height
-        );
-        data_out.resize(p.capacity, 0xFF);
-    }
-
-    let cs = if p.is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: p.width,
-        height: p.height,
-        color_space: cs,
-        data: data_out,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
-}
-
-/// Decode a Group 3 mixed 1D/2D (K>0, T.4 2D / "MR") CCITT fax stream.
-///
-/// Uses `hayro-ccitt` which natively supports `EncodingMode::Group3_2D { k }`.
-/// `rows_limit` caps the number of rows to emit (from `DecodeParms/Rows` or `height`).
-fn decode_ccitt_g3_2d(
-    data: &[u8],
-    p: &CcittParams,
-    rows_limit: u32,
-    k: u32,
-) -> Option<ImageDescriptor> {
-    use hayro_ccitt::{DecodeSettings, DecoderContext, EncodingMode};
-
-    // EncodingMode::Group3_1D/Group3_2D expect `end_of_line = true` for T.4.
-    // `end_of_block` tells the decoder it may encounter a 6-EOL RTC marker.
-    // `rows_are_byte_aligned` = false: T.4 mixed streams are NOT byte-aligned
-    // between rows (only the EOL acts as a row separator).
-    let settings = DecodeSettings {
-        columns: p.width,
-        rows: rows_limit,
-        end_of_block: true,
-        end_of_line: true,
-        rows_are_byte_aligned: false,
-        encoding: EncodingMode::Group3_2D { k },
-        invert_black: p.black_is_1,
-    };
-    let mut ctx = DecoderContext::new(settings);
-    let mut collector = HayroCcittCollector::new(p.capacity, p.width);
-
-    match hayro_ccitt::decode(data, &mut collector, &mut ctx) {
-        Ok(_) => {}
-        Err(e) => {
-            if collector.rows_decoded() == 0 {
-                log::warn!("image: CCITTFaxDecode Group3 2D decode failed: {e}");
-                return None;
-            }
-            log::debug!(
-                "image: CCITTFaxDecode Group3 2D partial decode ({}/{} rows): {e}",
-                collector.rows_decoded(),
-                p.height
-            );
-        }
-    }
-
-    let rows_decoded = collector.rows_decoded();
-    let mut data_out = collector.finish();
-    // Truncate overlong output (malformed stream that emitted too many pixels)
-    // then pad short output (truncated stream); both produce exactly p.capacity bytes.
-    if data_out.len() > p.capacity {
-        log::debug!(
-            "image: CCITTFaxDecode Group3 2D: output too long ({} > {}), truncating",
-            data_out.len(),
-            p.capacity
-        );
-        data_out.truncate(p.capacity);
-    } else if data_out.len() < p.capacity {
-        log::debug!(
-            "image: CCITTFaxDecode Group3 2D: got {rows_decoded}/{} rows — padding remainder",
-            p.height
-        );
-        data_out.resize(p.capacity, 0xFF);
-    }
-
-    let cs = if p.is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: p.width,
-        height: p.height,
-        color_space: cs,
-        data: data_out,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
-}
-
-/// Accumulates `hayro-ccitt` decoded pixels into a `Vec<u8>` (one byte per pixel,
-/// 0x00 = black, 0xFF = white).  Incomplete final rows are padded to `width`.
-struct HayroCcittCollector {
-    out: Vec<u8>,
-    width: u32,
-    col: u32,
-    rows: u32,
-}
-
-impl HayroCcittCollector {
-    fn new(capacity: usize, width: u32) -> Self {
-        Self {
-            out: Vec::with_capacity(capacity),
-            width,
-            col: 0,
-            rows: 0,
-        }
-    }
-
-    const fn rows_decoded(&self) -> u32 {
-        self.rows
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        // Pad any partial final row (malformed stream that ended mid-row).
-        if self.col > 0 {
-            // self.col < self.width is the invariant maintained by push_pixel /
-            // push_pixel_chunk; subtraction is therefore safe.
-            let remaining = usize::try_from(self.width - self.col).unwrap_or(0);
-            self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
-        }
-        self.out
-    }
-}
-
-impl hayro_ccitt::Decoder for HayroCcittCollector {
-    fn push_pixel(&mut self, white: bool) {
-        // Guard against over-wide rows from malformed bitstreams.
-        if self.col < self.width {
-            self.out.push(if white { 0xFF } else { 0x00 });
-            self.col += 1;
-        }
-    }
-
-    fn push_pixel_chunk(&mut self, white: bool, chunk_count: u32) {
-        // chunk_count × 8 pixels, all the same colour.
-        let total = chunk_count.saturating_mul(8);
-        let available = self.width.saturating_sub(self.col);
-        let n = total.min(available);
-        let byte = if white { 0xFFu8 } else { 0x00u8 };
-        self.out.extend(std::iter::repeat_n(byte, n as usize));
-        self.col += n;
-    }
-
-    fn next_line(&mut self) {
-        // Pad any short row produced by a malformed or truncated bitstream.
-        if self.col < self.width {
-            let remaining = usize::try_from(self.width - self.col).unwrap_or(0);
-            self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
-        }
-        self.col = 0;
-        self.rows += 1;
-    }
-}
-
-/// Expand one row of CCITT transitions into bytes and append to `out`.
-///
-/// The row is padded/truncated to exactly `width` bytes.
-/// `0x00` = black, `0xFF` = white (PDF image convention).
-fn append_ccitt_row(
-    out: &mut Vec<u8>,
-    transitions: &[u16],
-    w_u16: u16,
-    width: u32,
-    black_is_1: bool,
-) {
-    let row_start = out.len();
-    out.extend(fax::decoder::pels(transitions, w_u16).map(|color| {
-        let is_black = match color {
-            fax::Color::Black => !black_is_1,
-            fax::Color::White => black_is_1,
-        };
-        if is_black { 0x00u8 } else { 0xFFu8 }
-    }));
-    // Pad short rows (malformed data) with white.
-    let row_end = row_start + width as usize;
-    out.resize(row_end, 0xFF);
-}
-
-// ── DCTDecode (JPEG) ──────────────────────────────────────────────────────────
-
-/// Decode a `DCTDecode` (JPEG) stream.
-///
-/// `pdf_w` and `pdf_h` from the PDF stream dict are used only for a size sanity
-/// check; the actual dimensions come from the JPEG SOF marker and are
-/// authoritative.
-///
-/// # CMYK handling
-///
-/// JPEG CMYK images in PDF store ink densities in *inverted* form: a byte value
-/// of 0 means *full ink*, 255 means *no ink* (the complement of the usual
-/// convention).  `zune-jpeg` returns raw bytes in this form.  We convert to RGB
-/// using:
-///
-/// ```text
-/// R = (255 - C) * (255 - K) / 255
-/// ```
-///
-/// where `C`, `K` are the complemented (i.e. raw) CMYK byte values.  This is
-/// equivalent to the standard CMY+K → RGB conversion applied to the inverted
-/// ink densities.
-fn decode_dct(
-    data: &[u8],
-    pdf_w: u32,
-    pdf_h: u32,
-    #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
-    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
-) -> Option<ImageDescriptor> {
-    // ── GPU fast path (nvjpeg feature, large images, 1- or 3-component only) ──
-    #[cfg(feature = "nvjpeg")]
-    if let Some(dec) = gpu {
-        // Only dispatch to GPU when the image area meets the threshold.
-        // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
-        // decode_dct_gpu returns None for 4-component images, which causes
-        // the fall-through to the CPU path below that handles CMYK→RGB.
-        let area = pdf_w.saturating_mul(pdf_h);
-        if area >= GPU_JPEG_THRESHOLD_PX {
-            if let Some(img) = decode_dct_gpu(data, pdf_w, pdf_h, dec) {
-                return Some(img);
-            }
-            // GPU decode failed (e.g. unsupported encoding) — fall through to CPU.
-            log::debug!("image: DCTDecode: GPU path failed, retrying on CPU");
-        }
-    }
-
-    // ── CPU path (zune-jpeg) ──────────────────────────────────────────────────
-    // First pass: decode only the JPEG headers to learn the component count,
-    // which determines the output colourspace we request on the second decode.
-    // Two passes are necessary because zune-jpeg requires the output colourspace
-    // to be set before `decode()` is called.
-    let mut probe = JpegDecoder::new(ZCursor::new(data));
-    probe.decode_headers().ok()?;
-    let components = probe.info()?.components;
-
-    // Choose the output colorspace zune-jpeg should produce.
-    let out_cs = match components {
-        1 => ZColorSpace::Luma,
-        3 => ZColorSpace::RGB,
-        // CMYK — request raw CMYK output (4 bytes/pixel), convert to RGB below.
-        4 => ZColorSpace::CMYK,
-        n => {
-            log::warn!("image: DCTDecode: unexpected component count {n}");
-            return None;
-        }
-    };
-
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(out_cs);
-    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
-    let pixels = decoder
-        .decode()
-        .map_err(|e| log::warn!("image: DCTDecode decode error: {e}"))
-        .ok()?;
-
-    let jpeg_info = decoder.info()?;
-    let jw = u32::from(jpeg_info.width);
-    let jh = u32::from(jpeg_info.height);
-
-    if jw == 0 || jh == 0 {
-        log::warn!("image: DCTDecode: JPEG reported zero dimensions {jw}×{jh}");
-        return None;
-    }
-
-    if jw != pdf_w || jh != pdf_h {
-        log::debug!(
-            "image: DCTDecode: PDF dict says {pdf_w}×{pdf_h}, JPEG reports {jw}×{jh} — using JPEG dims"
-        );
-    }
-
-    match out_cs {
-        ZColorSpace::Luma => Some(ImageDescriptor {
-            width: jw,
-            height: jh,
-            color_space: ImageColorSpace::Gray,
-            data: pixels,
-            smask: None,
-            filter: ImageFilter::Raw,
-        }),
-        ZColorSpace::RGB => Some(ImageDescriptor {
-            width: jw,
-            height: jh,
-            color_space: ImageColorSpace::Rgb,
-            data: pixels,
-            smask: None,
-            filter: ImageFilter::Raw,
-        }),
-        ZColorSpace::CMYK => {
-            // zune-jpeg returns JPEG CMYK with inverted convention (0=full ink, 255=no ink).
-            // Complement to direct convention (255=full ink, 0=no ink) before dispatch.
-            let direct: Vec<u8> = pixels.iter().map(|&b| 255 - b).collect();
-            // JPEG streams embed their own colour profile; the PDF ICCBased stream
-            // is not available here, so ICC CLUT baking is not performed for DCT.
-            let rgb = cmyk_raw_to_rgb(
-                &direct,
-                #[cfg(feature = "gpu-icc")]
-                gpu_ctx,
-                #[cfg(feature = "gpu-icc")]
-                None,
-            )?;
-            Some(ImageDescriptor {
-                width: jw,
-                height: jh,
-                color_space: ImageColorSpace::Rgb,
-                data: rgb,
-                smask: None,
-                filter: ImageFilter::Raw,
-            })
-        }
-        // out_cs is always Luma, RGB, or CMYK — set from the components match above.
-        _ => unreachable!("DCTDecode: unexpected out_cs variant"),
-    }
-}
-
-/// GPU-accelerated DCT decode via nvJPEG.
-///
-/// Returns `None` if the component count is unsupported (e.g. CMYK, which
-/// nvJPEG cannot output as RGBI) or if any CUDA API call fails.  The caller
-/// must fall back to the CPU path when `None` is returned.
-///
-/// The stream is synchronised inside `NvJpegDecoder::decode_sync` before
-/// pixel bytes are returned, so the result is safe to use immediately.
-#[cfg(feature = "nvjpeg")]
-fn decode_dct_gpu(
-    data: &[u8],
-    pdf_w: u32,
-    pdf_h: u32,
-    dec: &mut NvJpegDecoder,
-) -> Option<ImageDescriptor> {
-    let img = match dec.decode_sync(data) {
-        Ok(img) => img,
-        Err(gpu::nvjpeg::NvJpegError::UnsupportedComponents(_)) => {
-            // CMYK or other unsupported component count — expected, fall back silently.
-            return None;
-        }
-        Err(e) => {
-            // Unexpected CUDA/nvJPEG failure — log at warn so it's visible.
-            log::warn!("image: DCTDecode GPU: unexpected nvJPEG error: {e}");
-            return None;
-        }
-    };
-
-    if img.width != pdf_w || img.height != pdf_h {
-        log::debug!(
-            "image: DCTDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG reports {}×{} — using nvJPEG dims",
-            img.width,
-            img.height,
-        );
-    }
-
-    let color_space = match img.color_space {
-        GpuCs::Gray => ImageColorSpace::Gray,
-        GpuCs::Rgb => ImageColorSpace::Rgb,
-    };
-
-    Some(ImageDescriptor {
-        width: img.width,
-        height: img.height,
-        color_space,
-        data: img.data,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
-}
-
-/// Convert a raw CMYK pixel buffer to RGB, dispatching to GPU when available.
-///
-/// Input convention (raw images / `decode_raw_8bpp`): 0 = no ink, 255 = full ink.
-/// This matches the `GpuCtx::icc_cmyk_to_rgb` matrix kernel directly.
-///
-/// `icc_bytes` — raw ICC profile bytes extracted from an `ICCBased` colour space.
-/// When provided (and the `gpu-icc` feature is active), a CLUT is baked from the
-/// profile and used for the colour transform instead of the fast matrix approximation.
-///
-/// Returns `None` only on arithmetic overflow (degenerate image size).
-fn cmyk_raw_to_rgb(
-    pixels: &[u8],
-    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
-    #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
-) -> Option<Vec<u8>> {
-    // GPU path: delegate to GpuCtx which handles the dispatch-threshold check and
-    // CPU fallback internally.  When ICC bytes are present, bake a CLUT for
-    // profile-accurate conversion; fall back to the fast matrix approximation if
-    // baking fails (e.g. corrupt profile or wrong colour space).
-    #[cfg(feature = "gpu-icc")]
-    if let Some(ctx) = gpu_ctx {
-        let clut_data: Option<Vec<u8>> = icc_bytes.and_then(|bytes| {
-            icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
-                .map_err(|e| log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}"))
-                .ok()
-        });
-
-        match ctx.icc_cmyk_to_rgb(
-            pixels,
-            clut_data.as_deref().map(|t| (t, icc::DEFAULT_GRID_N)),
-        ) {
-            Ok(rgb) => return Some(rgb),
-            Err(e) => log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}"),
-        }
-    }
-
-    // CPU path (also used below threshold by GpuCtx itself, but we land here
-    // when the feature is disabled or no GpuCtx is provided).
-    let npixels = pixels.len() / 4;
-    let mut rgb = Vec::with_capacity(npixels.checked_mul(3)?);
-    for chunk in pixels.chunks_exact(4) {
-        let (r, g, b) =
-            color::convert::cmyk_to_rgb_reflectance(chunk[0], chunk[1], chunk[2], chunk[3]);
-        rgb.push(r);
-        rgb.push(g);
-        rgb.push(b);
-    }
-    Some(rgb)
-}
-
-// ── JPXDecode (JPEG 2000) ─────────────────────────────────────────────────────
-
-/// Decode a `JPXDecode` (JPEG 2000) stream.
-///
-/// When the `nvjpeg2k` feature is active and `gpu` is `Some`, large images
-/// (pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`]) are decoded on the GPU via
-/// nvJPEG2000.  All other images, and any image for which the GPU path fails
-/// (unsupported component count, CUDA error, etc.), fall through to the CPU
-/// `jpeg2k`/`OpenJPEG` path.
-///
-/// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
-/// format (`.jp2`).  Both the GPU path (nvJPEG2000 via `nvjpeg2kStreamParse`)
-/// and the CPU path (`jpeg2k`/`OpenJPEG`) auto-detect the format from the stream.
-///
-/// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
-fn decode_jpx(
-    data: &[u8],
-    pdf_w: u32,
-    pdf_h: u32,
-    #[cfg(feature = "nvjpeg2k")] gpu: Option<&mut NvJpeg2kDecoder>,
-) -> Option<ImageDescriptor> {
-    // ── GPU fast path (nvjpeg2k feature, large images, 1- or 3-component only) ─
-    #[cfg(feature = "nvjpeg2k")]
-    if let Some(dec) = gpu {
-        let area = pdf_w.saturating_mul(pdf_h);
-        if area >= GPU_JPEG2K_THRESHOLD_PX {
-            if let Some(img) = decode_jpx_gpu(data, pdf_w, pdf_h, dec) {
-                return Some(img);
-            }
-            log::debug!("image: JPXDecode: GPU path failed, retrying on CPU");
-        }
-    }
-
-    // ── CPU path (jpeg2k / OpenJPEG) ─────────────────────────────────────────
-    let img = Jp2Image::from_bytes(data)
-        .map_err(|e| log::warn!("image: JPXDecode open error: {e}"))
-        .ok()?;
-
-    let img_data = img
-        .get_pixels(None)
-        .map_err(|e| log::warn!("image: JPXDecode get_pixels error: {e}"))
-        .ok()?;
-
-    let jw = img_data.width;
-    let jh = img_data.height;
-
-    if jw == 0 || jh == 0 {
-        log::warn!("image: JPXDecode: JP2 reported zero dimensions {jw}×{jh}");
-        return None;
-    }
-
-    if jw != pdf_w || jh != pdf_h {
-        log::debug!(
-            "image: JPXDecode: PDF dict says {pdf_w}×{pdf_h}, JP2 reports {jw}×{jh} — using JP2 dims"
-        );
-    }
-
-    // `jpeg2k` guarantees that `img_data.format` and `img_data.data` are always
-    // consistent: an L8 format always carries L8 data, etc.  We use
-    // `let … else { unreachable! }` inside each arm to surface any library
-    // regression loudly rather than silently skipping images.
-    match img_data.format {
-        ImageFormat::L8 => {
-            let ImagePixelData::L8(pixels) = img_data.data else {
-                unreachable!("jpeg2k: L8 format paired with non-L8 data")
-            };
-            Some(jpx_gray(jw, jh, pixels))
-        }
-        ImageFormat::La8 => {
-            let ImagePixelData::La8(pixels) = img_data.data else {
-                unreachable!("jpeg2k: La8 format paired with non-La8 data")
-            };
-            // Drop the alpha channel — keep luma bytes (every other byte starting at 0).
-            let gray = pixels.chunks_exact(2).map(|c| c[0]).collect();
-            Some(jpx_gray(jw, jh, gray))
-        }
-        ImageFormat::Rgb8 => {
-            let ImagePixelData::Rgb8(pixels) = img_data.data else {
-                unreachable!("jpeg2k: Rgb8 format paired with non-Rgb8 data")
-            };
-            Some(jpx_rgb(jw, jh, pixels))
-        }
-        ImageFormat::Rgba8 => {
-            let ImagePixelData::Rgba8(pixels) = img_data.data else {
-                unreachable!("jpeg2k: Rgba8 format paired with non-Rgba8 data")
-            };
-            // Drop alpha channel.
-            let rgb = pixels
-                .chunks_exact(4)
-                .flat_map(|c| [c[0], c[1], c[2]])
-                .collect();
-            Some(jpx_rgb(jw, jh, rgb))
-        }
-        ImageFormat::L16 => {
-            let ImagePixelData::L16(pixels) = img_data.data else {
-                unreachable!("jpeg2k: L16 format paired with non-L16 data")
-            };
-            // Downscale 16-bit → 8-bit: high byte (v >> 8 ≤ 255, cast is lossless).
-            let gray = pixels.iter().map(|&v| (v >> 8) as u8).collect();
-            Some(jpx_gray(jw, jh, gray))
-        }
-        ImageFormat::La16 => {
-            let ImagePixelData::La16(pixels) = img_data.data else {
-                unreachable!("jpeg2k: La16 format paired with non-La16 data")
-            };
-            // Drop alpha; downscale luma.
-            let gray = pixels.chunks_exact(2).map(|c| (c[0] >> 8) as u8).collect();
-            Some(jpx_gray(jw, jh, gray))
-        }
-        ImageFormat::Rgb16 => {
-            let ImagePixelData::Rgb16(pixels) = img_data.data else {
-                unreachable!("jpeg2k: Rgb16 format paired with non-Rgb16 data")
-            };
-            let rgb = pixels.iter().map(|&v| (v >> 8) as u8).collect();
-            Some(jpx_rgb(jw, jh, rgb))
-        }
-        ImageFormat::Rgba16 => {
-            let ImagePixelData::Rgba16(pixels) = img_data.data else {
-                unreachable!("jpeg2k: Rgba16 format paired with non-Rgba16 data")
-            };
-            // Drop alpha; downscale RGB.
-            let rgb = pixels
-                .chunks_exact(4)
-                .flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8])
-                .collect();
-            Some(jpx_rgb(jw, jh, rgb))
-        }
-    }
-}
-
-/// GPU-accelerated JPEG 2000 decode via nvJPEG2000.
-///
-/// Returns `None` for unsupported component counts (CMYK, LAB, N-channel) or
-/// when any CUDA API call fails; the caller falls back to the CPU path in
-/// both cases.
-#[cfg(feature = "nvjpeg2k")]
-fn decode_jpx_gpu(
-    data: &[u8],
-    pdf_w: u32,
-    pdf_h: u32,
-    dec: &mut NvJpeg2kDecoder,
-) -> Option<ImageDescriptor> {
-    let img = match dec.decode_sync(data) {
-        Ok(img) => img,
-        // Unsupported component count (CMYK, Gray+Alpha, N-channel), sub-sampled
-        // chroma, or a codestream type not supported by this nvJPEG2000 build
-        // (HTJ2K, status 4) — all are expected; fall through to CPU silently.
-        Err(
-            gpu::nvjpeg2k::NvJpeg2kError::UnsupportedComponents(_)
-            | gpu::nvjpeg2k::NvJpeg2kError::SubSampledComponents
-            | gpu::nvjpeg2k::NvJpeg2kError::Nvjpeg2kStatus(4),
-        ) => return None,
-        Err(e) => {
-            log::warn!("image: JPXDecode GPU: nvJPEG2000 error: {e}");
-            return None;
-        }
-    };
-
-    if img.width != pdf_w || img.height != pdf_h {
-        log::debug!(
-            "image: JPXDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG2000 reports {}×{} — using nvJPEG2000 dims",
-            img.width,
-            img.height,
-        );
-    }
-
-    let color_space = match img.color_space {
-        GpuJ2kCs::Gray => ImageColorSpace::Gray,
-        GpuJ2kCs::Rgb => ImageColorSpace::Rgb,
-    };
-
-    Some(ImageDescriptor {
-        width: img.width,
-        height: img.height,
-        color_space,
-        data: img.data,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
-}
-
-/// Wrap a decoded grayscale pixel buffer into an [`ImageDescriptor`].
-#[inline]
-const fn jpx_gray(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
-    ImageDescriptor {
-        width,
-        height,
-        color_space: ImageColorSpace::Gray,
-        data,
-        smask: None,
-        filter: ImageFilter::Raw,
-    }
-}
-
-/// Wrap a decoded RGB pixel buffer into an [`ImageDescriptor`].
-#[inline]
-const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
-    ImageDescriptor {
-        width,
-        height,
-        color_space: ImageColorSpace::Rgb,
-        data,
-        smask: None,
-        filter: ImageFilter::Raw,
-    }
-}
-
-// ── JBIG2Decode ──────────────────────────────────────────────────────────────
-
-/// Decode a `JBIG2Decode` stream via `hayro-jbig2`.
-///
-/// PDF JBIG2 uses the "embedded organisation" (Annex D.3 of T.88): the stream
-/// contains page segments only; global segments live in a separate
-/// `JBIG2Globals` stream referenced from `DecodeParms`.
-///
-/// The decoder produces one byte per pixel: 0x00 = black, 0xFF = white (for
-/// grayscale images) or 0x00 = paint, 0xFF = transparent (for `ImageMask`).
-/// JBIG2 convention is 0 = white, 1 = black; we invert to match the rest of
-/// the image pipeline.
-fn decode_jbig2(
-    doc: &Document,
-    data: &[u8],
-    width: u32,
-    height: u32,
-    is_mask: bool,
-    parms: Option<&Object>,
-) -> Option<ImageDescriptor> {
-    // Resolve optional JBIG2Globals stream from DecodeParms.
-    let globals_bytes: Option<Vec<u8>> = parms
-        .and_then(|o| o.as_dict().ok())
-        .and_then(|d| d.get(b"JBIG2Globals").ok())
-        .and_then(|o| match o {
-            Object::Reference(id) => {
-                let g_obj = doc.get_object(*id).ok()?;
-                let g_stream = g_obj.as_stream().ok()?;
-                // JBIG2Globals streams are typically not compressed, but
-                // decompressed_content handles both cases transparently.
-                g_stream.decompressed_content().ok()
-            }
-            _ => None,
-        });
-
-    // Parse the embedded JBIG2 image (page segments + optional globals).
-    let img = hayro_jbig2::Image::new_embedded(data, globals_bytes.as_deref())
-        .map_err(|e| log::warn!("image: JBIG2Decode parse error: {e}"))
-        .ok()?;
-
-    let jw = img.width();
-    let jh = img.height();
-
-    // Validate decoded dimensions against the PDF image dict.
-    if jw != width || jh != height {
-        log::warn!(
-            "image: JBIG2Decode dimension mismatch: image dict says {width}×{height}, JBIG2 stream says {jw}×{jh} — using stream dimensions"
-        );
-    }
-
-    let n_pixels = (jw as usize).checked_mul(jh as usize)?;
-    let mut collector = Jbig2Collector {
-        data: Vec::with_capacity(n_pixels),
-        is_mask,
-    };
-
-    img.decode(&mut collector)
-        .map_err(|e| log::warn!("image: JBIG2Decode decode error: {e}"))
-        .ok()?;
-
-    if collector.data.len() != n_pixels {
-        log::warn!(
-            "image: JBIG2Decode produced {} pixels, expected {n_pixels} — skipping",
-            collector.data.len()
-        );
-        return None;
-    }
-
-    let cs = if is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: jw,
-        height: jh,
-        color_space: cs,
-        data: collector.data,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
-}
-
-/// Pixel collector for `hayro_jbig2::Decoder`.
-///
-/// JBIG2 convention: 0 = white, 1 = black.
-/// `ImageColorSpace::Gray` convention: 0x00 = black, 0xFF = white.
-/// `ImageColorSpace::Mask` convention: 0x00 = paint (== JBIG2 black), 0xFF = transparent.
-///
-/// Both output conventions share the same polarity flip: JBIG2 black (1) → 0x00,
-/// JBIG2 white (0) → 0xFF.
-struct Jbig2Collector {
-    data: Vec<u8>,
-    is_mask: bool,
-}
-
-impl Jbig2Decoder for Jbig2Collector {
-    fn push_pixel(&mut self, black: bool) {
-        self.data.push(if black { 0x00 } else { 0xFF });
-    }
-
-    fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
-        let byte = if black { 0x00 } else { 0xFF };
-        let n = chunk_count as usize * 8;
-        self.data.extend(std::iter::repeat_n(byte, n));
-    }
-
-    fn next_line(&mut self) {
-        // Row boundary — nothing to do; pixels are already stored flat.
-        let _ = self.is_mask; // used at construction; suppress dead-code lint
-    }
-}
-
 // ── Color space helpers ───────────────────────────────────────────────────────
 
 /// Internal resolved colour space — what the decode path will actually produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvedCs {
+pub(super) enum ResolvedCs {
     Gray,
     Rgb,
     /// Raw CMYK (4 bytes/pixel, 255 = full ink).  Converted to RGB before returning.
@@ -2138,7 +958,7 @@ enum ResolvedCs {
 }
 
 impl ResolvedCs {
-    const fn components(self) -> usize {
+    pub(super) const fn components(self) -> usize {
         match self {
             Self::Gray => 1,
             Self::Rgb => 3,
@@ -2146,7 +966,7 @@ impl ResolvedCs {
         }
     }
 
-    const fn to_image_cs(self) -> ImageColorSpace {
+    pub(super) const fn to_image_cs(self) -> ImageColorSpace {
         match self {
             Self::Gray => ImageColorSpace::Gray,
             Self::Rgb | Self::Cmyk => ImageColorSpace::Rgb,
@@ -2165,7 +985,7 @@ impl ResolvedCs {
 /// - `Indexed`    → resolve the base space; Indexed expansion happens separately
 /// - `Separation` / `DeviceN`        → approximate as Gray (tint 0 = full ink = dark)
 /// - unknown / absent                → Gray (safe fallback)
-fn resolve_cs<'a>(doc: &'a Document, cs_obj: &'a Object) -> ResolvedCs {
+pub(super) fn resolve_cs<'a>(doc: &'a Document, cs_obj: &'a Object) -> ResolvedCs {
     match cs_obj {
         Object::Name(n) => device_cs_name(n),
         Object::Array(arr) => {
@@ -2201,7 +1021,7 @@ fn resolve_cs<'a>(doc: &'a Document, cs_obj: &'a Object) -> ResolvedCs {
     }
 }
 
-fn device_cs_name(name: &[u8]) -> ResolvedCs {
+pub(super) fn device_cs_name(name: &[u8]) -> ResolvedCs {
     match name {
         b"DeviceRGB" | b"CalRGB" => ResolvedCs::Rgb,
         b"DeviceCMYK" => ResolvedCs::Cmyk,
@@ -2231,7 +1051,7 @@ fn icc_based_cs(stream_dict: Option<&Dictionary>) -> ResolvedCs {
 /// Returns `None` if the object is not `[/ICCBased <ref>]`, the stream cannot be
 /// dereferenced, or decompression fails.  Only called under the `gpu-icc` feature.
 #[cfg(feature = "gpu-icc")]
-fn extract_icc_bytes(doc: &Document, cs_obj: &Object) -> Option<Vec<u8>> {
+pub(super) fn extract_icc_bytes(doc: &Document, cs_obj: &Object) -> Option<Vec<u8>> {
     let arr = cs_obj.as_array().ok()?;
     if arr.first().and_then(|o| o.as_name().ok()) != Some(b"ICCBased") {
         return None;
@@ -2535,196 +1355,6 @@ mod tests {
     fn validated_dims_accepts_boundary() {
         assert_eq!(validated_dims(1, 1), Some((1, 1)));
         assert_eq!(validated_dims(65536, 65536), Some((65536, 65536)));
-    }
-
-    // ── parse_inline_params / expand_inline_key ───────────────────────────────
-
-    #[test]
-    fn inline_key_expansion_canonical() {
-        assert_eq!(expand_inline_key(b"W"), b"Width");
-        assert_eq!(expand_inline_key(b"H"), b"Height");
-        assert_eq!(expand_inline_key(b"CS"), b"ColorSpace");
-        assert_eq!(expand_inline_key(b"BPC"), b"BitsPerComponent");
-        assert_eq!(expand_inline_key(b"F"), b"Filter");
-        assert_eq!(expand_inline_key(b"DP"), b"DecodeParms");
-        assert_eq!(expand_inline_key(b"IM"), b"ImageMask");
-    }
-
-    #[test]
-    fn inline_key_unknown_passthrough() {
-        // Unrecognised keys pass through unchanged.
-        assert_eq!(expand_inline_key(b"Width"), b"Width");
-        assert_eq!(expand_inline_key(b"Blah"), b"Blah");
-    }
-
-    #[test]
-    fn inline_name_filter_expansion() {
-        assert_eq!(expand_inline_name(b"Fl"), b"FlateDecode");
-        assert_eq!(expand_inline_name(b"DCT"), b"DCTDecode");
-        assert_eq!(expand_inline_name(b"CCF"), b"CCITTFaxDecode");
-        assert_eq!(expand_inline_name(b"RL"), b"RunLengthDecode");
-        assert_eq!(expand_inline_name(b"AHx"), b"ASCIIHexDecode");
-        assert_eq!(expand_inline_name(b"A85"), b"ASCII85Decode");
-        assert_eq!(expand_inline_name(b"LZW"), b"LZWDecode");
-    }
-
-    #[test]
-    fn inline_name_cs_expansion() {
-        assert_eq!(expand_inline_name(b"G"), b"DeviceGray");
-        assert_eq!(expand_inline_name(b"RGB"), b"DeviceRGB");
-        assert_eq!(expand_inline_name(b"CMYK"), b"DeviceCMYK");
-    }
-
-    #[test]
-    fn parse_inline_params_basic() {
-        // /W 4 /H 2 /CS /G /BPC 8 (abbreviated keys + abbreviated CS name)
-        let params = b"/W 4 /H 2 /CS /G /BPC 8";
-        let dict = parse_inline_params(params);
-        assert_eq!(dict.get_i64(b"Width"), Some(4));
-        assert_eq!(dict.get_i64(b"Height"), Some(2));
-        assert_eq!(dict.get_i64(b"BitsPerComponent"), Some(8));
-        // CS /G should expand to /DeviceGray.
-        assert_eq!(
-            dict.get(b"ColorSpace").ok().and_then(|o| o.as_name().ok()),
-            Some(b"DeviceGray".as_ref())
-        );
-    }
-
-    #[test]
-    fn parse_inline_params_full_names() {
-        // Full (non-abbreviated) names should also parse correctly.
-        let params = b"/Width 3 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8";
-        let dict = parse_inline_params(params);
-        assert_eq!(dict.get_i64(b"Width"), Some(3));
-        assert_eq!(dict.get_i64(b"Height"), Some(1));
-        assert_eq!(dict.get_i64(b"BitsPerComponent"), Some(8));
-    }
-
-    // ── decode_run_length ──────────────────────────────────────────────────────
-
-    #[test]
-    fn run_length_literal_run() {
-        // Run byte 2 → copy next 3 bytes.
-        let data = [2u8, 0xAA, 0xBB, 0xCC];
-        assert_eq!(decode_run_length(&data), vec![0xAA, 0xBB, 0xCC]);
-    }
-
-    #[test]
-    fn run_length_repeat_run() {
-        // Run byte 254 → repeat = 257 - 254 = 3.
-        let data = [254u8, 0x42];
-        assert_eq!(decode_run_length(&data), vec![0x42, 0x42, 0x42]);
-    }
-
-    #[test]
-    fn run_length_eod_terminates() {
-        // Run byte 128 = EOD; bytes after are ignored.
-        let data = [2u8, 0xAA, 0xBB, 0xCC, 128, 0xFF, 0xFF];
-        assert_eq!(decode_run_length(&data), vec![0xAA, 0xBB, 0xCC]);
-    }
-
-    #[test]
-    fn run_length_empty_input() {
-        assert_eq!(decode_run_length(&[]), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn run_length_truncates_at_max_output() {
-        // Use a tiny synthetic cap so the test allocates almost nothing.
-        // Each record (2 bytes: 0x81, byte) expands to 128 copies.
-        // Cap at 1000 bytes; send enough records to exceed it.
-        const CAP: usize = 1000;
-        let mut data = Vec::new();
-        for _ in 0..20 {
-            data.push(0x81_u8); // repeat = 257 - 129 = 128
-            data.push(0xAB_u8);
-        }
-        // 20 × 128 = 2560 bytes would be decoded without cap.
-        let out = decode_run_length_capped(&data, CAP);
-        assert!(out.len() <= CAP, "output {} exceeded cap {CAP}", out.len());
-        assert!(
-            !out.is_empty(),
-            "should have decoded something before truncation"
-        );
-        assert!(out.iter().all(|&b| b == 0xAB), "all bytes should be 0xAB");
-    }
-
-    // ── decode_inline_image ────────────────────────────────────────────────────
-
-    #[test]
-    fn inline_image_raw_gray() {
-        // 2×2 raw DeviceGray image, 8 bpc, no filter.
-        let params = b"/W 2 /H 2 /CS /G /BPC 8";
-        let data = [0x00u8, 0x80, 0xFF, 0x40];
-        let doc = lopdf::Document::new();
-        let img = decode_inline_image(&doc, params, &data).expect("decode should succeed");
-        assert_eq!(img.width, 2);
-        assert_eq!(img.height, 2);
-        assert_eq!(img.color_space, ImageColorSpace::Gray);
-        assert_eq!(img.data, data.to_vec());
-    }
-
-    #[test]
-    fn inline_image_mask() {
-        // 2×1 mask image (ImageMask=true means Mask colour space).
-        let params = b"/W 2 /H 1 /IM true /BPC 1";
-        // 1-bpp mask: byte 0b10000000 → pixel 0 = 1 (transparent), pixel 1 = 0 (paint).
-        let data = [0b1000_0000u8];
-        let doc = lopdf::Document::new();
-        let img = decode_inline_image(&doc, params, &data).expect("decode should succeed");
-        assert_eq!(img.color_space, ImageColorSpace::Mask);
-        // Expanded 1-bpp: bit 7 = 1 → 0xFF, bit 6 = 0 → 0x00
-        assert_eq!(img.data[0], 0xFF); // first pixel: transparent
-        assert_eq!(img.data[1], 0x00); // second pixel: paint
-    }
-
-    #[test]
-    fn inline_image_degenerate_dims() {
-        let params = b"/W 0 /H 1 /CS /G /BPC 8";
-        let doc = lopdf::Document::new();
-        assert!(decode_inline_image(&doc, params, &[]).is_none());
-    }
-
-    #[test]
-    fn inline_image_missing_dims() {
-        // No width/height → None.
-        let params = b"/CS /G /BPC 8";
-        let doc = lopdf::Document::new();
-        assert!(decode_inline_image(&doc, params, &[0u8; 4]).is_none());
-    }
-
-    // ── JBIG2 collector unit tests ────────────────────────────────────────────
-
-    #[test]
-    fn jbig2_collector_push_pixel_grayscale() {
-        // JBIG2: black=true → Gray 0x00, black=false → Gray 0xFF.
-        let mut c = Jbig2Collector {
-            data: Vec::new(),
-            is_mask: false,
-        };
-        Jbig2Decoder::push_pixel(&mut c, true);
-        Jbig2Decoder::push_pixel(&mut c, false);
-        assert_eq!(c.data, [0x00, 0xFF]);
-    }
-
-    #[test]
-    fn jbig2_collector_push_pixel_chunk() {
-        let mut c = Jbig2Collector {
-            data: Vec::new(),
-            is_mask: false,
-        };
-        // chunk_count=2 → 16 pixels of white (0xFF each).
-        Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
-        assert_eq!(c.data.len(), 16);
-        assert!(c.data.iter().all(|&b| b == 0xFF));
-    }
-
-    #[test]
-    fn jbig2_decode_invalid_data_returns_none() {
-        // Corrupt/empty JBIG2 data must not panic — it must return None.
-        let doc = lopdf::Document::new();
-        let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
-        assert!(result.is_none());
     }
 
     // ── expand_nbpp (bpc 2 and 4) ─────────────────────────────────────────────

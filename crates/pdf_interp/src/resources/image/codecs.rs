@@ -1,0 +1,945 @@
+//! Compressed-image codec decoders: CCITT, DCT (JPEG), JPX (JPEG 2000), JBIG2.
+//!
+//! All functions are `pub(super)` — they are called exclusively from
+//! `super` (the image `mod.rs`) and, transitively, from `inline.rs` via
+//! the re-exports in `mod.rs`.
+
+use hayro_jbig2::Decoder as Jbig2Decoder;
+use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
+use lopdf::{Document, Object};
+
+use super::{ImageColorSpace, ImageDescriptor, ImageFilter};
+use crate::resources::dict_ext::DictExt;
+
+// ── nvJPEG GPU acceleration ───────────────────────────────────────────────────
+
+#[cfg(feature = "nvjpeg")]
+use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
+
+#[cfg(feature = "nvjpeg2k")]
+use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
+
+// ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
+
+#[cfg(feature = "gpu-icc")]
+use gpu::GpuCtx;
+
+#[cfg(feature = "gpu-icc")]
+use super::icc;
+
+// ── CCITTFaxDecode ─────────────────────────────────────────────────────────────
+
+/// Decode a `CCITTFaxDecode` stream.
+///
+/// `K` in `DecodeParms` (PDF §7.4.6):
+/// - `K < 0` → Group 4 (T.6, 2D) — fully supported.
+/// - `K = 0` → Group 3 1D (T.4 1D) — supported.
+/// - `K > 0` → Group 3 mixed 1D/2D (T.4 2D) — not yet implemented.
+///
+/// `Rows` (if present) caps the number of rows decoded; otherwise decodes
+/// until the bitstream signals end-of-data.
+pub(super) fn decode_ccitt(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    is_mask: bool,
+    parms: Option<&Object>,
+) -> Option<ImageDescriptor> {
+    // Resolve DecodeParms once; all CCITT params live in the same dict.
+    let parms_dict = parms.and_then(|o| o.as_dict().ok());
+
+    let k = parms_dict.and_then(|d| d.get_i64(b"K")).unwrap_or(0);
+
+    // BlackIs1: when true, 1-bits encode black (reversed from the T.4/T.6 default).
+    let black_is_1 = parms_dict
+        .and_then(|d| d.get_bool(b"BlackIs1"))
+        .unwrap_or(false);
+
+    // Rows: optional override for the number of rows in the stream.  When present
+    // and smaller than height, we stop early; when absent we decode until EOD and
+    // pad any missing rows with white.
+    let rows_limit = parms_dict
+        .and_then(|d| d.get_i64(b"Rows"))
+        .and_then(|r| u32::try_from(r).ok())
+        .unwrap_or(height);
+
+    let w_u16 = u16::try_from(width).ok()?;
+    let capacity = (width as usize).checked_mul(height as usize)?;
+    let p = CcittParams {
+        w_u16,
+        capacity,
+        width,
+        height,
+        is_mask,
+        black_is_1,
+    };
+
+    match k.cmp(&0) {
+        std::cmp::Ordering::Less => decode_ccitt_g4(data, &p),
+        std::cmp::Ordering::Equal => decode_ccitt_g3_1d(data, &p, rows_limit),
+        std::cmp::Ordering::Greater => {
+            // K > 0: Group 3 mixed 1D/2D (T.4 2D, "MR").
+            // The fax 0.2.x crate only decodes 1D; use hayro-ccitt for the mixed path.
+            let k_u32 = u32::try_from(k).ok()?;
+            decode_ccitt_g3_2d(data, &p, rows_limit, k_u32)
+        }
+    }
+}
+
+/// Shared parameters for the CCITT decode helpers.
+struct CcittParams {
+    w_u16: u16,
+    capacity: usize,
+    width: u32,
+    height: u32,
+    is_mask: bool,
+    black_is_1: bool,
+}
+
+/// Decode a Group 4 (K<0, T.6) CCITT fax stream.
+fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
+    let h_u16 = u16::try_from(p.height).ok()?;
+    let mut data_out: Vec<u8> = Vec::with_capacity(p.capacity);
+    let mut rows_decoded: u32 = 0;
+
+    let completed =
+        fax::decoder::decode_g4(data.iter().copied(), p.w_u16, Some(h_u16), |transitions| {
+            append_ccitt_row(&mut data_out, transitions, p.w_u16, p.width, p.black_is_1);
+            rows_decoded += 1;
+        });
+
+    if completed.is_none() {
+        log::warn!(
+            "image: CCITTFaxDecode Group4 decode incomplete — got {rows_decoded}/{} rows",
+            p.height
+        );
+        if rows_decoded == 0 {
+            return None;
+        }
+        data_out.resize(p.capacity, 0xFF);
+    }
+
+    let cs = if p.is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: p.width,
+        height: p.height,
+        color_space: cs,
+        data: data_out,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// Decode a Group 3 1D (K=0, T.4) CCITT fax stream.
+///
+/// `rows_limit` is the maximum number of rows to emit (from `DecodeParms/Rows`
+/// or `height` when absent).  Extra rows in the stream are discarded; missing
+/// rows are padded with white.
+fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<ImageDescriptor> {
+    let mut data_out: Vec<u8> = Vec::with_capacity(p.capacity);
+    let mut rows_decoded: u32 = 0;
+
+    // decode_g3 fires the callback once per decoded row (after each EOL).
+    // It returns Some(()) on clean EOD, None on bitstream error.
+    let result = fax::decoder::decode_g3(data.iter().copied(), |transitions| {
+        if rows_decoded >= rows_limit {
+            return; // discard extra rows beyond the declared height
+        }
+        append_ccitt_row(&mut data_out, transitions, p.w_u16, p.width, p.black_is_1);
+        rows_decoded += 1;
+    });
+
+    if result.is_none() && rows_decoded == 0 {
+        log::warn!("image: CCITTFaxDecode Group3 1D decode failed with no rows");
+        return None;
+    }
+    if rows_decoded < p.height {
+        log::debug!(
+            "image: CCITTFaxDecode Group3 1D: got {rows_decoded}/{} rows — padding remainder",
+            p.height
+        );
+        data_out.resize(p.capacity, 0xFF);
+    }
+
+    let cs = if p.is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: p.width,
+        height: p.height,
+        color_space: cs,
+        data: data_out,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// Decode a Group 3 mixed 1D/2D (K>0, T.4 2D / "MR") CCITT fax stream.
+///
+/// Uses `hayro-ccitt` which natively supports `EncodingMode::Group3_2D { k }`.
+/// `rows_limit` caps the number of rows to emit (from `DecodeParms/Rows` or `height`).
+fn decode_ccitt_g3_2d(
+    data: &[u8],
+    p: &CcittParams,
+    rows_limit: u32,
+    k: u32,
+) -> Option<ImageDescriptor> {
+    use hayro_ccitt::{DecodeSettings, DecoderContext, EncodingMode};
+
+    // EncodingMode::Group3_1D/Group3_2D expect `end_of_line = true` for T.4.
+    // `end_of_block` tells the decoder it may encounter a 6-EOL RTC marker.
+    // `rows_are_byte_aligned` = false: T.4 mixed streams are NOT byte-aligned
+    // between rows (only the EOL acts as a row separator).
+    let settings = DecodeSettings {
+        columns: p.width,
+        rows: rows_limit,
+        end_of_block: true,
+        end_of_line: true,
+        rows_are_byte_aligned: false,
+        encoding: EncodingMode::Group3_2D { k },
+        invert_black: p.black_is_1,
+    };
+    let mut ctx = DecoderContext::new(settings);
+    let mut collector = HayroCcittCollector::new(p.capacity, p.width);
+
+    match hayro_ccitt::decode(data, &mut collector, &mut ctx) {
+        Ok(_) => {}
+        Err(e) => {
+            if collector.rows_decoded() == 0 {
+                log::warn!("image: CCITTFaxDecode Group3 2D decode failed: {e}");
+                return None;
+            }
+            log::debug!(
+                "image: CCITTFaxDecode Group3 2D partial decode ({}/{} rows): {e}",
+                collector.rows_decoded(),
+                p.height
+            );
+        }
+    }
+
+    let rows_decoded = collector.rows_decoded();
+    let mut data_out = collector.finish();
+    // Truncate overlong output (malformed stream that emitted too many pixels)
+    // then pad short output (truncated stream); both produce exactly p.capacity bytes.
+    if data_out.len() > p.capacity {
+        log::debug!(
+            "image: CCITTFaxDecode Group3 2D: output too long ({} > {}), truncating",
+            data_out.len(),
+            p.capacity
+        );
+        data_out.truncate(p.capacity);
+    } else if data_out.len() < p.capacity {
+        log::debug!(
+            "image: CCITTFaxDecode Group3 2D: got {rows_decoded}/{} rows — padding remainder",
+            p.height
+        );
+        data_out.resize(p.capacity, 0xFF);
+    }
+
+    let cs = if p.is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: p.width,
+        height: p.height,
+        color_space: cs,
+        data: data_out,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// Accumulates `hayro-ccitt` decoded pixels into a `Vec<u8>` (one byte per pixel,
+/// 0x00 = black, 0xFF = white).  Incomplete final rows are padded to `width`.
+struct HayroCcittCollector {
+    out: Vec<u8>,
+    width: u32,
+    col: u32,
+    rows: u32,
+}
+
+impl HayroCcittCollector {
+    fn new(capacity: usize, width: u32) -> Self {
+        Self {
+            out: Vec::with_capacity(capacity),
+            width,
+            col: 0,
+            rows: 0,
+        }
+    }
+
+    const fn rows_decoded(&self) -> u32 {
+        self.rows
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        // Pad any partial final row (malformed stream that ended mid-row).
+        if self.col > 0 {
+            // self.col < self.width is the invariant maintained by push_pixel /
+            // push_pixel_chunk; subtraction is therefore safe.
+            let remaining = usize::try_from(self.width - self.col).unwrap_or(0);
+            self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
+        }
+        self.out
+    }
+}
+
+impl hayro_ccitt::Decoder for HayroCcittCollector {
+    fn push_pixel(&mut self, white: bool) {
+        // Guard against over-wide rows from malformed bitstreams.
+        if self.col < self.width {
+            self.out.push(if white { 0xFF } else { 0x00 });
+            self.col += 1;
+        }
+    }
+
+    fn push_pixel_chunk(&mut self, white: bool, chunk_count: u32) {
+        // chunk_count × 8 pixels, all the same colour.
+        let total = chunk_count.saturating_mul(8);
+        let available = self.width.saturating_sub(self.col);
+        let n = total.min(available);
+        let byte = if white { 0xFFu8 } else { 0x00u8 };
+        self.out.extend(std::iter::repeat_n(byte, n as usize));
+        self.col += n;
+    }
+
+    fn next_line(&mut self) {
+        // Pad any short row produced by a malformed or truncated bitstream.
+        if self.col < self.width {
+            let remaining = usize::try_from(self.width - self.col).unwrap_or(0);
+            self.out.extend(std::iter::repeat_n(0xFFu8, remaining));
+        }
+        self.col = 0;
+        self.rows += 1;
+    }
+}
+
+/// Expand one row of CCITT transitions into bytes and append to `out`.
+///
+/// The row is padded/truncated to exactly `width` bytes.
+/// `0x00` = black, `0xFF` = white (PDF image convention).
+fn append_ccitt_row(
+    out: &mut Vec<u8>,
+    transitions: &[u16],
+    w_u16: u16,
+    width: u32,
+    black_is_1: bool,
+) {
+    let row_start = out.len();
+    out.extend(fax::decoder::pels(transitions, w_u16).map(|color| {
+        let is_black = match color {
+            fax::Color::Black => !black_is_1,
+            fax::Color::White => black_is_1,
+        };
+        if is_black { 0x00u8 } else { 0xFFu8 }
+    }));
+    // Pad short rows (malformed data) with white.
+    let row_end = row_start + width as usize;
+    out.resize(row_end, 0xFF);
+}
+
+// ── DCTDecode (JPEG) ──────────────────────────────────────────────────────────
+
+/// Decode a `DCTDecode` (JPEG) stream.
+///
+/// `pdf_w` and `pdf_h` from the PDF stream dict are used only for a size sanity
+/// check; the actual dimensions come from the JPEG SOF marker and are
+/// authoritative.
+///
+/// # CMYK handling
+///
+/// JPEG CMYK images in PDF store ink densities in *inverted* form: a byte value
+/// of 0 means *full ink*, 255 means *no ink* (the complement of the usual
+/// convention).  `zune-jpeg` returns raw bytes in this form.  We convert to RGB
+/// using:
+///
+/// ```text
+/// R = (255 - C) * (255 - K) / 255
+/// ```
+///
+/// where `C`, `K` are the complemented (i.e. raw) CMYK byte values.  This is
+/// equivalent to the standard CMY+K → RGB conversion applied to the inverted
+/// ink densities.
+pub(super) fn decode_dct(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+) -> Option<ImageDescriptor> {
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace as ZColorSpace;
+    use zune_core::options::DecoderOptions;
+    use zune_jpeg::JpegDecoder;
+
+    // ── GPU fast path (nvjpeg feature, large images, 1- or 3-component only) ──
+    #[cfg(feature = "nvjpeg")]
+    if let Some(dec) = gpu {
+        // Only dispatch to GPU when the image area meets the threshold.
+        // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
+        // decode_dct_gpu returns None for 4-component images, which causes
+        // the fall-through to the CPU path below that handles CMYK→RGB.
+        let area = pdf_w.saturating_mul(pdf_h);
+        if area >= super::GPU_JPEG_THRESHOLD_PX {
+            if let Some(img) = decode_dct_gpu(data, pdf_w, pdf_h, dec) {
+                return Some(img);
+            }
+            // GPU decode failed (e.g. unsupported encoding) — fall through to CPU.
+            log::debug!("image: DCTDecode: GPU path failed, retrying on CPU");
+        }
+    }
+
+    // ── CPU path (zune-jpeg) ──────────────────────────────────────────────────
+    // First pass: decode only the JPEG headers to learn the component count,
+    // which determines the output colourspace we request on the second decode.
+    // Two passes are necessary because zune-jpeg requires the output colourspace
+    // to be set before `decode()` is called.
+    let mut probe = JpegDecoder::new(ZCursor::new(data));
+    probe.decode_headers().ok()?;
+    let components = probe.info()?.components;
+
+    // Choose the output colorspace zune-jpeg should produce.
+    let out_cs = match components {
+        1 => ZColorSpace::Luma,
+        3 => ZColorSpace::RGB,
+        // CMYK — request raw CMYK output (4 bytes/pixel), convert to RGB below.
+        4 => ZColorSpace::CMYK,
+        n => {
+            log::warn!("image: DCTDecode: unexpected component count {n}");
+            return None;
+        }
+    };
+
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(out_cs);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+    let pixels = decoder
+        .decode()
+        .map_err(|e| log::warn!("image: DCTDecode decode error: {e}"))
+        .ok()?;
+
+    let jpeg_info = decoder.info()?;
+    let jw = u32::from(jpeg_info.width);
+    let jh = u32::from(jpeg_info.height);
+
+    if jw == 0 || jh == 0 {
+        log::warn!("image: DCTDecode: JPEG reported zero dimensions {jw}×{jh}");
+        return None;
+    }
+
+    if jw != pdf_w || jh != pdf_h {
+        log::debug!(
+            "image: DCTDecode: PDF dict says {pdf_w}×{pdf_h}, JPEG reports {jw}×{jh} — using JPEG dims"
+        );
+    }
+
+    match out_cs {
+        ZColorSpace::Luma => Some(ImageDescriptor {
+            width: jw,
+            height: jh,
+            color_space: ImageColorSpace::Gray,
+            data: pixels,
+            smask: None,
+            filter: ImageFilter::Raw,
+        }),
+        ZColorSpace::RGB => Some(ImageDescriptor {
+            width: jw,
+            height: jh,
+            color_space: ImageColorSpace::Rgb,
+            data: pixels,
+            smask: None,
+            filter: ImageFilter::Raw,
+        }),
+        ZColorSpace::CMYK => {
+            // zune-jpeg returns JPEG CMYK with inverted convention (0=full ink, 255=no ink).
+            // Complement to direct convention (255=full ink, 0=no ink) before dispatch.
+            let direct: Vec<u8> = pixels.iter().map(|&b| 255 - b).collect();
+            // JPEG streams embed their own colour profile; the PDF ICCBased stream
+            // is not available here, so ICC CLUT baking is not performed for DCT.
+            let rgb = cmyk_raw_to_rgb(
+                &direct,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                None,
+            )?;
+            Some(ImageDescriptor {
+                width: jw,
+                height: jh,
+                color_space: ImageColorSpace::Rgb,
+                data: rgb,
+                smask: None,
+                filter: ImageFilter::Raw,
+            })
+        }
+        // out_cs is always Luma, RGB, or CMYK — set from the components match above.
+        _ => unreachable!("DCTDecode: unexpected out_cs variant"),
+    }
+}
+
+/// GPU-accelerated DCT decode via nvJPEG.
+///
+/// Returns `None` if the component count is unsupported (e.g. CMYK, which
+/// nvJPEG cannot output as RGBI) or if any CUDA API call fails.  The caller
+/// must fall back to the CPU path when `None` is returned.
+///
+/// The stream is synchronised inside `NvJpegDecoder::decode_sync` before
+/// pixel bytes are returned, so the result is safe to use immediately.
+#[cfg(feature = "nvjpeg")]
+fn decode_dct_gpu(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    dec: &mut NvJpegDecoder,
+) -> Option<ImageDescriptor> {
+    let img = match dec.decode_sync(data) {
+        Ok(img) => img,
+        Err(gpu::nvjpeg::NvJpegError::UnsupportedComponents(_)) => {
+            // CMYK or other unsupported component count — expected, fall back silently.
+            return None;
+        }
+        Err(e) => {
+            // Unexpected CUDA/nvJPEG failure — log at warn so it's visible.
+            log::warn!("image: DCTDecode GPU: unexpected nvJPEG error: {e}");
+            return None;
+        }
+    };
+
+    if img.width != pdf_w || img.height != pdf_h {
+        log::debug!(
+            "image: DCTDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG reports {}×{} — using nvJPEG dims",
+            img.width,
+            img.height,
+        );
+    }
+
+    let color_space = match img.color_space {
+        GpuCs::Gray => ImageColorSpace::Gray,
+        GpuCs::Rgb => ImageColorSpace::Rgb,
+    };
+
+    Some(ImageDescriptor {
+        width: img.width,
+        height: img.height,
+        color_space,
+        data: img.data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// Convert a raw CMYK pixel buffer to RGB, dispatching to GPU when available.
+///
+/// Input convention (raw images / `decode_raw_8bpp`): 0 = no ink, 255 = full ink.
+/// This matches the `GpuCtx::icc_cmyk_to_rgb` matrix kernel directly.
+///
+/// `icc_bytes` — raw ICC profile bytes extracted from an `ICCBased` colour space.
+/// When provided (and the `gpu-icc` feature is active), a CLUT is baked from the
+/// profile and used for the colour transform instead of the fast matrix approximation.
+///
+/// Returns `None` only on arithmetic overflow (degenerate image size).
+pub(super) fn cmyk_raw_to_rgb(
+    pixels: &[u8],
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    // GPU path: delegate to GpuCtx which handles the dispatch-threshold check and
+    // CPU fallback internally.  When ICC bytes are present, bake a CLUT for
+    // profile-accurate conversion; fall back to the fast matrix approximation if
+    // baking fails (e.g. corrupt profile or wrong colour space).
+    #[cfg(feature = "gpu-icc")]
+    if let Some(ctx) = gpu_ctx {
+        let clut_data: Option<Vec<u8>> = icc_bytes.and_then(|bytes| {
+            icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
+                .map_err(|e| log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}"))
+                .ok()
+        });
+
+        match ctx.icc_cmyk_to_rgb(
+            pixels,
+            clut_data.as_deref().map(|t| (t, icc::DEFAULT_GRID_N)),
+        ) {
+            Ok(rgb) => return Some(rgb),
+            Err(e) => log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}"),
+        }
+    }
+
+    // CPU path (also used below threshold by GpuCtx itself, but we land here
+    // when the feature is disabled or no GpuCtx is provided).
+    let npixels = pixels.len() / 4;
+    let mut rgb = Vec::with_capacity(npixels.checked_mul(3)?);
+    for chunk in pixels.chunks_exact(4) {
+        let (r, g, b) =
+            color::convert::cmyk_to_rgb_reflectance(chunk[0], chunk[1], chunk[2], chunk[3]);
+        rgb.push(r);
+        rgb.push(g);
+        rgb.push(b);
+    }
+    Some(rgb)
+}
+
+// ── JPXDecode (JPEG 2000) ─────────────────────────────────────────────────────
+
+/// Decode a `JPXDecode` (JPEG 2000) stream.
+///
+/// When the `nvjpeg2k` feature is active and `gpu` is `Some`, large images
+/// (pixel area ≥ [`super::GPU_JPEG2K_THRESHOLD_PX`]) are decoded on the GPU via
+/// nvJPEG2000.  All other images, and any image for which the GPU path fails
+/// (unsupported component count, CUDA error, etc.), fall through to the CPU
+/// `jpeg2k`/`OpenJPEG` path.
+///
+/// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
+/// format (`.jp2`).  Both the GPU path (nvJPEG2000 via `nvjpeg2kStreamParse`)
+/// and the CPU path (`jpeg2k`/`OpenJPEG`) auto-detect the format from the stream.
+///
+/// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
+pub(super) fn decode_jpx(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    #[cfg(feature = "nvjpeg2k")] gpu: Option<&mut NvJpeg2kDecoder>,
+) -> Option<ImageDescriptor> {
+    // ── GPU fast path (nvjpeg2k feature, large images, 1- or 3-component only) ─
+    #[cfg(feature = "nvjpeg2k")]
+    if let Some(dec) = gpu {
+        let area = pdf_w.saturating_mul(pdf_h);
+        if area >= super::GPU_JPEG2K_THRESHOLD_PX {
+            if let Some(img) = decode_jpx_gpu(data, pdf_w, pdf_h, dec) {
+                return Some(img);
+            }
+            log::debug!("image: JPXDecode: GPU path failed, retrying on CPU");
+        }
+    }
+
+    // ── CPU path (jpeg2k / OpenJPEG) ─────────────────────────────────────────
+    let img = Jp2Image::from_bytes(data)
+        .map_err(|e| log::warn!("image: JPXDecode open error: {e}"))
+        .ok()?;
+
+    let img_data = img
+        .get_pixels(None)
+        .map_err(|e| log::warn!("image: JPXDecode get_pixels error: {e}"))
+        .ok()?;
+
+    let jw = img_data.width;
+    let jh = img_data.height;
+
+    if jw == 0 || jh == 0 {
+        log::warn!("image: JPXDecode: JP2 reported zero dimensions {jw}×{jh}");
+        return None;
+    }
+
+    if jw != pdf_w || jh != pdf_h {
+        log::debug!(
+            "image: JPXDecode: PDF dict says {pdf_w}×{pdf_h}, JP2 reports {jw}×{jh} — using JP2 dims"
+        );
+    }
+
+    // `jpeg2k` guarantees that `img_data.format` and `img_data.data` are always
+    // consistent: an L8 format always carries L8 data, etc.  We use
+    // `let … else { unreachable! }` inside each arm to surface any library
+    // regression loudly rather than silently skipping images.
+    match img_data.format {
+        ImageFormat::L8 => {
+            let ImagePixelData::L8(pixels) = img_data.data else {
+                unreachable!("jpeg2k: L8 format paired with non-L8 data")
+            };
+            Some(jpx_gray(jw, jh, pixels))
+        }
+        ImageFormat::La8 => {
+            let ImagePixelData::La8(pixels) = img_data.data else {
+                unreachable!("jpeg2k: La8 format paired with non-La8 data")
+            };
+            // Drop the alpha channel — keep luma bytes (every other byte starting at 0).
+            let gray = pixels.chunks_exact(2).map(|c| c[0]).collect();
+            Some(jpx_gray(jw, jh, gray))
+        }
+        ImageFormat::Rgb8 => {
+            let ImagePixelData::Rgb8(pixels) = img_data.data else {
+                unreachable!("jpeg2k: Rgb8 format paired with non-Rgb8 data")
+            };
+            Some(jpx_rgb(jw, jh, pixels))
+        }
+        ImageFormat::Rgba8 => {
+            let ImagePixelData::Rgba8(pixels) = img_data.data else {
+                unreachable!("jpeg2k: Rgba8 format paired with non-Rgba8 data")
+            };
+            // Drop alpha channel.
+            let rgb = pixels
+                .chunks_exact(4)
+                .flat_map(|c| [c[0], c[1], c[2]])
+                .collect();
+            Some(jpx_rgb(jw, jh, rgb))
+        }
+        ImageFormat::L16 => {
+            let ImagePixelData::L16(pixels) = img_data.data else {
+                unreachable!("jpeg2k: L16 format paired with non-L16 data")
+            };
+            // Downscale 16-bit → 8-bit: high byte (v >> 8 ≤ 255, cast is lossless).
+            let gray = pixels.iter().map(|&v| (v >> 8) as u8).collect();
+            Some(jpx_gray(jw, jh, gray))
+        }
+        ImageFormat::La16 => {
+            let ImagePixelData::La16(pixels) = img_data.data else {
+                unreachable!("jpeg2k: La16 format paired with non-La16 data")
+            };
+            // Drop alpha; downscale luma.
+            let gray = pixels.chunks_exact(2).map(|c| (c[0] >> 8) as u8).collect();
+            Some(jpx_gray(jw, jh, gray))
+        }
+        ImageFormat::Rgb16 => {
+            let ImagePixelData::Rgb16(pixels) = img_data.data else {
+                unreachable!("jpeg2k: Rgb16 format paired with non-Rgb16 data")
+            };
+            let rgb = pixels.iter().map(|&v| (v >> 8) as u8).collect();
+            Some(jpx_rgb(jw, jh, rgb))
+        }
+        ImageFormat::Rgba16 => {
+            let ImagePixelData::Rgba16(pixels) = img_data.data else {
+                unreachable!("jpeg2k: Rgba16 format paired with non-Rgba16 data")
+            };
+            // Drop alpha; downscale RGB.
+            let rgb = pixels
+                .chunks_exact(4)
+                .flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8])
+                .collect();
+            Some(jpx_rgb(jw, jh, rgb))
+        }
+    }
+}
+
+/// GPU-accelerated JPEG 2000 decode via nvJPEG2000.
+///
+/// Returns `None` for unsupported component counts (CMYK, LAB, N-channel) or
+/// when any CUDA API call fails; the caller falls back to the CPU path in
+/// both cases.
+#[cfg(feature = "nvjpeg2k")]
+fn decode_jpx_gpu(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    dec: &mut NvJpeg2kDecoder,
+) -> Option<ImageDescriptor> {
+    let img = match dec.decode_sync(data) {
+        Ok(img) => img,
+        // Unsupported component count (CMYK, Gray+Alpha, N-channel), sub-sampled
+        // chroma, or a codestream type not supported by this nvJPEG2000 build
+        // (HTJ2K, status 4) — all are expected; fall through to CPU silently.
+        Err(
+            gpu::nvjpeg2k::NvJpeg2kError::UnsupportedComponents(_)
+            | gpu::nvjpeg2k::NvJpeg2kError::SubSampledComponents
+            | gpu::nvjpeg2k::NvJpeg2kError::Nvjpeg2kStatus(4),
+        ) => return None,
+        Err(e) => {
+            log::warn!("image: JPXDecode GPU: nvJPEG2000 error: {e}");
+            return None;
+        }
+    };
+
+    if img.width != pdf_w || img.height != pdf_h {
+        log::debug!(
+            "image: JPXDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG2000 reports {}×{} — using nvJPEG2000 dims",
+            img.width,
+            img.height,
+        );
+    }
+
+    let color_space = match img.color_space {
+        GpuJ2kCs::Gray => ImageColorSpace::Gray,
+        GpuJ2kCs::Rgb => ImageColorSpace::Rgb,
+    };
+
+    Some(ImageDescriptor {
+        width: img.width,
+        height: img.height,
+        color_space,
+        data: img.data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// Wrap a decoded grayscale pixel buffer into an [`ImageDescriptor`].
+#[inline]
+pub(super) const fn jpx_gray(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
+    ImageDescriptor {
+        width,
+        height,
+        color_space: ImageColorSpace::Gray,
+        data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    }
+}
+
+/// Wrap a decoded RGB pixel buffer into an [`ImageDescriptor`].
+#[inline]
+pub(super) const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
+    ImageDescriptor {
+        width,
+        height,
+        color_space: ImageColorSpace::Rgb,
+        data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    }
+}
+
+// ── JBIG2Decode ──────────────────────────────────────────────────────────────
+
+/// Decode a `JBIG2Decode` stream via `hayro-jbig2`.
+///
+/// PDF JBIG2 uses the "embedded organisation" (Annex D.3 of T.88): the stream
+/// contains page segments only; global segments live in a separate
+/// `JBIG2Globals` stream referenced from `DecodeParms`.
+///
+/// The decoder produces one byte per pixel: 0x00 = black, 0xFF = white (for
+/// grayscale images) or 0x00 = paint, 0xFF = transparent (for `ImageMask`).
+/// JBIG2 convention is 0 = white, 1 = black; we invert to match the rest of
+/// the image pipeline.
+pub(super) fn decode_jbig2(
+    doc: &Document,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    is_mask: bool,
+    parms: Option<&Object>,
+) -> Option<ImageDescriptor> {
+    // Resolve optional JBIG2Globals stream from DecodeParms.
+    let globals_bytes: Option<Vec<u8>> = parms
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|d| d.get(b"JBIG2Globals").ok())
+        .and_then(|o| match o {
+            Object::Reference(id) => {
+                let g_obj = doc.get_object(*id).ok()?;
+                let g_stream = g_obj.as_stream().ok()?;
+                // JBIG2Globals streams are typically not compressed, but
+                // decompressed_content handles both cases transparently.
+                g_stream.decompressed_content().ok()
+            }
+            _ => None,
+        });
+
+    // Parse the embedded JBIG2 image (page segments + optional globals).
+    let img = hayro_jbig2::Image::new_embedded(data, globals_bytes.as_deref())
+        .map_err(|e| log::warn!("image: JBIG2Decode parse error: {e}"))
+        .ok()?;
+
+    let jw = img.width();
+    let jh = img.height();
+
+    // Validate decoded dimensions against the PDF image dict.
+    if jw != width || jh != height {
+        log::warn!(
+            "image: JBIG2Decode dimension mismatch: image dict says {width}×{height}, JBIG2 stream says {jw}×{jh} — using stream dimensions"
+        );
+    }
+
+    let n_pixels = (jw as usize).checked_mul(jh as usize)?;
+    let mut collector = Jbig2Collector {
+        data: Vec::with_capacity(n_pixels),
+        is_mask,
+    };
+
+    img.decode(&mut collector)
+        .map_err(|e| log::warn!("image: JBIG2Decode decode error: {e}"))
+        .ok()?;
+
+    if collector.data.len() != n_pixels {
+        log::warn!(
+            "image: JBIG2Decode produced {} pixels, expected {n_pixels} — skipping",
+            collector.data.len()
+        );
+        return None;
+    }
+
+    let cs = if is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    Some(ImageDescriptor {
+        width: jw,
+        height: jh,
+        color_space: cs,
+        data: collector.data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// Pixel collector for `hayro_jbig2::Decoder`.
+///
+/// JBIG2 convention: 0 = white, 1 = black.
+/// `ImageColorSpace::Gray` convention: 0x00 = black, 0xFF = white.
+/// `ImageColorSpace::Mask` convention: 0x00 = paint (== JBIG2 black), 0xFF = transparent.
+///
+/// Both output conventions share the same polarity flip: JBIG2 black (1) → 0x00,
+/// JBIG2 white (0) → 0xFF.
+struct Jbig2Collector {
+    data: Vec<u8>,
+    is_mask: bool,
+}
+
+impl Jbig2Decoder for Jbig2Collector {
+    fn push_pixel(&mut self, black: bool) {
+        self.data.push(if black { 0x00 } else { 0xFF });
+    }
+
+    fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+        let byte = if black { 0x00 } else { 0xFF };
+        let n = chunk_count as usize * 8;
+        self.data.extend(std::iter::repeat_n(byte, n));
+    }
+
+    fn next_line(&mut self) {
+        // Row boundary — nothing to do; pixels are already stored flat.
+        let _ = self.is_mask; // used at construction; suppress dead-code lint
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jbig2_collector_push_pixel_grayscale() {
+        // JBIG2: black=true → Gray 0x00, black=false → Gray 0xFF.
+        let mut c = Jbig2Collector {
+            data: Vec::new(),
+            is_mask: false,
+        };
+        Jbig2Decoder::push_pixel(&mut c, true);
+        Jbig2Decoder::push_pixel(&mut c, false);
+        assert_eq!(c.data, [0x00, 0xFF]);
+    }
+
+    #[test]
+    fn jbig2_collector_push_pixel_chunk() {
+        let mut c = Jbig2Collector {
+            data: Vec::new(),
+            is_mask: false,
+        };
+        // chunk_count=2 → 16 pixels of white (0xFF each).
+        Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
+        assert_eq!(c.data.len(), 16);
+        assert!(c.data.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn jbig2_decode_invalid_data_returns_none() {
+        // Corrupt/empty JBIG2 data must not panic — it must return None.
+        let doc = lopdf::Document::new();
+        let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
+        assert!(result.is_none());
+    }
+}
