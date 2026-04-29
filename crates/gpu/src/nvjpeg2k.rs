@@ -38,25 +38,11 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 
 // ── CUDA driver API ───────────────────────────────────────────────────────────
-//
-// These symbols are from libcuda.so (the NVIDIA driver).  They are also
-// declared in nvjpeg.rs but that module is compiled as a separate translation
-// unit; we re-declare them here to avoid cross-module FFI coupling.
 
-/// Opaque CUDA stream handle; we only ever pass it through to nvJPEG2000 and
-/// the synchronise call.
-type CUstream = *mut c_void;
-
-unsafe extern "C" {
-    fn cuInit(flags: u32) -> i32;
-    fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
-    fn cuDevicePrimaryCtxRetain(ctx: *mut *mut c_void, device: i32) -> i32;
-    fn cuDevicePrimaryCtxRelease(device: i32) -> i32;
-    fn cuCtxSetCurrent(ctx: *mut c_void) -> i32;
-    fn cuStreamCreate(stream: *mut CUstream, flags: u32) -> i32;
-    fn cuStreamDestroy(stream: CUstream) -> i32;
-    fn cuStreamSynchronize(stream: CUstream) -> i32;
-}
+use crate::cuda::{
+    CUstream, cuCtxSetCurrent, cuDevicePrimaryCtxRelease, cuStreamDestroy, cuStreamSynchronize,
+    init_primary_ctx_and_stream,
+};
 
 // ── CUDA runtime API ──────────────────────────────────────────────────────────
 //
@@ -866,50 +852,14 @@ impl NvJpeg2kDecoder {
     /// Panics if a CUDA or nvJPEG2000 function reports success but returns a
     /// null handle — that would indicate a driver bug.
     pub fn new(ordinal: usize) -> Result<Self> {
-        // Step 1 — initialise the CUDA driver.  Safe to call multiple times.
-        let r = unsafe { cuInit(0) };
-        if r != 0 {
-            return Err(NvJpeg2kError::CudaError(r));
-        }
-
-        // Step 2 — get device handle.
+        // Steps 1–5: cuInit → cuDeviceGet → cuDevicePrimaryCtxRetain →
+        // cuCtxSetCurrent → cuStreamCreate.  Stream is created before nvJPEG2000
+        // init so it belongs to the primary context, not any internal context the
+        // library might push.
         let ordinal_i32 = i32::try_from(ordinal).map_err(|_| NvJpeg2kError::CudaError(101))?;
-        let mut device: i32 = 0;
-        let r = unsafe { cuDeviceGet(&raw mut device, ordinal_i32) };
-        if r != 0 {
-            return Err(NvJpeg2kError::CudaError(r));
-        }
-
-        // Step 3 — retain primary context.
-        let mut cu_ctx: *mut c_void = ptr::null_mut();
-        let r = unsafe { cuDevicePrimaryCtxRetain(&raw mut cu_ctx, device) };
-        if r != 0 {
-            return Err(NvJpeg2kError::CudaError(r));
-        }
-        assert!(
-            !cu_ctx.is_null(),
-            "cuDevicePrimaryCtxRetain succeeded but returned null context"
-        );
-
-        // Step 4 — bind context to calling thread.
-        let r = unsafe { cuCtxSetCurrent(cu_ctx) };
-        if r != 0 {
-            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
-            return Err(NvJpeg2kError::CudaError(r));
-        }
-
-        // Step 5 — create stream before nvJPEG2000 init so it belongs to the
-        // primary context, not any internal context the library might push.
-        let mut stream: CUstream = ptr::null_mut();
-        let r = unsafe { cuStreamCreate(&raw mut stream, 0) };
-        if r != 0 {
-            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
-            return Err(NvJpeg2kError::CudaError(r));
-        }
-        assert!(
-            !stream.is_null(),
-            "cuStreamCreate returned null despite success"
-        );
+        let init = init_primary_ctx_and_stream(ordinal_i32)
+            .map_err(|e| NvJpeg2kError::CudaError(e.code))?;
+        let (cu_ctx, device, stream) = (init.cu_ctx, init.device, init.stream);
 
         // Step 6 — initialise nvJPEG2000.  nvjpeg2kCreateSimple captures the
         // current context (set in step 4), so handle and stream share a context.

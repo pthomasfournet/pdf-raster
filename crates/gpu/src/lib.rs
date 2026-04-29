@@ -20,6 +20,8 @@
 //!   (`nppiRotate_8u_C1R_Ctx`).  Requires `libnppig.so`, `libnppc.so`, and
 //!   `libcudart.so` at link time.
 
+pub(crate) mod cuda;
+
 #[cfg(feature = "nvjpeg")]
 pub mod nvjpeg;
 

@@ -480,7 +480,7 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 
 ---
 
-## Phase 6 — Integration hardening and OCR pipeline fit
+## Phase 6 — Integration hardening and OCR pipeline fit ✓ COMPLETE (Apr 2026)
 
 ### Goal
 
@@ -528,8 +528,12 @@ Phase 6 closes the remaining gaps before the first production integration.
   vector/text-only pages so callers fall back to their default DPI.
   No stored field — pure computed from existing `source_ppi_hint`.
 
-- [ ] **`npp_rotate` / `nvjpeg2k` shared CUDA init helper** — `NppRotator::new`
-  and `NvJpeg2kDecoder::new` duplicate the five-step CUDA init sequence
-  (`cuInit → cuDeviceGet → cuDevicePrimaryCtxRetain → cuCtxSetCurrent →
-  cuStreamCreate`) with divergent null checks.  Extract into
-  `gpu::cuda::init_stream(device_ordinal) -> Result<CudaStream>` shared by both.
+- [x] **`npp_rotate` / `nvjpeg2k` shared CUDA init helper** — the duplicated
+  five-step CUDA driver init sequence (`cuInit → cuDeviceGet →
+  cuDevicePrimaryCtxRetain → cuCtxSetCurrent → cuStreamCreate`) and the eight
+  `libcuda.so` FFI declarations are extracted into `crates/gpu/src/cuda.rs` as
+  `gpu::cuda::init_primary_ctx_and_stream(device_ordinal: i32) → Result<CudaInit,
+  CudaInitError>`.  `NppRotator::new` maps the error to `NppRotateError(format!)`
+  and `NvJpeg2kDecoder::new` maps it to `NvJpeg2kError::CudaError(code)`.
+  The module is unconditionally compiled; `#[cfg_attr]` guards suppress dead-code
+  lints when neither GPU feature is active.
