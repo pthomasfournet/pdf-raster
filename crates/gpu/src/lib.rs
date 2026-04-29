@@ -868,26 +868,6 @@ pub fn apply_soft_mask_cpu(pixels: &mut [u8], mask: &[u8]) {
     }
 }
 
-/// Scalar per-pixel CMYK→RGB: `R=(255−C)*(255−K)/255` (rounded), same for G/M, B/Y.
-///
-/// `src` is a 4-byte CMYK slice; `dst` is a 3-byte RGB slice.
-fn cmyk_to_rgb_pixel_scalar(src: &[u8], dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), 4);
-    debug_assert_eq!(dst.len(), 3);
-    // u16 arithmetic: max product = 255*255 = 65025, fits without overflow.
-    // (255*255 + 127)/255 = 255 exactly — the as u8 cast cannot truncate.
-    let inv_k = u16::from(255 - src[3]);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "value ≤ 255 by construction"
-    )]
-    {
-        dst[0] = ((u16::from(255 - src[0]) * inv_k + 127) / 255) as u8;
-        dst[1] = ((u16::from(255 - src[1]) * inv_k + 127) / 255) as u8;
-        dst[2] = ((u16::from(255 - src[2]) * inv_k + 127) / 255) as u8;
-    }
-}
-
 // ── AVX-512 CMYK→RGB ──────────────────────────────────────────────────────────
 //
 // Vectorised subtractive complement: R=(255−C)*(255−K)/255 (rounded).
@@ -1130,7 +1110,11 @@ pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
                     .chunks_exact(4)
                     .zip(rgb[out_off..].chunks_exact_mut(3))
                 {
-                    cmyk_to_rgb_pixel_scalar(src, dst);
+                    let (r, g, b) =
+                        color::convert::cmyk_to_rgb_reflectance(src[0], src[1], src[2], src[3]);
+                    dst[0] = r;
+                    dst[1] = g;
+                    dst[2] = b;
                 }
             }
             #[cfg(not(all(
@@ -1140,7 +1124,11 @@ pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
             )))]
             {
                 for (src, dst) in cmyk.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
-                    cmyk_to_rgb_pixel_scalar(src, dst);
+                    let (r, g, b) =
+                        color::convert::cmyk_to_rgb_reflectance(src[0], src[1], src[2], src[3]);
+                    dst[0] = r;
+                    dst[1] = g;
+                    dst[2] = b;
                 }
             }
         }
@@ -1508,10 +1496,13 @@ mod tests {
         ];
         assert_eq!(cmyk.len(), 64, "test vector must be exactly 16 pixels");
 
-        // Reference via the extracted scalar helper — not an inline reimplementation.
+        // Reference via color::convert::cmyk_to_rgb_reflectance.
         let mut scalar_rgb = vec![0u8; 48];
         for (src, dst) in cmyk.chunks_exact(4).zip(scalar_rgb.chunks_exact_mut(3)) {
-            super::cmyk_to_rgb_pixel_scalar(src, dst);
+            let (r, g, b) = color::convert::cmyk_to_rgb_reflectance(src[0], src[1], src[2], src[3]);
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
         }
 
         let avx_rgb = icc_cmyk_to_rgb_cpu(&cmyk, None);

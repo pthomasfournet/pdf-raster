@@ -226,6 +226,13 @@ pub fn unpremul(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
 ///
 /// When `c + k > 255` the sum would exceed 255, so `saturating_sub` clamps
 /// the result to 0. This correctly models full ink coverage producing black.
+///
+/// # Distinction from other CMYK variants
+///
+/// - [`cmyk_to_rgb_reflectance`]: uses the reflectance formula
+///   `R = (255−C)×(255−K)/255` (rounded), for raw JPEG/CMYK pixel data.
+/// - `pdf_interp::renderer::color::cmyk_to_rgb_bytes`: takes normalised f64
+///   inputs per PDF §10.3.3 (`R = 1−min(1, C+K)`), for PDF colour operators.
 #[inline]
 #[must_use]
 pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
@@ -251,6 +258,52 @@ pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
 #[must_use]
 pub const fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
     (v, v, v)
+}
+
+/// CMYK → RGB via the reflectance formula: `R = (255−C)×(255−K)/255` (rounded).
+///
+/// Used for raw JPEG/CMYK pixel data where channels represent ink density.
+/// The `+127` bias before dividing by 255 removes truncation error; the
+/// numerator `(255−ch)×(255−k)+127 ≤ 255×255+127 = 65152` fits in `u32`.
+///
+/// # Distinction from other CMYK variants
+///
+/// - [`cmyk_to_rgb`]: simple saturating-subtract `R = 255−(C+K)`, matching
+///   poppler's matrix multiply path.  Faster but less accurate for mid-tones.
+/// - `pdf_interp::renderer::color::cmyk_to_rgb_bytes`: takes normalised f64
+///   inputs per PDF §10.3.3 (`R = 1−min(1, C+K)`), for PDF colour operators.
+///
+/// # Arguments
+///
+/// All inputs in \[0, 255\].
+///
+/// # Output range
+///
+/// Each output channel is in \[0, 255\].
+#[inline]
+#[must_use]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "CMYK and RGB are conventional single-letter colour channel names"
+)]
+pub fn cmyk_to_rgb_reflectance(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
+    let inv_k = u32::from(255 - k);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
+    )]
+    let r = ((u32::from(255 - c) * inv_k + 127) / 255) as u8;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
+    )]
+    let g = ((u32::from(255 - m) * inv_k + 127) / 255) as u8;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
+    )]
+    let b = ((u32::from(255 - y) * inv_k + 127) / 255) as u8;
+    (r, g, b)
 }
 
 // ── GfxColorComp fixed-point ──────────────────────────────────────────────────
@@ -573,6 +626,36 @@ mod tests {
                 "byte_to_col({b}) = {c}, col_to_byte = {back}"
             );
         }
+    }
+
+    /// `cmyk_to_rgb_reflectance` — all-zero ink (no ink) must produce white.
+    #[test]
+    fn cmyk_reflectance_no_ink_is_white() {
+        assert_eq!(cmyk_to_rgb_reflectance(0, 0, 0, 0), (255, 255, 255));
+    }
+
+    /// `cmyk_to_rgb_reflectance` — full K (key/black) must produce black.
+    #[test]
+    fn cmyk_reflectance_full_k_is_black() {
+        assert_eq!(cmyk_to_rgb_reflectance(0, 0, 0, 255), (0, 0, 0));
+    }
+
+    /// `cmyk_to_rgb_reflectance` — C=255, no K → R=0, G=B=255.
+    #[test]
+    fn cmyk_reflectance_full_cyan_no_k() {
+        let (r, g, b) = cmyk_to_rgb_reflectance(255, 0, 0, 0);
+        assert_eq!(r, 0);
+        assert_eq!(g, 255);
+        assert_eq!(b, 255);
+    }
+
+    /// `cmyk_to_rgb_reflectance` — midtone C=128 gives R ≈ 127–128.
+    #[test]
+    fn cmyk_reflectance_midtone() {
+        let (r, g, b) = cmyk_to_rgb_reflectance(128, 0, 0, 0);
+        assert!((127..=128).contains(&r), "r={r}");
+        assert_eq!(g, 255);
+        assert_eq!(b, 255);
     }
 
     /// `cmyk_to_rgb` saturation: when c+k > 255 the channel must be 0.

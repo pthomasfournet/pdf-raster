@@ -1100,37 +1100,6 @@ fn decode_raw_indexed(
     })
 }
 
-/// Convert raw PDF CMYK (255 = full ink) to RGB.
-///
-/// Direct ink density convention (non-JPEG): 255 = full ink, 0 = no ink.
-/// Equivalent to: subtract each channel and K from 255, then apply K attenuation.
-#[expect(
-    clippy::many_single_char_names,
-    reason = "CMYK and RGB are conventional single-letter colour channel names"
-)]
-#[inline]
-fn cmyk_raw_to_rgb_triple(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
-    // Reflectance formula: R = (255−C)*(255−K)/255, rounded to nearest.
-    // +127 before /255 removes truncation bias; numerator ≤ 255*255+127 = 65152 < u32::MAX.
-    let inv_k = u32::from(255 - k);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
-    )]
-    let r = ((u32::from(255 - c) * inv_k + 127) / 255) as u8;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
-    )]
-    let g = ((u32::from(255 - m) * inv_k + 127) / 255) as u8;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "((255-ch)*(255-k)+127)/255 ≤ 255, always fits u8"
-    )]
-    let b = ((u32::from(255 - y) * inv_k + 127) / 255) as u8;
-    (r, g, b)
-}
-
 /// Expand 1-bit-per-pixel packed data (MSB first) to 1 byte per pixel.
 ///
 /// Returns `None` if `width × height` overflows `usize`.
@@ -1828,7 +1797,8 @@ fn cmyk_raw_to_rgb(
     let npixels = pixels.len() / 4;
     let mut rgb = Vec::with_capacity(npixels.checked_mul(3)?);
     for chunk in pixels.chunks_exact(4) {
-        let (r, g, b) = cmyk_raw_to_rgb_triple(chunk[0], chunk[1], chunk[2], chunk[3]);
+        let (r, g, b) =
+            color::convert::cmyk_to_rgb_reflectance(chunk[0], chunk[1], chunk[2], chunk[3]);
         rgb.push(r);
         rgb.push(g);
         rgb.push(b);
@@ -2328,7 +2298,8 @@ fn indexed_palette<'a>(doc: &'a Document, cs_arr: &'a [Object]) -> Option<(Vec<u
     let palette: Vec<u8> = if base == ResolvedCs::Cmyk {
         let mut out = Vec::with_capacity(n_entries * 3);
         for chunk in lookup_bytes[..needed].chunks_exact(4) {
-            let (r, g, b) = cmyk_raw_to_rgb_triple(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let (r, g, b) =
+                color::convert::cmyk_to_rgb_reflectance(chunk[0], chunk[1], chunk[2], chunk[3]);
             out.push(r);
             out.push(g);
             out.push(b);
@@ -2351,38 +2322,6 @@ fn indexed_palette<'a>(doc: &'a Document, cs_arr: &'a [Object]) -> Option<(Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── cmyk_raw_to_rgb_triple ────────────────────────────────────────────────
-
-    #[test]
-    fn cmyk_no_ink_is_white() {
-        // All channels 0 = no ink = white.
-        assert_eq!(cmyk_raw_to_rgb_triple(0, 0, 0, 0), (255, 255, 255));
-    }
-
-    #[test]
-    fn cmyk_full_k_is_black() {
-        // K = 255 (full black ink), no other ink → black.
-        assert_eq!(cmyk_raw_to_rgb_triple(0, 0, 0, 255), (0, 0, 0));
-    }
-
-    #[test]
-    fn cmyk_full_cyan_no_k() {
-        // C=255, M=0, Y=0, K=0 → R=0, G=255, B=255.
-        let (r, g, b) = cmyk_raw_to_rgb_triple(255, 0, 0, 0);
-        assert_eq!(r, 0);
-        assert_eq!(g, 255);
-        assert_eq!(b, 255);
-    }
-
-    #[test]
-    fn cmyk_midtone() {
-        // C=128, M=0, Y=0, K=0 → R ≈ 127, G=255, B=255.
-        let (r, g, b) = cmyk_raw_to_rgb_triple(128, 0, 0, 0);
-        assert!((127..=128).contains(&r), "r={r}");
-        assert_eq!(g, 255);
-        assert_eq!(b, 255);
-    }
 
     // ── resolve_cs (Name variants) ────────────────────────────────────────────
 

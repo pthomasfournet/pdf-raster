@@ -7,7 +7,7 @@
 //       R = (255 - C) * (255 - K) / 255
 //       G = (255 - M) * (255 - K) / 255
 //       B = (255 - Y) * (255 - K) / 255
-//     This is identical to the CPU fallback in image.rs::cmyk_raw_to_rgb_triple.
+//     This is identical to color::convert::cmyk_to_rgb_reflectance in the Rust codebase.
 //
 //   icc_cmyk_clut — full 4D CLUT path for A2B0 profiles.
 //     Evaluates the CLUT using manual quadrilinear interpolation with __ldg()
