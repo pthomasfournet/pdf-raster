@@ -20,9 +20,19 @@ fn main() {
         .build()
         .expect("failed to build thread pool");
 
+    if args.odd_only && args.even_only {
+        eprintln!("pdf-raster: --odd and --even are mutually exclusive");
+        std::process::exit(1);
+    }
+
     let session = pdf_raster::open_session(std::path::Path::new(&args.input))
         .unwrap_or_else(|e| {
             eprintln!("pdf-raster: failed to open PDF: {e}");
+            let mut src = std::error::Error::source(&e);
+            while let Some(cause) = src {
+                eprintln!("  caused by: {cause}");
+                src = cause.source();
+            }
             std::process::exit(1);
         });
 

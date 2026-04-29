@@ -13,8 +13,8 @@
 //! 2. **Coarse sweep**: evaluate the differential-square-sum score at
 //!    [`SWEEP_STEPS`] evenly-spaced angles in ±[`MAX_SEARCH_DEG`] using
 //!    Rayon parallel iteration (each angle is independent).
-//! 3. **Binary search**: starting from the best coarse angle, halve the search
-//!    interval repeatedly until Δ < [`REFINE_STOP_DEG`].
+//! 3. **Refinement**: starting from the best coarse angle, shrink the search
+//!    interval repeatedly until half-width < [`REFINE_STOP_DEG`].
 //!
 //! # Score function
 //!
@@ -27,22 +27,26 @@
 //! # Performance
 //!
 //! At 4× downsampling a 300 DPI A4 page (2550×3300) becomes 638×825.
-//! The inner row-sum loop uses `u32` accumulation; no SIMD intrinsics are
-//! needed — the compiler auto-vectorises to AVX-512 from the simple scalar
-//! loop.  Rayon distributes the [`SWEEP_STEPS`] independent angle evaluations
-//! across available cores; the 9900X3D's 96 MB V-Cache keeps the 8.4 MB source
-//! image warm through all sweep iterations.
+//! The inner loop scatters foreground weights into a `u32` row-sum array using
+//! data-dependent indices (not auto-vectorisable).  Rayon distributes the
+//! [`SWEEP_STEPS`] independent angle evaluations across available cores; the
+//! 9900X3D's 96 MB V-Cache keeps the downsampled source image warm across all
+//! sweep iterations.
 
 use color::Gray8;
 use raster::Bitmap;
+use rayon::prelude::*;
 
 use super::MAX_SEARCH_DEG;
 
 /// Number of candidate angles in the coarse sweep (covers ±MAX_SEARCH_DEG).
-const SWEEP_STEPS: usize = 56; // 0.25° steps over 14° range
+const SWEEP_STEPS: usize = 56; // ≈ 0.255° steps over 14° range
 
-/// Binary-search refinement stops when interval width < this.
+/// Refinement stops when the half-interval width (`delta`) falls below this.
 const REFINE_STOP_DEG: f32 = 0.01;
+
+// Safety: step = 14° / (SWEEP_STEPS-1) must be finite; require ≥ 2 steps.
+const _: () = assert!(SWEEP_STEPS >= 2, "SWEEP_STEPS must be ≥ 2");
 
 /// Downsampling factor applied before scoring (4× linear = 16× pixel count).
 const DOWNSAMPLE: u32 = 4;
@@ -59,26 +63,18 @@ pub fn find_skew_deg(img: &Bitmap<Gray8>) -> f32 {
 
     let small = downsample(img, DOWNSAMPLE);
 
-    // Coarse sweep: evaluate all candidate angles in parallel.
+    // Coarse sweep: score all candidate angles in parallel, fold to the best.
     let step = (2.0 * MAX_SEARCH_DEG) / (SWEEP_STEPS - 1) as f32;
-    let angles: Vec<f32> = (0..SWEEP_STEPS)
-        .map(|i| -MAX_SEARCH_DEG + i as f32 * step)
-        .collect();
-
-    // Each angle is scored independently; rayon::par_iter distributes work.
-    use rayon::prelude::*;
-    let scores: Vec<(f32, f64)> = angles
-        .par_iter()
-        .map(|&deg| (deg, score_angle(&small, deg)))
-        .collect();
-
-    let (best_deg, best_score) =
-        scores
-            .iter()
-            .copied()
-            .fold((0.0_f32, f64::NEG_INFINITY), |(bd, bs), (d, s)| {
-                if s > bs { (d, s) } else { (bd, bs) }
-            });
+    let (best_deg, best_score) = (0..SWEEP_STEPS)
+        .into_par_iter()
+        .map(|i| {
+            let deg = -MAX_SEARCH_DEG + i as f32 * step;
+            (deg, score_angle(&small, deg))
+        })
+        .reduce(
+            || (0.0_f32, f64::NEG_INFINITY),
+            |(bd, bs), (d, s)| if s > bs { (d, s) } else { (bd, bs) },
+        );
 
     // Sanity check: if best score is too low the page is likely blank or has
     // no horizontal text structure — return 0 rather than a noisy estimate.
@@ -91,10 +87,10 @@ pub fn find_skew_deg(img: &Bitmap<Gray8>) -> f32 {
     refine(&small, best_deg, step / 2.0)
 }
 
-/// Refine the angle estimate by binary search.
+/// Refine the angle estimate by iterative interval shrinkage.
 ///
-/// Evaluates the score at `centre ± delta` and moves toward the better side,
-/// halving `delta` each iteration until `delta < REFINE_STOP_DEG`.
+/// Evaluates the score at `centre ± delta`, moves toward the better side,
+/// and halves `delta` each iteration until `delta < REFINE_STOP_DEG`.
 fn refine(img: &Bitmap<Gray8>, mut centre: f32, mut delta: f32) -> f32 {
     while delta >= REFINE_STOP_DEG {
         let left = (centre - delta).clamp(-MAX_SEARCH_DEG, MAX_SEARCH_DEG);
@@ -133,8 +129,7 @@ fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
             // Sheared row index: y + round(x · tan θ), clamped to valid range.
             #[expect(
                 clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "shear_offset is bounded by shear_extent which fits usize"
+                reason = "offset ≤ shear_extent which is bounded by downsampled width × |tan(MAX_SEARCH_DEG)|, well within i32"
             )]
             let offset = (x as f32 * tan).round() as i32;
             let row_idx = (y as i32 + offset).clamp(0, (n_rows - 1) as i32) as usize;
@@ -145,7 +140,12 @@ fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
     // Differential square sum: Σ (s[i] - s[i-1])²
     // Skip the outermost rows to avoid shear-induced edge artefacts.
     let skip = (h / 20).max(1);
-    sums[skip..n_rows - skip]
+    debug_assert!(
+        n_rows >= 2 * skip,
+        "skip ({skip}) too large for n_rows ({n_rows}); increase DOWNSAMPLE or decrease SWEEP_STEPS"
+    );
+    let end = n_rows.saturating_sub(skip);
+    sums[skip..end]
         .windows(2)
         .map(|w| {
             let diff = w[1] as i64 - w[0] as i64;
@@ -159,7 +159,7 @@ fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
 /// Output pixel = average of the `factor × factor` block of source pixels.
 /// Strips bottom/right partial blocks so output dimensions are exact integers.
 fn downsample(src: &Bitmap<Gray8>, factor: u32) -> Bitmap<Gray8> {
-    assert!(factor > 0, "downsample factor must be ≥ 1");
+    debug_assert!(factor > 0, "downsample factor must be ≥ 1");
     let ow = src.width / factor;
     let oh = src.height / factor;
     if ow == 0 || oh == 0 {
@@ -198,15 +198,13 @@ fn downsample(src: &Bitmap<Gray8>, factor: u32) -> Bitmap<Gray8> {
 mod tests {
     use super::*;
 
-    /// A blank white image has no text structure; detection should return 0.
+    /// A solid black image has uniform foreground weight — projection scores are flat
+    /// and detection returns 0 (score below `min_reliable`) or a noise value in range.
     #[test]
-    fn blank_page_returns_zero() {
+    fn black_image_returns_zero_or_in_range() {
         let img = Bitmap::<Gray8>::new(256, 256, 1, false);
-        // new() zero-initialises (black); make it white.
-        // We don't have a fill API, so just test that find_skew_deg doesn't panic.
+        // Bitmap::new zero-initialises to black (all pixels = 0).
         let angle = find_skew_deg(&img);
-        // Black image has maximum weight everywhere — score will be flat → 0.0 or noise.
-        // Either way it must not panic and must be within search range.
         assert!(angle.abs() <= MAX_SEARCH_DEG + 0.01);
     }
 

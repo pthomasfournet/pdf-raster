@@ -191,6 +191,13 @@ impl RasterSession {
     }
 }
 
+// Compile-time assertion: RasterSession must be Sync (shared across rayon threads).
+// If lopdf::Document ever becomes !Sync this will fail here rather than silently misbehave.
+const _: fn() = || {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<RasterSession>();
+};
+
 /// Open a PDF and create a [`RasterSession`] for rendering.
 ///
 /// Eagerly builds the page-ID map so repeated per-page calls are O(1) lookups
@@ -201,8 +208,9 @@ impl RasterSession {
 /// Returns [`RasterError::Pdf`] if the file cannot be opened or parsed.
 pub fn open_session(path: &std::path::Path) -> Result<RasterSession, RasterError> {
     let doc = pdf_interp::open(path).map_err(RasterError::from)?;
-    let total_pages = pdf_interp::page_count(&doc);
+    // Build the page map once; derive total_pages from it to avoid a second get_pages() call.
     let pages = doc.get_pages();
+    let total_pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     let gpu_ctx = match gpu::GpuCtx::new() {
@@ -250,10 +258,12 @@ pub fn render_page_rgb(
     page_num: u32,
     scale: f64,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
-    // A non-positive or non-finite scale is a caller error; catch it explicitly
-    // so the error message names the real cause rather than "degenerate dimensions".
+    // A non-positive or non-finite scale is a caller error; return InvalidOptions
+    // so callers can distinguish this from a genuinely malformed page MediaBox.
     if !scale.is_finite() || scale <= 0.0 {
-        return Err(RasterError::PageDegenerate { width: 0, height: 0 });
+        return Err(RasterError::InvalidOptions(format!(
+            "scale must be a positive finite number, got {scale}"
+        )));
     }
 
     let doc = &session.doc;
@@ -263,7 +273,8 @@ pub fn render_page_rgb(
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "page dimensions × scale are always positive and ≪ u32::MAX"
+        reason = "scale and dimensions are positive; f64-to-u32 saturates at u32::MAX for \
+                  adversarial values, which the MAX_PX_DIMENSION check below catches"
     )]
     let (w_px, h_px) = (
         (geom.width_pts * scale).round() as u32,
@@ -295,8 +306,8 @@ pub fn render_page_rgb(
 
     #[expect(
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "scale = dpi/72 is always positive; result ≪ f32::MAX"
+        reason = "scale = dpi/72 is always positive and small; f64→f32 precision loss is \
+                  negligible for sub-pixel rounding at any practical DPI"
     )]
     let scale_f32 = scale as f32;
 
@@ -412,10 +423,12 @@ impl Iterator for PageIter {
         match self.state.as_mut()? {
             Err(_) => {
                 // Document-open error: take it out (sets state → None), yield once.
-                // first_page is unknown here — use 1 as a placeholder.
-                // The caller only cares about the Err payload, not the page number.
-                let err = self.state.take()?.map(|_| unreachable!());
-                Some((1, err))
+                // Use page 1 as a placeholder; the caller cares about the Err, not the number.
+                let e = match self.state.take()? {
+                    Err(e) => e,
+                    Ok(_) => unreachable!("matched Err arm above"),
+                };
+                Some((1, Err(e)))
             }
             Ok(state) => {
                 if state.current_page > state.opts.last_page

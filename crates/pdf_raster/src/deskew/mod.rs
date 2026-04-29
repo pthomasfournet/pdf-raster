@@ -13,6 +13,8 @@
 //! 2. **Rotation** (`rotate` module) — bilinear rotation by the detected angle.
 //!    GPU path (CUDA NPP `nppiRotate`) when the `gpu-deskew` feature is enabled
 //!    and a CUDA device is available; CPU bilinear fallback otherwise.
+//!    Rotation is clockwise-positive: a detected CCW tilt of +θ° is corrected
+//!    by passing +θ° to `rotate_inplace` (CW rotation by θ°).
 //!
 //! # Usage
 //!

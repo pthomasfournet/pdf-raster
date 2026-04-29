@@ -1,6 +1,6 @@
 //! Image rotation for deskew correction.
 //!
-//! Rotates an 8-bit grayscale bitmap by a given angle (in degrees, CCW positive)
+//! Rotates an 8-bit grayscale bitmap by a given angle (in degrees, CW positive)
 //! using bilinear interpolation.  Background pixels introduced by the rotation
 //! are set to 255 (white — scanner background convention).
 //!
@@ -19,7 +19,7 @@ use raster::Bitmap;
 
 use super::DeskewError;
 
-/// Rotate `img` in-place by `angle_deg` degrees (counter-clockwise positive).
+/// Rotate `img` in-place by `angle_deg` degrees (clockwise positive).
 ///
 /// The image is replaced with a new bitmap of the same dimensions containing
 /// the rotated content.  Out-of-bounds source pixels are filled with 255 (white).
@@ -27,8 +27,8 @@ use super::DeskewError;
 /// # Errors
 ///
 /// Returns [`DeskewError`] if GPU allocation fails and CPU fallback is also
-/// unavailable (extremely unlikely — CPU path has no allocation that can fail
-/// beyond `Vec` OOM, which aborts).
+/// unavailable (extremely unlikely — the CPU path has no allocation that can fail
+/// beyond `Vec` OOM, which panics).
 pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), DeskewError> {
     #[cfg(feature = "gpu-deskew")]
     if let Ok(rotated) = rotate_gpu(img, angle_deg) {
@@ -40,12 +40,12 @@ pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), Des
     Ok(())
 }
 
-/// CPU bilinear rotation.
+/// CPU bilinear rotation (clockwise-positive).
 ///
 /// Uses inverse mapping: for each output pixel `(ox, oy)`, compute the
-/// corresponding source coordinates `(sx, sy)` by applying the inverse
-/// rotation matrix centred on the image centre, then bilinear-interpolate
-/// from the four surrounding source pixels.
+/// corresponding source coordinates `(sx, sy)` by applying a CW rotation
+/// matrix centred on the image centre, then bilinear-interpolate from the
+/// four surrounding source pixels.
 ///
 /// Out-of-bounds source pixels are filled with 255 (white).  The rightmost
 /// and bottom source columns/rows are treated as out-of-bounds because bilinear

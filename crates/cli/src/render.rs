@@ -36,7 +36,7 @@ impl std::fmt::Display for RenderError {
             Self::Raster(e) => write!(f, "render error: {e}"),
             Self::Encode(e) => write!(f, "encode error: {e}"),
             Self::UnsupportedFormatCombination { output } => {
-                write!(f, "output format {output:?} is not yet supported")
+                write!(f, "output format {output} is not yet supported")
             }
         }
     }
@@ -140,7 +140,10 @@ pub fn render_page(
         return encode_result;
     }
 
-    fs::rename(&tmp_path, &out_path)?;
+    fs::rename(&tmp_path, &out_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        RenderError::Io(e)
+    })?;
     Ok(())
 }
 

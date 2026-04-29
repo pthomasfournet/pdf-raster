@@ -2,10 +2,20 @@
 
 use clap::Parser;
 
+/// Parser that rejects non-positive or non-finite DPI values at the CLI boundary.
+fn parse_positive_dpi(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a valid number"))?;
+    if v.is_finite() && v > 0.0 {
+        Ok(v)
+    } else {
+        Err(format!("DPI must be a positive finite number, got {s}"))
+    }
+}
+
 /// Rust replacement for pdftoppm — renders PDF pages to images.
 #[derive(Parser, Debug)]
 #[command(name = "pdf-raster", about, long_about = None)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools, reason = "CLI mirrors all pdftoppm flags; each bool maps to a distinct flag")]
 pub struct Args {
     /// Input PDF file ("-" for stdin).
     pub input: String,
@@ -28,28 +38,33 @@ pub struct Args {
     pub last_page: Option<i32>,
 
     /// Render only odd pages.
-    #[arg(short = 'o', long = "odd", default_value_t = false)]
+    #[arg(short = 'o', long = "odd")]
     pub odd_only: bool,
 
     /// Render only even pages.
-    #[arg(short = 'e', long = "even", default_value_t = false)]
+    #[arg(short = 'e', long = "even")]
     pub even_only: bool,
 
     /// Stop after rendering the first matching page (single-file output).
-    #[arg(long = "singlefile", default_value_t = false)]
+    #[arg(long = "singlefile")]
     pub single_file: bool,
 
     // ── Resolution / scaling ─────────────────────────────────────────────────
     /// Render resolution in DPI (both axes, default 150).
-    #[arg(short = 'r', long = "resolution", value_name = "DPI")]
+    #[arg(
+        short = 'r',
+        long = "resolution",
+        value_name = "DPI",
+        value_parser = parse_positive_dpi
+    )]
     pub resolution: Option<f64>,
 
     /// Horizontal resolution in DPI (overrides -r).
-    #[arg(long = "rx", value_name = "DPI")]
+    #[arg(long = "rx", value_name = "DPI", value_parser = parse_positive_dpi)]
     pub resolution_x: Option<f64>,
 
     /// Vertical resolution in DPI (overrides -r).
-    #[arg(long = "ry", value_name = "DPI")]
+    #[arg(long = "ry", value_name = "DPI", value_parser = parse_positive_dpi)]
     pub resolution_y: Option<f64>,
 
     /// Scale output so the longest edge is this many pixels (preserves aspect).
@@ -82,36 +97,41 @@ pub struct Args {
     pub crop_h: Option<u32>,
 
     /// Use the PDF crop box instead of the media box.
-    #[arg(long = "cropbox", default_value_t = false)]
+    #[arg(long = "cropbox")]
     pub use_cropbox: bool,
 
     // ── Output format ────────────────────────────────────────────────────────
     /// Output PNG (default: PPM).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub png: bool,
 
     /// Output JPEG.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub jpeg: bool,
 
     /// Output JPEG in CMYK colour space.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub jpegcmyk: bool,
 
     /// Output TIFF.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub tiff: bool,
 
     /// Output grey-scale PPM/PNG.
-    #[arg(long = "gray", default_value_t = false)]
+    #[arg(long = "gray")]
     pub gray: bool,
 
     /// Output 1-bit mono PPM/PNG.
-    #[arg(long = "mono", default_value_t = false)]
+    #[arg(long = "mono")]
     pub mono: bool,
 
     /// JPEG quality 0-100 (default 75).
-    #[arg(long = "jpegopt", value_name = "QUALITY", default_value_t = 75)]
+    #[arg(
+        long = "jpegopt",
+        value_name = "QUALITY",
+        default_value_t = 75,
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
     pub jpeg_quality: u8,
 
     // ── Rendering options ────────────────────────────────────────────────────
@@ -124,11 +144,11 @@ pub struct Args {
     pub vector_antialias: AaFlag,
 
     /// Hide PDF annotations.
-    #[arg(long = "hide-annotations", default_value_t = false)]
+    #[arg(long = "hide-annotations")]
     pub hide_annotations: bool,
 
     /// Enable overprint preview.
-    #[arg(long = "overprint", default_value_t = false)]
+    #[arg(long = "overprint")]
     pub overprint: bool,
 
     /// Thin line rendering mode (default, solid, shape).
@@ -160,7 +180,7 @@ pub struct Args {
 
     // ── Progress ─────────────────────────────────────────────────────────────
     /// Print progress to stderr: pages done, elapsed time, and ETA.
-    #[arg(short = 'P', long = "progress", default_value_t = false)]
+    #[arg(short = 'P', long = "progress")]
     pub progress: bool,
 }
 
@@ -220,6 +240,17 @@ pub enum OutputFormat {
     Jpeg,
     /// TIFF.
     Tiff,
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ppm => f.write_str("PPM"),
+            Self::Png => f.write_str("PNG"),
+            Self::Jpeg => f.write_str("JPEG"),
+            Self::Tiff => f.write_str("TIFF"),
+        }
+    }
 }
 
 impl OutputFormat {
