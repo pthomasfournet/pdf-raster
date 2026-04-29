@@ -31,9 +31,10 @@ fn main() {
     let kernels_dir = PathBuf::from("kernels");
 
     println!("cargo:rerun-if-changed=kernels/");
-    println!("cargo:rerun-if-changed=shim/");
+    println!("cargo:rerun-if-changed=shim/nvjpeg2k_shim.cpp");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=NVJPEG2K_INCLUDE_DIR");
 
     let nvcc_path = env::var("NVCC").unwrap_or_else(|_| {
         for path in ["/usr/local/cuda-12.8/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
@@ -93,9 +94,9 @@ fn main() {
 
         // Compile the C++ exception-boundary shim.  nvjpeg2k throws C++
         // exceptions on malformed codestreams; those cannot propagate through
-        // Rust extern "C" FFI (undefined behaviour).  The shim wraps the two
-        // throwing entry points in try/catch and maps any exception to
-        // NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9).
+        // Rust extern "C" FFI (undefined behaviour).  The shim wraps all
+        // nvjpeg2k entry points that may throw in try/catch and maps any
+        // exception to NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9).
         compile_nvjpeg2k_shim(&out_dir, nvcc);
         println!("cargo:rustc-link-lib=static=nvjpeg2k_shim");
         // The shim uses C++ exception handling; link the C++ runtime.
@@ -139,10 +140,18 @@ fn main() {
 /// Compile `shim/nvjpeg2k_shim.cpp` into a static library `libnvjpeg2k_shim.a`
 /// placed in `OUT_DIR`.  Uses nvcc as the C++ compiler so the include path for
 /// nvjpeg2k headers is automatically available, and links with -lstdc++.
+///
+/// The include directory defaults to `/usr/include/libnvjpeg2k/12` but can be
+/// overridden via the `NVJPEG2K_INCLUDE_DIR` environment variable (useful for
+/// non-standard installations or CI).
 fn compile_nvjpeg2k_shim(out_dir: &Path, nvcc: &str) {
     let shim_src = PathBuf::from("shim/nvjpeg2k_shim.cpp");
     let shim_obj = out_dir.join("nvjpeg2k_shim.o");
     let shim_lib = out_dir.join("libnvjpeg2k_shim.a");
+    let out_dir_s = out_dir.to_str().expect("OUT_DIR path non-UTF-8");
+
+    let include_dir = env::var("NVJPEG2K_INCLUDE_DIR")
+        .unwrap_or_else(|_| "/usr/include/libnvjpeg2k/12".to_owned());
 
     // Compile the C++ source to an object file.
     let status = Command::new(nvcc)
@@ -150,7 +159,7 @@ fn compile_nvjpeg2k_shim(out_dir: &Path, nvcc: &str) {
             "-x",
             "c++", // treat as C++ (nvcc default for .cpp)
             "-O2",
-            "-I/usr/include/libnvjpeg2k/12",
+            &format!("-I{include_dir}"),
             "-c",
             "-o",
             shim_obj.to_str().expect("OUT_DIR path non-UTF-8"),
@@ -169,10 +178,10 @@ fn compile_nvjpeg2k_shim(out_dir: &Path, nvcc: &str) {
         ])
         .status()
         .unwrap_or_else(|e| panic!("failed to run ar for nvjpeg2k shim: {e}"));
-    assert!(status.success(), "ar failed to archive nvjpeg2k_shim.o");
-
-    println!(
-        "cargo:rustc-link-search=native={}",
-        out_dir.to_str().expect("OUT_DIR path non-UTF-8")
+    assert!(
+        status.success(),
+        "ar failed to archive nvjpeg2k_shim.o into libnvjpeg2k_shim.a"
     );
+
+    println!("cargo:rustc-link-search=native={out_dir_s}");
 }

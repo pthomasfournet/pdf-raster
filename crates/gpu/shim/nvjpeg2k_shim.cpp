@@ -1,8 +1,12 @@
-// C++ shim: wraps nvjpeg2kStreamParse and nvjpeg2kDecode in try/catch so that
-// C++ exceptions thrown by the library cannot propagate through Rust FFI
-// (which is undefined behaviour).  Any exception is caught and converted to
+// C++ shim: wraps all nvjpeg2k entry points that may throw in try/catch so
+// that C++ exceptions cannot propagate through Rust FFI (undefined behaviour).
+// Any exception is caught and converted to
 // NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9), causing the Rust caller
 // to fall back to the CPU OpenJPEG path.
+//
+// NOTE: catch (...) catches C++ exceptions only.  On Linux with GCC/Clang this
+// covers std::exception and its subclasses (including nvjpeg2k::ExceptionJPEG).
+// POSIX signals and hardware faults are not catchable here.
 
 #include <nvjpeg2k.h>
 
@@ -88,6 +92,38 @@ nvjpeg2k_shim_stream_get_image_component_info(nvjpeg2kStream_t stream,
 {
     try {
         return nvjpeg2kStreamGetImageComponentInfo(stream, comp_info, component_id);
+    } catch (...) {
+        return NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED;
+    }
+}
+
+// Destroy functions are not documented to throw, but are shimmed for
+// defence-in-depth: they are called from Drop (which must not unwind).
+nvjpeg2kStatus_t
+nvjpeg2k_shim_destroy(nvjpeg2kHandle_t handle)
+{
+    try {
+        return nvjpeg2kDestroy(handle);
+    } catch (...) {
+        return NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED;
+    }
+}
+
+nvjpeg2kStatus_t
+nvjpeg2k_shim_decode_state_destroy(nvjpeg2kDecodeState_t decode_state)
+{
+    try {
+        return nvjpeg2kDecodeStateDestroy(decode_state);
+    } catch (...) {
+        return NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED;
+    }
+}
+
+nvjpeg2kStatus_t
+nvjpeg2k_shim_stream_destroy(nvjpeg2kStream_t stream)
+{
+    try {
+        return nvjpeg2kStreamDestroy(stream);
     } catch (...) {
         return NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED;
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# bench.sh — throughput comparison: pdftoppm vs pdf-raster.
+# bench.sh — throughput comparison: pdftoppm vs pdf-raster (+ optional extras).
 #
-# For each fixture PDF and each DPI, runs hyperfine with both commands
+# For each fixture PDF and each DPI, runs hyperfine with all enabled commands
 # rendering the same page range and reports wall-clock time + pages/sec.
 #
 # Usage:
@@ -15,9 +15,11 @@
 #   -w N            Hyperfine warmup runs per benchmark (default: 1)
 #   -c N            Hyperfine measurement runs per benchmark (default: 5)
 #   -o FILE         Write JSON results to FILE (default: bench/bench-results.json)
+#   -e              Include extra rasterisers: Ghostscript (gs) and MuPDF (mutool)
 #   -d              Dry run: print hyperfine commands without executing them
 #
 # Requires: hyperfine, pdftoppm, pdf-raster (release build), python3
+# With -e: also requires gs (Ghostscript) and mutool (MuPDF)
 
 set -euo pipefail
 
@@ -34,6 +36,7 @@ LAST_PAGE=5
 WARMUP=1
 RUNS=5
 JSON_OUT="${SCRIPT_DIR}/bench-results.json"
+EXTRAS=false
 DRY_RUN=false
 
 usage() {
@@ -44,7 +47,7 @@ usage() {
 die() { echo "Error: $*" >&2; exit 1; }
 is_positive_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 
-while getopts ":r:f:p:l:w:c:o:dh" opt; do
+while getopts ":r:f:p:l:w:c:o:edh" opt; do
     case $opt in
         r) DPI_LIST="$OPTARG" ;;
         f) FIXTURES_DIR="$OPTARG" ;;
@@ -53,6 +56,7 @@ while getopts ":r:f:p:l:w:c:o:dh" opt; do
         w) WARMUP="$OPTARG" ;;
         c) RUNS="$OPTARG" ;;
         o) JSON_OUT="$OPTARG" ;;
+        e) EXTRAS=true ;;
         d) DRY_RUN=true ;;
         h) usage ;;
         :) die "option -$OPTARG requires an argument." ;;
@@ -69,6 +73,11 @@ is_positive_int "$RUNS"      || die "-c must be a positive integer, got: $RUNS"
 for cmd in hyperfine pdftoppm python3; do
     command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found in PATH"
 done
+if $EXTRAS; then
+    for cmd in gs mutool; do
+        command -v "$cmd" >/dev/null 2>&1 || die "-e requires $cmd but it was not found in PATH"
+    done
+fi
 [[ -x "$RASTER_BIN" ]] || {
     echo "Error: pdf-raster not built at $RASTER_BIN" >&2
     echo "  Run: cargo build --release -p pdf-raster" >&2
@@ -105,6 +114,14 @@ if $DRY_RUN; then
             echo "  hyperfine --warmup ${WARMUP} --runs ${RUNS} --export-json ${frag} \\"
             echo "    --command-name 'pdftoppm  @${dpi}dpi' '${ref_cmd}' \\"
             echo "    --command-name 'pdf-raster@${dpi}dpi' '${new_cmd}'"
+            if $EXTRAS; then
+                # gs: ppmraw device, quiet mode (-q), batch (-dBATCH -dNOPAUSE)
+                gs_cmd="gs -q -sDEVICE=ppmraw -r${dpi} -dNOPAUSE -dBATCH -dFirstPage=1 -dLastPage=${LAST_PAGE} -sOutputFile=<TMP>/gs/pg_%d.ppm ${pdf}"
+                # mutool: draw subcommand, ppm format, page range 1-N
+                mut_cmd="mutool draw -q -r ${dpi} -F ppm -o <TMP>/mut/pg_%d.ppm ${pdf} 1-${LAST_PAGE}"
+                echo "    --command-name 'gs        @${dpi}dpi' '${gs_cmd}' \\"
+                echo "    --command-name 'mutool    @${dpi}dpi' '${mut_cmd}'"
+            fi
             echo ""
         done
     done
@@ -118,8 +135,11 @@ trap 'rm -rf "$OUT_DIR"' EXIT
 
 json_fragments=()
 
+extras_label=""
+$EXTRAS && extras_label=" + gs + mutool"
+
 echo "══════════════════════════════════════════════════════════════════════════"
-printf " Benchmark: pdftoppm vs pdf-raster\n"
+printf " Benchmark: pdftoppm vs pdf-raster%s\n" "$extras_label"
 printf " Fixtures:  %s\n" "$FIXTURES_DIR"
 printf " DPIs:      %s\n" "$DPI_LIST"
 printf " Pages:     1-%s per run\n" "$LAST_PAGE"
@@ -144,17 +164,40 @@ for pdf in "${pdf_files[@]}"; do
         new_cmd="${RASTER_BIN} -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} ${new_out}/pg"
         frag_file="${OUT_DIR}/frag_${pdf_name//[^a-zA-Z0-9]/_}_${dpi}.json"
 
-        hyperfine \
-            --warmup "$WARMUP" \
-            --runs "$RUNS" \
-            --export-json "$frag_file" \
-            --command-name "pdftoppm  @${dpi}dpi" "$ref_cmd" \
+        # Build the hyperfine invocation; extra rasterisers are appended when -e is set.
+        hyperfine_args=(
+            --warmup "$WARMUP"
+            --runs "$RUNS"
+            --export-json "$frag_file"
+            --command-name "pdftoppm  @${dpi}dpi" "$ref_cmd"
             --command-name "pdf-raster@${dpi}dpi" "$new_cmd"
+        )
 
+        if $EXTRAS; then
+            gs_out="${OUT_DIR}/gs_${dpi}"
+            mut_out="${OUT_DIR}/mut_${dpi}"
+            mkdir -p "$gs_out" "$mut_out"
+
+            # Ghostscript: ppmraw device, quiet (-q), batch mode, per-page output files.
+            gs_cmd="gs -q -sDEVICE=ppmraw -r${dpi} -dNOPAUSE -dBATCH \
+                -dFirstPage=1 -dLastPage=${LAST_PAGE} \
+                -sOutputFile=${gs_out}/pg_%d.ppm ${pdf}"
+            # MuPDF mutool: draw subcommand, ppm output, page range 1-N, quiet.
+            mut_cmd="mutool draw -q -r ${dpi} -F ppm \
+                -o ${mut_out}/pg_%d.ppm ${pdf} 1-${LAST_PAGE}"
+
+            hyperfine_args+=(
+                --command-name "gs        @${dpi}dpi" "$gs_cmd"
+                --command-name "mutool    @${dpi}dpi" "$mut_cmd"
+            )
+        fi
+
+        hyperfine "${hyperfine_args[@]}"
         json_fragments+=("$frag_file")
 
         # Discard rendered pages to keep disk usage bounded on large fixtures.
         rm -rf "$ref_out" "$new_out"
+        $EXTRAS && rm -rf "${OUT_DIR}/gs_${dpi}" "${OUT_DIR}/mut_${dpi}"
     done
 done
 
@@ -187,6 +230,7 @@ echo ""
 echo "── Pages/second summary ─────────────────────────────────────────────────"
 python3 - "$JSON_OUT" "$LAST_PAGE" <<'PYEOF'
 import json, sys
+from collections import defaultdict
 
 with open(sys.argv[1]) as fh:
     data = json.load(fh)
@@ -198,28 +242,42 @@ if not results:
     print("  (no results)", file=sys.stderr)
     sys.exit(0)
 
-print(f"  {'Command':<30} {'Mean (s)':>9} {'Pages/s':>10} {'vs ref':>8}")
-print(f"  {'-'*30} {'-'*9} {'-'*10} {'-'*8}")
+# Group by the DPI label (the "@NNNdpi" suffix) so the table is readable
+# when multiple rasterisers and DPIs are in the same run.
+def dpi_key(r):
+    name = r["command"]
+    return name.split("@")[1] if "@" in name else ""
 
-# Build ref lookup before printing so ordering in the JSON doesn't matter.
+groups = defaultdict(list)
+for r in results:
+    groups[dpi_key(r)].append(r)
+
+# Build pdftoppm reference times per DPI key for the "vs ref" column.
 ref_times = {
-    r["command"].split("@")[1]: r["mean"]
+    dpi_key(r): r["mean"]
     for r in results
-    if r["command"].startswith("pdftoppm") and "@" in r["command"]
+    if r["command"].strip().startswith("pdftoppm") and "@" in r["command"]
 }
 
-for r in results:
-    name = r["command"]
-    mean = r["mean"]
-    pps  = last_page / mean
-    label = name.split("@")[1] if "@" in name else ""
-    is_ref = name.startswith("pdftoppm")
+hdr = f"  {'Command':<32} {'Mean (s)':>9} {'Pages/s':>10} {'vs pdftoppm':>13}"
+sep = f"  {'-'*32} {'-'*9} {'-'*10} {'-'*13}"
 
-    speedup = ""
-    if not is_ref and label in ref_times and ref_times[label] > 0:
-        speedup = f"{ref_times[label] / mean:+.2f}×"
-
-    print(f"  {name:<30} {mean:>9.3f} {pps:>10.1f} {speedup:>8}")
+for group_label in sorted(groups):
+    print()
+    print(f"  ── {group_label} {'─'*50}" if group_label else "  ──")
+    print(hdr)
+    print(sep)
+    ref_t = ref_times.get(group_label, 0.0)
+    for r in groups[group_label]:
+        name = r["command"]
+        mean = r["mean"]
+        pps  = last_page / mean
+        is_ref = name.strip().startswith("pdftoppm")
+        if is_ref or ref_t <= 0:
+            speedup = "  (ref)" if is_ref else ""
+        else:
+            speedup = f"{ref_t / mean:.2f}×"
+        print(f"  {name:<32} {mean:>9.3f} {pps:>10.1f} {speedup:>13}")
 PYEOF
 
 echo ""
