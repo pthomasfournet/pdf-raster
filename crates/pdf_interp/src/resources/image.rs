@@ -36,10 +36,10 @@
 //!
 //! When the crate is built with `--features nvjpeg2k`, `JPXDecode` streams
 //! with pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`] are decoded on the GPU via
-//! NVIDIA nvJPEG2000 instead of `jpeg2k`/OpenJPEG.  Pass an
+//! NVIDIA nvJPEG2000 instead of `jpeg2k`/`OpenJPEG`.  Pass an
 //! [`NvJpeg2kDecoder`] to [`resolve_image`] to enable this path; pass `None`
 //! for CPU-only behaviour.  Only 1- and 3-component images are accelerated;
-//! CMYK and other multi-channel images always fall through to OpenJPEG.
+//! CMYK and other multi-channel images always fall through to `OpenJPEG`.
 
 use std::borrow::Cow;
 
@@ -81,7 +81,7 @@ pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
 ///
 /// Below this threshold `PCIe` transfer overhead dominates and CPU
-/// `jpeg2k`/OpenJPEG is faster.  512 × 512 = 262 144 pixels — same crossover
+/// `jpeg2k`/`OpenJPEG` is faster.  512 × 512 = 262 144 pixels — same crossover
 /// as nvJPEG; JPEG 2000 decode is CPU-bound at similar pixel counts.
 #[cfg(feature = "nvjpeg2k")]
 pub const GPU_JPEG2K_THRESHOLD_PX: u32 = 262_144;
@@ -1788,11 +1788,11 @@ fn cmyk_raw_to_rgb(
 /// (pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`]) are decoded on the GPU via
 /// nvJPEG2000.  All other images, and any image for which the GPU path fails
 /// (unsupported component count, CUDA error, etc.), fall through to the CPU
-/// `jpeg2k`/OpenJPEG path.
+/// `jpeg2k`/`OpenJPEG` path.
 ///
 /// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
 /// format (`.jp2`).  Both the GPU path (nvJPEG2000 via `nvjpeg2kStreamParse`)
-/// and the CPU path (`jpeg2k`/OpenJPEG) auto-detect the format from the stream.
+/// and the CPU path (`jpeg2k`/`OpenJPEG`) auto-detect the format from the stream.
 ///
 /// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
 fn decode_jpx(

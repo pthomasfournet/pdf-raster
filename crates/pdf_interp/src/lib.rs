@@ -173,13 +173,33 @@ pub fn page_count(doc: &Document) -> u32 {
     u32::try_from(doc.get_pages().len()).unwrap_or(u32::MAX)
 }
 
-/// Return the `MediaBox` dimensions (`width_pts`, `height_pts`) for page `page_num` (1-based).
+/// Page geometry: visible dimensions in PDF points and the clockwise rotation angle.
 ///
-/// Falls back to US Letter (612 × 792 pt) if the `MediaBox` cannot be read.
+/// `width_pts` and `height_pts` are already adjusted for rotation — they describe the
+/// output bitmap dimensions, not the raw `MediaBox`.  For example a landscape page with
+/// `/Rotate 270` has `width_pts > height_pts` even though its `MediaBox` may be portrait.
+#[derive(Debug, Clone, Copy)]
+pub struct PageGeometry {
+    /// Width of the rendered output in PDF points (after rotation).
+    pub width_pts: f64,
+    /// Height of the rendered output in PDF points (after rotation).
+    pub height_pts: f64,
+    /// Clockwise rotation in degrees; always one of 0, 90, 180, 270.
+    pub rotate_cw: u16,
+}
+
+/// Return the geometry for page `page_num` (1-based).
+///
+/// Reads the page's `CropBox` (the display region, per ISO 32000-2 §14.11.2), falling back
+/// to `MediaBox` when absent. Applies the `/Rotate` entry (multiples of 90° CW). Dimensions
+/// in the returned struct are already swapped for 90°/270° rotations so callers can use
+/// `width_pts × height_pts` directly as output pixel dimensions.
+///
+/// Falls back to US Letter (612 × 792 pt, no rotation) when neither box can be read.
 ///
 /// # Errors
 /// Returns [`InterpError::PageOutOfRange`] if the page number is invalid.
-pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<(f64, f64), InterpError> {
+pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, InterpError> {
     let total = page_count(doc);
     if page_num == 0 || page_num > total {
         return Err(InterpError::PageOutOfRange {
@@ -193,15 +213,14 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<(f64, f64), Interp
         total,
     })?;
 
-    let fallback = (612.0, 792.0); // US Letter
+    let fallback = PageGeometry {
+        width_pts: 612.0,
+        height_pts: 792.0,
+        rotate_cw: 0,
+    };
 
     let Ok(dict) = doc.get_dictionary(page_id) else {
         return Ok(fallback);
-    };
-
-    let media_box = match dict.get(b"MediaBox") {
-        Ok(lopdf::Object::Array(arr)) if arr.len() == 4 => arr,
-        _ => return Ok(fallback),
     };
 
     #[expect(
@@ -214,18 +233,55 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<(f64, f64), Interp
         _ => 0.0,
     };
 
-    let x0 = to_f64(&media_box[0]);
-    let y0 = to_f64(&media_box[1]);
-    let x1 = to_f64(&media_box[2]);
-    let y1 = to_f64(&media_box[3]);
+    let box_wh = |key: &[u8]| -> Option<(f64, f64)> {
+        let arr = match dict.get(key) {
+            Ok(lopdf::Object::Array(a)) if a.len() == 4 => a,
+            _ => return None,
+        };
+        let (x0, y0, x1, y1) = (
+            to_f64(&arr[0]),
+            to_f64(&arr[1]),
+            to_f64(&arr[2]),
+            to_f64(&arr[3]),
+        );
+        let w = (x1 - x0).abs();
+        let h = (y1 - y0).abs();
+        if w > 0.0 && h > 0.0 {
+            Some((w, h))
+        } else {
+            None
+        }
+    };
 
-    let w = (x1 - x0).abs();
-    let h = (y1 - y0).abs();
-    if w > 0.0 && h > 0.0 {
-        Ok((w, h))
+    // CropBox is the display box — the region actually shown to the viewer.
+    // Falls back to MediaBox when CropBox is absent (spec: CropBox defaults to MediaBox).
+    let Some((w_pts, h_pts)) = box_wh(b"CropBox").or_else(|| box_wh(b"MediaBox")) else {
+        return Ok(fallback);
+    };
+
+    // /Rotate is a multiple of 90 (CW). Normalise to 0/90/180/270.
+    // rem_euclid(360) is always 0..=359, which fits u16.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rem_euclid(360) is always 0..=359, which fits u16"
+    )]
+    let rotate_cw: u16 = match dict.get(b"Rotate") {
+        Ok(lopdf::Object::Integer(n)) => (*n).rem_euclid(360) as u16 / 90 * 90,
+        _ => 0,
+    };
+
+    // Swap dimensions for 90°/270° so the caller gets output-bitmap dimensions directly.
+    let (width_pts, height_pts) = if rotate_cw == 90 || rotate_cw == 270 {
+        (h_pts, w_pts)
     } else {
-        Ok(fallback)
-    }
+        (w_pts, h_pts)
+    };
+
+    Ok(PageGeometry {
+        width_pts,
+        height_pts,
+        rotate_cw,
+    })
 }
 
 /// Parse the content stream for page `page_num` (1-based) and return the

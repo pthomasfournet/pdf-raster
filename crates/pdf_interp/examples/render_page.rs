@@ -27,17 +27,21 @@ fn main() {
         std::process::exit(1);
     });
 
-    let (w_pts, h_pts) = pdf_interp::page_size_pts(&doc, page).expect("page size");
-    println!("Page {page} size: {w_pts:.1} × {h_pts:.1} pt");
+    let geom = pdf_interp::page_size_pts(&doc, page).expect("page size");
+    println!(
+        "Page {page} size: {:.1} × {:.1} pt (rotate {}°)",
+        geom.width_pts, geom.height_pts, geom.rotate_cw
+    );
 
-    let w = (w_pts * dpi / 72.0).round() as u32;
-    let h = (h_pts * dpi / 72.0).round() as u32;
+    let scale = dpi / 72.0;
+    let w = (geom.width_pts * scale).round() as u32;
+    let h = (geom.height_pts * scale).round() as u32;
 
     let ops = pdf_interp::parse_page(&doc, page).expect("parse page");
     println!("Page {page}: {} operators", ops.len());
 
-    let scale = dpi / 72.0;
-    let mut renderer = pdf_interp::renderer::PageRenderer::new_scaled(w, h, scale, &doc, page_id);
+    let mut renderer =
+        pdf_interp::renderer::PageRenderer::new_scaled(w, h, scale, geom.rotate_cw, &doc, page_id);
     renderer.execute(&ops);
     let bitmap = renderer.finish();
 

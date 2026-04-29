@@ -268,8 +268,7 @@ fn resolve_function_based(
     page_h: f64,
 ) -> Option<(Box<dyn Pattern + Send + Sync>, [f64; 4])> {
     // Domain: [xmin, xmax, ymin, ymax] in user space. PDF spec default is [0,1,0,1].
-    let domain = read_f64_array(sh, b"Domain", 4)
-        .unwrap_or_else(|| vec![0.0, 1.0, 0.0, 1.0]);
+    let domain = read_f64_array(sh, b"Domain", 4).unwrap_or_else(|| vec![0.0, 1.0, 0.0, 1.0]);
     let (xd0, xd1, yd0, yd1) = (domain[0], domain[1], domain[2], domain[3]);
 
     if !xd0.is_finite() || !xd1.is_finite() || !yd0.is_finite() || !yd1.is_finite() {
@@ -317,8 +316,7 @@ fn resolve_function_based(
         .map(|col| {
             #[expect(clippy::cast_precision_loss, reason = "col < 64; exact in f64")]
             let ux = (col as f64 / gf).mul_add(xd1 - xd0, xd0);
-            let channels = eval_function(doc, fn_obj, ux, n)
-                .unwrap_or_else(|| vec![0.0; n]);
+            let channels = eval_function(doc, fn_obj, ux, n).unwrap_or_else(|| vec![0.0; n]);
             cs_to_rgb(cs, &channels)
         })
         .collect();
@@ -373,10 +371,7 @@ fn resolve_function_based(
         let (c0, r0) = (fx.floor() as usize, fy.floor() as usize);
         let c1 = (c0 + 1).min(g - 1);
         let r1 = (r0 + 1).min(g - 1);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "c0/r0 ≤ g-1=63; exact in f64"
-        )]
+        #[expect(clippy::cast_precision_loss, reason = "c0/r0 ≤ g-1=63; exact in f64")]
         let (wc, wr) = (fx - c0 as f64, fy - r0 as f64); // weights ∈ [0,1)
 
         let s00 = grid[r0 * g + c0];

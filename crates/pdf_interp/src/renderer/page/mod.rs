@@ -161,12 +161,14 @@ impl<'doc> PageRenderer<'doc> {
     /// `doc` and `page_id` are used to resolve font and resource dictionaries.
     #[must_use]
     pub fn new(width: u32, height: u32, doc: &'doc Document, page_id: ObjectId) -> Self {
-        Self::new_scaled(width, height, 1.0, doc, page_id)
+        Self::new_scaled(width, height, 1.0, 0, doc, page_id)
     }
 
     /// Create a renderer with an initial uniform scale in the CTM.
     ///
-    /// `scale = dpi / 72.0` maps PDF points to device pixels.
+    /// `scale = dpi / 72.0` maps PDF points to device pixels.  `rotate_cw` is
+    /// the page `/Rotate` value (one of 0, 90, 180, 270); the bitmap dimensions
+    /// must already be swapped for 90°/270° before calling this method.
     ///
     /// # Panics
     ///
@@ -177,6 +179,7 @@ impl<'doc> PageRenderer<'doc> {
         width: u32,
         height: u32,
         scale: f64,
+        rotate_cw: u16,
         doc: &'doc Document,
         page_id: ObjectId,
     ) -> Self {
@@ -189,9 +192,23 @@ impl<'doc> PageRenderer<'doc> {
         bitmap.data_mut().fill(255u8); // white background
 
         let mut gstate = GStateStack::new(width, height);
-        if (scale - 1.0).abs() > f64::EPSILON {
-            gstate.current_mut().ctm = [scale, 0.0, 0.0, scale, 0.0, 0.0];
-        }
+        // Build the initial CTM combining scale with the page rotation.
+        // The `to_device` helper applies an additional Y-flip (`height - dy`) so
+        // the formulas below account for that flip.  `w` and `h` are the output
+        // bitmap dimensions in points (`width_px / scale`, `height_px / scale`).
+        let w = f64::from(width) / scale;
+        let h = f64::from(height) / scale;
+        let ctm: [f64; 6] = match rotate_cw % 360 {
+            // Rotate 0: standard scale + y-flip handled by to_device.
+            0 => [scale, 0.0, 0.0, scale, 0.0, 0.0],
+            // Rotate 90 CW: swap axes. Width of bitmap = original H, height = original W.
+            90 => [0.0, -scale, -scale, 0.0, h * scale, w * scale],
+            // Rotate 180: flip both axes.
+            180 => [-scale, 0.0, 0.0, scale, w * scale, 0.0],
+            // Rotate 270 CW (= 90 CCW): swap axes, opposite orientation.
+            _ => [0.0, scale, scale, 0.0, 0.0, 0.0],
+        };
+        gstate.current_mut().ctm = ctm;
 
         let engine: SharedEngine =
             FontEngine::init(true, true, false).expect("FreeType initialisation failed");
@@ -235,7 +252,7 @@ impl<'doc> PageRenderer<'doc> {
     ///
     /// When set, `JPXDecode` image streams with pixel area ≥
     /// [`crate::resources::image::GPU_JPEG2K_THRESHOLD_PX`] are decoded on the
-    /// GPU via nvJPEG2000 rather than `jpeg2k`/OpenJPEG.
+    /// GPU via nvJPEG2000 rather than `jpeg2k`/`OpenJPEG`.
     ///
     /// Call with `None` to revert to CPU-only JPEG 2000 decode.
     #[cfg(feature = "nvjpeg2k")]
@@ -259,7 +276,7 @@ impl<'doc> PageRenderer<'doc> {
     /// Used by the CLI to return the decoder to its thread-local slot
     /// after each page render so it survives across pages.
     #[cfg(feature = "nvjpeg2k")]
-    pub fn take_nvjpeg2k(&mut self) -> Option<NvJpeg2kDecoder> {
+    pub const fn take_nvjpeg2k(&mut self) -> Option<NvJpeg2kDecoder> {
         self.nvjpeg2k.take()
     }
 

@@ -217,7 +217,7 @@ pub fn render_page_native(
         return Err(RenderError::UnsupportedFormatCombination { output: format });
     }
 
-    let (w_pts, h_pts) = pdf_interp::page_size_pts(doc, page_num)?;
+    let geom = pdf_interp::page_size_pts(doc, page_num)?;
     let x_dpi = args.x_dpi();
     let y_dpi = args.y_dpi();
 
@@ -230,8 +230,8 @@ pub fn render_page_native(
         reason = "page dimensions in pts × scale are always positive and ≪ u32::MAX"
     )]
     let (w_px, h_px) = (
-        (w_pts * scale).round() as u32,
-        (h_pts * scale).round() as u32,
+        (geom.width_pts * scale).round() as u32,
+        (geom.height_pts * scale).round() as u32,
     );
 
     if w_px == 0 || h_px == 0 {
@@ -256,8 +256,14 @@ pub fn render_page_native(
         })?;
 
     let ops = pdf_interp::parse_page(doc, page_num)?;
-    let mut renderer =
-        pdf_interp::renderer::PageRenderer::new_scaled(w_px, h_px, scale, doc, page_id);
+    let mut renderer = pdf_interp::renderer::PageRenderer::new_scaled(
+        w_px,
+        h_px,
+        scale,
+        geom.rotate_cw,
+        doc,
+        page_id,
+    );
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     renderer.set_gpu_ctx(gpu_ctx.map(Arc::clone));
 
