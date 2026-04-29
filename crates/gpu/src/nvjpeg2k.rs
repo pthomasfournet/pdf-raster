@@ -285,7 +285,9 @@ impl std::fmt::Display for NvJpeg2kError {
                     6 => "NVJPEG2K_STATUS_EXECUTION_FAILED",
                     7 => "NVJPEG2K_STATUS_ARCH_MISMATCH",
                     8 => "NVJPEG2K_STATUS_INTERNAL_ERROR",
-                    9 => "NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED",
+                    NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED => {
+                        "NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED"
+                    }
                     _ => "NVJPEG2K_STATUS_UNKNOWN",
                 };
                 write!(f, "nvJPEG2000 error {code} ({name})")
@@ -447,6 +449,7 @@ impl NvJpeg2k {
     /// # Errors
     ///
     /// Returns an error if parsing, decode, or memory allocation fails.
+    #[allow(clippy::too_many_lines)] // CUDA/FFI decode pipeline — phases are sequential and cannot be split without fragmenting the flow
     fn decode(&mut self, data: &[u8], cu_stream: CUstream) -> Result<DecodedJpeg2k> {
         // Fast-path: the library returns BAD_JPEG (3) on empty input, but an FFI
         // call for a trivially-invalid input is unnecessary noise.
@@ -656,10 +659,10 @@ impl NvJpeg2k {
         // interleave logic received the wrong number of planes.
         match color_space {
             Jpeg2kColorSpace::Gray => {
-                assert_eq!(nc, 1, "Gray requires exactly 1 component plane")
+                assert_eq!(nc, 1, "Gray requires exactly 1 component plane");
             }
             Jpeg2kColorSpace::Rgb => {
-                assert_eq!(nc, 3, "Rgb requires exactly 3 component planes")
+                assert_eq!(nc, 3, "Rgb requires exactly 3 component planes");
             }
         }
 

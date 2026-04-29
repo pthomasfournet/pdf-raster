@@ -159,14 +159,15 @@ pub struct CudaInit {
     not(any(feature = "gpu-deskew", feature = "nvjpeg2k")),
     allow(dead_code)
 )]
-pub fn init_primary_ctx_and_stream(
-    device_ordinal: i32,
-) -> Result<CudaInit, CudaInitError> {
+pub fn init_primary_ctx_and_stream(device_ordinal: i32) -> Result<CudaInit, CudaInitError> {
     // Step 1 — load the CUDA driver.  cuInit is idempotent: calling it on a
     // thread that already initialised CUDA is a no-op returning CUDA_SUCCESS.
     let r = unsafe { cuInit(0) };
     if r != 0 {
-        return Err(CudaInitError { step: "cuInit", code: r });
+        return Err(CudaInitError {
+            step: "cuInit",
+            code: r,
+        });
     }
 
     // Step 2 — resolve the integer ordinal to a device handle.
@@ -174,7 +175,10 @@ pub fn init_primary_ctx_and_stream(
     let mut device: i32 = 0;
     let r = unsafe { cuDeviceGet(&raw mut device, device_ordinal) };
     if r != 0 {
-        return Err(CudaInitError { step: "cuDeviceGet", code: r });
+        return Err(CudaInitError {
+            step: "cuDeviceGet",
+            code: r,
+        });
     }
 
     // Step 3 — retain the primary context (ref-counted; safe to call multiple
@@ -182,7 +186,10 @@ pub fn init_primary_ctx_and_stream(
     let mut cu_ctx: CUcontext = ptr::null_mut();
     let r = unsafe { cuDevicePrimaryCtxRetain(&raw mut cu_ctx, device) };
     if r != 0 {
-        return Err(CudaInitError { step: "cuDevicePrimaryCtxRetain", code: r });
+        return Err(CudaInitError {
+            step: "cuDevicePrimaryCtxRetain",
+            code: r,
+        });
     }
     assert!(
         !cu_ctx.is_null(),
@@ -200,7 +207,10 @@ pub fn init_primary_ctx_and_stream(
             let _ = cuDevicePrimaryCtxRelease(device);
             let _ = cuCtxSetCurrent(ptr::null_mut());
         }
-        return Err(CudaInitError { step: "cuCtxSetCurrent", code: r });
+        return Err(CudaInitError {
+            step: "cuCtxSetCurrent",
+            code: r,
+        });
     }
 
     // Step 5 — create a stream in the now-current context.
@@ -212,12 +222,19 @@ pub fn init_primary_ctx_and_stream(
             let _ = cuDevicePrimaryCtxRelease(device);
             let _ = cuCtxSetCurrent(ptr::null_mut());
         }
-        return Err(CudaInitError { step: "cuStreamCreate", code: r });
+        return Err(CudaInitError {
+            step: "cuStreamCreate",
+            code: r,
+        });
     }
     assert!(
         !stream.is_null(),
         "cuStreamCreate succeeded but returned null stream"
     );
 
-    Ok(CudaInit { cu_ctx, device, stream })
+    Ok(CudaInit {
+        cu_ctx,
+        device,
+        stream,
+    })
 }

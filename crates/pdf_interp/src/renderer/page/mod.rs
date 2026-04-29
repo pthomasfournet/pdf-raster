@@ -142,7 +142,11 @@ impl PageDiagnostics {
         const STEPS: [f32; 7] = [72.0, 96.0, 150.0, 200.0, 300.0, 400.0, 600.0];
         const STEPS_MAX: f32 = STEPS[STEPS.len() - 1]; // 600.0 — infallible const index
         let ppi = self.source_ppi_hint?;
-        let stepped = STEPS.iter().copied().find(|&s| s >= ppi).unwrap_or(STEPS_MAX);
+        let stepped = STEPS
+            .iter()
+            .copied()
+            .find(|&s| s >= ppi)
+            .unwrap_or(STEPS_MAX);
         Some(stepped.clamp(min_dpi, max_dpi))
     }
 }

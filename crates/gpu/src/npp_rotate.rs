@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 
 use crate::cuda::{
-    CUstream as CudaHandle, DeviceBuf, cuCtxSetCurrent, cuDevicePrimaryCtxRelease,
-    cuStreamDestroy, cuStreamSynchronize, init_primary_ctx_and_stream,
+    CUstream as CudaHandle, DeviceBuf, cuCtxSetCurrent, cuDevicePrimaryCtxRelease, cuStreamDestroy,
+    cuStreamSynchronize, init_primary_ctx_and_stream,
 };
 
 // ── CUDA runtime API (libcudart.so) ───────────────────────────────────────────
@@ -94,7 +94,6 @@ struct NppiRect {
 const NPPI_INTER_LINEAR: i32 = 2;
 
 unsafe extern "C" {
-    #[expect(clippy::too_many_arguments, reason = "mirrors the NPP C API exactly")]
     fn nppiRotate_8u_C1R_Ctx(
         p_src: *const u8,
         src_size: NppiSize,
@@ -259,8 +258,9 @@ impl NppRotator {
             )));
         }
 
-        let d_src = DeviceBuf::alloc(src.len())
-            .map_err(|code| NppRotateError(format!("cudaMalloc(src, {}): code {code}", src.len())))?;
+        let d_src = DeviceBuf::alloc(src.len()).map_err(|code| {
+            NppRotateError(format!("cudaMalloc(src, {}): code {code}", src.len()))
+        })?;
         let d_dst = DeviceBuf::alloc(dst_len)
             .map_err(|code| NppRotateError(format!("cudaMalloc(dst, {dst_len}): code {code}")))?;
 

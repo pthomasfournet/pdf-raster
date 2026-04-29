@@ -422,7 +422,9 @@ pub fn render_pages(
     opts: &RasterOptions,
 ) -> impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)> {
     if let Some(e) = validate_opts(opts) {
-        return PageIter { state: Some(Err(e)) };
+        return PageIter {
+            state: Some(Err(e)),
+        };
     }
 
     let state = open_session(path).map(|session| RenderState {
@@ -646,12 +648,20 @@ mod channel_tests {
     use super::*;
 
     fn valid_opts() -> RasterOptions {
-        RasterOptions { dpi: 150.0, first_page: 1, last_page: 1, deskew: false }
+        RasterOptions {
+            dpi: 150.0,
+            first_page: 1,
+            last_page: 1,
+            deskew: false,
+        }
     }
 
     #[test]
     fn validation_error_delivered_and_channel_closes() {
-        let bad = RasterOptions { dpi: 0.0, ..valid_opts() };
+        let bad = RasterOptions {
+            dpi: 0.0,
+            ..valid_opts()
+        };
         let rx = render_channel(Path::new("/irrelevant"), &bad, 4);
         let (page, res) = rx.recv().expect("first item must arrive");
         assert_eq!(page, 1);
@@ -659,7 +669,10 @@ mod channel_tests {
             matches!(res, Err(RasterError::InvalidOptions(_))),
             "expected InvalidOptions, got {res:?}"
         );
-        assert!(rx.recv().is_err(), "channel must be closed after validation error");
+        assert!(
+            rx.recv().is_err(),
+            "channel must be closed after validation error"
+        );
     }
 
     #[test]
@@ -668,7 +681,10 @@ mod channel_tests {
         let (page, res) = rx.recv().expect("first item must arrive");
         assert_eq!(page, 1);
         assert!(res.is_err(), "expected Err from session open, got Ok");
-        assert!(rx.recv().is_err(), "channel must be closed after session error");
+        assert!(
+            rx.recv().is_err(),
+            "channel must be closed after session error"
+        );
     }
 
     #[test]
@@ -686,16 +702,25 @@ mod channel_tests {
     #[test]
     fn capacity_zero_raised_to_one_no_deadlock() {
         // capacity=0 would be a rendezvous; the error fast-path must not deadlock.
-        let bad = RasterOptions { dpi: 0.0, ..valid_opts() };
+        let bad = RasterOptions {
+            dpi: 0.0,
+            ..valid_opts()
+        };
         let rx = render_channel(Path::new("/irrelevant"), &bad, 0);
         // Must receive the error item without blocking forever.
-        assert!(rx.recv().is_ok(), "error item must be delivered even with capacity=0");
+        assert!(
+            rx.recv().is_ok(),
+            "error item must be delivered even with capacity=0"
+        );
         assert!(rx.recv().is_err(), "channel must be closed after error");
     }
 
     #[test]
     fn validation_errors_match_between_iterator_and_channel() {
-        let bad = RasterOptions { dpi: -1.0, ..valid_opts() };
+        let bad = RasterOptions {
+            dpi: -1.0,
+            ..valid_opts()
+        };
         let (_, iter_err) = render_pages(Path::new("/irrelevant"), &bad)
             .next()
             .expect("iterator must yield one item");
