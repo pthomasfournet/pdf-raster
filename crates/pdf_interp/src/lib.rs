@@ -40,6 +40,9 @@ pub enum InterpError {
         /// Which entry point in the PDF triggered the rejection.
         location: &'static str,
     },
+    /// A Page dictionary entry has a value that is structurally valid PDF but
+    /// outside the range permitted by the spec or our safety limits.
+    InvalidPageGeometry(String),
 }
 
 impl std::fmt::Display for InterpError {
@@ -56,6 +59,7 @@ impl std::fmt::Display for InterpError {
             Self::JavaScript { location } => {
                 write!(f, "document contains JavaScript ({location}) — refused")
             }
+            Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
         }
     }
 }
@@ -173,32 +177,45 @@ pub fn page_count(doc: &Document) -> u32 {
     u32::try_from(doc.get_pages().len()).unwrap_or(u32::MAX)
 }
 
-/// Page geometry: visible dimensions in PDF points and the clockwise rotation angle.
+/// Page geometry: visible dimensions in PDF points, rotation, and user-space scale.
 ///
 /// `width_pts` and `height_pts` are already adjusted for rotation — they describe the
 /// output bitmap dimensions, not the raw `MediaBox`.  For example a landscape page with
 /// `/Rotate 270` has `width_pts > height_pts` even though its `MediaBox` may be portrait.
+///
+/// Both dimensions are also already scaled by `user_unit` (PDF 1.6+ `UserUnit` key).
+/// Callers should multiply their target DPI by `user_unit` to obtain the correct
+/// physical resolution to report to downstream consumers (e.g. Tesseract).
 #[derive(Debug, Clone, Copy)]
 pub struct PageGeometry {
-    /// Width of the rendered output in PDF points (after rotation).
+    /// Width of the rendered output in PDF points (after rotation and `UserUnit` scaling).
     pub width_pts: f64,
-    /// Height of the rendered output in PDF points (after rotation).
+    /// Height of the rendered output in PDF points (after rotation and `UserUnit` scaling).
     pub height_pts: f64,
     /// Clockwise rotation in degrees; always one of 0, 90, 180, 270.
     pub rotate_cw: u16,
+    /// `UserUnit` scale factor from the Page dictionary (PDF 1.6+, ISO 32000-2 §14.11.2).
+    ///
+    /// Specifies the size of one default user-space unit in 1/72-inch increments.
+    /// `1.0` for the vast majority of documents.  Multiply the target DPI by this
+    /// value to get the true physical resolution of the rendered bitmap.
+    pub user_unit: f64,
 }
 
 /// Return the geometry for page `page_num` (1-based).
 ///
 /// Reads the page's `CropBox` (the display region, per ISO 32000-2 §14.11.2), falling back
 /// to `MediaBox` when absent. Applies the `/Rotate` entry (multiples of 90° CW). Dimensions
-/// in the returned struct are already swapped for 90°/270° rotations so callers can use
-/// `width_pts × height_pts` directly as output pixel dimensions.
+/// in the returned struct are already swapped for 90°/270° rotations and scaled by `UserUnit`
+/// so callers can use `width_pts × height_pts` directly as output point dimensions.
 ///
-/// Falls back to US Letter (612 × 792 pt, no rotation) when neither box can be read.
+/// Falls back to US Letter (612 × 792 pt, no rotation, `UserUnit` 1.0) when neither box
+/// can be read.
 ///
 /// # Errors
-/// Returns [`InterpError::PageOutOfRange`] if the page number is invalid.
+///
+/// - [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document page count.
+/// - [`InterpError::InvalidPageGeometry`] if `UserUnit` is present but outside `[0.1, 10.0]`.
 pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, InterpError> {
     let total = page_count(doc);
     if page_num == 0 || page_num > total {
@@ -217,6 +234,7 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
         width_pts: 612.0,
         height_pts: 792.0,
         rotate_cw: 0,
+        user_unit: 1.0,
     };
 
     let Ok(dict) = doc.get_dictionary(page_id) else {
@@ -270,17 +288,38 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
         _ => 0,
     };
 
+    // UserUnit (PDF 1.6+, ISO 32000-2 §14.11.2): scales one default user-space unit
+    // from 1/72 inch to UserUnit/72 inches.  Absent → 1.0.  Must be positive.
+    // We reject values outside [0.1, 10.0]: below 0.1 the page would be < 0.1×0.1
+    // inches at any practical box size; above 10.0 (720 pt per user unit = 10 inches
+    // per point) the resulting pixel dimensions would exceed MAX_PX_DIMENSION at even
+    // modest DPI settings.  Neither extreme appears in real documents.
+    let user_unit: f64 = match dict.get(b"UserUnit") {
+        Err(_) => 1.0, // absent — use default
+        Ok(obj) => {
+            let v = to_f64(obj);
+            if v < 0.1 || v > 10.0 {
+                return Err(InterpError::InvalidPageGeometry(format!(
+                    "UserUnit {v} on page {page_num} is outside the valid range [0.1, 10.0]"
+                )));
+            }
+            v
+        }
+    };
+
     // Swap dimensions for 90°/270° so the caller gets output-bitmap dimensions directly.
+    // Scale both dimensions by UserUnit so downstream only needs to apply dpi/72.
     let (width_pts, height_pts) = if rotate_cw == 90 || rotate_cw == 270 {
-        (h_pts, w_pts)
+        (h_pts * user_unit, w_pts * user_unit)
     } else {
-        (w_pts, h_pts)
+        (w_pts * user_unit, h_pts * user_unit)
     };
 
     Ok(PageGeometry {
         width_pts,
         height_pts,
         rotate_cw,
+        user_unit,
     })
 }
 

@@ -116,6 +116,9 @@ pub enum RasterError {
     },
     /// Deskew rotation failed.
     Deskew(String),
+    /// A Page dictionary entry is structurally valid but outside permitted range
+    /// (e.g. `UserUnit` outside `[0.1, 10.0]`).
+    InvalidPageGeometry(String),
 }
 
 impl std::fmt::Display for RasterError {
@@ -140,6 +143,7 @@ impl std::fmt::Display for RasterError {
                  ({MAX_PX_DIMENSION}); lower the DPI or check the document"
             ),
             Self::Deskew(msg) => write!(f, "deskew failed: {msg}"),
+            Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
         }
     }
 }
@@ -159,6 +163,7 @@ impl From<pdf_interp::InterpError> for RasterError {
             pdf_interp::InterpError::PageOutOfRange { page, total } => {
                 Self::PageOutOfRange { page, total }
             }
+            pdf_interp::InterpError::InvalidPageGeometry(msg) => Self::InvalidPageGeometry(msg),
             other => Self::Pdf(other),
         }
     }
@@ -258,6 +263,19 @@ pub fn render_page_rgb(
     page_num: u32,
     scale: f64,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
+    let geom = pdf_interp::page_size_pts(&session.doc, page_num)?;
+    render_page_rgb_with_geom(session, page_num, scale, geom)
+}
+
+/// Inner implementation shared by [`render_page_rgb`] and [`render_one`].
+/// Accepts a pre-resolved [`PageGeometry`] to avoid a second dict lookup when
+/// the caller already has it (e.g. to read `user_unit` for `effective_dpi`).
+fn render_page_rgb_with_geom(
+    session: &RasterSession,
+    page_num: u32,
+    scale: f64,
+    geom: pdf_interp::PageGeometry,
+) -> Result<Bitmap<Rgb8>, RasterError> {
     // A non-positive or non-finite scale is a caller error; return InvalidOptions
     // so callers can distinguish this from a genuinely malformed page MediaBox.
     if !scale.is_finite() || scale <= 0.0 {
@@ -267,8 +285,6 @@ pub fn render_page_rgb(
     }
 
     let doc = &session.doc;
-
-    let geom = pdf_interp::page_size_pts(doc, page_num)?;
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -452,7 +468,10 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
     let dpi = state.opts.dpi;
     let scale = f64::from(dpi) / 72.0;
 
-    let rgb = render_page_rgb(&state.session, page_num, scale)?;
+    // Resolve geometry first to obtain UserUnit before rendering.
+    let geom = pdf_interp::page_size_pts(&state.session.doc, page_num)?;
+
+    let rgb = render_page_rgb_with_geom(&state.session, page_num, scale, geom)?;
     let mut gray = rgb_to_gray(&rgb);
 
     if state.opts.deskew {
@@ -461,12 +480,23 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
 
     let pixels = bitmap_to_vec(&gray);
 
+    // effective_dpi accounts for UserUnit: a UserUnit:2.0 page has twice the
+    // physical size per point, so the same pixel count represents half the DPI.
+    // For the common case (UserUnit = 1.0) effective_dpi == dpi.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "user_unit is validated to [0.1, 10.0] and dpi is a normal f32; \
+                  the product fits comfortably in f32"
+    )]
+    let effective_dpi = (f64::from(dpi) * geom.user_unit) as f32;
+
     Ok(RenderedPage {
         page_num,
         width: gray.width,
         height: gray.height,
         pixels,
         dpi,
+        effective_dpi,
     })
 }
 
