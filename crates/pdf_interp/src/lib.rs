@@ -177,6 +177,31 @@ pub fn page_count(doc: &Document) -> u32 {
     u32::try_from(doc.get_pages().len()).unwrap_or(u32::MAX)
 }
 
+/// Resolve a 1-based page number to its lopdf object ID.
+///
+/// Calls `doc.get_pages()` once and derives the total from the map, avoiding a
+/// redundant second call when both the count and the ID are needed.
+///
+/// # Errors
+/// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document.
+fn resolve_page_id(doc: &Document, page_num: u32) -> Result<lopdf::ObjectId, InterpError> {
+    let pages = doc.get_pages();
+    let total = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+    if page_num == 0 || page_num > total {
+        return Err(InterpError::PageOutOfRange {
+            page: page_num,
+            total,
+        });
+    }
+    pages
+        .get(&page_num)
+        .copied()
+        .ok_or(InterpError::PageOutOfRange {
+            page: page_num,
+            total,
+        })
+}
+
 /// Page geometry: visible dimensions in PDF points, rotation, and user-space scale.
 ///
 /// `width_pts` and `height_pts` are already adjusted for rotation — they describe the
@@ -184,8 +209,8 @@ pub fn page_count(doc: &Document) -> u32 {
 /// `/Rotate 270` has `width_pts > height_pts` even though its `MediaBox` may be portrait.
 ///
 /// Both dimensions are also already scaled by `user_unit` (PDF 1.6+ `UserUnit` key).
-/// Callers should multiply their target DPI by `user_unit` to obtain the correct
-/// physical resolution to report to downstream consumers (e.g. Tesseract).
+/// Multiply the render DPI by `user_unit` to get the true physical resolution of the
+/// rendered bitmap (i.e. the value to pass to `tesseract::set_source_resolution`).
 #[derive(Debug, Clone, Copy)]
 pub struct PageGeometry {
     /// Width of the rendered output in PDF points (after rotation and `UserUnit` scaling).
@@ -197,8 +222,7 @@ pub struct PageGeometry {
     /// `UserUnit` scale factor from the Page dictionary (PDF 1.6+, ISO 32000-2 §14.11.2).
     ///
     /// Specifies the size of one default user-space unit in 1/72-inch increments.
-    /// `1.0` for the vast majority of documents.  Multiply the target DPI by this
-    /// value to get the true physical resolution of the rendered bitmap.
+    /// `1.0` for the vast majority of documents.  Validated to `[0.1, 10.0]`.
     pub user_unit: f64,
 }
 
@@ -217,18 +241,7 @@ pub struct PageGeometry {
 /// - [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document page count.
 /// - [`InterpError::InvalidPageGeometry`] if `UserUnit` is present but outside `[0.1, 10.0]`.
 pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, InterpError> {
-    let total = page_count(doc);
-    if page_num == 0 || page_num > total {
-        return Err(InterpError::PageOutOfRange {
-            page: page_num,
-            total,
-        });
-    }
-    let pages = doc.get_pages();
-    let page_id = *pages.get(&page_num).ok_or(InterpError::PageOutOfRange {
-        page: page_num,
-        total,
-    })?;
+    let page_id = resolve_page_id(doc, page_num)?;
 
     let fallback = PageGeometry {
         width_pts: 612.0,
@@ -289,16 +302,26 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
     };
 
     // UserUnit (PDF 1.6+, ISO 32000-2 §14.11.2): scales one default user-space unit
-    // from 1/72 inch to UserUnit/72 inches.  Absent → 1.0.  Must be positive.
-    // We reject values outside [0.1, 10.0]: below 0.1 the page would be < 0.1×0.1
-    // inches at any practical box size; above 10.0 (720 pt per user unit = 10 inches
-    // per point) the resulting pixel dimensions would exceed MAX_PX_DIMENSION at even
-    // modest DPI settings.  Neither extreme appears in real documents.
+    // from 1/72 inch to UserUnit/72 inches.  Absent → 1.0.  Must be a finite positive
+    // number.  We reject values outside [0.1, 10.0]: below 0.1 the page would be
+    // unreasonably small at any practical DPI; above 10.0 the pixel dimensions would
+    // exceed MAX_PX_DIMENSION at even modest DPI settings.  NaN/Inf in a Real object
+    // are rejected explicitly because the range check (NaN comparisons are always false)
+    // would otherwise silently pass them through.
     let user_unit: f64 = match dict.get(b"UserUnit") {
         Err(_) => 1.0, // absent — use default
         Ok(obj) => {
+            match obj {
+                lopdf::Object::Real(_) | lopdf::Object::Integer(_) => {}
+                other => {
+                    return Err(InterpError::InvalidPageGeometry(format!(
+                        "UserUnit on page {page_num} is not a number (got {})",
+                        other.enum_variant()
+                    )));
+                }
+            }
             let v = to_f64(obj);
-            if v < 0.1 || v > 10.0 {
+            if !v.is_finite() || v < 0.1 || v > 10.0 {
                 return Err(InterpError::InvalidPageGeometry(format!(
                     "UserUnit {v} on page {page_num} is outside the valid range [0.1, 10.0]"
                 )));
@@ -331,20 +354,7 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
 /// document page count, or [`InterpError::Pdf`] if the content stream cannot
 /// be read.
 pub fn parse_page(doc: &Document, page_num: u32) -> Result<Vec<content::Operator>, InterpError> {
-    let total = page_count(doc);
-    if page_num == 0 || page_num > total {
-        return Err(InterpError::PageOutOfRange {
-            page: page_num,
-            total,
-        });
-    }
-
-    let pages = doc.get_pages();
-    let page_id = *pages.get(&page_num).ok_or(InterpError::PageOutOfRange {
-        page: page_num,
-        total,
-    })?;
-
+    let page_id = resolve_page_id(doc, page_num)?;
     let content_bytes = doc.get_page_content(page_id)?;
     Ok(content::parse(&content_bytes))
 }

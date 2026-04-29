@@ -247,13 +247,13 @@ pub fn open_session(path: &std::path::Path) -> Result<RasterSession, RasterError
 ///
 /// `scale` is the pixel-per-point multiplier: `dpi / 72.0` for square-pixel
 /// rendering, or `(x_dpi/72 · y_dpi/72).sqrt()` for the geometric-mean when
-/// horizontal and vertical DPI differ.  Must be a positive finite number;
-/// zero or NaN produces [`RasterError::PageDegenerate`].
+/// horizontal and vertical DPI differ.  Must be a positive finite number.
 ///
 /// # Errors
 ///
-/// - [`RasterError::PageDegenerate`] if `scale` is ≤ 0, NaN, or the page
-///   `MediaBox` has zero area.
+/// - [`RasterError::InvalidOptions`] if `scale` is ≤ 0 or non-finite.
+/// - [`RasterError::InvalidPageGeometry`] if the page has a malformed `UserUnit`.
+/// - [`RasterError::PageDegenerate`] if the page `MediaBox` has zero area.
 /// - [`RasterError::PageTooLarge`] if the computed pixel dimensions exceed
 ///   [`MAX_PX_DIMENSION`].
 /// - [`RasterError::PageOutOfRange`] if `page_num` is not in the document.
@@ -480,13 +480,14 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
 
     let pixels = bitmap_to_vec(&gray);
 
-    // effective_dpi accounts for UserUnit: a UserUnit:2.0 page has twice the
-    // physical size per point, so the same pixel count represents half the DPI.
-    // For the common case (UserUnit = 1.0) effective_dpi == dpi.
+    // effective_dpi accounts for UserUnit: a UserUnit:2.0 page has user-space units
+    // twice as large (each unit = 2/72 inch), so the rendered pixels cover twice the
+    // physical area — effective DPI is doubled.  For the common case (UserUnit = 1.0)
+    // effective_dpi == dpi.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "user_unit is validated to [0.1, 10.0] and dpi is a normal f32; \
-                  the product fits comfortably in f32"
+        reason = "dpi is an f32 (≤ ~3400 in practice); user_unit is validated to [0.1, 10.0]; \
+                  the product is at most ~34 000, well within f32 range"
     )]
     let effective_dpi = (f64::from(dpi) * geom.user_unit) as f32;
 
