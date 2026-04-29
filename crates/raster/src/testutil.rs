@@ -8,26 +8,15 @@ use crate::pipe::PipeState;
 use crate::state::TransferSet;
 use crate::types::BlendMode;
 
+/// Identity CTM `[a b c d e f] = [1 0 0 1 0 0]`.
 pub(crate) fn identity_matrix() -> [f64; 6] {
     [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 }
 
-pub(crate) fn simple_pipe() -> PipeState<'static> {
-    PipeState {
-        blend_mode: BlendMode::Normal,
-        a_input: 255,
-        overprint_mask: 0xFFFF_FFFF,
-        overprint_additive: false,
-        transfer: TransferSet::identity_rgb(),
-        soft_mask: None,
-        alpha0: None,
-        knockout: false,
-        knockout_opacity: 255,
-        non_isolated_group: false,
-    }
-}
-
 /// Parametric pipe with configurable `a_input` and `blend_mode`.
+///
+/// All other fields are set to their neutral defaults (identity transfer,
+/// no soft mask, no overprint, no knockout).
 pub(crate) fn make_pipe(a_input: u8, blend_mode: BlendMode) -> PipeState<'static> {
     PipeState {
         blend_mode,
@@ -43,6 +32,16 @@ pub(crate) fn make_pipe(a_input: u8, blend_mode: BlendMode) -> PipeState<'static
     }
 }
 
+/// Opaque Normal-blend pipe — the simplest possible rendering state.
+pub(crate) fn simple_pipe() -> PipeState<'static> {
+    make_pipe(255, BlendMode::Normal)
+}
+
+/// Clip covering the entire `w × h` bitmap.
+///
+/// The upper bounds are inset by `0.001` to stay strictly inside the last pixel;
+/// `Clip` uses exclusive-right semantics so a bound exactly at `w` would
+/// exclude the rightmost column on some edge cases.
 pub(crate) fn make_clip(w: u32, h: u32) -> Clip {
     Clip::new(0.0, 0.0, f64::from(w) - 0.001, f64::from(h) - 0.001, false)
 }
