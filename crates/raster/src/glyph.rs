@@ -481,7 +481,7 @@ pub fn fill_glyph<P: Pixel>(
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::pipe::{PipeSrc, PipeState};
+    use crate::pipe::PipeSrc;
     use crate::testutil::{make_clip, simple_pipe};
     use color::Rgb8;
 

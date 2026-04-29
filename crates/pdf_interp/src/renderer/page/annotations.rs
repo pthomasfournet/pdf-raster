@@ -57,6 +57,7 @@ pub(super) fn render_annotations(renderer: &mut PageRenderer<'_>, page_id: Objec
     }
 }
 
+/// Render a single annotation object into `renderer`'s bitmap.
 pub(super) fn render_one_annotation(renderer: &mut PageRenderer<'_>, annot_id: ObjectId) {
     let doc = renderer.resources.doc();
 

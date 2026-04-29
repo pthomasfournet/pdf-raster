@@ -377,7 +377,6 @@ pub fn gouraud_triangle_fill<P: Pixel>(
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::pipe::PipeState;
     use crate::testutil::{make_clip, simple_pipe};
     use color::Rgb8;
 

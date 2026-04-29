@@ -155,6 +155,7 @@ fn decode_run_length(data: &[u8]) -> Vec<u8> {
     decode_run_length_capped(data, 256 * 1024 * 1024)
 }
 
+/// `RunLength` decode with an output cap; returns immediately when `max_output` bytes are reached.
 pub(super) fn decode_run_length_capped(data: &[u8], max_output: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
