@@ -21,7 +21,7 @@ let text = tesseract::ocr_from_frame(
 )?;
 ```
 
-The API surface for this integration does not yet exist — it is the subject of Phase 5 below.
+Phase 5 is complete. The API exists and is integrated.
 
 ---
 
@@ -367,7 +367,7 @@ cargo run -p gpu --release --bin threshold_bench
 
 ---
 
-## Phase 5 — Public library API (IN PROGRESS — library shipped, two review passes done)
+## Phase 5 — Public library API ✓ COMPLETE (Apr 2026)
 
 Extract the render pipeline into a reusable library crate. The caller gets 8-bit grayscale pixels in memory and passes them directly to Tesseract — no subprocess, no files, no Leptonica.
 
@@ -478,5 +478,57 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 - [x] Make CLI a thin wrapper over `crates/pdf_raster` (RasterSession, render_page_rgb, open_session)
 - [x] Second review pass (Apr 2026): scale validation guard in `render_page_rgb`; GPU init failure `eprintln!`; `PageIter::next` Err arm cleaned; dead variable removed from `bitmap_to_vec`; `# Panics` doc corrected in lib.rs; `MONO_THRESHOLD` const extracted in CLI; atomic temp-file rename in CLI `render_page` (no partial files on encode failure)
 - [x] Third review pass (Apr 2026): `open_session` double get_pages eliminated; bad `scale` returns `InvalidOptions` (not `PageDegenerate`); `PageIter::next` Err arm rewritten with explicit match; compile-time `Sync` assertion on `RasterSession`; `#[expect]` replaces `#[allow]` on Args; erroneous `cast_sign_loss` suppression removed from f64→f32 and f32→i32 casts; SWEEP_STEPS≥2 compile-time assert; `n_rows-skip` saturation guard; intermediate Vec allocations in coarse sweep eliminated (par reduce); `assert!→debug_assert!` in private `downsample`; rotation docs corrected (CW-positive throughout); GPU deskew stub noted in lib.rs; scatter loop AVX-512 auto-vec claim removed from doc; rename failure now also removes temp file; `--odd`+`--even` mutual exclusion check; open_session error walks source chain; DPI args validated ≥1 at CLI; jpeg_quality validated 0–100; `OutputFormat` implements Display; 13 redundant `default_value_t=false` removed
-- [x] GPU rotation: `rotate_gpu` via `nppiRotate_8u_C1R_Ctx` — NPP CW-positive (Y-down); GPU/CPU parity ≤2 grey levels at 2°; thread-local `NppRotator`, CPU fallback retained
-- [ ] Integration tests: round-trip a fixture PDF, assert pixel dimensions and grayscale range; deskew unit tests with synthetic skewed images at known angles
+- [x] GPU rotation: `rotate_gpu` via `nppiRotate_8u_C1R_Ctx` — NPP CW-positive (Y-down); GPU/CPU parity ≤2 grey levels at 2°; thread-local `NppRotator`, CPU fallback retained; hardening pass (input validation, three-state slot, Drop logging, null asserts)
+- [x] Integration tests: round-trip a fixture PDF, assert pixel dimensions and grayscale range; deskew unit tests with synthetic skewed images at known angles
+
+---
+
+## Phase 6 — Integration hardening and OCR pipeline fit
+
+### Goal
+
+Make pdf-raster the drop-in replacement for the pdftoppm + Leptonica preprocessing
+stack in the mss OCR pipeline.  The rasterise + deskew path is feature-complete;
+Phase 6 closes the remaining gaps before the first production integration.
+
+### Open work items
+
+- [ ] **`UserUnit` support** — `page_size_pts` does not read the `UserUnit` Page
+  dictionary key (PDF 1.6+, scales user-space from 1/72 in to `UserUnit/72` in).
+  Fix: multiply `w_pts`/`h_pts` by `UserUnit`; expose `effective_dpi` on
+  `RenderedPage` (= `opts.dpi × user_unit`) so callers pass the right value to
+  `tesseract::set_source_resolution`.  Reject `UserUnit` outside [0.1, 10.0]
+  with `RasterError::InvalidPageGeometry` rather than silently producing a
+  wrong-scale bitmap.  Affects large-format and engineering PDFs; rare in the
+  Gallica/GODF corpus but a latent correctness bug.
+
+- [ ] **`RenderDiagnostics` on `RenderedPage`** — add a lightweight metadata
+  struct exposing information the renderer already has at decode time:
+  `{ is_scan: bool, dominant_filter: ImageFilter, has_vector_text: bool }`.
+  `is_scan`: true when all image XObjects use `DCTDecode` or `CCITTFaxDecode`
+  and no text operators are present.  `dominant_filter`: most-used image
+  compression type on the page (`DCT`, `JBIG2`, `JPX`, `Raw`, `Mixed`).
+  `has_vector_text`: any `Tj`/`TJ`/`'`/`"` operators executed.
+  This lets the OCR caller make better routing decisions (force_ocr, PSM, DPI)
+  without a separate post-hoc page analysis pass.
+
+- [ ] **Pipelined render + OCR** — `raster_pdf` returns an iterator but mss-pdf
+  collects it into `Vec` before OCR starts, keeping the sequential bottleneck.
+  Add a `render_channel` API: `fn render_channel(path, opts, capacity) ->
+  Receiver<(u32, Result<RenderedPage>)>` backed by a Rayon-spawned producer.
+  The consumer (Tesseract) processes pages as they arrive; the producer renders
+  ahead up to `capacity` pages.  Halves peak memory on large books; hides GPU
+  decode latency behind Tesseract inference on the previous page.
+
+- [ ] **DPI auto-selection hint** — expose a `suggested_dpi` on `RenderedPage`
+  or `RenderDiagnostics` based on the source image PPI embedded in the PDF.
+  Many Gallica scans encode images at 62–67 PPI; rendering at 300 DPI upsamples
+  4× without adding information.  The hint lets the caller choose: render at
+  source PPI for speed, or override for quality.  Read-only hint — no behaviour
+  change, caller decides.
+
+- [ ] **`npp_rotate` / `nvjpeg2k` shared CUDA init helper** — `NppRotator::new`
+  and `NvJpeg2kDecoder::new` duplicate the five-step CUDA init sequence
+  (`cuInit → cuDeviceGet → cuDevicePrimaryCtxRetain → cuCtxSetCurrent →
+  cuStreamCreate`) with divergent null checks.  Extract into
+  `gpu::cuda::init_stream(device_ordinal) -> Result<CudaStream>` shared by both.
