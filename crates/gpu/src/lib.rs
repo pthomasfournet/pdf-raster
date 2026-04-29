@@ -149,6 +149,10 @@ const TILE_H_F: f32 = TILE_H as f32;
 /// require more than 65535 tiles in either dimension (i.e. exceed `65535 × TILE_W`
 /// or `65535 × TILE_H` pixels) — the sort key packs tile coordinates into 16 bits each.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "tile-record builder is a single coherent algorithm; splitting would obscure the data flow"
+)]
 pub fn build_tile_records(
     segs: &[f32],
     x_min: f32,

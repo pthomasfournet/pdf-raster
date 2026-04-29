@@ -58,6 +58,14 @@ pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), Des
 /// Out-of-bounds source pixels are filled with 255 (white).  The rightmost
 /// and bottom source columns/rows are treated as out-of-bounds because bilinear
 /// sampling requires a 2×2 neighbourhood — the last valid origin is (w-2, h-2).
+#[expect(
+    clippy::similar_names,
+    reason = "sx_*/sy_* are paired coordinate variables; renaming would obscure the symmetry"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "bilinear rotation is a single coherent algorithm; splitting would fragment the coordinate math"
+)]
 pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     let w = src.width as usize;
     let h = src.height as usize;
@@ -69,49 +77,121 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     let sin_a = rad.sin();
 
     // Rotation centre: image centre (may be fractional).
+    // w, h ≤ MAX_PX_DIMENSION = 32768; exact in f32 (24-bit mantissa covers integers to 16 M).
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "image dimensions ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+    )]
     let cx = (w as f32 - 1.0) * 0.5;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "image dimensions ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+    )]
     let cy = (h as f32 - 1.0) * 0.5;
 
     // Valid source coordinate range for bilinear sampling: x ∈ [0, w-2], y ∈ [0, h-2].
+    // w, h ≤ 32768 — safe to cast to i32 (fits in i32 range).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "image dimensions ≤ MAX_PX_DIMENSION = 32768; fits in i32"
+    )]
     let sx_max = (w as i32) - 2;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "image dimensions ≤ MAX_PX_DIMENSION = 32768; fits in i32"
+    )]
     let sy_max = (h as i32) - 2;
 
     for oy in 0..h {
+        // oy < h ≤ 32768; safe to cast to u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "oy < h ≤ MAX_PX_DIMENSION = 32768; fits in u32"
+        )]
         let dst_row = dst.row_bytes_mut(oy as u32);
         // Pre-compute the y-dependent terms outside the x loop.
+        // oy ≤ 32768; exact in f32.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "oy ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+        )]
         let dy = oy as f32 - cy;
-        let sx_base = cos_a * (-cx) - sin_a * dy + cx;
-        let sy_base = sin_a * (-cx) + cos_a * dy + cy;
+        let sx_base = cos_a.mul_add(-cx, -(sin_a * dy)) + cx;
+        let sy_base = sin_a.mul_add(-cx, cos_a * dy) + cy;
 
-        for ox in 0..w {
+        for (ox, dst_px) in dst_row.iter_mut().enumerate() {
+            // ox ≤ 32768; exact in f32.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "ox ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+            )]
             let dx = ox as f32;
-            let sx = sx_base + cos_a * dx;
-            let sy = sy_base + sin_a * dx;
+            let sx = cos_a.mul_add(dx, sx_base);
+            let sy = sin_a.mul_add(dx, sy_base);
 
+            // floor() → i32: sx/sy are image coordinates bounded by the rotated image
+            // extent, which is ≤ ~46341 px (32768 * sqrt(2)) at worst — fits in i32.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "image coordinates bounded by rotated extent ≤ 32768 * sqrt(2) ≈ 46341; fits in i32"
+            )]
             let x0 = sx.floor() as i32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "image coordinates bounded by rotated extent ≤ 32768 * sqrt(2) ≈ 46341; fits in i32"
+            )]
             let y0 = sy.floor() as i32;
 
             if x0 < 0 || y0 < 0 || x0 > sx_max || y0 > sy_max {
-                dst_row[ox] = 255;
+                *dst_px = 255;
                 continue;
             }
 
+            // x0 ≥ 0 and y0 ≥ 0 checked above; safe to cast to usize.
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "x0 ≥ 0 and y0 ≥ 0 verified by the guard above"
+            )]
             let x0u = x0 as usize;
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "x0 ≥ 0 and y0 ≥ 0 verified by the guard above"
+            )]
             let y0u = y0 as usize;
+            // x0, y0 fit in i32 (≤ 46341); x0 as f32 / y0 as f32 exact (24-bit mantissa).
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "x0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
+            )]
             let fx = sx - x0 as f32;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "y0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
+            )]
             let fy = sy - y0 as f32;
 
+            // y0u < h ≤ 32768; y0u + 1 ≤ 32768 (sx_max/sy_max guard ensures y0 ≤ h-2).
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "y0u ≤ h - 2 ≤ 32766; fits in u32"
+            )]
             let r0 = src.row_bytes(y0u as u32);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "y0u + 1 ≤ h - 1 ≤ 32767; fits in u32"
+            )]
             let r1 = src.row_bytes((y0u + 1) as u32);
 
-            let p00 = r0[x0u] as f32;
-            let p10 = r0[x0u + 1] as f32;
-            let p01 = r1[x0u] as f32;
-            let p11 = r1[x0u + 1] as f32;
+            let p00 = f32::from(r0[x0u]);
+            let p10 = f32::from(r0[x0u + 1]);
+            let p01 = f32::from(r1[x0u]);
+            let p11 = f32::from(r1[x0u + 1]);
 
-            let top = p00 + fx * (p10 - p00);
-            let bot = p01 + fx * (p11 - p01);
-            let val = top + fy * (bot - top);
+            let top = (p10 - p00).mul_add(fx, p00);
+            let bot = (p11 - p01).mul_add(fx, p01);
+            let val = (bot - top).mul_add(fy, top);
 
             #[expect(
                 clippy::cast_possible_truncation,
@@ -119,7 +199,7 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
                 reason = "bilinear of values in [0,255] stays in [0,255]"
             )]
             {
-                dst_row[ox] = val.round() as u8;
+                *dst_px = val.round() as u8;
             }
         }
     }

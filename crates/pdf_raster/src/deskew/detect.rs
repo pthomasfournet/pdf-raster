@@ -39,7 +39,7 @@ use rayon::prelude::*;
 
 use super::MAX_SEARCH_DEG;
 
-/// Number of candidate angles in the coarse sweep (covers ±MAX_SEARCH_DEG).
+/// Number of candidate angles in the coarse sweep (covers ±[`MAX_SEARCH_DEG`]).
 const SWEEP_STEPS: usize = 56; // ≈ 0.255° steps over 14° range
 
 /// Refinement stops when the half-interval width (`delta`) falls below this.
@@ -56,6 +56,7 @@ const DOWNSAMPLE: u32 = 4;
 /// Returns the estimated skew in degrees (positive = counter-clockwise tilt,
 /// negative = clockwise tilt).  Returns 0.0 when detection is unreliable
 /// (e.g. blank or near-blank page).
+#[must_use]
 pub fn find_skew_deg(img: &Bitmap<Gray8>) -> f32 {
     if img.width < 8 || img.height < 8 {
         return 0.0;
@@ -63,12 +64,19 @@ pub fn find_skew_deg(img: &Bitmap<Gray8>) -> f32 {
 
     let small = downsample(img, DOWNSAMPLE);
 
+    // SWEEP_STEPS is a compile-time constant ≤ usize::MAX; (SWEEP_STEPS - 1) ≤ 55 — exact in f32.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "SWEEP_STEPS = 56; SWEEP_STEPS - 1 = 55 is exact in f32"
+    )]
     // Coarse sweep: score all candidate angles in parallel, fold to the best.
     let step = (2.0 * MAX_SEARCH_DEG) / (SWEEP_STEPS - 1) as f32;
     let (best_deg, best_score) = (0..SWEEP_STEPS)
         .into_par_iter()
         .map(|i| {
-            let deg = -MAX_SEARCH_DEG + i as f32 * step;
+            // i ≤ SWEEP_STEPS - 1 = 55 — exact in f32.
+            #[expect(clippy::cast_precision_loss, reason = "i ≤ 55; exact in f32")]
+            let deg = (i as f32).mul_add(step, -MAX_SEARCH_DEG);
             (deg, score_angle(&small, deg))
         })
         .reduce(
@@ -78,7 +86,7 @@ pub fn find_skew_deg(img: &Bitmap<Gray8>) -> f32 {
 
     // Sanity check: if best score is too low the page is likely blank or has
     // no horizontal text structure — return 0 rather than a noisy estimate.
-    let min_reliable = small.width as f64 * small.height as f64 * 0.01;
+    let min_reliable = f64::from(small.width) * f64::from(small.height) * 0.01;
     if best_score < min_reliable {
         return 0.0;
     }
@@ -92,6 +100,10 @@ pub fn find_skew_deg(img: &Bitmap<Gray8>) -> f32 {
 /// Evaluates the score at `centre ± delta`, moves toward the better side,
 /// and halves `delta` each iteration until `delta < REFINE_STOP_DEG`.
 fn refine(img: &Bitmap<Gray8>, mut centre: f32, mut delta: f32) -> f32 {
+    #[expect(
+        clippy::while_float,
+        reason = "delta halves each iteration; the f32 comparison is exact for the termination check"
+    )]
     while delta >= REFINE_STOP_DEG {
         let left = (centre - delta).clamp(-MAX_SEARCH_DEG, MAX_SEARCH_DEG);
         let right = (centre + delta).clamp(-MAX_SEARCH_DEG, MAX_SEARCH_DEG);
@@ -107,17 +119,31 @@ fn refine(img: &Bitmap<Gray8>, mut centre: f32, mut delta: f32) -> f32 {
 ///
 /// Higher score = text baselines better aligned with horizontal scanlines.
 fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
+    // img.width/height are u32 (≤ MAX_PX_DIMENSION = 32768); safe to cast to usize.
     let w = img.width as usize;
     let h = img.height as usize;
     let tan = deg.to_radians().tan();
 
     // Number of output rows: image height plus the shear-induced vertical extent.
+    // w ≤ 8192 after 4× downsample; tan(MAX_SEARCH_DEG=7°) ≈ 0.123; product ≤ ~1008.
+    // ceil() is non-negative and fits in usize.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "w ≤ 8192 after downsample; shear_extent = ceil(w * |tan(7°)|) ≤ ~1009; fits in usize"
+    )]
     let shear_extent = (w as f32 * tan.abs()).ceil() as usize;
     let n_rows = h + shear_extent;
 
     let mut sums = vec![0u32; n_rows];
 
     for y in 0..h {
+        // y < h ≤ 8192 after downsample; safe to cast to u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "y < h ≤ img.height ≤ MAX_PX_DIMENSION; fits in u32"
+        )]
         let row = &img.row_bytes(y as u32)[..w];
         // Shear offset for this row: pixels shift vertically by x·tan(θ).
         // We iterate x and accumulate foreground weight into the sheared row.
@@ -127,11 +153,21 @@ fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
                 continue;
             }
             // Sheared row index: y + round(x · tan θ), clamped to valid range.
+            // x ≤ w ≤ 8192; x as f32 exact (≤ 2^23); offset ≤ shear_extent ≤ 1009.
             #[expect(
+                clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
-                reason = "offset ≤ shear_extent which is bounded by downsampled width × |tan(MAX_SEARCH_DEG)|, well within i32"
+                reason = "x ≤ 8192 (exact in f32); offset = round(x * tan) ≤ 1009; fits in i32"
             )]
             let offset = (x as f32 * tan).round() as i32;
+            // y ≤ h ≤ 8192 ≤ i32::MAX; n_rows - 1 ≤ h + shear_extent ≤ 9201 ≤ i32::MAX.
+            // After clamp(0, …), result ≥ 0 — safe to cast to usize.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                clippy::cast_sign_loss,
+                reason = "y ≤ 8192 and n_rows ≤ 9201; fits in i32; clamp ensures ≥ 0 before usize cast"
+            )]
             let row_idx = (y as i32 + offset).clamp(0, (n_rows - 1) as i32) as usize;
             sums[row_idx] += weight;
         }
@@ -148,8 +184,16 @@ fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
     sums[skip..end]
         .windows(2)
         .map(|w| {
-            let diff = w[1] as i64 - w[0] as i64;
-            (diff * diff) as f64
+            // w[i] are u32 row sums; difference fits in i64; square fits in u64 but we use f64.
+            let diff = i64::from(w[1]) - i64::from(w[0]);
+            // diff² ≤ (u32::MAX)² = ~1.8×10^19 which overflows i64; use f64 which is fine
+            // for our scoring purposes (monotone, no overflow for realistic row sums).
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "diff² for realistic row sums fits comfortably in f64's 52-bit mantissa"
+            )]
+            let sq: f64 = (diff * diff) as f64;
+            sq
         })
         .sum()
 }
@@ -168,15 +212,27 @@ fn downsample(src: &Bitmap<Gray8>, factor: u32) -> Bitmap<Gray8> {
 
     let mut dst = Bitmap::<Gray8>::new(ow, oh, 1, false);
     let factor_u = factor as usize;
+    // factor ≤ src dimension ≤ MAX_PX_DIMENSION = 32768; factor_u² ≤ 32768² fits in u32.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "factor ≤ MAX_PX_DIMENSION = 32768; factor_u² ≤ 32768² < u32::MAX"
+    )]
     let area = (factor_u * factor_u) as u32;
 
     for oy in 0..oh {
         let dst_row = dst.row_bytes_mut(oy);
-        for ox in 0..ow as usize {
+        // ow is u32 (from src.width / factor); iterate as usize for indexing.
+        for (ox, dst_px) in dst_row.iter_mut().enumerate() {
+            // oy is u32; oy as usize is always lossless (usize ≥ 32 bits).
             let sy0 = oy as usize * factor_u;
             let sx0 = ox * factor_u;
             let mut sum = 0u32;
             for dy in 0..factor_u {
+                // sy0 + dy ≤ src.height ≤ MAX_PX_DIMENSION = 32768; fits in u32.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "sy0 + dy ≤ src.height ≤ MAX_PX_DIMENSION; fits in u32"
+                )]
                 let src_row = &src.row_bytes((sy0 + dy) as u32);
                 for dx in 0..factor_u {
                     sum += u32::from(src_row[sx0 + dx]);
@@ -187,7 +243,7 @@ fn downsample(src: &Bitmap<Gray8>, factor: u32) -> Bitmap<Gray8> {
                 reason = "sum / area ≤ 255 by construction"
             )]
             {
-                dst_row[ox] = (sum / area) as u8;
+                *dst_px = (sum / area) as u8;
             }
         }
     }

@@ -191,7 +191,8 @@ pub struct RasterSession {
 
 impl RasterSession {
     /// Total number of pages in the document.
-    pub fn total_pages(&self) -> u32 {
+    #[must_use]
+    pub const fn total_pages(&self) -> u32 {
         self.total_pages
     }
 }
@@ -199,7 +200,7 @@ impl RasterSession {
 // Compile-time assertion: RasterSession must be Sync (shared across rayon threads).
 // If lopdf::Document ever becomes !Sync this will fail here rather than silently misbehave.
 const _: fn() = || {
-    fn assert_sync<T: Sync>() {}
+    const fn assert_sync<T: Sync>() {}
     assert_sync::<RasterSession>();
 };
 
@@ -386,7 +387,7 @@ struct RenderState {
     current_page: u32,
 }
 
-pub(crate) fn render_pages(
+pub fn render_pages(
     path: &std::path::Path,
     opts: &RasterOptions,
 ) -> impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)> {
@@ -438,9 +439,8 @@ impl Iterator for PageIter {
             Err(_) => {
                 // Document-open error: take it out (sets state → None), yield once.
                 // Use page 1 as a placeholder; the caller cares about the Err, not the number.
-                let e = match self.state.take()? {
-                    Err(e) => e,
-                    Ok(_) => unreachable!("matched Err arm above"),
+                let Err(e) = self.state.take()? else {
+                    unreachable!("matched Err arm above")
                 };
                 Some((1, Err(e)))
             }
@@ -506,6 +506,7 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
 /// Convert an RGB bitmap to grayscale using BT.709 luminance coefficients.
 ///
 /// Output is 0 = black, 255 = white, matching the input convention.
+#[must_use]
 pub fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
     let mut dst = Bitmap::<Gray8>::new(src.width, src.height, 1, false);
     let w = src.width as usize;
