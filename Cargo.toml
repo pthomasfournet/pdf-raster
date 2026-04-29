@@ -7,6 +7,7 @@ members = [
     "crates/font",
     "crates/pdf_bridge",
     "crates/pdf_interp",
+    "crates/pdf_raster",
     "crates/cli",
     "crates/gpu",
     "crates/bench",

@@ -1,0 +1,36 @@
+[package]
+name    = "pdf_raster"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# GPU-accelerated AA fill and tile fill.
+gpu-aa  = ["dep:gpu", "pdf_interp/gpu-aa"]
+# GPU-accelerated JPEG decoding via nvJPEG.
+nvjpeg  = ["dep:gpu", "pdf_interp/nvjpeg"]
+# GPU-accelerated JPEG 2000 decoding via nvJPEG2000.
+nvjpeg2k = ["dep:gpu", "pdf_interp/nvjpeg2k"]
+# GPU ICC CMYK→RGB transform.
+gpu-icc = ["dep:gpu", "pdf_interp/gpu-icc"]
+# GPU-accelerated deskew rotation via CUDA NPP (nppiRotate).
+# Falls back to CPU bilinear when disabled.
+gpu-deskew = ["dep:gpu"]
+
+[dependencies]
+pdf_interp  = { path = "../pdf_interp" }
+raster      = { path = "../raster" }
+color       = { path = "../color" }
+gpu         = { path = "../gpu", optional = true }
+lopdf       = "0.40"
+rayon       = "1"
+log         = { workspace = true }
+
+[lints.rust]
+unsafe_code    = "warn"   # deskew rotate may need unsafe for SIMD; explicit allow per site
+missing_docs   = "warn"
+unused_results = "warn"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
