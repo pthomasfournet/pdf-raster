@@ -21,6 +21,7 @@
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use super::image::resolve_dict;
+use super::{read_bbox, read_matrix};
 
 /// Parameters extracted from a PDF Type 1 (tiling) pattern stream.
 ///
@@ -88,8 +89,8 @@ pub fn resolve_tiling(
     let paint_type = stream.dict.get(b"PaintType").ok()?.as_i64().ok()?;
 
     let bbox = read_bbox(&stream.dict)?;
-    let x_step = read_real(&stream.dict, b"XStep")?;
-    let y_step = read_real(&stream.dict, b"YStep")?;
+    let x_step = super::read_f64_n::<1>(&stream.dict, b"XStep").map(|a| a[0])?;
+    let y_step = super::read_f64_n::<1>(&stream.dict, b"YStep").map(|a| a[0])?;
 
     if x_step == 0.0 || y_step == 0.0 {
         log::warn!(
@@ -114,46 +115,4 @@ pub fn resolve_tiling(
         matrix,
         paint_type,
     })
-}
-
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
-    let arr = dict.get(b"BBox").ok()?.as_array().ok()?;
-    if arr.len() < 4 {
-        return None;
-    }
-    let mut b = [0.0f64; 4];
-    for (i, obj) in arr.iter().take(4).enumerate() {
-        b[i] = obj_to_f64(obj)?;
-    }
-    Some(b)
-}
-
-fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
-    let arr = dict.get(b"Matrix").ok()?.as_array().ok()?;
-    if arr.len() < 6 {
-        return None;
-    }
-    let mut m = [0.0f64; 6];
-    for (i, obj) in arr.iter().take(6).enumerate() {
-        m[i] = obj_to_f64(obj)?;
-    }
-    Some(m)
-}
-
-fn read_real(dict: &lopdf::Dictionary, key: &[u8]) -> Option<f64> {
-    obj_to_f64(dict.get(key).ok()?)
-}
-
-fn obj_to_f64(obj: &Object) -> Option<f64> {
-    match obj {
-        Object::Real(r) => Some(f64::from(*r)),
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "pattern step and bbox values are small; precision loss is negligible"
-        )]
-        Object::Integer(n) => Some(*n as f64),
-        _ => None,
-    }
 }

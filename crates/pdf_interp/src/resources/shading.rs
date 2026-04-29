@@ -39,6 +39,7 @@ use raster::shading::radial::RadialPattern;
 
 use super::dict_ext::DictExt;
 use super::image::{ImageColorSpace, cs_to_image_color_space};
+use super::obj_to_f64;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -1737,19 +1738,6 @@ fn read_fn_color(dict: &Dictionary, key: &[u8], n: usize) -> Option<Vec<f64>> {
     }
     vals.resize(n, *vals.last().unwrap_or(&0.0));
     Some(vals)
-}
-
-/// Convert a `lopdf::Object` (Real or Integer) to `f64`.
-fn obj_to_f64(obj: &Object) -> Option<f64> {
-    match obj {
-        Object::Real(r) => Some(f64::from(*r)),
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "PDF numeric values in function dicts are small; precision loss is negligible"
-        )]
-        Object::Integer(i) => Some(*i as f64),
-        _ => None,
-    }
 }
 
 // ── Coordinate transforms ─────────────────────────────────────────────────────

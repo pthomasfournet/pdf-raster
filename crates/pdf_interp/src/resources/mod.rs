@@ -496,10 +496,27 @@ pub(crate) fn read_f64_n<const N: usize>(dict: &lopdf::Dictionary, key: &[u8]) -
     Some(out)
 }
 
+/// Convert a [`lopdf::Object`] (Real or Integer) to `f64`.
+///
+/// Returns `None` for any non-numeric object type.
+pub(crate) fn obj_to_f64(obj: &Object) -> Option<f64> {
+    match obj {
+        Object::Real(r) => Some(f64::from(*r)),
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "PDF numeric values fit within f64 mantissa in all real-world uses"
+        )]
+        Object::Integer(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
 /// Read the `BBox` array `[llx, lly, urx, ury]` from a dictionary.
 ///
 /// Returns `None` if absent or fewer than 4 numeric entries.
-fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+/// Normalises the result so that `llx ≤ urx` and `lly ≤ ury` — PDF allows
+/// inverted `BBox` values.
+pub(crate) fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
     let mut r = read_f64_n::<4>(dict, b"BBox")?;
     // Normalise so llx ≤ urx and lly ≤ ury — PDF allows inverted BBox.
     if r[0] > r[2] {
@@ -542,7 +559,7 @@ fn read_transparency_group(
 
 /// Read a 6-element `Matrix` array from a dictionary, returning `None` if the
 /// key is absent or has fewer than 6 numeric entries.
-fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
+pub(crate) fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
     read_f64_n::<6>(dict, b"Matrix")
 }
 
