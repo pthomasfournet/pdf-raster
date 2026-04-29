@@ -159,6 +159,7 @@ fn score_angle(img: &Bitmap<Gray8>, deg: f32) -> f64 {
 /// Output pixel = average of the `factor × factor` block of source pixels.
 /// Strips bottom/right partial blocks so output dimensions are exact integers.
 fn downsample(src: &Bitmap<Gray8>, factor: u32) -> Bitmap<Gray8> {
+    assert!(factor > 0, "downsample factor must be ≥ 1");
     let ow = src.width / factor;
     let oh = src.height / factor;
     if ow == 0 || oh == 0 {

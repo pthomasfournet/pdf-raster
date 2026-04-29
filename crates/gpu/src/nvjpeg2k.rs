@@ -175,13 +175,18 @@ const NVJPEG2K_STATUS_SUCCESS: nvjpeg2kStatus_t = 0;
 /// Returned by the library for a malformed/truncated codestream, and also
 /// returned by the shims when a C++ exception is caught during decode.
 const NVJPEG2K_STATUS_BAD_JPEG: nvjpeg2kStatus_t = 3;
+/// Returned when the requested feature is not supported, and also used by the
+/// C++ exception shims as the sentinel value for any caught exception.  Callers
+/// that receive this code cannot distinguish the two cases; both are treated as
+/// "fall back to the CPU decoder".
+const NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED: nvjpeg2kStatus_t = 9;
 
 unsafe extern "C" {
     // ── Exception-safe shims (from shim/nvjpeg2k_shim.cpp) ───────────────────
     //
     // All nvjpeg2k functions that can throw C++ exceptions are routed through
     // the C++ shim which wraps each call in try/catch and returns
-    // NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9) on any exception.
+    // NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED on any exception.
     // C++ exceptions must not propagate through Rust FFI (undefined behaviour).
     //
     // Destroy functions are shimmed for defence-in-depth: they are called from
@@ -620,11 +625,6 @@ impl NvJpeg2k {
         // Both live until end of this scope, so no use-after-free is possible.
         // Vec capacity == nc means no reallocation occurs during push, so
         // as_mut_ptr() into pixel_ptrs/pitches is stable across the decode call.
-        debug_assert_eq!(
-            comp_infos.len(),
-            nc as usize,
-            "comp_infos length must equal nc"
-        );
         let mut dev_bufs: Vec<DeviceBuf> = Vec::with_capacity(nc as usize);
         let mut pixel_ptrs: Vec<*mut c_void> = Vec::with_capacity(comp_infos.len());
         let mut pitches: Vec<usize> = Vec::with_capacity(comp_infos.len());
@@ -710,13 +710,15 @@ impl NvJpeg2k {
         let (width_us, height_us) = (width as usize, height as usize);
 
         // Invariant: nc matches color_space (1 for Gray, 3 for Rgb).
-        // These asserts catch future refactoring bugs; they fire in debug builds only.
+        // These assertions are cheap (one match per decode) and guard against
+        // future refactoring bugs that could cause silent data corruption if the
+        // interleave logic received the wrong number of planes.
         match color_space {
             Jpeg2kColorSpace::Gray => {
-                debug_assert_eq!(nc, 1, "Gray requires exactly 1 component plane")
+                assert_eq!(nc, 1, "Gray requires exactly 1 component plane")
             }
             Jpeg2kColorSpace::Rgb => {
-                debug_assert_eq!(nc, 3, "Rgb requires exactly 3 component planes")
+                assert_eq!(nc, 3, "Rgb requires exactly 3 component planes")
             }
         }
 
@@ -756,7 +758,8 @@ impl NvJpeg2k {
         }
 
         let data = match color_space {
-            Jpeg2kColorSpace::Gray => host_planes.remove(0),
+            // For Gray: exactly one plane; take it without shifting the Vec.
+            Jpeg2kColorSpace::Gray => host_planes.swap_remove(0),
             Jpeg2kColorSpace::Rgb => {
                 // Interleave three planar buffers (R, G, B) into packed RGBRGB…
                 // All three planes are exactly width×height bytes (validated in Phase 3).
@@ -799,8 +802,9 @@ impl Drop for NvJpeg2k {
         // nvjpeg2kDestroy.  nvjpeg2kStreamDestroy is independent but follows the
         // same reverse-creation convention for clarity.
         //
-        // Null-check each pointer: `new` always stores all three before returning
-        // Ok, so nulls only appear if the struct is ever constructed unsafely.
+        // `new()` asserts non-null after each successful create, so these
+        // pointers are always valid here.  The null checks are defence-in-depth
+        // only and cannot fire through the public constructor.
         //
         // SAFETY: non-null handles are valid and exclusively owned; no aliases.
         unsafe {

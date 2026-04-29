@@ -11,9 +11,13 @@
 //!
 //! let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 5, deskew: true };
 //! for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
-//!     let page = result.expect("page render failed");
-//!     // page.pixels: &[u8], 8-bit grayscale, width × height, top-to-bottom
-//!     // pass to tesseract::ocr_from_frame(&page.pixels, page.width, page.height, 1, page.width, "eng")
+//!     match result {
+//!         Ok(page) => {
+//!             // page.pixels: Vec<u8>, 8-bit grayscale, width × height, top-to-bottom
+//!             // pass to tesseract::ocr_from_frame(&page.pixels, page.width, page.height, 1, page.width, "eng")
+//!         }
+//!         Err(e) => eprintln!("page {page_num}: {e}"),
+//!     }
 //! }
 //! ```
 //!
@@ -51,17 +55,20 @@ pub use render::RasterError;
 /// Options controlling how pages are rendered.
 #[derive(Debug, Clone)]
 pub struct RasterOptions {
-    /// Render resolution in dots per inch.
+    /// Render resolution in dots per inch.  Must be > 0.
     ///
     /// Pass this same value to Tesseract's `set_source_resolution` — lying about
     /// DPI degrades OCR accuracy because Tesseract uses it for internal scaling.
     /// Recommended: 300 DPI for scanned documents.
     pub dpi: f32,
 
-    /// First page to render (1-based, inclusive).
+    /// First page to render (1-based, inclusive).  Must be ≥ 1.
     pub first_page: u32,
 
-    /// Last page to render (1-based, inclusive).
+    /// Last page to render (1-based, inclusive).  Must be ≥ `first_page`.
+    ///
+    /// If `last_page` exceeds the document's page count, rendering stops at the
+    /// last page in the document rather than returning an error.
     pub last_page: u32,
 
     /// Apply deskew before returning pixels.
@@ -106,6 +113,8 @@ pub struct RenderedPage {
 ///
 /// # Errors
 ///
+/// - [`RasterError::InvalidOptions`] if `opts` violates documented constraints
+///   (e.g. `dpi ≤ 0`, `first_page > last_page`).
 /// - [`RasterError::Pdf`] if the document cannot be opened or parsed.
 /// - [`RasterError::PageOutOfRange`] if a requested page exceeds the document.
 /// - [`RasterError::PageDegenerate`] / [`RasterError::PageTooLarge`] for

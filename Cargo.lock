@@ -1164,6 +1164,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf_raster"
+version = "0.1.0"
+dependencies = [
+ "color 0.1.0",
+ "gpu",
+ "log",
+ "lopdf",
+ "pdf_interp",
+ "raster",
+ "rayon",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

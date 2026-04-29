@@ -46,6 +46,10 @@ pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), Des
 /// corresponding source coordinates `(sx, sy)` by applying the inverse
 /// rotation matrix centred on the image centre, then bilinear-interpolate
 /// from the four surrounding source pixels.
+///
+/// Out-of-bounds source pixels are filled with 255 (white).  The rightmost
+/// and bottom source columns/rows are treated as out-of-bounds because bilinear
+/// sampling requires a 2×2 neighbourhood — the last valid origin is (w-2, h-2).
 pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     let w = src.width as usize;
     let h = src.height as usize;
@@ -60,6 +64,10 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     let cx = (w as f32 - 1.0) * 0.5;
     let cy = (h as f32 - 1.0) * 0.5;
 
+    // Valid source coordinate range for bilinear sampling: x ∈ [0, w-2], y ∈ [0, h-2].
+    let sx_max = (w as i32) - 2;
+    let sy_max = (h as i32) - 2;
+
     for oy in 0..h {
         let dst_row = dst.row_bytes_mut(oy as u32);
         // Pre-compute the y-dependent terms outside the x loop.
@@ -68,60 +76,47 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
         let sy_base = sin_a * (-cx) + cos_a * dy + cy;
 
         for ox in 0..w {
-            let dx = ox as f32; // relative to left edge; cx offset folded in above
+            let dx = ox as f32;
             let sx = sx_base + cos_a * dx;
             let sy = sy_base + sin_a * dx;
 
-            dst_row[ox] = bilinear(src, sx, sy);
+            let x0 = sx.floor() as i32;
+            let y0 = sy.floor() as i32;
+
+            if x0 < 0 || y0 < 0 || x0 > sx_max || y0 > sy_max {
+                dst_row[ox] = 255;
+                continue;
+            }
+
+            let x0u = x0 as usize;
+            let y0u = y0 as usize;
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+
+            let r0 = src.row_bytes(y0u as u32);
+            let r1 = src.row_bytes((y0u + 1) as u32);
+
+            let p00 = r0[x0u] as f32;
+            let p10 = r0[x0u + 1] as f32;
+            let p01 = r1[x0u] as f32;
+            let p11 = r1[x0u + 1] as f32;
+
+            let top = p00 + fx * (p10 - p00);
+            let bot = p01 + fx * (p11 - p01);
+            let val = top + fy * (bot - top);
+
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "bilinear of values in [0,255] stays in [0,255]"
+            )]
+            {
+                dst_row[ox] = val.round() as u8;
+            }
         }
     }
 
     dst
-}
-
-/// Bilinear interpolation from a grayscale bitmap.
-///
-/// Returns 255 (white) for any source coordinate outside image bounds.
-#[inline]
-fn bilinear(src: &Bitmap<Gray8>, sx: f32, sy: f32) -> u8 {
-    let w = src.width as usize;
-    let h = src.height as usize;
-
-    let x0 = sx.floor() as i32;
-    let y0 = sy.floor() as i32;
-
-    // All four corners must be within bounds; otherwise fill with white.
-    if x0 < 0 || y0 < 0 || x0 + 1 >= w as i32 || y0 + 1 >= h as i32 {
-        return 255;
-    }
-
-    let x0u = x0 as usize;
-    let y0u = y0 as usize;
-
-    let fx = sx - x0 as f32; // fractional x [0, 1)
-    let fy = sy - y0 as f32; // fractional y [0, 1)
-
-    let r0 = src.row_bytes(y0u as u32);
-    let r1 = src.row_bytes((y0u + 1) as u32);
-
-    let p00 = r0[x0u] as f32;
-    let p10 = r0[x0u + 1] as f32;
-    let p01 = r1[x0u] as f32;
-    let p11 = r1[x0u + 1] as f32;
-
-    // Bilinear blend.
-    let top = p00 + fx * (p10 - p00);
-    let bot = p01 + fx * (p11 - p01);
-    let val = top + fy * (bot - top);
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "bilinear of values in [0,255] stays in [0,255]"
-    )]
-    {
-        val.round() as u8
-    }
 }
 
 /// GPU rotation via CUDA NPP (stub — enabled by `gpu-deskew` feature).

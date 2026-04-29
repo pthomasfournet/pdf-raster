@@ -88,6 +88,9 @@ fn init_nvjpeg2k() {
 /// Errors returned by [`crate::raster_pdf`].
 #[derive(Debug)]
 pub enum RasterError {
+    /// [`RasterOptions`](crate::RasterOptions) fields violate documented constraints
+    /// (e.g. `dpi ≤ 0`, `first_page > last_page`).
+    InvalidOptions(String),
     /// The PDF could not be opened or parsed.
     Pdf(pdf_interp::InterpError),
     /// The requested page number is outside the document.
@@ -118,6 +121,7 @@ pub enum RasterError {
 impl std::fmt::Display for RasterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidOptions(msg) => write!(f, "invalid raster options: {msg}"),
             Self::Pdf(e) => write!(f, "PDF error: {e}"),
             Self::PageOutOfRange { page, total } => {
                 write!(
@@ -165,6 +169,9 @@ impl From<pdf_interp::InterpError> for RasterError {
 /// State shared across all pages rendered in one `raster_pdf` call.
 struct RenderState {
     doc: lopdf::Document,
+    /// Page-number → object-ID map, built once at construction to avoid O(n²)
+    /// cost from calling `doc.get_pages()` on every page.
+    pages: std::collections::BTreeMap<u32, lopdf::ObjectId>,
     opts: RasterOptions,
     total_pages: u32,
     current_page: u32,
@@ -176,11 +183,39 @@ pub(crate) fn render_pages(
     path: &std::path::Path,
     opts: &RasterOptions,
 ) -> impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)> {
+    // Validate options early so the caller gets a clear error rather than silent
+    // empty output or a confusing downstream panic.
+    if opts.dpi <= 0.0 || !opts.dpi.is_finite() {
+        return PageIter {
+            state: Some(Err(RasterError::InvalidOptions(format!(
+                "dpi must be a positive finite number, got {}",
+                opts.dpi
+            )))),
+        };
+    }
+    if opts.first_page == 0 {
+        return PageIter {
+            state: Some(Err(RasterError::InvalidOptions(
+                "first_page must be ≥ 1 (pages are 1-based)".to_owned(),
+            ))),
+        };
+    }
+    if opts.first_page > opts.last_page {
+        return PageIter {
+            state: Some(Err(RasterError::InvalidOptions(format!(
+                "first_page ({}) > last_page ({})",
+                opts.first_page, opts.last_page
+            )))),
+        };
+    }
+
     let result = pdf_interp::open(path);
 
     // Construct state eagerly so document-level errors surface on first next().
     let state = result.map(|doc| {
         let total_pages = pdf_interp::page_count(&doc);
+        // Build once: avoid O(n²) cost from re-building the pages map per page.
+        let pages = doc.get_pages();
 
         #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
         let gpu_ctx = gpu::GpuCtx::new().ok().map(Arc::new);
@@ -188,6 +223,7 @@ pub(crate) fn render_pages(
         RenderState {
             current_page: opts.first_page,
             total_pages,
+            pages,
             doc,
             opts: opts.clone(),
             #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
@@ -196,42 +232,46 @@ pub(crate) fn render_pages(
     });
 
     PageIter {
-        state: state.map_err(RasterError::from),
+        state: Some(state.map_err(RasterError::from)),
     }
 }
 
 struct PageIter {
-    state: Result<RenderState, RasterError>,
+    // `None` once the iterator is exhausted or a document-open error has been yielded.
+    state: Option<Result<RenderState, RasterError>>,
 }
 
 impl Iterator for PageIter {
     type Item = (u32, Result<RenderedPage, RasterError>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let state = match &mut self.state {
-            Ok(s) => s,
+        match self.state.as_mut()? {
             Err(_) => {
-                // Swap out the error so we yield it exactly once then stop.
-                let err = std::mem::replace(
-                    &mut self.state,
-                    Err(RasterError::Deskew(String::new())), // sentinel, never read
-                );
-                // We started with Err so we yield the document-open error on page first_page.
-                // But we need to know first_page without having the state — use 1 as a safe
-                // placeholder; the caller only cares that result is Err.
-                return Some((1, err.map(|_| unreachable!())));
+                // Document-open error: take it out, yield once, then stop (state → None).
+                let err = self
+                    .state
+                    .take()
+                    .expect("state was Some(_) one line above")
+                    .map(|_| unreachable!());
+                // first_page is not available when the document failed to open; use 1
+                // as a placeholder — the caller only cares about the Err payload.
+                Some((1, err))
             }
-        };
+            Ok(state) => {
+                if state.current_page > state.opts.last_page
+                    || state.current_page > state.total_pages
+                {
+                    self.state = None;
+                    return None;
+                }
 
-        if state.current_page > state.opts.last_page || state.current_page > state.total_pages {
-            return None;
+                let page_num = state.current_page;
+                state.current_page += 1;
+
+                let result = render_one(state, page_num);
+                Some((page_num, result))
+            }
         }
-
-        let page_num = state.current_page;
-        state.current_page += 1;
-
-        let result = render_one(state, page_num);
-        Some((page_num, result))
     }
 }
 
@@ -267,8 +307,7 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
         });
     }
 
-    let pages = doc.get_pages();
-    let page_id = *pages.get(&page_num).ok_or(RasterError::PageOutOfRange {
+    let page_id = *state.pages.get(&page_num).ok_or(RasterError::PageOutOfRange {
         page: page_num,
         total: state.total_pages,
     })?;

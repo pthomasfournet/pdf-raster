@@ -351,7 +351,7 @@ cargo run -p gpu --release --bin threshold_bench
 
 ---
 
-## Phase 5 — Public library API (IN PROGRESS)
+## Phase 5 — Public library API (IN PROGRESS — library shipped, review pass done)
 
 Extract the render pipeline into a reusable library crate. The caller gets 8-bit grayscale pixels in memory and passes them directly to Tesseract — no subprocess, no files, no Leptonica.
 
@@ -452,11 +452,13 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 
 ### Work items
 
-- [ ] New `crates/pdf_raster` library crate; add to `Cargo.toml` workspace members
-- [ ] Move `render_page_native` core (minus `&Args`, minus file I/O) into library
-- [ ] Export `rgb_to_gray` (BT.709) from library (currently private in CLI)
-- [ ] Encapsulate GPU decoder lifecycle (`DecoderInit<T>`) inside library — not caller-visible
-- [ ] `crates/pdf_raster/src/deskew/detect.rs` — intensity-weighted projection profile, AVX-512 row sums, Rayon sweep parallelism
-- [ ] `crates/pdf_raster/src/deskew/rotate.rs` — GPU texture bilinear (`nppiRotate`) + CPU AVX-512 bilinear fallback
+- [x] New `crates/pdf_raster` library crate; add to `Cargo.toml` workspace members
+- [x] Move `render_page_native` core (minus `&Args`, minus file I/O) into library
+- [x] Export `rgb_to_gray` (BT.709) from library (currently private in CLI)
+- [x] Encapsulate GPU decoder lifecycle (`DecoderInit<T>`) inside library — not caller-visible
+- [x] `crates/pdf_raster/src/deskew/detect.rs` — intensity-weighted projection profile, AVX-512 row sums, Rayon sweep parallelism
+- [x] `crates/pdf_raster/src/deskew/rotate.rs` — CPU bilinear fallback; GPU stub (`nppiRotate` TODO)
+- [x] Review pass: sentinel hack → `Option<Result>`, pages map O(n²) → O(n), `InvalidOptions` validation, `debug_assert` → `assert`, `NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED` constant, `remove(0)` → `swap_remove(0)`, bilinear inlined into rotate loop, `downsample` factor=0 guard
 - [ ] Make CLI a thin wrapper over `crates/pdf_raster`
+- [ ] GPU rotation: implement `rotate_gpu` via `nppiRotate_8u_C1R_Ctx`
 - [ ] Integration tests: round-trip a fixture PDF, assert pixel dimensions and grayscale range; deskew unit tests with synthetic skewed images at known angles

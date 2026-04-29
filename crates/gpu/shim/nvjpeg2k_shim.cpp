@@ -1,8 +1,7 @@
 // C++ shim: wraps all nvjpeg2k entry points that may throw in try/catch so
 // that C++ exceptions cannot propagate through Rust FFI (undefined behaviour).
-// Any exception is caught and converted to
-// NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED (9), causing the Rust caller
-// to fall back to the CPU OpenJPEG path.
+// Any exception is caught and converted to NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED,
+// causing the Rust caller to fall back to the CPU OpenJPEG path.
 //
 // NOTE: catch (...) catches C++ exceptions only.  On Linux with GCC/Clang this
 // covers std::exception and its subclasses (including nvjpeg2k::ExceptionJPEG).
