@@ -234,8 +234,9 @@ fn resolve_radial(
     }
 
     let scale = ctm_scale(ctm);
-    let dr0 = coords[2] * scale;
-    let dr1 = coords[5] * scale;
+    // PDF spec requires r ≥ 0; take abs to handle malformed input gracefully.
+    let dr0 = coords[2].abs() * scale;
+    let dr1 = coords[5].abs() * scale;
 
     // Bounding box: union of both circles.
     let outer_r = dr0.max(dr1);
@@ -426,8 +427,11 @@ fn resolve_function_based(
 pub(super) struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
-    /// Bits already fetched from `data` but not yet consumed (MSB-justified).
-    bit_buf: u32,
+    /// Bits already fetched from `data` but not yet consumed.
+    /// Right-justified (LSB-aligned): live bits occupy `bit_buf[bits_in_buf-1..0]`.
+    /// Extraction uses `(bit_buf >> bits_in_buf) & mask` to pull from the top of
+    /// the live region.  64-bit so `n=32` never overflows the accumulator.
+    bit_buf: u64,
     bits_in_buf: u8,
 }
 
@@ -458,38 +462,58 @@ impl<'a> BitReader<'a> {
             if self.byte_pos >= self.data.len() {
                 return None;
             }
-            self.bit_buf = (self.bit_buf << 8) | u32::from(self.data[self.byte_pos]);
+            // u64 accumulator: safe for n=32 even when bits_in_buf > 0 on entry,
+            // since 32 + 32 (max pre-existing) = 64 ≤ u64::BITS.
+            self.bit_buf = (self.bit_buf << 8) | u64::from(self.data[self.byte_pos]);
             self.byte_pos += 1;
             self.bits_in_buf += 8;
         }
         self.bits_in_buf -= n;
-        // Safe: n ∈ [1,32], bits_in_buf ≥ 0 after subtraction.
-        let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
-        Some((self.bit_buf >> self.bits_in_buf) & mask)
+        let mask = if n == 32 { u64::from(u32::MAX) } else { (1u64 << n) - 1 };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "mask is at most u32::MAX; the extracted value fits u32"
+        )]
+        Some(((self.bit_buf >> self.bits_in_buf) & mask) as u32)
     }
 }
 
 /// PDF-legal values for `BitsPerCoordinate` and `BitsPerComponent` (Table 84/85).
 pub(super) const VALID_BITS: &[u8] = &[1, 2, 4, 8, 12, 16, 24, 32];
 
+/// Validate a PDF integer field against a set of legal bit-width values.
+///
+/// Shared by `parse_bits_per_coord`, `parse_bits_per_comp`, and `parse_bits_per_flag`.
+/// Logs a warning and returns `None` if the value is absent or not in `valid_set`.
+pub(super) fn parse_bits_field(
+    sh: &Dictionary,
+    key: &[u8],
+    valid_set: &[u8],
+    field_name: &str,
+    tag: &str,
+) -> Option<u8> {
+    let v = sh.get_i64(key)?;
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
+    )]
+    if let Some(bits) = u8::try_from(v).ok().filter(|b| valid_set.contains(b)) {
+        Some(bits)
+    } else {
+        log::warn!(
+            "shading/{tag}: {field_name}={v} is not a legal PDF value \
+             (must be one of {valid_set:?}) — skipping"
+        );
+        None
+    }
+}
+
 /// Validate and extract `BitsPerCoordinate` from a mesh shading dictionary.
 ///
 /// Logs a warning and returns `None` if the key is absent or the value is not
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 pub(super) fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
-    let v = sh.get_i64(b"BitsPerCoordinate")?;
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
-    )]
-    if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
-        Some(bits)
-    } else {
-        log::warn!(
-            "shading/{tag}: BitsPerCoordinate={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping"
-        );
-        None
-    }
+    parse_bits_field(sh, b"BitsPerCoordinate", VALID_BITS, "BitsPerCoordinate", tag)
 }
 
 /// Validate and extract `BitsPerComponent` from a mesh shading dictionary.
@@ -497,19 +521,7 @@ pub(super) fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
 /// Logs a warning and returns `None` if the key is absent or the value is not
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 pub(super) fn parse_bits_per_comp(sh: &Dictionary, tag: &str) -> Option<u8> {
-    let v = sh.get_i64(b"BitsPerComponent")?;
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
-    )]
-    if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_BITS.contains(b)) {
-        Some(bits)
-    } else {
-        log::warn!(
-            "shading/{tag}: BitsPerComponent={v} is not a legal PDF value (must be one of {VALID_BITS:?}) — skipping"
-        );
-        None
-    }
+    parse_bits_field(sh, b"BitsPerComponent", VALID_BITS, "BitsPerComponent", tag)
 }
 
 /// Decode a Type 4 (free-form Gouraud triangle mesh) shading stream.
@@ -733,12 +745,17 @@ pub(super) fn read_decode_array(sh: &Dictionary, n_channels: usize) -> Vec<f64> 
         Some(v) if v.len() == expected => v,
         Some(v) => {
             log::warn!(
-                "shading: Decode array has {} entries, expected {expected} — using defaults",
+                "shading: Decode array has {} entries, expected {expected} — using [0,1] defaults",
                 v.len()
             );
             default_decode(n_channels)
         }
-        None => default_decode(n_channels),
+        None => {
+            log::warn!(
+                "shading: Decode array missing (required for mesh shadings) — using [0,1] defaults"
+            );
+            default_decode(n_channels)
+        }
     }
 }
 
@@ -869,13 +886,11 @@ pub(super) fn bbox_from_coords(pts: &[f64]) -> [f64; 4] {
     let mut ymin = f64::INFINITY;
     let mut xmax = f64::NEG_INFINITY;
     let mut ymax = f64::NEG_INFINITY;
-    let mut i = 0;
-    while i + 1 < pts.len() {
-        xmin = xmin.min(pts[i]);
-        xmax = xmax.max(pts[i]);
-        ymin = ymin.min(pts[i + 1]);
-        ymax = ymax.max(pts[i + 1]);
-        i += 2;
+    for chunk in pts.chunks_exact(2) {
+        xmin = xmin.min(chunk[0]);
+        xmax = xmax.max(chunk[0]);
+        ymin = ymin.min(chunk[1]);
+        ymax = ymax.max(chunk[1]);
     }
     [xmin, ymin, xmax, ymax]
 }
@@ -883,14 +898,11 @@ pub(super) fn bbox_from_coords(pts: &[f64]) -> [f64; 4] {
 /// Read the `Extend` array `[extend_start, extend_end]`; both default to `false`.
 fn read_extend(sh: &Dictionary) -> (bool, bool) {
     let arr = sh.get(b"Extend").ok().and_then(|o| o.as_array().ok());
-    match arr {
-        Some(arr) if arr.len() >= 2 => {
-            let s = arr[0].as_bool().unwrap_or(false);
-            let e = arr[1].as_bool().unwrap_or(false);
-            (s, e)
-        }
-        _ => (false, false),
-    }
+    let Some(a) = arr.filter(|a| a.len() >= 2) else {
+        return (false, false);
+    };
+    let b = |i: usize| a.get(i).and_then(|o| o.as_bool().ok()).unwrap_or(false);
+    (b(0), b(1))
 }
 
 #[cfg(test)]

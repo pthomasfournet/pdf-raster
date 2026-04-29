@@ -1,11 +1,21 @@
 //! PDF Function evaluation for shading types 2 (Exponential) and 3 (Stitching).
 //!
 //! The entry point is [`eval_function`], which dispatches on `FunctionType`.
+//!
+//! # Limitations
+//!
+//! For Type 0 (Sampled), the actual sample table is not consulted (stream decoding
+//! is not yet implemented); only the `Decode` range is linearly interpolated.
+//! The PDF `Range` clip is not applied for any function type.
 
 use lopdf::{Dictionary, Document, Object};
 
 use crate::resources::dict_ext::DictExt;
 use crate::resources::{obj_to_f64, resolve_dict};
+
+/// Maximum nesting depth for recursive function evaluation (guards against
+/// crafted PDFs with deeply or circularly nested Type 3 functions).
+const MAX_FN_DEPTH: u8 = 10;
 
 // ── Public-to-parent API ──────────────────────────────────────────────────────
 
@@ -14,15 +24,33 @@ use crate::resources::{obj_to_f64, resolve_dict};
 /// Supported function types:
 /// - **Type 2** (Exponential): `C0 + t^N × (C1 − C0)`.
 /// - **Type 3** (Stitching): maps `t` to a sub-function and recursively evaluates.
-/// - **Type 0** (Sampled): linear interpolation across the decode range (no stream data).
+/// - **Type 0** (Sampled): linear interpolation across the decode range (stream data not used).
 ///
 /// Unknown types fall back to `C0` if available.
 pub(super) fn eval_function(doc: &Document, fn_obj: &Object, t: f64, n: usize) -> Option<Vec<f64>> {
+    eval_function_depth(doc, fn_obj, t, n, 0)
+}
+
+fn eval_function_depth(
+    doc: &Document,
+    fn_obj: &Object,
+    t: f64,
+    n: usize,
+    depth: u8,
+) -> Option<Vec<f64>> {
+    if depth >= MAX_FN_DEPTH {
+        log::warn!(
+            "shading: PDF function nesting depth {depth} exceeds limit {MAX_FN_DEPTH} — \
+             returning C0 fallback to prevent stack overflow"
+        );
+        let fn_dict = resolve_dict(doc, fn_obj)?;
+        return read_fn_color(fn_dict, b"C0", n);
+    }
     let fn_dict = resolve_dict(doc, fn_obj)?;
     let fn_type = fn_dict.get_i64(b"FunctionType")?;
     match fn_type {
         2 => Some(eval_exponential(fn_dict, t, n)),
-        3 => eval_stitching(doc, fn_dict, t, n),
+        3 => eval_stitching_depth(doc, fn_dict, t, n, depth),
         0 => Some(eval_sampled_approx(fn_dict, t, n)),
         _ => {
             log::debug!("shading: FunctionType {fn_type} not yet implemented — using C0 fallback");
@@ -37,15 +65,22 @@ pub(super) fn eval_exponential(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f6
     let c1 = read_fn_color(fn_dict, b"C1", n).unwrap_or_else(|| vec![1.0; n]);
 
     let (d0, d1) = read_fn_domain(fn_dict);
-    let t_clamped = t.clamp(d0, d1);
 
-    let exponent = fn_dict.get(b"N").ok().and_then(obj_to_f64).unwrap_or(1.0);
-    let t_norm = if (d1 - d0).abs() < f64::EPSILON {
-        0.0
+    // PDF spec says N ≥ 0; clamp exponent to avoid +infinity from 0^(negative).
+    let exponent = fn_dict
+        .get(b"N")
+        .ok()
+        .and_then(obj_to_f64)
+        .unwrap_or(1.0)
+        .max(0.0);
+
+    // safe_clamp: f64::clamp panics when min > max or either is NaN.
+    let t_norm = if d1 > d0 {
+        ((t - d0) / (d1 - d0)).clamp(0.0, 1.0)
     } else {
-        (t_clamped - d0) / (d1 - d0)
+        0.0
     };
-    let weight = t_norm.max(0.0).powf(exponent);
+    let weight = t_norm.powf(exponent);
 
     c0.iter()
         .zip(c1.iter())
@@ -53,18 +88,27 @@ pub(super) fn eval_exponential(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f6
         .collect()
 }
 
-/// Evaluate a Type 3 Stitching function.
-///
-/// Maps `t` to the appropriate sub-function via `Bounds` and `Encode`,
-/// then recursively evaluates that sub-function.
+/// Evaluate a Type 3 Stitching function (test entry point).
+#[cfg(test)]
 pub(super) fn eval_stitching(
     doc: &Document,
     fn_dict: &Dictionary,
     t: f64,
     n: usize,
 ) -> Option<Vec<f64>> {
+    eval_stitching_depth(doc, fn_dict, t, n, 0)
+}
+
+fn eval_stitching_depth(
+    doc: &Document,
+    fn_dict: &Dictionary,
+    t: f64,
+    n: usize,
+    depth: u8,
+) -> Option<Vec<f64>> {
     let (d0, d1) = read_fn_domain(fn_dict);
-    let t_clamped = t.clamp(d0, d1);
+    // safe_clamp: f64::clamp panics when min > max; guard before calling.
+    let t_clamped = if d1 > d0 { t.clamp(d0, d1) } else { d0 };
 
     let fns = fn_dict.get(b"Functions").ok()?.as_array().ok()?;
     let num_fns = fns.len();
@@ -90,7 +134,7 @@ pub(super) fn eval_stitching(
             bounds.len(),
             num_fns - 1,
         );
-        return eval_function(doc, &fns[0], t_clamped, n);
+        return eval_function_depth(doc, &fns[0], t_clamped, n, depth + 1);
     }
 
     // Build breakpoint list: [d0, bounds..., d1].
@@ -132,7 +176,7 @@ pub(super) fn eval_stitching(
         ((t_clamped - in_lo) / (in_hi - in_lo)).mul_add(out_hi - out_lo, out_lo)
     };
 
-    eval_function(doc, &fns[idx], t_encoded, n)
+    eval_function_depth(doc, &fns[idx], t_encoded, n, depth + 1)
 }
 
 /// Approximate a Type 0 Sampled function by linearly interpolating the decode range.
@@ -141,10 +185,11 @@ pub(super) fn eval_stitching(
 /// it returns the correct endpoints at `t = Domain[0]` and `t = Domain[1]`.
 pub(super) fn eval_sampled_approx(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f64> {
     let (d0, d1) = read_fn_domain(fn_dict);
-    let t_norm = if (d1 - d0).abs() < f64::EPSILON {
-        0.0
-    } else {
+    // Guard: d1 > d0 before dividing; avoids divide-by-zero and clamp panic.
+    let t_norm = if d1 > d0 {
         ((t - d0) / (d1 - d0)).clamp(0.0, 1.0)
+    } else {
+        0.0
     };
 
     // Decode range defaults to [0, 1] per channel.
@@ -187,7 +232,8 @@ pub(super) fn read_fn_color(dict: &Dictionary, key: &[u8], n: usize) -> Option<V
     if vals.is_empty() {
         return None;
     }
-    vals.resize(n, *vals.last().unwrap_or(&0.0));
+    // vals is non-empty: the `if vals.is_empty()` guard above returned early.
+    vals.resize(n, *vals.last().expect("vals non-empty: checked above"));
     Some(vals)
 }
 

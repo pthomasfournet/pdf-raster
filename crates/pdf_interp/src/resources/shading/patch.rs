@@ -10,7 +10,6 @@ use super::{
     BitReader, cs_to_rgb, parse_bits_per_comp, parse_bits_per_coord, read_decode_array,
     transform_point,
 };
-use crate::resources::dict_ext::DictExt;
 use crate::resources::image::ImageColorSpace;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -183,8 +182,11 @@ pub(super) const fn corner_vertex(p: &Patch, u: usize, v: usize) -> GouraudVerte
     reason = "Patch (272 B) is consumed on the work stack; reference would require a Clone per push"
 )]
 pub(super) fn tessellate_patch(patch: Patch, out: &mut Vec<[GouraudVertex; 3]>) {
-    // Pre-allocate the work stack; worst case is 4 * MAX_PATCH_DEPTH live entries.
-    let mut stack: Vec<(Patch, u8)> = Vec::with_capacity(4 * MAX_PATCH_DEPTH as usize);
+    // Pre-allocate the work stack.  In a DFS traversal of a 4-ary tree of depth D,
+    // at most 3*D+1 nodes are simultaneously live on the stack (3 siblings waiting
+    // at each level plus the children just pushed).  For MAX_PATCH_DEPTH=6 that is 19;
+    // 24 is a safe round-up.
+    let mut stack: Vec<(Patch, u8)> = Vec::with_capacity(3 * MAX_PATCH_DEPTH as usize + 1);
     stack.push((patch, 0));
 
     while let Some((p, depth)) = stack.pop() {
@@ -287,20 +289,7 @@ pub(super) fn read_patch_colors(
 
 /// Validate and extract `BitsPerFlag` from a patch mesh shading dictionary.
 pub(super) fn parse_bits_per_flag(sh: &Dictionary, tag: &str) -> Option<u8> {
-    let v = sh.get_i64(b"BitsPerFlag")?;
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "else branch has a side-effect (log::warn); map_or_else would be less clear"
-    )]
-    if let Some(bits) = u8::try_from(v).ok().filter(|b| VALID_FLAG_BITS.contains(b)) {
-        Some(bits)
-    } else {
-        log::warn!(
-            "shading/{tag}: BitsPerFlag={v} is not a legal PDF value \
-             (must be one of {VALID_FLAG_BITS:?}) — skipping"
-        );
-        None
-    }
+    super::parse_bits_field(sh, b"BitsPerFlag", VALID_FLAG_BITS, "BitsPerFlag", tag)
 }
 
 // ── Patch assembly — Type 6 ───────────────────────────────────────────────────
@@ -351,25 +340,21 @@ pub(super) fn fill_type6_interior(p: &mut Patch) {
         let [p20, p23] = [p.xy[2][0][k], p.xy[2][3][k]];
         let [p30, p31, p32, p33] = [p.xy[3][0][k], p.xy[3][1][k], p.xy[3][2][k], p.xy[3][3][k]];
         // Coons formula: (-4a + 6(b+c) - 2(d+e) + 3(f+g) - h) / 9
-        // Written with mul_add to minimise rounding error.
-        p.xy[1][1][k] = ((-4.0f64)
-            .mul_add(p00, 6.0 * (p01 + p10))
-            .mul_add(1.0, (-2.0f64).mul_add(p03 + p30, 3.0 * (p31 + p13)))
+        // Inner mul_add calls use FMA for reduced rounding error.
+        p.xy[1][1][k] = ((-4.0f64).mul_add(p00, 6.0 * (p01 + p10))
+            + (-2.0f64).mul_add(p03 + p30, 3.0 * (p31 + p13))
             - p33)
             / 9.0;
-        p.xy[1][2][k] = ((-4.0f64)
-            .mul_add(p03, 6.0 * (p02 + p13))
-            .mul_add(1.0, (-2.0f64).mul_add(p00 + p33, 3.0 * (p32 + p10)))
+        p.xy[1][2][k] = ((-4.0f64).mul_add(p03, 6.0 * (p02 + p13))
+            + (-2.0f64).mul_add(p00 + p33, 3.0 * (p32 + p10))
             - p30)
             / 9.0;
-        p.xy[2][1][k] = ((-4.0f64)
-            .mul_add(p30, 6.0 * (p31 + p20))
-            .mul_add(1.0, (-2.0f64).mul_add(p33 + p00, 3.0 * (p01 + p23)))
+        p.xy[2][1][k] = ((-4.0f64).mul_add(p30, 6.0 * (p31 + p20))
+            + (-2.0f64).mul_add(p33 + p00, 3.0 * (p01 + p23))
             - p03)
             / 9.0;
-        p.xy[2][2][k] = ((-4.0f64)
-            .mul_add(p33, 6.0 * (p32 + p23))
-            .mul_add(1.0, (-2.0f64).mul_add(p30 + p03, 3.0 * (p02 + p20)))
+        p.xy[2][2][k] = ((-4.0f64).mul_add(p33, 6.0 * (p32 + p23))
+            + (-2.0f64).mul_add(p30 + p03, 3.0 * (p02 + p20))
             - p00)
             / 9.0;
     }
