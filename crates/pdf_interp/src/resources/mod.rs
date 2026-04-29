@@ -584,9 +584,9 @@ pub(crate) fn resolve_stream_dict<'a>(
     match obj {
         Object::Dictionary(d) => Some(d),
         Object::Reference(id) => match doc.get_object(*id).ok()? {
-            Object::Dictionary(d) => Some(d),
             Object::Stream(s) => Some(&s.dict),
-            _ => None,
+            // Reference to a plain dictionary: share the plain-dict path.
+            other => resolve_dict(doc, other),
         },
         _ => None,
     }

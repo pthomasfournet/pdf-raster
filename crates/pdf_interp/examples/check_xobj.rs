@@ -30,7 +30,7 @@ fn main() {
             if let Object::Reference(id) = v {
                 let stream = doc
                     .get_object(*id)
-                    .and_then(|o| o.as_stream().map(|s| s.clone()))
+                    .and_then(|o| o.as_stream().cloned())
                     .ok();
                 if let Some(s) = stream {
                     let filter = s
