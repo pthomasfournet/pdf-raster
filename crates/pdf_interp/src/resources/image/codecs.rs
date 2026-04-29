@@ -116,7 +116,9 @@ fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
         if rows_decoded == 0 {
             return None;
         }
-        data_out.resize(p.capacity, 0xFF);
+        // When black_is_1=true, 0xFF encodes black; pad with 0x00 (white) instead.
+        let pad = if p.black_is_1 { 0x00 } else { 0xFF };
+        data_out.resize(p.capacity, pad);
     }
 
     let cs = if p.is_mask {
@@ -162,7 +164,8 @@ fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<I
             "image: CCITTFaxDecode Group3 1D: got {rows_decoded}/{} rows — padding remainder",
             p.height
         );
-        data_out.resize(p.capacity, 0xFF);
+        let pad = if p.black_is_1 { 0x00 } else { 0xFF };
+        data_out.resize(p.capacity, pad);
     }
 
     let cs = if p.is_mask {
@@ -239,7 +242,8 @@ fn decode_ccitt_g3_2d(
             "image: CCITTFaxDecode Group3 2D: got {rows_decoded}/{} rows — padding remainder",
             p.height
         );
-        data_out.resize(p.capacity, 0xFF);
+        let pad = if p.black_is_1 { 0x00 } else { 0xFF };
+        data_out.resize(p.capacity, pad);
     }
 
     let cs = if p.is_mask {
@@ -425,12 +429,30 @@ pub(super) fn decode_dct(
         .map_err(|e| log::warn!("image: DCTDecode decode error: {e}"))
         .ok()?;
 
-    let jpeg_info = decoder.info()?;
+    let jpeg_info = decoder.info().or_else(|| {
+        log::warn!("image: DCTDecode: JPEG info unavailable after decode");
+        None
+    })?;
     let jw = u32::from(jpeg_info.width);
     let jh = u32::from(jpeg_info.height);
 
     if jw == 0 || jh == 0 {
         log::warn!("image: DCTDecode: JPEG reported zero dimensions {jw}×{jh}");
+        return None;
+    }
+
+    // Validate the pixel buffer length against the dimensions we are about to use.
+    // A mismatch means the JPEG SOF markers misreported dimensions; trust jw/jh
+    // only when the buffer is consistent with them.
+    let expected_pixels = (jw as usize)
+        .checked_mul(jh as usize)
+        .and_then(|n| n.checked_mul(usize::from(components)));
+    if expected_pixels.is_none_or(|e| pixels.len() < e) {
+        log::warn!(
+            "image: DCTDecode: pixel buffer length {} inconsistent with \
+             {jw}×{jh}×{components} — skipping",
+            pixels.len()
+        );
         return None;
     }
 
@@ -573,6 +595,14 @@ pub(super) fn cmyk_raw_to_rgb(
 
     // CPU path (also used below threshold by GpuCtx itself, but we land here
     // when the feature is disabled or no GpuCtx is provided).
+    if !pixels.len().is_multiple_of(4) {
+        log::warn!(
+            "image: cmyk_raw_to_rgb: pixel buffer length {} is not a multiple of 4 — \
+             {} trailing bytes ignored",
+            pixels.len(),
+            pixels.len() % 4
+        );
+    }
     let npixels = pixels.len() / 4;
     let mut rgb = Vec::with_capacity(npixels.checked_mul(3)?);
     for chunk in pixels.chunks_exact(4) {
@@ -845,7 +875,6 @@ pub(super) fn decode_jbig2(
     let n_pixels = (jw as usize).checked_mul(jh as usize)?;
     let mut collector = Jbig2Collector {
         data: Vec::with_capacity(n_pixels),
-        is_mask,
     };
 
     img.decode(&mut collector)
@@ -882,10 +911,9 @@ pub(super) fn decode_jbig2(
 /// `ImageColorSpace::Mask` convention: 0x00 = paint (== JBIG2 black), 0xFF = transparent.
 ///
 /// Both output conventions share the same polarity flip: JBIG2 black (1) → 0x00,
-/// JBIG2 white (0) → 0xFF.
+/// JBIG2 white (0) → 0xFF.  `ImageColorSpace` selection is handled by the caller.
 struct Jbig2Collector {
     data: Vec<u8>,
-    is_mask: bool,
 }
 
 impl Jbig2Decoder for Jbig2Collector {
@@ -895,13 +923,17 @@ impl Jbig2Decoder for Jbig2Collector {
 
     fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
         let byte = if black { 0x00 } else { 0xFF };
-        let n = chunk_count as usize * 8;
+        // saturating_mul prevents overflow on adversarial chunk_count; cap to
+        // pre-allocated capacity so a crafted stream can't grow the buffer past
+        // the expected pixel count.
+        let n = (chunk_count as usize)
+            .saturating_mul(8)
+            .min(self.data.capacity().saturating_sub(self.data.len()));
         self.data.extend(std::iter::repeat_n(byte, n));
     }
 
     fn next_line(&mut self) {
         // Row boundary — nothing to do; pixels are already stored flat.
-        let _ = self.is_mask; // used at construction; suppress dead-code lint
     }
 }
 
@@ -914,10 +946,7 @@ mod tests {
     #[test]
     fn jbig2_collector_push_pixel_grayscale() {
         // JBIG2: black=true → Gray 0x00, black=false → Gray 0xFF.
-        let mut c = Jbig2Collector {
-            data: Vec::new(),
-            is_mask: false,
-        };
+        let mut c = Jbig2Collector { data: Vec::new() };
         Jbig2Decoder::push_pixel(&mut c, true);
         Jbig2Decoder::push_pixel(&mut c, false);
         assert_eq!(c.data, [0x00, 0xFF]);
@@ -925,10 +954,8 @@ mod tests {
 
     #[test]
     fn jbig2_collector_push_pixel_chunk() {
-        let mut c = Jbig2Collector {
-            data: Vec::new(),
-            is_mask: false,
-        };
+        // Pre-allocate 16 pixels, matching the `n_pixels` pattern used in production.
+        let mut c = Jbig2Collector { data: Vec::with_capacity(16) };
         // chunk_count=2 → 16 pixels of white (0xFF each).
         Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
         assert_eq!(c.data.len(), 16);

@@ -166,7 +166,15 @@ pub(super) fn decode_run_length_capped(data: &[u8], max_output: usize) -> Vec<u8
             128 => break, // EOD
             0..=127 => {
                 let count = run_byte as usize + 1;
-                let end = i.saturating_add(count).min(data.len());
+                let end = i.saturating_add(count);
+                if end > data.len() {
+                    log::warn!(
+                        "inline image: RunLengthDecode literal run truncated at EOF \
+                         (wanted {count} bytes, {} available)",
+                        data.len() - i
+                    );
+                }
+                let end = end.min(data.len());
                 if out.len() + (end - i) > max_output {
                     log::warn!("inline image: RunLengthDecode output exceeds limit — truncating");
                     break;
@@ -186,6 +194,11 @@ pub(super) fn decode_run_length_capped(data: &[u8], max_output: usize) -> Vec<u8
                     }
                     out.extend(std::iter::repeat_n(b, repeat));
                     i += 1;
+                } else {
+                    log::warn!(
+                        "inline image: RunLengthDecode truncated — repeat byte missing at EOF"
+                    );
+                    break;
                 }
             }
         }

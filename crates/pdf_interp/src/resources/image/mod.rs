@@ -280,7 +280,7 @@ pub fn resolve_image(
             // mask would paint the image's colour over a large area it should
             // not cover (e.g. a solid-colour overlay that is transparent
             // everywhere the mask is zero).  Skip the image instead.
-            log::debug!("image: skipping image — SMask (object {smask_id:?}) could not be decoded");
+            log::warn!("image: skipping image — SMask (object {smask_id:?}) could not be decoded");
             return None;
         }
     }
@@ -379,7 +379,16 @@ fn expand_smask_1bpp(raw: &[u8], sm_w: u32, sm_h: u32) -> Option<Vec<u8>> {
     let total = cols.checked_mul(rows)?;
     let row_bytes = cols.div_ceil(8);
     let mut out = Vec::with_capacity(total);
-    for row in raw.chunks(row_bytes) {
+    // Iterate exactly `rows` times regardless of how many bytes `raw` contains —
+    // a FlateDecode stream that decompresses to more bytes than the declared
+    // dimensions imply must not produce more output rows than `sm_h`.
+    for row_idx in 0..rows {
+        let row_start = row_idx * row_bytes;
+        let row = if row_start < raw.len() {
+            &raw[row_start..raw.len().min(row_start + row_bytes)]
+        } else {
+            &[]
+        };
         for x in 0..cols {
             let byte = row.get(x / 8).copied().unwrap_or(0);
             let bit = (byte >> (7 - (x % 8))) & 1;
@@ -409,7 +418,11 @@ fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let src_h = u64::from(sh);
     let dst_w = u64::from(dw);
     let dst_h = u64::from(dh);
-    let mut out = Vec::with_capacity(usize::try_from(dst_w * dst_h).unwrap_or(0));
+    let capacity = dst_w
+        .checked_mul(dst_h)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(capacity);
     for dy in 0..dh {
         // sy = floor(dy * src_h / dst_h); since dy < dst_h, result < src_h ≤ u32::MAX.
         #[expect(
@@ -834,10 +847,12 @@ fn unpack_packed_bits(
     height: u32,
     map: impl Fn(u8, u8) -> u8, // (raw_value, mask) → output byte
 ) -> Option<Vec<u8>> {
-    debug_assert!(
-        bits == 1 || bits == 2 || bits == 4,
-        "unpack_packed_bits: bits must be 1, 2, or 4"
-    );
+    // `bits` must be 1, 2, or 4 — enforced as a hard precondition rather than
+    // debug_assert so that adversarial PDF data cannot trigger a divide-by-zero
+    // in release builds.
+    if !matches!(bits, 1 | 2 | 4) {
+        return None;
+    }
     let samples_per_byte = (8 / bits) as usize;
     let row_bytes = samples_per_row.div_ceil(samples_per_byte);
     let height_usize = usize::try_from(height).ok()?;
@@ -909,10 +924,6 @@ fn expand_nbpp<const BITS: u32>(
 ///
 /// Returns `None` if `width × height` overflows `usize`.
 fn expand_nbpp_indexed(data: &[u8], width: u32, height: u32, bits: u32) -> Option<Vec<u8>> {
-    debug_assert!(
-        bits == 1 || bits == 2 || bits == 4,
-        "expand_nbpp_indexed: bits must be 1, 2, or 4"
-    );
     let width_usize = usize::try_from(width).ok()?;
     unpack_packed_bits(data, bits, width_usize, height, |val, _mask| val)
 }
