@@ -99,6 +99,26 @@ pub enum ImageColorSpace {
     Mask,
 }
 
+/// The compression filter used to store an image in the PDF stream.
+///
+/// Used by [`RenderDiagnostics`](crate::renderer::page::PageDiagnostics) to
+/// classify image content without re-reading the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFilter {
+    /// `DCTDecode` — JPEG baseline or progressive.
+    Dct,
+    /// `JPXDecode` — JPEG 2000.
+    Jpx,
+    /// `CCITTFaxDecode` — Group 3 (T.4) or Group 4 (T.6) fax compression.
+    CcittFax,
+    /// `JBIG2Decode` — JBIG2 bilevel compression.
+    Jbig2,
+    /// `FlateDecode` — zlib/deflate.
+    Flate,
+    /// No filter — raw uncompressed pixels.
+    Raw,
+}
+
 /// Decoded image data, ready for blitting onto the page bitmap.
 ///
 /// See the module-level table for the exact byte layout per [`ImageColorSpace`].
@@ -117,6 +137,8 @@ pub struct ImageDescriptor {
     /// transparent (pixel is skipped during blit); `0xFF` = fully opaque.
     /// `None` means every pixel is fully opaque.
     pub smask: Option<Vec<u8>>,
+    /// The compression filter that was applied to this image in the PDF stream.
+    pub filter: ImageFilter,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -157,6 +179,15 @@ pub fn resolve_image(
     let is_mask = stream.dict.get_bool(b"ImageMask").unwrap_or(false);
 
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
+
+    let img_filter = match filter.as_deref() {
+        Some("DCTDecode") => ImageFilter::Dct,
+        Some("JPXDecode") => ImageFilter::Jpx,
+        Some("CCITTFaxDecode") => ImageFilter::CcittFax,
+        Some("JBIG2Decode") => ImageFilter::Jbig2,
+        Some("FlateDecode") => ImageFilter::Flate,
+        _ => ImageFilter::Raw,
+    };
 
     let mut img = match filter.as_deref() {
         None => decode_raw(
@@ -226,6 +257,7 @@ pub fn resolve_image(
             None
         }
     }?;
+    img.filter = img_filter;
 
     // Resolve and decode the soft mask (`SMask`), if present.
     if let Ok(Object::Reference(smask_id)) = stream.dict.get(b"SMask") {
@@ -259,6 +291,10 @@ pub fn resolve_image(
 /// Returns `None` if the parameter block is unparseable, dimensions are
 /// degenerate, or the filter is unsupported.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per supported filter; each arm is small but the set is large"
+)]
 pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option<ImageDescriptor> {
     let dict = parse_inline_params(params);
 
@@ -272,7 +308,16 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
     let is_mask = dict.get_bool(b"ImageMask").unwrap_or(false);
     let filter = dict.get(b"Filter").ok().and_then(filter_name);
 
-    match filter.as_deref() {
+    let img_filter = match filter.as_deref() {
+        Some("DCTDecode") => ImageFilter::Dct,
+        Some("JPXDecode") => ImageFilter::Jpx,
+        Some("CCITTFaxDecode") => ImageFilter::CcittFax,
+        Some("JBIG2Decode") => ImageFilter::Jbig2,
+        Some("FlateDecode") => ImageFilter::Flate,
+        _ => ImageFilter::Raw,
+    };
+
+    let mut img = match filter.as_deref() {
         None => decode_raw(
             doc,
             data,
@@ -360,7 +405,9 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
             log::warn!("inline image: unknown filter {other:?}");
             None
         }
-    }
+    }?;
+    img.filter = img_filter;
+    Some(img)
 }
 
 /// Decode a `RunLengthDecode` stream (PDF §7.4.5).
@@ -813,6 +860,7 @@ fn decode_raw(
                     color_space: ImageColorSpace::Mask,
                     data: pixels,
                     smask: None,
+                    filter: ImageFilter::Raw,
                 })
             }
             8 => {
@@ -830,6 +878,7 @@ fn decode_raw(
                     color_space: ImageColorSpace::Mask,
                     data: data[..expected].to_vec(),
                     smask: None,
+                    filter: ImageFilter::Raw,
                 })
             }
             other => {
@@ -877,6 +926,7 @@ fn decode_raw(
                 color_space: resolved.to_image_cs(),
                 data: pixels,
                 smask: None,
+                filter: ImageFilter::Raw,
             })
         }
         2 => decode_raw_8bpp(
@@ -966,6 +1016,7 @@ fn decode_raw_8bpp(
             color_space: ImageColorSpace::Rgb,
             data: rgb,
             smask: None,
+            filter: ImageFilter::Raw,
         })
     } else {
         Some(ImageDescriptor {
@@ -974,6 +1025,7 @@ fn decode_raw_8bpp(
             color_space: resolved.to_image_cs(),
             data: raw.to_vec(),
             smask: None,
+            filter: ImageFilter::Raw,
         })
     }
 }
@@ -1048,6 +1100,7 @@ fn decode_raw_indexed(
         color_space: out_cs.to_image_cs(),
         data: out,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 
@@ -1338,6 +1391,7 @@ fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
         color_space: cs,
         data: data_out,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 
@@ -1383,6 +1437,7 @@ fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<I
         color_space: cs,
         data: data_out,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 
@@ -1459,6 +1514,7 @@ fn decode_ccitt_g3_2d(
         color_space: cs,
         data: data_out,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 
@@ -1647,6 +1703,7 @@ fn decode_dct(
             color_space: ImageColorSpace::Gray,
             data: pixels,
             smask: None,
+            filter: ImageFilter::Raw,
         }),
         ZColorSpace::RGB => Some(ImageDescriptor {
             width: jw,
@@ -1654,6 +1711,7 @@ fn decode_dct(
             color_space: ImageColorSpace::Rgb,
             data: pixels,
             smask: None,
+            filter: ImageFilter::Raw,
         }),
         ZColorSpace::CMYK => {
             // zune-jpeg returns JPEG CMYK with inverted convention (0=full ink, 255=no ink).
@@ -1674,6 +1732,7 @@ fn decode_dct(
                 color_space: ImageColorSpace::Rgb,
                 data: rgb,
                 smask: None,
+                filter: ImageFilter::Raw,
             })
         }
         // out_cs is always Luma, RGB, or CMYK — set from the components match above.
@@ -1728,6 +1787,7 @@ fn decode_dct_gpu(
         color_space,
         data: img.data,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 
@@ -1957,6 +2017,7 @@ fn decode_jpx_gpu(
         color_space,
         data: img.data,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 
@@ -1969,6 +2030,7 @@ const fn jpx_gray(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
         color_space: ImageColorSpace::Gray,
         data,
         smask: None,
+        filter: ImageFilter::Raw,
     }
 }
 
@@ -1981,6 +2043,7 @@ const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDescriptor {
         color_space: ImageColorSpace::Rgb,
         data,
         smask: None,
+        filter: ImageFilter::Raw,
     }
 }
 
@@ -2063,6 +2126,7 @@ fn decode_jbig2(
         color_space: cs,
         data: collector.data,
         smask: None,
+        filter: ImageFilter::Raw,
     })
 }
 

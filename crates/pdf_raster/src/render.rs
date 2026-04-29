@@ -265,18 +265,19 @@ pub fn render_page_rgb(
     scale: f64,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
     let geom = pdf_interp::page_size_pts(&session.doc, page_num)?;
-    render_page_rgb_with_geom(session, page_num, scale, geom)
+    render_page_rgb_with_geom(session, page_num, scale, geom).map(|(bmp, _diag)| bmp)
 }
 
 /// Inner implementation shared by [`render_page_rgb`] and [`render_one`].
 /// Accepts a pre-resolved [`PageGeometry`] to avoid a second dict lookup when
 /// the caller already has it (e.g. to read `user_unit` for `effective_dpi`).
+/// Returns the bitmap and the [`PageDiagnostics`] collected during rendering.
 fn render_page_rgb_with_geom(
     session: &RasterSession,
     page_num: u32,
     scale: f64,
     geom: pdf_interp::PageGeometry,
-) -> Result<Bitmap<Rgb8>, RasterError> {
+) -> Result<(Bitmap<Rgb8>, pdf_interp::renderer::PageDiagnostics), RasterError> {
     // A non-positive or non-finite scale is a caller error; return InvalidOptions
     // so callers can distinguish this from a genuinely malformed page MediaBox.
     if !scale.is_finite() || scale <= 0.0 {
@@ -471,7 +472,7 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
     // Resolve geometry first to obtain UserUnit before rendering.
     let geom = pdf_interp::page_size_pts(&state.session.doc, page_num)?;
 
-    let rgb = render_page_rgb_with_geom(&state.session, page_num, scale, geom)?;
+    let (rgb, diagnostics) = render_page_rgb_with_geom(&state.session, page_num, scale, geom)?;
     let mut gray = rgb_to_gray(&rgb);
 
     if state.opts.deskew {
@@ -498,6 +499,7 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
         pixels,
         dpi,
         effective_dpi,
+        diagnostics,
     })
 }
 

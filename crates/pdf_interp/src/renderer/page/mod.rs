@@ -70,7 +70,7 @@ use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use super::text::TextState;
 use crate::content::{Operator, TextArrayElement};
-use crate::resources::{ImageColorSpace, PageResources, image::decode_inline_image};
+use crate::resources::{ImageColorSpace, ImageFilter, PageResources, image::decode_inline_image};
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use gpu::GpuCtx;
 #[cfg(feature = "nvjpeg")]
@@ -79,6 +79,34 @@ use gpu::nvjpeg::NvJpegDecoder;
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
+
+/// Lightweight page metadata collected at zero extra cost during rendering.
+///
+/// Returned alongside the finished bitmap from [`PageRenderer::finish`].
+/// Callers can use this to route pages to different OCR configurations without
+/// a separate post-hoc analysis pass.
+#[derive(Debug, Clone, Default)]
+pub struct PageDiagnostics {
+    /// `true` when at least one image `XObject` or inline image was blitted.
+    pub has_images: bool,
+    /// `true` when at least one text-showing operator (`Tj`, `TJ`, `'`, `"`)
+    /// was executed with a non-empty glyph sequence.  `false` on scan-only pages.
+    pub has_vector_text: bool,
+    /// The image filter seen most often on this page.
+    ///
+    /// `None` when no images were decoded (e.g. a pure-vector page).  When
+    /// multiple filters are equally frequent the one that appeared first wins —
+    /// stable across identical pages.
+    pub dominant_filter: Option<ImageFilter>,
+    /// Estimated source pixels-per-inch of the dominant image, if any.
+    ///
+    /// Computed as `(image_width_px / page_width_pts) × 72`.  Useful as a hint
+    /// for DPI auto-selection: rendering at the source PPI avoids upsampling a
+    /// 67-PPI scan at 300 DPI (4.5× upscale with no information gain).
+    ///
+    /// `None` when no images were blitted or page geometry is unavailable.
+    pub source_ppi_hint: Option<f32>,
+}
 
 /// Identity CTM for passing to raster functions — coordinate transform is
 /// already baked into the path points by `to_device`.
@@ -134,6 +162,10 @@ pub struct PageRenderer<'doc> {
     resources: PageResources<'doc>,
     /// Current Form `XObject` nesting depth (0 = top-level page).
     form_depth: u32,
+    /// Accumulated page diagnostics, populated during rendering.
+    diag: PageDiagnostics,
+    /// Per-filter blit counts used to compute `diag.dominant_filter`.
+    filter_counts: [u32; 6],
     /// Optional Content Group (OCG) visibility stack.
     ///
     /// Each `BDC /OC /Name` pushes a `bool` (`true` = visible); `EMC` pops it.
@@ -226,6 +258,8 @@ impl<'doc> PageRenderer<'doc> {
             font_cache,
             resources,
             form_depth: 0,
+            diag: PageDiagnostics::default(),
+            filter_counts: [0u32; 6],
             ocg_stack: Vec::new(),
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
@@ -292,10 +326,27 @@ impl<'doc> PageRenderer<'doc> {
         self.gpu_ctx = ctx;
     }
 
-    /// Consume the renderer and return the finished bitmap.
+    /// Consume the renderer and return the finished bitmap and page diagnostics.
     #[must_use]
-    pub fn finish(self) -> Bitmap<Rgb8> {
-        self.bitmap
+    pub fn finish(mut self) -> (Bitmap<Rgb8>, PageDiagnostics) {
+        // Resolve dominant_filter from per-filter blit counts.
+        // Order matches the ImageFilter discriminants (Dct=0, Jpx=1, CcittFax=2, Jbig2=3, Flate=4, Raw=5).
+        const FILTERS: [ImageFilter; 6] = [
+            ImageFilter::Dct,
+            ImageFilter::Jpx,
+            ImageFilter::CcittFax,
+            ImageFilter::Jbig2,
+            ImageFilter::Flate,
+            ImageFilter::Raw,
+        ];
+        self.diag.dominant_filter = self
+            .filter_counts
+            .iter()
+            .zip(FILTERS.iter())
+            .filter(|(count, _)| **count > 0)
+            .max_by_key(|(count, _)| *count)
+            .map(|(_, filter)| *filter);
+        (self.bitmap, self.diag)
     }
 
     /// Execute a slice of decoded operators in order.
@@ -735,6 +786,7 @@ impl<'doc> PageRenderer<'doc> {
         if bytes.is_empty() {
             return;
         }
+        self.diag.has_vector_text = true;
 
         // PDF render modes (PDF §9.3.6 Table 106):
         //   0 fill, 1 stroke, 2 fill+stroke, 3 invisible
@@ -1699,7 +1751,7 @@ impl<'doc> PageRenderer<'doc> {
 
         let ops = crate::content::parse(&desc.content);
         tile_renderer.execute(&ops);
-        tile_renderer.finish()
+        tile_renderer.finish().0
     }
 
     // ── XObject rendering ─────────────────────────────────────────────────────
@@ -1934,10 +1986,39 @@ impl<'doc> PageRenderer<'doc> {
         clippy::similar_names,
         reason = "dx_rel / dy_rel are the standard names for the per-axis deltas in the inverse CTM formula"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "axis-aligned fast path + full inverse-CTM path + diagnostic tracking; splitting would scatter the CTM logic across multiple helpers with shared mutable state"
+    )]
     fn blit_image(&mut self, img: &crate::resources::ImageDescriptor) {
         // Degenerate image — nothing to blit.
         if img.width == 0 || img.height == 0 {
             return;
+        }
+
+        // Track diagnostics: image presence and per-filter counts.
+        self.diag.has_images = true;
+        let filter_idx = img.filter as usize;
+        self.filter_counts[filter_idx] = self.filter_counts[filter_idx].saturating_add(1);
+
+        // Update source_ppi_hint: take the widest image seen (best resolution proxy).
+        // ppi = (image_px_width / page_pts_width) × 72.
+        let page_pts_w = f64::from(self.width) / {
+            // Extract scale from CTM[0] — valid only for axis-aligned pages.
+            // If scale is not available fall back gracefully.
+            let ctm_scale = self.gstate.current().ctm[0].abs();
+            if ctm_scale > 0.0 { ctm_scale } else { 1.0 }
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "src_ppi is finite and positive, checked below; f64→f32 is safe for PPI values in practice (well under f32::MAX)"
+        )]
+        let src_ppi = ((f64::from(img.width) / page_pts_w) * 72.0) as f32;
+        if src_ppi.is_finite() && src_ppi > 0.0 {
+            self.diag.source_ppi_hint = Some(match self.diag.source_ppi_hint {
+                Some(prev) if prev >= src_ppi => prev,
+                _ => src_ppi,
+            });
         }
 
         let ctm = self.gstate.current().ctm;

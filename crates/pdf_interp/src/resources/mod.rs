@@ -28,7 +28,7 @@ pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 /// then pass to [`PageRenderer::set_nvjpeg`].
 #[cfg(feature = "nvjpeg")]
 pub use gpu::nvjpeg::NvJpegDecoder;
-pub use image::{ImageColorSpace, ImageDescriptor, resolve_image};
+pub use image::{ImageColorSpace, ImageDescriptor, ImageFilter, resolve_image};
 
 /// Selected parameters extracted from a PDF `ExtGState` resource dictionary.
 ///

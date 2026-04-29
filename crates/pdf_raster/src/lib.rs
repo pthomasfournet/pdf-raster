@@ -48,6 +48,8 @@ mod render;
 
 use std::path::Path;
 
+pub use pdf_interp::renderer::PageDiagnostics;
+pub use pdf_interp::resources::ImageFilter;
 pub use render::{
     MAX_PX_DIMENSION, RasterError, RasterSession, open_session, render_page_rgb, rgb_to_gray,
 };
@@ -110,6 +112,11 @@ pub struct RenderedPage {
     /// Omitting the resolution call causes Tesseract to fall back to 70 DPI, which
     /// severely degrades recognition accuracy.
     pub effective_dpi: f32,
+    /// Lightweight metadata collected at zero extra cost during rendering.
+    ///
+    /// Use this to route pages to different OCR configurations — e.g. skip deskew
+    /// on `has_vector_text = true` pages, or set Tesseract PSM based on `is_scan`.
+    pub diagnostics: PageDiagnostics,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

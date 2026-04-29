@@ -6,4 +6,4 @@ pub mod gstate;
 pub mod page;
 pub mod text;
 
-pub use page::PageRenderer;
+pub use page::{PageDiagnostics, PageRenderer};
