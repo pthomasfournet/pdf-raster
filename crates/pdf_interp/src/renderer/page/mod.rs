@@ -116,6 +116,39 @@ pub struct PageDiagnostics {
     pub source_ppi_hint: Option<f32>,
 }
 
+impl PageDiagnostics {
+    /// Suggest a render DPI based on the source image resolution embedded in the PDF.
+    ///
+    /// Returns the source PPI rounded up to the nearest standard DPI step
+    /// (72 / 96 / 150 / 200 / 300 / 400 / 600), clamped to `[min_dpi, max_dpi]`.
+    ///
+    /// Returns `None` when [`source_ppi_hint`](Self::source_ppi_hint) is absent
+    /// (no images on the page), in which case the caller should use their default DPI.
+    ///
+    /// ## Rationale
+    ///
+    /// Many scanned PDFs store images at 62–67 PPI.  Rendering at 300 DPI upsamples
+    /// 4.5× with no additional information.  Passing the suggested DPI to
+    /// [`RasterOptions::dpi`] renders at the minimum resolution that avoids
+    /// upsampling, bounded by the caller's quality floor (`min_dpi`) and ceiling
+    /// (`max_dpi`).
+    ///
+    /// Typical call: `diag.suggested_dpi(150.0, 300.0)` — never render below
+    /// 150 DPI (Tesseract minimum for acceptable accuracy), never above 300 DPI.
+    #[must_use]
+    pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32> {
+        let ppi = self.source_ppi_hint?;
+        // Round up to the nearest standard step so we don't land on an odd value.
+        const STEPS: &[f32] = &[72.0, 96.0, 150.0, 200.0, 300.0, 400.0, 600.0];
+        let stepped = STEPS
+            .iter()
+            .copied()
+            .find(|&s| s >= ppi)
+            .unwrap_or(*STEPS.last().expect("STEPS is non-empty"));
+        Some(stepped.clamp(min_dpi, max_dpi))
+    }
+}
+
 /// Identity CTM for passing to raster functions — coordinate transform is
 /// already baked into the path points by `to_device`.
 const DEVICE_MATRIX: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -2216,4 +2249,47 @@ fn read_rect(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
         r.swap(1, 3);
     }
     Some(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diag_with_ppi(ppi: f32) -> PageDiagnostics {
+        PageDiagnostics {
+            has_images: true,
+            source_ppi_hint: Some(ppi),
+            ..PageDiagnostics::default()
+        }
+    }
+
+    #[test]
+    fn suggested_dpi_rounds_up_to_nearest_step() {
+        // 67 PPI → next step is 72.
+        assert_eq!(diag_with_ppi(67.0).suggested_dpi(72.0, 600.0), Some(72.0));
+        // 73 PPI → next step is 96.
+        assert_eq!(diag_with_ppi(73.0).suggested_dpi(72.0, 600.0), Some(96.0));
+        // 150 PPI exactly → stays at 150.
+        assert_eq!(diag_with_ppi(150.0).suggested_dpi(72.0, 600.0), Some(150.0));
+        // 280 PPI → next step is 300.
+        assert_eq!(diag_with_ppi(280.0).suggested_dpi(72.0, 600.0), Some(300.0));
+    }
+
+    #[test]
+    fn suggested_dpi_respects_min_clamp() {
+        // 67 PPI → step is 72, but min=150 clamps it up.
+        assert_eq!(diag_with_ppi(67.0).suggested_dpi(150.0, 300.0), Some(150.0));
+    }
+
+    #[test]
+    fn suggested_dpi_respects_max_clamp() {
+        // 700 PPI → above all steps; last step is 600, then clamped to max=300.
+        assert_eq!(diag_with_ppi(700.0).suggested_dpi(72.0, 300.0), Some(300.0));
+    }
+
+    #[test]
+    fn suggested_dpi_none_when_no_images() {
+        let diag = PageDiagnostics::default(); // source_ppi_hint is None
+        assert_eq!(diag.suggested_dpi(150.0, 300.0), None);
+    }
 }

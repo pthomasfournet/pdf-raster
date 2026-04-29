@@ -517,12 +517,12 @@ Phase 6 closes the remaining gaps before the first production integration.
   ahead up to `capacity` pages.  Halves peak memory on large books; hides GPU
   decode latency behind Tesseract inference on the previous page.
 
-- [ ] **DPI auto-selection hint** — expose a `suggested_dpi` on `RenderedPage`
-  or `RenderDiagnostics` based on the source image PPI embedded in the PDF.
-  Many Gallica scans encode images at 62–67 PPI; rendering at 300 DPI upsamples
-  4× without adding information.  The hint lets the caller choose: render at
-  source PPI for speed, or override for quality.  Read-only hint — no behaviour
-  change, caller decides.
+- [x] **DPI auto-selection hint** — `PageDiagnostics::suggested_dpi(min, max)`
+  rounds `source_ppi_hint` up to the nearest standard DPI step
+  (72 / 96 / 150 / 200 / 300 / 400 / 600) and clamps to `[min, max]`.
+  `RenderedPage::suggested_dpi` delegates to it.  Returns `None` for
+  vector/text-only pages so callers fall back to their default DPI.
+  No stored field — pure computed from existing `source_ppi_hint`.
 
 - [ ] **`npp_rotate` / `nvjpeg2k` shared CUDA init helper** — `NppRotator::new`
   and `NvJpeg2kDecoder::new` duplicate the five-step CUDA init sequence

@@ -119,6 +119,29 @@ pub struct RenderedPage {
     pub diagnostics: PageDiagnostics,
 }
 
+impl RenderedPage {
+    /// Suggest a render DPI for re-rendering this page at its native image resolution.
+    ///
+    /// Delegates to [`PageDiagnostics::suggested_dpi`].  Returns `None` for pages
+    /// with no raster images (vector/text-only pages should just use the caller's
+    /// default DPI).
+    ///
+    /// Typical usage in an OCR pipeline:
+    /// ```rust,ignore
+    /// let opts = RasterOptions { dpi: 300.0, ..Default::default() };
+    /// let page = render_one_page(path, page_num, &opts)?;
+    /// if let Some(native_dpi) = page.suggested_dpi(150.0, 300.0) {
+    ///     if (native_dpi - opts.dpi).abs() > 10.0 {
+    ///         // Re-render at native resolution to avoid upsampling.
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32> {
+        self.diagnostics.suggested_dpi(min_dpi, max_dpi)
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Render a range of pages from a PDF file.
