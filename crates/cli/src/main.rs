@@ -2,8 +2,6 @@ mod args;
 mod naming;
 mod render;
 
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -13,23 +11,22 @@ use rayon::prelude::*;
 use args::Args;
 
 fn main() {
-    // try_init so tests and embedders that already called init() don't panic.
     let _ = env_logger::try_init();
 
     let args = Args::parse();
 
-    // Build rayon thread pool.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)
         .build()
         .expect("failed to build thread pool");
 
-    let doc = pdf_interp::open(&args.input).unwrap_or_else(|e| {
-        eprintln!("pdf-raster: failed to open PDF: {e}");
-        std::process::exit(1);
-    });
+    let session = pdf_raster::open_session(std::path::Path::new(&args.input))
+        .unwrap_or_else(|e| {
+            eprintln!("pdf-raster: failed to open PDF: {e}");
+            std::process::exit(1);
+        });
 
-    let n = pdf_interp::page_count(&doc);
+    let n = session.total_pages();
     if n == 0 {
         eprintln!("pdf-raster: document has no pages");
         std::process::exit(1);
@@ -40,24 +37,6 @@ fn main() {
     });
 
     let pages = build_page_list(total, &args);
-
-    // Initialise the GPU context after confirming the document is valid and
-    // there are pages to render.  Init failure is a warning, not a hard error —
-    // the CPU fallback path activates automatically.  A driver-version mismatch
-    // after an upgrade will surface here; run `nvidia-smi` to confirm the
-    // driver is loaded correctly.
-    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
-    let gpu_ctx: Option<Arc<gpu::GpuCtx>> = match gpu::GpuCtx::init() {
-        Ok(ctx) => Some(Arc::new(ctx)),
-        Err(e) => {
-            eprintln!(
-                "pdf-raster: GPU initialisation failed ({e}); falling back to CPU. \
-                 Run `nvidia-smi` to verify the driver is loaded."
-            );
-            None
-        }
-    };
-
     let n_pages = pages.len();
     let done = AtomicU32::new(0);
     let start = Instant::now();
@@ -77,14 +56,7 @@ fn main() {
                     reason = "page_num ≥ 1, enforced by build_page_list"
                 )]
                 let page_u32 = page_num as u32;
-                let result = render::render_page_native(
-                    &doc,
-                    page_u32,
-                    total_u32,
-                    &args,
-                    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
-                    gpu_ctx.as_ref(),
-                );
+                let result = render::render_page(&session, page_u32, total_u32, &args);
                 report_progress(&args, &done, n_pages, &start, page_num);
                 result.err().map(|e| (page_num, e))
             })
@@ -96,9 +68,7 @@ fn main() {
 
 /// Build the filtered, clamped list of 1-based page numbers to render.
 ///
-/// Exits the process with status 1 if the resulting range is empty (first > last
-/// after clamping).  Boundary violations that can be clamped are warned and
-/// clamped rather than rejected.
+/// Exits with status 1 if the range is empty after clamping.
 fn build_page_list(total: i32, args: &Args) -> Vec<i32> {
     let requested_first = args.first_page;
     let requested_last = args.last_page.unwrap_or(total);
@@ -127,14 +97,12 @@ fn build_page_list(total: i32, args: &Args) -> Vec<i32> {
         .filter(|&p| match (args.odd_only, args.even_only) {
             (true, false) => p % 2 == 1,
             (false, true) => p % 2 == 0,
-            // both set or neither set → no filtering
             (true, true) | (false, false) => true,
         })
         .take(if args.single_file { 1 } else { usize::MAX })
         .collect()
 }
 
-/// Print per-page progress to stderr if `--progress` was requested.
 fn report_progress(args: &Args, done: &AtomicU32, n_pages: usize, start: &Instant, page_num: i32) {
     if !args.progress {
         return;
@@ -158,7 +126,6 @@ fn report_progress(args: &Args, done: &AtomicU32, n_pages: usize, start: &Instan
     }
 }
 
-/// Print all render errors sorted by page number, then exit with status 1 if any.
 fn report_errors(mut errors: Vec<(i32, render::RenderError)>) {
     if errors.is_empty() {
         return;

@@ -48,7 +48,9 @@ mod render;
 
 use std::path::Path;
 
-pub use render::RasterError;
+pub use render::{
+    MAX_PX_DIMENSION, RasterError, RasterSession, open_session, render_page_rgb, rgb_to_gray,
+};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 

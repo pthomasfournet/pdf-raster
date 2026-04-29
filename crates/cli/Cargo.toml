@@ -8,19 +8,17 @@ name = "pdf-raster"
 path = "src/main.rs"
 
 [features]
-# Enable GPU-accelerated AA fill and tile fill via CUDA.  Mirrors pdf_interp/gpu-aa.
-gpu-aa  = ["dep:gpu", "pdf_interp/gpu-aa"]
-# Enable GPU-accelerated JPEG decoding via nvJPEG.  Mirrors pdf_interp/nvjpeg.
-nvjpeg  = ["dep:gpu", "pdf_interp/nvjpeg"]
-# Enable GPU-accelerated JPEG 2000 decoding via nvJPEG2000.  Mirrors pdf_interp/nvjpeg2k.
-nvjpeg2k = ["dep:gpu", "pdf_interp/nvjpeg2k"]
-# Enable GPU ICC CMYK→RGB transform.  Mirrors pdf_interp/gpu-icc.
-gpu-icc = ["dep:gpu", "pdf_interp/gpu-icc"]
+# Enable GPU-accelerated AA fill and tile fill via CUDA.
+gpu-aa   = ["pdf_raster/gpu-aa"]
+# Enable GPU-accelerated JPEG decoding via nvJPEG.
+nvjpeg   = ["pdf_raster/nvjpeg"]
+# Enable GPU-accelerated JPEG 2000 decoding via nvJPEG2000.
+nvjpeg2k = ["pdf_raster/nvjpeg2k"]
+# Enable GPU ICC CMYK→RGB transform.
+gpu-icc  = ["pdf_raster/gpu-icc"]
 
 [dependencies]
-pdf_interp  = { path = "../pdf_interp" }
-gpu         = { path = "../gpu", optional = true }
-lopdf       = "0.40"
+pdf_raster  = { path = "../pdf_raster" }
 encode      = { path = "../encode" }
 color       = { path = "../color" }
 raster      = { path = "../raster" }
