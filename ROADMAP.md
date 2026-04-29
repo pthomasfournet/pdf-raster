@@ -4,6 +4,61 @@ Goal: full PDF → pixels pipeline in pure Rust. Zero poppler. Zero C++ in the r
 
 The raster crate is complete at the pixel level. The `pdf_interp` crate is the native renderer and is now the only CLI path. The `pdf_bridge` / poppler crate is retained as a reference baseline but is no longer linked by the CLI binary.
 
+**Integration target (Apr 2026):** pdf-raster replaces steps 3 (pdftoppm subprocess) and 4 (Leptonica preprocessing) in an OCR pipeline:
+
+```
+pdf_oxide → [quality check fails] → pdf-raster (rasterise + deskew) → Tesseract → (LLM correct)
+```
+
+The caller's Tesseract step becomes a single in-process call — no subprocess, no files, no Leptonica:
+
+```rust
+let page = pdf_raster::render_page(path, page_num, &opts)?;
+// page.pixels is 8-bit grayscale, tightly packed, top-to-bottom
+let text = tesseract::ocr_from_frame(
+    &page.pixels, page.width as i32, page.height as i32,
+    1, page.width as i32, "eng",
+)?;
+```
+
+The API surface for this integration does not yet exist — it is the subject of Phase 5 below.
+
+---
+
+## Phase 0 — Library API research ✓ COMPLETE (Apr 2026)
+
+### Tesseract integration findings (researched Apr 2026)
+
+**Tesseract 5.3.4 / Leptonica 1.82.0 on this machine.**
+
+| Question | Answer |
+|---|---|
+| Raw pixel input without files? | Yes — `tesseract::ocr_from_frame(&[u8], w, h, bpp, stride, lang)` in the `tesseract` crate (v0.15.2). No file I/O on either side. |
+| Best Rust crate? | `tesseract` 0.15.2 (April 2025, actively maintained). `leptess` is stale (last release Feb 2023). |
+| Pre-binarise before passing? | **No.** LSTM engine reads grayscale directly for feature extraction; binarising first discards information it would have used. Feed 8-bit gray. |
+| Background normalisation needed? | **No — drop it from our scope.** Tesseract does its own internal binarisation (Otsu / tiled Otsu / Sauvola, configurable). For uneven scanned backgrounds, caller sets `thresholding_method=2` (Sauvola) on the Tesseract side. |
+| Does Tesseract deskew? | **No.** Tesseract can *detect* skew angle (PSM 0/1) but the caller must rotate the image. Deskew is the **one preprocessing step we still own**. |
+| DPI handling? | Call `set_source_resolution(dpi)` explicitly after `set_frame`. Default fallback is 70 DPI which severely degrades accuracy. Pass the actual render DPI. |
+| libopenjp2 on this machine? | Yes — Leptonica 1.82.0 links libopenjp2 2.5.0. JPEG 2000 works natively. |
+
+### What exists in pdf-raster
+
+- `render_page_native()` in `crates/cli/src/render.rs` — closest to a pipeline entry point, but CLI-entangled: takes `&Args`, writes to disk, returns `()`
+- `rgb_to_gray()` in `crates/cli/src/render.rs` — BT.709 grayscale, unexported
+- `pdf_interp::open()`, `page_count()`, `page_size_pts()`, `parse_page()` — clean public surface
+- `raster::Bitmap<T>` — pixel buffer type, usable as a return type
+- GPU decoder lifecycle (`DecoderInit<T>` thread-locals) — CLI-specific, needs encapsulation
+
+### Remaining gaps for Phase 5
+
+| Gap | Notes |
+|---|---|
+| Library crate with public API | No such crate; logic buried in CLI binary |
+| In-memory grayscale output | `rgb_to_gray` unexported; nothing returns `Bitmap<Gray8>` |
+| Deskew (±7°) | The one preprocessing step we own; algorithm decided — see Phase 5 |
+| Per-page error handling | CLI fails fast; library should return `Result` per page |
+| GPU decoder lifecycle for library callers | `DecoderInit` thread-locals are CLI-specific |
+
 ---
 
 ## Phase 1 — Native PDF interpreter ✓ COMPLETE
@@ -293,3 +348,115 @@ cargo run -p gpu --release --bin threshold_bench
 # mount -t resctrl resctrl /sys/fs/resctrl
 # cat /sys/fs/resctrl/mon_data/mon_L3_XX/llc_occupancy
 ```
+
+---
+
+## Phase 5 — Public library API (IN PROGRESS)
+
+Extract the render pipeline into a reusable library crate. The caller gets 8-bit grayscale pixels in memory and passes them directly to Tesseract — no subprocess, no files, no Leptonica.
+
+### Crate: `crates/pdf_raster`
+
+```rust
+pub struct RasterOptions {
+    pub dpi: f32,          // render DPI; pass same value to Tesseract set_source_resolution
+    pub first_page: u32,   // 1-based
+    pub last_page: u32,    // 1-based, inclusive
+    pub deskew: bool,      // run deskew before returning pixels (scanned PDFs only)
+}
+
+pub struct RenderedPage {
+    pub page_num: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,   // 8-bit grayscale, tightly packed, top-to-bottom
+    pub dpi: f32,          // pass to Tesseract set_source_resolution — do not lie
+}
+
+/// Render pages from a PDF file, one result per page.
+/// A per-page error does not abort remaining pages.
+pub fn raster_pdf(
+    path: &Path,
+    opts: &RasterOptions,
+) -> impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)>;
+```
+
+**Caller's OCR step after integration:**
+
+```rust
+for (page_num, result) in pdf_raster::raster_pdf(path, &opts) {
+    let page = result?;
+    let text = tesseract::ocr_from_frame(
+        &page.pixels, page.width as i32, page.height as i32,
+        1, page.width as i32, "eng",   // bpp=1 (grayscale), stride=width
+    )?;
+    // for uneven-background scans, set thresholding_method=2 (Sauvola) on Tesseract side
+}
+```
+
+### Preprocessing scope
+
+| Step | Owner | Notes |
+|---|---|---|
+| Rasterise to grayscale | **pdf-raster** | BT.709 RGB→Gray; already in CLI, just needs exporting |
+| Deskew | **pdf-raster** | See deskew design below |
+| Background normalisation | **Tesseract** | Sauvola `thresholding_method=2` on the caller side |
+| Binarisation | **Tesseract** | LSTM reads grayscale directly; do NOT pre-binarise |
+| DPI metadata | **caller** | Pass `page.dpi` to `set_source_resolution`; default is 70 DPI (useless) |
+
+### Deskew design (researched Apr 2026)
+
+**Goal**: beat Leptonica's `pixDeskew` in both speed and accuracy.
+
+**How Leptonica works (and where it fails):**
+Hierarchical differential-projection-profile sweep: binarise at threshold 160 → 4x downsample → 14-angle coarse sweep (±7°, 1° steps) → quadratic interpolation → binary search to 0.01° convergence. Accuracy: ~0.03–0.05°. Failure modes: fixed threshold 160 fails on light/dark scans; skips angles < 0.1°; single-threaded; CPU-only rotation.
+
+**Our approach — two-phase hybrid:**
+
+**Phase A — Angle detection (CPU, intensity-weighted projection profile)**
+
+Same algorithm family as Leptonica but without the binarisation threshold:
+- Use `255 - pixel` as the foreground weight on raw 8-bit gray — dark pixels count as foreground proportionally, no hard threshold, no parameter to tune
+- 4× downsample for coarse sweep (620×825 working set)
+- 28-angle coarse sweep at 0.5° steps (±7°), scored by differential square sum of weighted row sums
+- Binary search refinement to 0.01° convergence
+- AVX-512 row summation via `VPSADBW` (64 pixels/cycle): each row of 2550px takes ~40 AVX-512 ops
+- Parallelise sweep angles across Rayon threads (each angle is independent)
+- **9900X3D V-Cache advantage**: 8.4MB image fits entirely in 96MB L3; stays warm through all sweep iterations — no DRAM traffic after first load
+- Target: **1–3ms** for detection
+
+Accuracy advantage over Leptonica: no binarisation threshold → correct on images where threshold 160 over- or under-segments; corrects angles < 0.1° that Leptonica skips.
+
+**Phase B — Rotation (GPU, CUDA texture bilinear)**
+
+- Bind source image as `cudaTextureObject_t` with `cudaFilterModeLinear` — hardware bilinear at no extra compute cost
+- Use `nppiRotate_8u_C1R_Ctx` (NPP single-channel 8-bit rotate) or a custom kernel with `tex2D<float>()` per output pixel
+- RTX 5070 texture fill rate: 482 GTexel/s → **0.3–0.5ms** for 8.4MP
+- If image is already on GPU from nvJPEG/nvJPEG2K decode, PCIe upload cost is zero
+- CPU fallback (12-core AVX-512 bilinear): ~1.5ms — used when GPU unavailable or image is CPU-only
+
+**Steady-state pipeline (scan-heavy PDFs with GPU decode active):**
+```
+CPU: detect angle for page N+1  (~1ms, overlapped)
+GPU stream A: rotate page N     (~0.4ms)
+GPU stream B: D→H transfer N-1  (~0.3ms)
+```
+Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection hidden).
+
+**Single-page cold path (CPU RAM, no GPU decode):**
+- Detection: ~2ms
+- PCIe H2D (8.4MB @ 28GB/s): ~0.3ms
+- GPU rotation: ~0.4ms
+- PCIe D2H: ~0.3ms
+- Total: **~3ms** — still faster than Leptonica's ~10–15ms
+
+### Work items
+
+- [ ] New `crates/pdf_raster` library crate; add to `Cargo.toml` workspace members
+- [ ] Move `render_page_native` core (minus `&Args`, minus file I/O) into library
+- [ ] Export `rgb_to_gray` (BT.709) from library (currently private in CLI)
+- [ ] Encapsulate GPU decoder lifecycle (`DecoderInit<T>`) inside library — not caller-visible
+- [ ] `crates/pdf_raster/src/deskew/detect.rs` — intensity-weighted projection profile, AVX-512 row sums, Rayon sweep parallelism
+- [ ] `crates/pdf_raster/src/deskew/rotate.rs` — GPU texture bilinear (`nppiRotate`) + CPU AVX-512 bilinear fallback
+- [ ] Make CLI a thin wrapper over `crates/pdf_raster`
+- [ ] Integration tests: round-trip a fixture PDF, assert pixel dimensions and grayscale range; deskew unit tests with synthetic skewed images at known angles
