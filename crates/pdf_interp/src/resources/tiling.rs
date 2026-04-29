@@ -20,7 +20,7 @@
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use super::{read_bbox, read_matrix, resolve_dict};
+use super::{read_bbox, read_f64_1, read_matrix, resolve_dict};
 
 /// Parameters extracted from a PDF Type 1 (tiling) pattern stream.
 ///
@@ -88,12 +88,13 @@ pub fn resolve_tiling(
     let paint_type = stream.dict.get(b"PaintType").ok()?.as_i64().ok()?;
 
     let bbox = read_bbox(&stream.dict)?;
-    let x_step = super::read_f64_n::<1>(&stream.dict, b"XStep").map(|a| a[0])?;
-    let y_step = super::read_f64_n::<1>(&stream.dict, b"YStep").map(|a| a[0])?;
+    let x_step = read_f64_1(&stream.dict, b"XStep")?;
+    let y_step = read_f64_1(&stream.dict, b"YStep")?;
 
-    if x_step == 0.0 || y_step == 0.0 {
+    // Zero or NaN step would cause divide-by-zero or infinite tile counts downstream.
+    if !x_step.is_finite() || !y_step.is_finite() || x_step == 0.0 || y_step == 0.0 {
         log::warn!(
-            "pdf_interp: Pattern /{} has zero XStep or YStep — skipping",
+            "pdf_interp: Pattern /{} has invalid XStep ({x_step}) or YStep ({y_step}) — skipping",
             String::from_utf8_lossy(name)
         );
         return None;
@@ -101,7 +102,15 @@ pub fn resolve_tiling(
 
     let matrix = read_matrix(&stream.dict).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
 
-    let content = stream.decompressed_content().ok()?;
+    let content = stream
+        .decompressed_content()
+        .map_err(|e| {
+            log::warn!(
+                "pdf_interp: Pattern /{} — failed to decompress content stream: {e}",
+                String::from_utf8_lossy(name)
+            );
+        })
+        .ok()?;
     let has_own_resources = stream.dict.get(b"Resources").is_ok();
 
     Some(TilingDescriptor {
