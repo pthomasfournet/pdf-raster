@@ -24,11 +24,10 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::ptr;
 
 use crate::cuda::{
-    CUstream as CudaHandle, cuCtxSetCurrent, cuDevicePrimaryCtxRelease, cuStreamDestroy,
-    cuStreamSynchronize, init_primary_ctx_and_stream,
+    CUstream as CudaHandle, DeviceBuf, cuCtxSetCurrent, cuDevicePrimaryCtxRelease,
+    cuStreamDestroy, cuStreamSynchronize, init_primary_ctx_and_stream,
 };
 
 // ── CUDA runtime API (libcudart.so) ───────────────────────────────────────────
@@ -37,8 +36,6 @@ const CUDA_MEMCPY_H2D: i32 = 1;
 const CUDA_MEMCPY_D2H: i32 = 2;
 
 unsafe extern "C" {
-    fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> i32;
-    fn cudaFree(dev_ptr: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
 }
 
@@ -112,46 +109,6 @@ unsafe extern "C" {
         interpolation: i32,
         npp_ctx: NppStreamContext,
     ) -> NppStatus;
-}
-
-// ── DeviceBuf RAII ────────────────────────────────────────────────────────────
-
-/// RAII wrapper for a device-side `cudaMalloc` allocation.
-struct DeviceBuf {
-    ptr: *mut c_void,
-}
-
-impl DeviceBuf {
-    /// Allocate `size` bytes on the current CUDA device.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NppRotateError`] if `cudaMalloc` fails or returns a null
-    /// pointer on success (the latter indicates a driver bug).
-    fn alloc(size: usize) -> Result<Self> {
-        let mut ptr: *mut c_void = ptr::null_mut();
-        // SAFETY: cudaMalloc writes a valid device pointer (or null) to `ptr`.
-        let code = unsafe { cudaMalloc(&raw mut ptr, size) };
-        if code != 0 {
-            return Err(NppRotateError(format!("cudaMalloc({size}): code {code}")));
-        }
-        if ptr.is_null() {
-            return Err(NppRotateError(
-                "cudaMalloc succeeded but returned null pointer".into(),
-            ));
-        }
-        Ok(Self { ptr })
-    }
-}
-
-impl Drop for DeviceBuf {
-    fn drop(&mut self) {
-        // SAFETY: ptr came from cudaMalloc; no other reference exists at drop time.
-        let code = unsafe { cudaFree(self.ptr) };
-        if code != 0 {
-            log::warn!("npp_rotate: cudaFree failed: code {code}");
-        }
-    }
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -285,7 +242,10 @@ impl NppRotator {
         }
 
         let dst_stride = w; // tightly packed output
-        let dst_len = w * h; // w and h are both ≤ i32::MAX so this can't overflow usize on 64-bit
+        // w and h are both ≤ i32::MAX (2 147 483 647); checked_mul is defence-in-depth.
+        let dst_len = w
+            .checked_mul(h)
+            .ok_or_else(|| NppRotateError("width * height overflows usize".into()))?;
 
         // ── Computation ──────────────────────────────────────────────────────
 
@@ -299,8 +259,10 @@ impl NppRotator {
             )));
         }
 
-        let d_src = DeviceBuf::alloc(src.len())?;
-        let d_dst = DeviceBuf::alloc(dst_len)?;
+        let d_src = DeviceBuf::alloc(src.len())
+            .map_err(|code| NppRotateError(format!("cudaMalloc(src, {}): code {code}", src.len())))?;
+        let d_dst = DeviceBuf::alloc(dst_len)
+            .map_err(|code| NppRotateError(format!("cudaMalloc(dst, {dst_len}): code {code}")))?;
 
         // H → D upload.
         // SAFETY: src is valid for `src.len()` bytes; we validated src.len() >= src_stride*h

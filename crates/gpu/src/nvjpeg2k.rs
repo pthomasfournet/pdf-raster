@@ -40,22 +40,19 @@ use std::ptr;
 // ── CUDA driver API ───────────────────────────────────────────────────────────
 
 use crate::cuda::{
-    CUstream, cuCtxSetCurrent, cuDevicePrimaryCtxRelease, cuStreamDestroy, cuStreamSynchronize,
-    init_primary_ctx_and_stream,
+    CUstream, DeviceBuf, cuCtxSetCurrent, cuDevicePrimaryCtxRelease, cuStreamDestroy,
+    cuStreamSynchronize, init_primary_ctx_and_stream,
 };
 
 // ── CUDA runtime API ──────────────────────────────────────────────────────────
 //
-// These symbols are in libcudart.so (CUDA runtime, ships with the toolkit).
-// cudaMalloc / cudaFree / cudaMemcpy2D are required for device-memory I/O
-// since nvJPEG2000 writes output to device (not pinned host) memory.
+// cudaMalloc / cudaFree are shared via crate::cuda::DeviceBuf.
+// cudaMemcpy2D is used directly here for D→H component copies.
 
 /// `cudaMemcpyDeviceToHost = 2` — direction flag for `cudaMemcpy2D`.
 const CUDAMEMCPY_D2H: i32 = 2;
 
 unsafe extern "C" {
-    fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> i32;
-    fn cudaFree(dev_ptr: *mut c_void) -> i32;
     fn cudaMemcpy2D(
         dst: *mut c_void,
         dpitch: usize,
@@ -359,48 +356,6 @@ pub struct DecodedJpeg2k {
     pub color_space: Jpeg2kColorSpace,
 }
 
-// ── DeviceBuf ─────────────────────────────────────────────────────────────────
-
-/// RAII wrapper for a device-side allocation (`cudaMalloc` / `cudaFree`).
-///
-/// nvJPEG2000 writes decoded pixel planes into device memory, unlike nvJPEG
-/// (which writes to pinned host memory).  We allocate one `DeviceBuf` per image
-/// component, pass the raw device pointers to `nvjpeg2kDecode`, then copy the
-/// finished planes back to host via `cudaMemcpy2D` after stream sync.
-struct DeviceBuf {
-    ptr: *mut c_void,
-}
-
-impl DeviceBuf {
-    /// Allocate `size` bytes of device memory.
-    fn alloc(size: usize) -> Result<Self> {
-        let mut ptr: *mut c_void = ptr::null_mut();
-        // SAFETY: cudaMalloc writes to `ptr`; `size` is the allocation size.
-        let code = unsafe { cudaMalloc(&raw mut ptr, size) };
-        if code != 0 {
-            return Err(NvJpeg2kError::CudartError(code));
-        }
-        assert!(
-            !ptr.is_null(),
-            "cudaMalloc succeeded but returned null pointer"
-        );
-        Ok(Self { ptr })
-    }
-}
-
-impl Drop for DeviceBuf {
-    fn drop(&mut self) {
-        // ptr is always non-null: DeviceBuf::alloc asserts this after cudaMalloc
-        // succeeds, so a null ptr is unreachable through the public constructor.
-        // SAFETY: ptr came from cudaMalloc; no other references exist at drop time.
-        // Error ignored — cannot propagate from Drop.
-        let _ = unsafe { cudaFree(self.ptr) };
-    }
-}
-
-// SAFETY: DeviceBuf is an exclusively-owned device allocation.
-unsafe impl Send for DeviceBuf {}
-
 // ── NvJpeg2k ─────────────────────────────────────────────────────────────────
 
 /// nvJPEG2000 decoder inner context.
@@ -620,7 +575,7 @@ impl NvJpeg2k {
             let cw = ci.component_width as usize;
             let ch = ci.component_height as usize;
             let size = cw.checked_mul(ch).ok_or(NvJpeg2kError::Overflow)?;
-            let buf = DeviceBuf::alloc(size)?;
+            let buf = DeviceBuf::alloc(size).map_err(NvJpeg2kError::CudartError)?;
             pixel_ptrs.push(buf.ptr);
             pitches.push(cw);
             dev_bufs.push(buf);
@@ -856,26 +811,30 @@ impl NvJpeg2kDecoder {
         // cuCtxSetCurrent → cuStreamCreate.  Stream is created before nvJPEG2000
         // init so it belongs to the primary context, not any internal context the
         // library might push.
-        let ordinal_i32 = i32::try_from(ordinal).map_err(|_| NvJpeg2kError::CudaError(101))?;
+        // CUDA_ERROR_INVALID_VALUE = 1: the ordinal is out of i32 range, which is
+        // equivalent to an invalid device ordinal from the driver's perspective.
+        let ordinal_i32 = i32::try_from(ordinal).map_err(|_| NvJpeg2kError::CudaError(1))?;
         let init = init_primary_ctx_and_stream(ordinal_i32)
             .map_err(|e| NvJpeg2kError::CudaError(e.code))?;
-        let (cu_ctx, device, stream) = (init.cu_ctx, init.device, init.stream);
 
         // Step 6 — initialise nvJPEG2000.  nvjpeg2kCreateSimple captures the
         // current context (set in step 4), so handle and stream share a context.
         let dec = NvJpeg2k::new().inspect_err(|_| {
-            // SAFETY: stream was created successfully; no work is enqueued yet.
+            // SAFETY: stream was created in init; no work is enqueued yet.
+            // Rebind context first: nvjpeg2kCreateSimple may have pushed its own
+            // internal context, leaving the primary context no longer current.
             unsafe {
-                let _ = cuStreamDestroy(stream);
-                let _ = cuDevicePrimaryCtxRelease(device);
+                let _ = cuCtxSetCurrent(init.cu_ctx);
+                let _ = cuStreamDestroy(init.stream);
+                let _ = cuDevicePrimaryCtxRelease(init.device);
             }
         })?;
 
         Ok(Self {
             dec: ManuallyDrop::new(dec),
-            device,
-            cu_ctx,
-            stream,
+            device: init.device,
+            cu_ctx: init.cu_ctx,
+            stream: init.stream,
         })
     }
 
