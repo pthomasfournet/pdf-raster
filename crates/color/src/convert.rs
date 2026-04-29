@@ -14,9 +14,15 @@
 //! - [`premul`] — multiply RGB channels by alpha
 //! - [`unpremul`] — undo premultiplication (safe for alpha = 0)
 //!
-//! **Color-space conversion**
+//! **Color-space conversion (u8 domain)**
 //! - [`cmyk_to_rgb`] — simple subtractive CMYK → RGB
+//! - [`cmyk_to_rgb_reflectance`] — reflectance formula for raw JPEG/CMYK pixels
 //! - [`gray_to_rgb`] — broadcast a gray value to RGB
+//!
+//! **Color-space conversion (f64 → u8, normalised PDF values)**
+//! - [`gray_to_u8`] — normalised grey \[0,1\] → byte
+//! - [`rgb_to_bytes`] — normalised RGB \[0,1\] → 3-byte array
+//! - [`cmyk_to_rgb_bytes`] — normalised CMYK \[0,1\] → RGB bytes via PDF §10.3.3
 //!
 //! **Fixed-point byte/col**
 //! - [`byte_to_col`] — u8 → 16.16 `GfxColorComp`
@@ -304,6 +310,55 @@ pub fn cmyk_to_rgb_reflectance(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
     )]
     let b = ((u32::from(255 - y) * inv_k + 127) / 255) as u8;
     (r, g, b)
+}
+
+// ── f64 → u8 conversions ─────────────────────────────────────────────────────
+
+/// Convert a normalised PDF value \[0.0, 1.0\] to a `u8` byte.
+///
+/// Clamps then rounds; NaN maps to 0 (via the clamp lower-bound).
+/// Used for PDF colour operators where channel components are normalised floats.
+#[inline]
+#[must_use]
+pub fn gray_to_u8(v: f64) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is clamped to [0, 1] and scaled to [0.0, 255.0]; round() output fits u8"
+    )]
+    let out = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    out
+}
+
+/// Convert three normalised PDF RGB components to `[r, g, b]` bytes.
+///
+/// Each channel is clamped to \[0.0, 1.0\] independently.
+#[inline]
+#[must_use]
+pub fn rgb_to_bytes(r: f64, g: f64, b: f64) -> [u8; 3] {
+    [gray_to_u8(r), gray_to_u8(g), gray_to_u8(b)]
+}
+
+/// Convert PDF CMYK \[0.0, 1.0\] to RGB bytes via PDF §10.3.3 formula.
+///
+/// `R = 1 − min(1, C + K)`, clamped per channel.
+///
+/// # Distinction from other CMYK variants
+///
+/// - [`cmyk_to_rgb`]: takes `u8` inputs with saturating-subtract.
+/// - [`cmyk_to_rgb_reflectance`]: takes `u8` inputs with reflectance product formula.
+/// - This function: takes normalised `f64` inputs for use with PDF colour operators.
+#[inline]
+#[must_use]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "CMYK and RGB are conventional single-letter colour channel names"
+)]
+pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
+    let r = 1.0 - (c.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
+    let g = 1.0 - (m.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
+    let b = 1.0 - (y.clamp(0.0, 1.0) + k.clamp(0.0, 1.0)).min(1.0);
+    rgb_to_bytes(r, g, b)
 }
 
 // ── GfxColorComp fixed-point ──────────────────────────────────────────────────
@@ -627,6 +682,34 @@ mod tests {
             );
         }
     }
+
+    // ── gray_to_u8 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn gray_extremes() {
+        assert_eq!(gray_to_u8(0.0), 0);
+        assert_eq!(gray_to_u8(1.0), 255);
+    }
+
+    #[test]
+    fn gray_clamped() {
+        assert_eq!(gray_to_u8(-1.0), 0);
+        assert_eq!(gray_to_u8(2.0), 255);
+    }
+
+    // ── cmyk_to_rgb_bytes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cmyk_bytes_black() {
+        assert_eq!(cmyk_to_rgb_bytes(0.0, 0.0, 0.0, 1.0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn cmyk_bytes_white() {
+        assert_eq!(cmyk_to_rgb_bytes(0.0, 0.0, 0.0, 0.0), [255, 255, 255]);
+    }
+
+    // ── cmyk_to_rgb_reflectance ───────────────────────────────────────────────
 
     /// `cmyk_to_rgb_reflectance` — all-zero ink (no ink) must produce white.
     #[test]
