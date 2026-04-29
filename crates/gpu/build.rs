@@ -26,6 +26,19 @@ fn link_lib_in_dir(dirs: &[&str], lib: &str, warn_context: &str) {
     println!("cargo:rustc-link-lib=dylib={lib}");
 }
 
+/// Candidate directories for CUDA toolkit libraries, in preference order.
+///
+/// Covers versioned installs (cuda-12.8, cuda-12), the generic symlink
+/// (`/usr/local/cuda`), and the legacy flat layout (`/usr/local/cuda/lib64`).
+/// All GPU feature blocks use this same list so they all benefit from a
+/// cuda-12.8 install even when that version was added after the others.
+const CUDA_LIB_DIRS: &[&str] = &[
+    "/usr/local/cuda-12.8/targets/x86_64-linux/lib",
+    "/usr/local/cuda-12/targets/x86_64-linux/lib",
+    "/usr/local/cuda/targets/x86_64-linux/lib",
+    "/usr/local/cuda/lib64",
+];
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let kernels_dir = PathBuf::from("kernels");
@@ -46,25 +59,15 @@ fn main() {
     });
     let nvcc = &nvcc_path;
 
-    // When the nvjpeg feature is enabled, emit the linker directive so that
-    // rustc links against libnvjpeg.so from the CUDA toolkit.  The library is
-    // available on any machine with CUDA 12 installed; it ships at
-    // /usr/local/cuda-12/targets/x86_64-linux/lib/libnvjpeg.so.
+    // nvJPEG: libnvjpeg.so ships with the CUDA toolkit.
+    // On Linux this is provided by the NVIDIA driver, typically at
+    // /usr/lib/x86_64-linux-gnu/libcuda.so.1 (driver-managed symlink).
     if env::var("CARGO_FEATURE_NVJPEG").is_ok() {
-        // Prefer the versioned CUDA 12 install directory so the exact .so is
-        // found even when /usr/local/cuda is a symlink to a different version.
         link_lib_in_dir(
-            &[
-                "/usr/local/cuda-12/targets/x86_64-linux/lib",
-                "/usr/local/cuda/targets/x86_64-linux/lib",
-                "/usr/local/cuda/lib64",
-            ],
+            CUDA_LIB_DIRS,
             "nvjpeg",
             "nvjpeg feature enabled but no CUDA lib",
         );
-        // cuStreamSynchronize lives in the CUDA driver library (libcuda.so).
-        // On Linux this is provided by the NVIDIA driver, typically at
-        // /usr/lib/x86_64-linux-gnu/libcuda.so.1 (driver-managed symlink).
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 
@@ -81,11 +84,7 @@ fn main() {
         );
         // cudart provides cudaMalloc / cudaFree / cudaMemcpy2D (runtime API).
         link_lib_in_dir(
-            &[
-                "/usr/local/cuda-12/targets/x86_64-linux/lib",
-                "/usr/local/cuda/targets/x86_64-linux/lib",
-                "/usr/local/cuda/lib64",
-            ],
+            CUDA_LIB_DIRS,
             "cudart",
             "nvjpeg2k feature enabled but no CUDA lib for cudart",
         );
@@ -108,15 +107,9 @@ fn main() {
     // in libnppc).  cudart and the driver are also required for cudaMalloc /
     // cudaMemcpy / cuStreamSynchronize.
     if env::var("CARGO_FEATURE_GPU_DESKEW").is_ok() {
-        let cuda_lib_dirs = &[
-            "/usr/local/cuda-12.8/targets/x86_64-linux/lib",
-            "/usr/local/cuda-12/targets/x86_64-linux/lib",
-            "/usr/local/cuda/targets/x86_64-linux/lib",
-            "/usr/local/cuda/lib64",
-        ];
-        link_lib_in_dir(cuda_lib_dirs, "nppig", "gpu-deskew: libnppig not found");
-        link_lib_in_dir(cuda_lib_dirs, "nppc", "gpu-deskew: libnppc not found");
-        link_lib_in_dir(cuda_lib_dirs, "cudart", "gpu-deskew: libcudart not found");
+        link_lib_in_dir(CUDA_LIB_DIRS, "nppig", "gpu-deskew: libnppig not found");
+        link_lib_in_dir(CUDA_LIB_DIRS, "nppc", "gpu-deskew: libnppc not found");
+        link_lib_in_dir(CUDA_LIB_DIRS, "cudart", "gpu-deskew: libcudart not found");
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 

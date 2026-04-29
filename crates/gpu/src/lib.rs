@@ -16,6 +16,9 @@
 //!   via NVIDIA nvJPEG.  Requires `libnvjpeg.so` at link time.
 //! - `nvjpeg2k` — enables [`nvjpeg2k`] module for GPU-accelerated JPEG 2000
 //!   decoding via NVIDIA nvJPEG2000.  Requires `libnvjpeg2k.so` at link time.
+//! - `gpu-deskew` — enables [`npp_rotate`] module for GPU rotation via CUDA NPP
+//!   (`nppiRotate_8u_C1R_Ctx`).  Requires `libnppig.so`, `libnppc.so`, and
+//!   `libcudart.so` at link time.
 
 #[cfg(feature = "nvjpeg")]
 pub mod nvjpeg;

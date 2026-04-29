@@ -24,16 +24,24 @@ use super::DeskewError;
 /// The image is replaced with a new bitmap of the same dimensions containing
 /// the rotated content.  Out-of-bounds source pixels are filled with 255 (white).
 ///
+/// When the `gpu-deskew` feature is enabled, attempts GPU rotation first and
+/// falls back to the CPU bilinear path on any GPU error.
+///
 /// # Errors
 ///
-/// Returns [`DeskewError`] if GPU allocation fails and CPU fallback is also
-/// unavailable (extremely unlikely — the CPU path has no allocation that can fail
-/// beyond `Vec` OOM, which panics).
+/// Currently always returns `Ok(())` — the CPU path cannot fail beyond OOM
+/// (which panics).  The return type is `Result` to accommodate future GPU-only
+/// configurations where CPU fallback may not be available.
 pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), DeskewError> {
     #[cfg(feature = "gpu-deskew")]
-    if let Ok(rotated) = rotate_gpu(img, angle_deg) {
-        *img = rotated;
-        return Ok(());
+    match rotate_gpu(img, angle_deg) {
+        Ok(rotated) => {
+            *img = rotated;
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("rotate_inplace: GPU rotation failed ({e}); falling back to CPU");
+        }
     }
 
     *img = rotate_cpu(img, angle_deg);

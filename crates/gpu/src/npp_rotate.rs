@@ -14,9 +14,11 @@
 //!
 //! # Thread safety
 //!
-//! [`NppRotator`] is `Send` but not `Sync`.  Each thread gets its own
-//! instance via a `thread_local!` inside [`rotate_gray8`] — lazy,
-//! initialise-once, never retry on failure.
+//! [`NppRotator`] is `Send` but not `Sync`.  The recommended entry point is
+//! [`rotate_gray8`], which manages a per-thread instance via `thread_local!`.
+//! Constructing [`NppRotator`] directly is safe, but it must only be used from
+//! the thread that called [`NppRotator::new`] — CUDA primary contexts are
+//! thread-bound and sharing an instance across threads is unsound.
 
 #![cfg(feature = "gpu-deskew")]
 
@@ -24,10 +26,12 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
 
-// ── CUDA driver API (libcuda.so) ──────────────────────────────────────────────
+// ── CUDA handles ─────────────────────────────────────────────────────────────
 
-/// Opaque CUDA stream / context handle.
-type CUstream = *mut c_void;
+/// Opaque CUDA stream handle (`CUstream` / `cudaStream_t` — same ABI on Linux).
+type CudaHandle = *mut c_void;
+
+// ── CUDA driver API (libcuda.so) ──────────────────────────────────────────────
 
 unsafe extern "C" {
     fn cuInit(flags: u32) -> i32;
@@ -35,9 +39,9 @@ unsafe extern "C" {
     fn cuDevicePrimaryCtxRetain(ctx: *mut *mut c_void, device: i32) -> i32;
     fn cuDevicePrimaryCtxRelease(device: i32) -> i32;
     fn cuCtxSetCurrent(ctx: *mut c_void) -> i32;
-    fn cuStreamCreate(stream: *mut CUstream, flags: u32) -> i32;
-    fn cuStreamDestroy(stream: CUstream) -> i32;
-    fn cuStreamSynchronize(stream: CUstream) -> i32;
+    fn cuStreamCreate(stream: *mut CudaHandle, flags: u32) -> i32;
+    fn cuStreamDestroy(stream: CudaHandle) -> i32;
+    fn cuStreamSynchronize(stream: CudaHandle) -> i32;
 }
 
 // ── CUDA runtime API (libcudart.so) ───────────────────────────────────────────
@@ -53,19 +57,19 @@ unsafe extern "C" {
 
 // ── NPP core (libnppc.so) ─────────────────────────────────────────────────────
 
-/// Opaque `cudaStream_t` handle as used by the CUDA runtime API.
-type CudaStreamT = *mut c_void;
-
 /// NPP status code: 0 = success, negative = error, positive = warning.
 type NppStatus = i32;
 const NPP_SUCCESS: i32 = 0;
+/// NPP warning: rotated source quad does not intersect the destination ROI;
+/// **no pixels were written**.  Value confirmed in `nppdefs.h`.
+const NPP_WRONG_INTERSECTION_QUAD_WARNING: i32 = 30;
 
 /// NPP stream context; populated by [`nppGetStreamContext`] after
 /// [`nppSetStream`] points NPP at the correct stream.
 #[repr(C)]
 #[derive(Default)]
 struct NppStreamContext {
-    h_stream: CudaStreamT,
+    h_stream: CudaHandle,
     cuda_device_id: i32,
     multi_processor_count: i32,
     max_threads_per_multi_processor: i32,
@@ -78,7 +82,8 @@ struct NppStreamContext {
 }
 
 unsafe extern "C" {
-    fn nppSetStream(stream: CudaStreamT) -> NppStatus;
+    // No warning codes are defined for these two calls; any non-zero is an error.
+    fn nppSetStream(stream: CudaHandle) -> NppStatus;
     fn nppGetStreamContext(ctx: *mut NppStreamContext) -> NppStatus;
 }
 
@@ -93,6 +98,7 @@ struct NppiSize {
 
 /// 2-D integer rectangle: top-left corner (x, y) and dimensions.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct NppiRect {
     x: i32,
     y: i32,
@@ -104,7 +110,7 @@ struct NppiRect {
 const NPPI_INTER_LINEAR: i32 = 2;
 
 unsafe extern "C" {
-    #[allow(clippy::too_many_arguments)] // mirrors the C API exactly
+    #[expect(clippy::too_many_arguments, reason = "mirrors the NPP C API exactly")]
     fn nppiRotate_8u_C1R_Ctx(
         p_src: *const u8,
         src_size: NppiSize,
@@ -133,20 +139,20 @@ impl DeviceBuf {
     ///
     /// # Errors
     ///
-    /// Returns [`NppRotateError`] if `cudaMalloc` fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `cudaMalloc` reports success but returns a null pointer
-    /// (should never happen in practice).
+    /// Returns [`NppRotateError`] if `cudaMalloc` fails or returns a null
+    /// pointer on success (the latter indicates a driver bug).
     fn alloc(size: usize) -> Result<Self> {
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: cudaMalloc writes a valid device pointer (or null) to `ptr`.
-        let code = unsafe { cudaMalloc(ptr::addr_of_mut!(ptr), size) };
+        let code = unsafe { cudaMalloc(&raw mut ptr, size) };
         if code != 0 {
             return Err(NppRotateError(format!("cudaMalloc({size}): code {code}")));
         }
-        assert!(!ptr.is_null(), "cudaMalloc succeeded but returned null");
+        if ptr.is_null() {
+            return Err(NppRotateError(
+                "cudaMalloc succeeded but returned null pointer".into(),
+            ));
+        }
         Ok(Self { ptr })
     }
 }
@@ -154,7 +160,10 @@ impl DeviceBuf {
 impl Drop for DeviceBuf {
     fn drop(&mut self) {
         // SAFETY: ptr came from cudaMalloc; no other reference exists at drop time.
-        let _ = unsafe { cudaFree(self.ptr) };
+        let code = unsafe { cudaFree(self.ptr) };
+        if code != 0 {
+            log::warn!("npp_rotate: cudaFree failed: code {code}");
+        }
     }
 }
 
@@ -180,10 +189,17 @@ type Result<T> = std::result::Result<T, NppRotateError>;
 ///
 /// Reuse across pages — context and stream creation are expensive; the
 /// per-rotate cost is two `cudaMalloc` + two `cudaMemcpy` + the NPP kernel.
-pub struct NppRotator {
+///
+/// # Safety
+///
+/// `NppRotator` must only be used from the thread that called [`NppRotator::new`].
+/// CUDA primary contexts are thread-bound; using the same instance from a
+/// different thread produces `CUDA_ERROR_INVALID_CONTEXT`.  The recommended
+/// entry point is [`rotate_gray8`], which enforces this via `thread_local!`.
+pub(crate) struct NppRotator {
     cu_ctx: *mut c_void,
     device: i32,
-    stream: CUstream,
+    stream: CudaHandle,
 }
 
 // SAFETY: NppRotator is accessed exclusively through the per-thread
@@ -197,41 +213,56 @@ impl NppRotator {
     ///
     /// Returns [`NppRotateError`] if any CUDA driver call fails (e.g. no GPU
     /// is present, or the driver is not loaded).
-    pub fn new() -> Result<Self> {
-        macro_rules! cu {
-            ($call:expr, $label:literal) => {{
-                let r = unsafe { $call };
-                if r != 0 {
-                    return Err(NppRotateError(format!("{}: code {}", $label, r)));
-                }
-            }};
+    ///
+    /// # Panics
+    ///
+    /// Panics if a CUDA function reports success but returns a null handle —
+    /// that indicates a driver bug.
+    pub(crate) fn new() -> Result<Self> {
+        // Step 1: initialise the CUDA driver.  Safe to call multiple times.
+        let r = unsafe { cuInit(0) };
+        if r != 0 {
+            return Err(NppRotateError(format!("cuInit: code {r}")));
         }
 
-        cu!(cuInit(0), "cuInit");
-
+        // Step 2: get device handle.
         let mut device: i32 = 0;
-        cu!(cuDeviceGet(ptr::addr_of_mut!(device), 0), "cuDeviceGet");
-
-        let mut cu_ctx: *mut c_void = ptr::null_mut();
-        cu!(
-            cuDevicePrimaryCtxRetain(ptr::addr_of_mut!(cu_ctx), device),
-            "cuDevicePrimaryCtxRetain"
-        );
-
-        let ctx_code = unsafe { cuCtxSetCurrent(cu_ctx) };
-        if ctx_code != 0 {
-            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
-            return Err(NppRotateError(format!("cuCtxSetCurrent: code {ctx_code}")));
+        let r = unsafe { cuDeviceGet(&raw mut device, 0) };
+        if r != 0 {
+            return Err(NppRotateError(format!("cuDeviceGet: code {r}")));
         }
 
-        let mut stream: CUstream = ptr::null_mut();
-        let stream_code = unsafe { cuStreamCreate(ptr::addr_of_mut!(stream), 0) };
-        if stream_code != 0 {
-            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
+        // Step 3: retain primary context.
+        let mut cu_ctx: *mut c_void = ptr::null_mut();
+        let r = unsafe { cuDevicePrimaryCtxRetain(&raw mut cu_ctx, device) };
+        if r != 0 {
             return Err(NppRotateError(format!(
-                "cuStreamCreate: code {stream_code}"
+                "cuDevicePrimaryCtxRetain: code {r}"
             )));
         }
+        assert!(
+            !cu_ctx.is_null(),
+            "cuDevicePrimaryCtxRetain succeeded but returned null context"
+        );
+
+        // Step 4: bind context to calling thread.
+        let r = unsafe { cuCtxSetCurrent(cu_ctx) };
+        if r != 0 {
+            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
+            return Err(NppRotateError(format!("cuCtxSetCurrent: code {r}")));
+        }
+
+        // Step 5: create stream.
+        let mut stream: CudaHandle = ptr::null_mut();
+        let r = unsafe { cuStreamCreate(&raw mut stream, 0) };
+        if r != 0 {
+            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
+            return Err(NppRotateError(format!("cuStreamCreate: code {r}")));
+        }
+        assert!(
+            !stream.is_null(),
+            "cuStreamCreate succeeded but returned null stream"
+        );
 
         Ok(Self {
             cu_ctx,
@@ -243,16 +274,20 @@ impl NppRotator {
     /// Rotate a single-channel 8-bit grayscale image by `angle_deg` degrees
     /// (clockwise positive) via NPP bilinear.
     ///
-    /// - `src`: pixel data, `src_stride * height` bytes (may have row padding).
-    /// - `src_stride`: bytes per row in `src` (≥ `width`).
-    /// - `width`, `height`: image dimensions in pixels.
+    /// - `src`: pixel data; must be at least `src_stride * height` bytes.
+    /// - `src_stride`: bytes per row in `src`; must be ≥ `width`.
+    /// - `width`, `height`: image dimensions in pixels; both must be non-zero
+    ///   and fit in `i32` (i.e. ≤ 2 147 483 647).
+    /// - `angle_deg`: rotation angle in degrees (clockwise positive); must be
+    ///   finite (not NaN or ±infinity).
     ///
     /// Returns tightly packed output pixels (`width * height` bytes, no padding).
     ///
     /// # Errors
     ///
-    /// Returns [`NppRotateError`] if any CUDA or NPP call fails.
-    pub fn rotate(
+    /// Returns [`NppRotateError`] if any precondition is violated or any CUDA
+    /// or NPP call fails.
+    pub(crate) fn rotate(
         &self,
         src: &[u8],
         src_stride: usize,
@@ -260,18 +295,63 @@ impl NppRotator {
         height: u32,
         angle_deg: f32,
     ) -> Result<Vec<u8>> {
+        // ── Input validation ─────────────────────────────────────────────────
+
+        if !angle_deg.is_finite() {
+            return Err(NppRotateError(format!(
+                "angle_deg is not finite: {angle_deg}"
+            )));
+        }
+
         let w = width as usize;
         let h = height as usize;
+
+        if w == 0 || h == 0 {
+            return Err(NppRotateError(format!(
+                "degenerate image: {width}×{height}"
+            )));
+        }
+
+        // NPP API uses i32 for dimensions and step; check before casting.
+        // (PDF pages are well under this limit, but the public API must enforce it.)
+        if w > i32::MAX as usize || h > i32::MAX as usize {
+            return Err(NppRotateError(format!(
+                "image {width}×{height} exceeds NPP i32 dimension limit"
+            )));
+        }
+        if src_stride < w {
+            return Err(NppRotateError(format!(
+                "src_stride {src_stride} < width {w}"
+            )));
+        }
+        if src_stride > i32::MAX as usize {
+            return Err(NppRotateError(format!(
+                "src_stride {src_stride} exceeds NPP i32 step limit"
+            )));
+        }
+
+        let required_src = src_stride
+            .checked_mul(h)
+            .ok_or_else(|| NppRotateError("src_stride * height overflows usize".into()))?;
+        if src.len() < required_src {
+            return Err(NppRotateError(format!(
+                "src too short: {} bytes for stride {src_stride} × {h} rows",
+                src.len()
+            )));
+        }
+
         let dst_stride = w; // tightly packed output
-        let dst_len = dst_stride * h;
+        let dst_len = w * h; // w and h are both ≤ i32::MAX so this can't overflow usize on 64-bit
+
+        // ── Computation ──────────────────────────────────────────────────────
 
         let (n_angle, shift_x, shift_y) = centre_pivot_shift(w, h, angle_deg);
 
-        // Restore CUDA context (rayon workers may interleave).
-        let ctx_code = unsafe { cuCtxSetCurrent(self.cu_ctx) };
-        if ctx_code != 0 {
+        // Restore CUDA context (rayon workers may interleave threads between calls).
+        let r = unsafe { cuCtxSetCurrent(self.cu_ctx) };
+        if r != 0 {
             return Err(NppRotateError(format!(
-                "cuCtxSetCurrent (rotate): code {ctx_code}"
+                "cuCtxSetCurrent (rotate): code {r}"
             )));
         }
 
@@ -279,10 +359,11 @@ impl NppRotator {
         let d_dst = DeviceBuf::alloc(dst_len)?;
 
         // H → D upload.
-        // SAFETY: src is valid for `src.len()` bytes; d_src is a device alloc of the same size.
-        let h2d = unsafe { cudaMemcpy(d_src.ptr, src.as_ptr().cast(), src.len(), CUDA_MEMCPY_H2D) };
-        if h2d != 0 {
-            return Err(NppRotateError(format!("cudaMemcpy H2D: code {h2d}")));
+        // SAFETY: src is valid for `src.len()` bytes; we validated src.len() >= src_stride*h
+        // above, so NPP will not read past the device allocation.
+        let r = unsafe { cudaMemcpy(d_src.ptr, src.as_ptr().cast(), src.len(), CUDA_MEMCPY_H2D) };
+        if r != 0 {
+            return Err(NppRotateError(format!("cudaMemcpy H2D: code {r}")));
         }
 
         let npp_ctx = self.build_npp_ctx()?;
@@ -291,14 +372,14 @@ impl NppRotator {
         )?;
 
         // Stream sync then D → H download.
-        let sync = unsafe { cuStreamSynchronize(self.stream) };
-        if sync != 0 {
-            return Err(NppRotateError(format!("cuStreamSynchronize: code {sync}")));
+        let r = unsafe { cuStreamSynchronize(self.stream) };
+        if r != 0 {
+            return Err(NppRotateError(format!("cuStreamSynchronize: code {r}")));
         }
 
         let mut dst_pixels = vec![0u8; dst_len];
         // SAFETY: d_dst was written by the NPP kernel and synced; dst_pixels has `dst_len` bytes.
-        let d2h = unsafe {
+        let r = unsafe {
             cudaMemcpy(
                 dst_pixels.as_mut_ptr().cast(),
                 d_dst.ptr,
@@ -306,8 +387,8 @@ impl NppRotator {
                 CUDA_MEMCPY_D2H,
             )
         };
-        if d2h != 0 {
-            return Err(NppRotateError(format!("cudaMemcpy D2H: code {d2h}")));
+        if r != 0 {
+            return Err(NppRotateError(format!("cudaMemcpy D2H: code {r}")));
         }
 
         Ok(dst_pixels)
@@ -317,22 +398,27 @@ impl NppRotator {
     fn build_npp_ctx(&self) -> Result<NppStreamContext> {
         // nppSetStream + nppGetStreamContext fills in device properties,
         // avoiding manual cudaGetDeviceProperties calls.
-        let set_code = unsafe { nppSetStream(self.stream.cast()) };
-        if set_code != NPP_SUCCESS {
-            return Err(NppRotateError(format!("nppSetStream: code {set_code}")));
+        // No warning codes are defined for either call; any non-zero is a hard error.
+        let r = unsafe { nppSetStream(self.stream) };
+        if r != NPP_SUCCESS {
+            return Err(NppRotateError(format!("nppSetStream: code {r}")));
         }
         let mut npp_ctx = NppStreamContext::default();
-        let get_code = unsafe { nppGetStreamContext(ptr::addr_of_mut!(npp_ctx)) };
-        if get_code != NPP_SUCCESS {
-            return Err(NppRotateError(format!(
-                "nppGetStreamContext: code {get_code}"
-            )));
+        let r = unsafe { nppGetStreamContext(&raw mut npp_ctx) };
+        if r != NPP_SUCCESS {
+            return Err(NppRotateError(format!("nppGetStreamContext: code {r}")));
         }
         Ok(npp_ctx)
     }
 
     /// Launch `nppiRotate_8u_C1R_Ctx`.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Precondition: `w`, `h`, `src_stride`, and `dst_stride` all fit in `i32`
+    /// (caller must validate before calling — see [`NppRotator::rotate`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal helper mirroring the NPP C API"
+    )]
     fn call_nppi_rotate(
         d_src: &DeviceBuf,
         src_stride: usize,
@@ -345,12 +431,11 @@ impl NppRotator {
         shift_y: f64,
         npp_ctx: NppStreamContext,
     ) -> Result<()> {
-        // NPP image dimensions must fit in i32 (API contract).
-        // Real PDF pages are well under 2^31 pixels per side.
+        // All dimension/stride values were range-checked in rotate() before this call.
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_possible_wrap,
-            reason = "PDF page dimensions are always < 2^31; NPP API requires i32"
+            reason = "bounds checked against i32::MAX in rotate() before this call"
         )]
         let (wi, hi, src_step, dst_step) =
             (w as i32, h as i32, src_stride as i32, dst_stride as i32);
@@ -361,8 +446,9 @@ impl NppRotator {
             width: wi,
             height: hi,
         };
-        // SAFETY: d_src/d_dst are valid device allocations; size and step are consistent;
-        //         npp_ctx was filled by nppGetStreamContext for the current device and stream.
+        // SAFETY: d_src/d_dst are valid device allocations sized for the pixel data;
+        //         size and step are consistent with width/height; npp_ctx was filled
+        //         by nppGetStreamContext for the current device and stream.
         let status = unsafe {
             nppiRotate_8u_C1R_Ctx(
                 d_src.ptr.cast::<u8>(),
@@ -371,12 +457,7 @@ impl NppRotator {
                     height: hi,
                 },
                 src_step,
-                NppiRect {
-                    x: 0,
-                    y: 0,
-                    width: wi,
-                    height: hi,
-                },
+                full_roi,
                 d_dst.ptr.cast::<u8>(),
                 dst_step,
                 full_roi,
@@ -387,8 +468,16 @@ impl NppRotator {
                 npp_ctx,
             )
         };
-        // status >= 0: success or non-fatal warning (e.g. 29 = quad out of dst ROI).
-        if status < 0 {
+
+        if status == NPP_WRONG_INTERSECTION_QUAD_WARNING {
+            // No pixels were written; the rotated quad fell entirely outside the
+            // destination ROI.  This should not occur for small deskew angles
+            // (≤ ±7°) on non-trivial images, but log it so it is diagnosable.
+            log::warn!(
+                "npp_rotate: nppiRotate returned NPP_WRONG_INTERSECTION_QUAD_WARNING (30); \
+                 destination image will be blank"
+            );
+        } else if status < 0 {
             return Err(NppRotateError(format!(
                 "nppiRotate_8u_C1R_Ctx: status {status}"
             )));
@@ -401,8 +490,14 @@ impl Drop for NppRotator {
     fn drop(&mut self) {
         // SAFETY: stream and cu_ctx were initialised in new(); this is the unique owner.
         unsafe {
-            let _ = cuStreamDestroy(self.stream);
-            let _ = cuDevicePrimaryCtxRelease(self.device);
+            let r = cuStreamDestroy(self.stream);
+            if r != 0 {
+                log::warn!("npp_rotate: cuStreamDestroy failed: code {r}");
+            }
+            let r = cuDevicePrimaryCtxRelease(self.device);
+            if r != 0 {
+                log::warn!("npp_rotate: cuDevicePrimaryCtxRelease failed: code {r}");
+            }
         }
     }
 }
@@ -413,18 +508,24 @@ impl Drop for NppRotator {
 /// image CW by `angle_deg` around its centre.
 ///
 /// NPP uses a CW-positive angle convention (image-space: Y axis points down).
-/// The post-rotation shift keeps the image centred on its original centre:
-///   `nAngle  = +θ`   (CW-positive, same as our deskew convention)
-///   `shiftX  = cx − cx·cos(θ) − cy·sin(θ)`
-///   `shiftY  = cy + cx·sin(θ) − cy·cos(θ)`
+/// The post-rotation shift keeps the image anchored to its original centre:
+///
+/// ```text
+/// nAngle  = +θ                            (CW-positive, same as deskew convention)
+/// shiftX  = cx − cx·cos(θ) − cy·sin(θ)
+/// shiftY  = cy + cx·sin(θ) − cy·cos(θ)
+/// ```
+///
+/// Derivation: NPP applies `dst = R_CW(θ)·src + shift`.  Setting the centre
+/// point `(cx, cy)` to map to itself gives `shift = (I − R_CW(θ))·(cx, cy)`.
 fn centre_pivot_shift(w: usize, h: usize, angle_deg: f32) -> (f64, f64, f64) {
     let theta = f64::from(angle_deg).to_radians();
     let cos_t = theta.cos();
     let sin_t = theta.sin();
-    // Image dimensions fit comfortably in f64 mantissa (≤ 32 768 px per side).
+    // w and h are ≤ i32::MAX (< 2^31); f64 mantissa is 52 bits; exact.
     #[expect(
         clippy::cast_precision_loss,
-        reason = "image dimensions ≤ 32_768 px; f64 mantissa is 52 bits; no precision lost"
+        reason = "dimensions validated ≤ i32::MAX < 2^31; f64 mantissa is 52 bits; exact"
     )]
     let (cx, cy) = ((w as f64 - 1.0) * 0.5, (h as f64 - 1.0) * 0.5);
     let n_angle = f64::from(angle_deg); // NPP is CW-positive (image-space Y-down)
@@ -435,31 +536,39 @@ fn centre_pivot_shift(w: usize, h: usize, angle_deg: f32) -> (f64, f64, f64) {
 
 // ── Thread-local entry point ──────────────────────────────────────────────────
 
+/// Per-thread rotator state.
+enum RotatorSlot {
+    /// Not yet initialised.
+    Uninit,
+    /// Initialisation failed permanently; do not retry.
+    Failed,
+    /// Ready to use.
+    Ready(NppRotator),
+}
+
 thread_local! {
-    /// Per-thread rotator: `None` = not yet initialised or previously failed.
-    static ROTATOR: RefCell<Option<NppRotator>> = const { RefCell::new(None) };
+    static ROTATOR: RefCell<RotatorSlot> = const { RefCell::new(RotatorSlot::Uninit) };
 }
 
 /// Rotate a single-channel 8-bit grayscale image by `angle_deg` (clockwise
 /// positive) on the GPU.
 ///
-/// - `src`: pixel data, `src_stride * height` bytes (may have row padding).
-/// - `src_stride`: bytes per row in `src`.
+/// - `src`: pixel data; must be at least `src_stride * height` bytes.
+/// - `src_stride`: bytes per row in `src`; must be ≥ `width`.
+/// - `width`, `height`: image dimensions in pixels; both must be non-zero.
+/// - `angle_deg`: rotation angle in degrees (clockwise positive); must be finite.
 ///
 /// Returns tightly packed output pixels (`width * height` bytes).
 ///
 /// On the first call per thread, initialises the CUDA context and stream.
-/// Returns `Err` if GPU initialisation or the NPP kernel fails, so the
-/// caller can fall back to the CPU path.
+/// If GPU initialisation fails, logs a warning and returns `Err` — the slot
+/// is permanently marked as failed and no further init is attempted.
+/// If the NPP kernel fails on a subsequent call, returns `Err` without
+/// poisoning the slot (a transient error may be recoverable).
 ///
 /// # Errors
 ///
 /// Returns [`NppRotateError`] if GPU initialisation or any CUDA/NPP call fails.
-///
-/// # Panics
-///
-/// Panics if the internal `thread_local` slot is in an unexpected state (should
-/// never happen; the slot is always `None` or `Some`).
 pub fn rotate_gray8(
     src: &[u8],
     src_stride: usize,
@@ -469,17 +578,22 @@ pub fn rotate_gray8(
 ) -> std::result::Result<Vec<u8>, NppRotateError> {
     ROTATOR.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_none() {
+
+        if matches!(*slot, RotatorSlot::Uninit) {
             match NppRotator::new() {
-                Ok(r) => *slot = Some(r),
+                Ok(r) => *slot = RotatorSlot::Ready(r),
                 Err(e) => {
-                    log::warn!("npp_rotate: GPU init failed ({e}); using CPU fallback");
+                    log::warn!("npp_rotate: GPU init failed ({e}); falling back to CPU for all pages on this thread");
+                    *slot = RotatorSlot::Failed;
                     return Err(e);
                 }
             }
         }
-        slot.as_ref()
-            .expect("just initialised above")
-            .rotate(src, src_stride, width, height, angle_deg)
+
+        match &*slot {
+            RotatorSlot::Ready(r) => r.rotate(src, src_stride, width, height, angle_deg),
+            RotatorSlot::Failed => Err(NppRotateError("GPU init previously failed".into())),
+            RotatorSlot::Uninit => unreachable!("slot was just initialised"),
+        }
     })
 }
