@@ -6,7 +6,7 @@ Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tes
 
 ```toml
 # Cargo.toml
-pdf_raster = { git = "https://github.com/tom/pdf-raster", tag = "v0.1.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.1.0" }
 ```
 
 ```rust

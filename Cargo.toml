@@ -16,10 +16,10 @@ members = [
 [workspace.package]
 version     = "0.1.0"
 edition     = "2024"
-authors     = ["Tom <pthomasfournet@gmail.com>"]
+authors     = ["pthomasfournet"]
 license     = "MIT"
-repository  = "https://github.com/tom/pdf-raster"
-homepage    = "https://github.com/tom/pdf-raster"
+repository  = "https://github.com/pthomasfournet/pdf-raster"
+homepage    = "https://github.com/pthomasfournet/pdf-raster"
 readme      = "README.md"
 
 [workspace.dependencies]
