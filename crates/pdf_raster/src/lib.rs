@@ -54,6 +54,23 @@ pub use render::{
     MAX_PX_DIMENSION, RasterError, RasterSession, open_session, render_page_rgb, rgb_to_gray,
 };
 
+/// Eagerly release GPU decoders on every rayon worker thread.
+///
+/// Call this via `pool.broadcast(|_| pdf_raster::release_gpu_decoders())`
+/// after all rendering is done and before `pool` is dropped.  This drops each
+/// thread's `NvJpegDecoder` while the CUDA driver is still fully live, avoiding
+/// the process-exit teardown race where all workers call `nvjpegJpegStateDestroy`
+/// concurrently into a driver that has already started its own atexit shutdown.
+///
+/// After this call the TLS slots hold `Uninitialised`, so their own destructors
+/// at process exit are no-ops.
+pub fn release_gpu_decoders() {
+    #[cfg(feature = "nvjpeg")]
+    render::release_nvjpeg_this_thread();
+    #[cfg(feature = "nvjpeg2k")]
+    render::release_nvjpeg2k_this_thread();
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Options controlling how pages are rendered.

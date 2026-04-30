@@ -115,9 +115,17 @@ const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 type nvjpegBackend_t = i32;
 
 /// Auto-select the best available backend (typically `HYBRID`).
-/// Used as the fallback when `NVJPEG_BACKEND_HARDWARE` is unavailable.
+/// Final fallback when both `GPU_HYBRID` and `HARDWARE` are unavailable.
 const NVJPEG_BACKEND_DEFAULT: nvjpegBackend_t = 0;
-/// Hardware JPEG decode engine — fastest for baseline JPEGs on Turing+/Blackwell.
+/// GPU-accelerated Huffman + SM IDCT/colour-convert.  Better aggregate throughput
+/// than `HARDWARE` when many threads decode concurrently, because it uses CUDA SMs
+/// rather than the single fixed-function JPEG engine that serialises all callers.
+const NVJPEG_BACKEND_GPU_HYBRID: nvjpegBackend_t = 2;
+/// Fixed-function on-die JPEG engine (Turing+/Blackwell).  Fastest for
+/// single-threaded baseline JPEG; serialises across all concurrent callers so it
+/// is slower than `GPU_HYBRID` in multi-threaded workloads.
+/// Retained as a named constant for documentation; not used in production code paths.
+#[expect(dead_code, reason = "documents the HARDWARE backend value; not used in production")]
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;
 
 /// Maximum number of colour plane pointers in `nvjpegImage_t`.
@@ -168,6 +176,9 @@ unsafe extern "C" {
     fn cuStreamDestroy(stream: CUstream) -> i32;
     /// Block the calling thread until all work enqueued on `stream` completes.
     fn cuStreamSynchronize(stream: CUstream) -> i32;
+    /// Probe a context for validity.  Returns non-zero if the context is not
+    /// fully initialised (e.g. driver still recovering after a peer process crash).
+    fn cuCtxGetApiVersion(ctx: *mut std::ffi::c_void, version: *mut u32) -> i32;
     /// Allocate page-locked (pinned) host memory.
     ///
     /// Pinned memory can be DMA'd by the GPU without an intermediate copy.
@@ -474,12 +485,16 @@ impl PendingDecode {
 unsafe impl Send for NvJpeg {}
 
 impl NvJpeg {
-    /// Initialise nvJPEG, preferring the hardware decode engine on Turing+/Blackwell GPUs.
+    /// Initialise nvJPEG, preferring `GPU_HYBRID` for multi-threaded workloads.
     ///
-    /// Attempts `NVJPEG_BACKEND_HARDWARE` first (fastest for baseline JPEGs on
-    /// RTX 5070 / CC 12.0).  Falls back to `NVJPEG_BACKEND_DEFAULT` if the
-    /// hardware engine is unavailable (older GPUs, driver too old, or VRAM
-    /// pressure).
+    /// Attempts `NVJPEG_BACKEND_GPU_HYBRID` first — uses CUDA SMs for Huffman
+    /// decode + IDCT/colour-convert and scales well when many threads decode
+    /// concurrently.  Falls back to `NVJPEG_BACKEND_DEFAULT` if unavailable.
+    ///
+    /// `NVJPEG_BACKEND_HARDWARE` is intentionally not used here: it routes all
+    /// decodes through the single fixed-function JPEG engine, which serialises
+    /// across all concurrent callers and degrades throughput in multi-threaded
+    /// PDF rendering.
     ///
     /// Returns `Err` if both backends fail to initialise, or if per-decode state
     /// allocation fails.  Callers should treat the error as "nvJPEG unavailable;
@@ -489,38 +504,38 @@ impl NvJpeg {
     ///
     /// Returns an error if nvJPEG device initialisation or state allocation fails.
     pub(crate) fn new() -> Result<Self> {
-        // Try hardware engine first; fall back to default (hybrid) if unavailable.
         let (handle, hardware_backend) = Self::create_handle()?;
         Self::with_handle(handle, hardware_backend)
     }
 
-    /// Try `NVJPEG_BACKEND_HARDWARE` first; fall back to `NVJPEG_BACKEND_DEFAULT`.
+    /// Try `NVJPEG_BACKEND_GPU_HYBRID` first; fall back to `NVJPEG_BACKEND_DEFAULT`.
     ///
-    /// Returns the handle and a flag indicating which backend was selected.
+    /// Returns the handle and `hardware_backend = false` (neither selected backend
+    /// uses the fixed-function engine).
     fn create_handle() -> Result<(nvjpegHandle_t, bool)> {
         let mut handle: nvjpegHandle_t = ptr::null_mut();
         // SAFETY: nvjpegCreateEx initialises a fresh library handle with the chosen backend.
         // NULL allocator pointers request the default CUDA device/pinned allocators.
         // flags must be 0 (reserved; any other value returns NVJPEG_STATUS_INVALID_PARAMETER).
-        let hw_status = unsafe {
+        let hybrid_status = unsafe {
             nvjpegCreateEx(
-                NVJPEG_BACKEND_HARDWARE,
+                NVJPEG_BACKEND_GPU_HYBRID,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
                 ptr::addr_of_mut!(handle),
             )
         };
-        if hw_status == NVJPEG_STATUS_SUCCESS {
+        if hybrid_status == NVJPEG_STATUS_SUCCESS {
             assert!(
                 !handle.is_null(),
-                "nvjpegCreateEx(HARDWARE) succeeded but returned null handle"
+                "nvjpegCreateEx(GPU_HYBRID) succeeded but returned null handle"
             );
-            return Ok((handle, true));
+            return Ok((handle, false));
         }
 
         log::debug!(
-            "nvJPEG HARDWARE backend unavailable ({hw_status}), falling back to DEFAULT backend"
+            "nvJPEG GPU_HYBRID backend unavailable ({hybrid_status}), falling back to DEFAULT backend"
         );
         handle = ptr::null_mut();
         // SAFETY: same as above; NVJPEG_BACKEND_DEFAULT with default allocators.
@@ -837,15 +852,50 @@ impl NvJpegDecoder {
             return Err(NvJpegError::CudaError(r));
         }
 
-        // Step 3 — retain the primary context.  Reference-counted by the driver;
-        // we release it in Drop via cuDevicePrimaryCtxRelease.
+        // Steps 3–4 — retain + bind the primary context.
+        //
+        // Retry up to 3 times with a short sleep: if a peer process crashed
+        // without calling cuDevicePrimaryCtxRelease the driver marks the primary
+        // context as "in recovery".  cuDevicePrimaryCtxRetain can return a
+        // not-yet-fully-initialised context pointer in that window; probing it
+        // with cuCtxGetApiVersion distinguishes a live context from a stale one.
+        // After the driver finishes cleanup (typically < 200 ms) the next retain
+        // succeeds cleanly.  Pattern confirmed by TensorFlow #51400 and Numba #2875.
         let mut cu_ctx: *mut std::ffi::c_void = ptr::null_mut();
-        let r = unsafe { cuDevicePrimaryCtxRetain(ptr::addr_of_mut!(cu_ctx), device) };
-        if r != 0 {
-            return Err(NvJpegError::CudaError(r));
+        let mut ctx_ready = false;
+        for attempt in 0..3_u32 {
+            cu_ctx = ptr::null_mut();
+            // SAFETY: cuDevicePrimaryCtxRetain writes to cu_ctx.
+            let r = unsafe { cuDevicePrimaryCtxRetain(ptr::addr_of_mut!(cu_ctx), device) };
+            if r != 0 {
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                return Err(NvJpegError::CudaError(r));
+            }
+            // Probe: a recovering context returns an error here even though Retain
+            // succeeded and the pointer is non-null.
+            let mut _ver: u32 = 0;
+            // SAFETY: cu_ctx is non-null (Retain succeeded); cuCtxGetApiVersion is a
+            // read-only probe that does not modify driver state.
+            let probe = unsafe { cuCtxGetApiVersion(cu_ctx, ptr::addr_of_mut!(_ver)) };
+            if probe == 0 {
+                ctx_ready = true;
+                break;
+            }
+            log::debug!(
+                "nvJPEG: primary context not ready (attempt {attempt}, probe={probe}), retrying"
+            );
+            // SAFETY: we just retained it; release before retrying.
+            let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !ctx_ready {
+            return Err(NvJpegError::CudaError(700)); // CUDA_ERROR_UNKNOWN
         }
 
-        // Step 4 — bind the primary context to the calling thread.
+        // Bind the now-verified primary context to the calling thread.
         let r = unsafe { cuCtxSetCurrent(cu_ctx) };
         if r != 0 {
             let _ = unsafe { cuDevicePrimaryCtxRelease(device) };

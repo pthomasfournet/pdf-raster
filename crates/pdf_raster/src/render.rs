@@ -33,6 +33,12 @@ enum DecoderInit<T> {
     Failed,
 }
 
+// nvjpegCreateEx is not safe to call concurrently from multiple threads —
+// simultaneous calls race inside the library and can null-deref.  This mutex
+// serialises all decoder construction calls across threads.
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(feature = "nvjpeg")]
 thread_local! {
     static NVJPEG_DEC: RefCell<DecoderInit<gpu::nvjpeg::NvJpegDecoder>> =
@@ -48,38 +54,73 @@ thread_local! {
 #[cfg(feature = "nvjpeg")]
 fn init_nvjpeg() {
     NVJPEG_DEC.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if matches!(*slot, DecoderInit::Uninitialised) {
-            match gpu::nvjpeg::NvJpegDecoder::new(0) {
-                Ok(dec) => *slot = DecoderInit::Ready(Some(dec)),
-                Err(e) => {
-                    eprintln!(
-                        "pdf_raster: nvJPEG unavailable ({e}); \
-                         JPEG images will be decoded on CPU for this thread"
-                    );
-                    *slot = DecoderInit::Failed;
-                }
+        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
+            return;
+        }
+        // Serialise construction: nvjpegCreateEx races if called concurrently
+        // from multiple threads and can null-deref inside the library.
+        let _guard = DECODER_INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
+            return;
+        }
+        let result = gpu::nvjpeg::NvJpegDecoder::new(0);
+        drop(_guard);
+        match result {
+            Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
+            Err(e) => {
+                eprintln!(
+                    "pdf_raster: nvJPEG unavailable ({e}); \
+                     JPEG images will be decoded on CPU for this thread"
+                );
+                *cell.borrow_mut() = DecoderInit::Failed;
             }
         }
+    });
+}
+
+/// Drop this thread's nvJPEG decoder immediately.
+///
+/// Called via `rayon::broadcast` before the pool is dropped, so TLS
+/// destructors at process exit see `Uninitialised` and become no-ops.
+/// This avoids the process-exit teardown race where all worker threads call
+/// `nvjpegJpegStateDestroy` concurrently into an already-shutting-down driver.
+#[cfg(feature = "nvjpeg")]
+pub(crate) fn release_nvjpeg_this_thread() {
+    NVJPEG_DEC.with(|cell| {
+        *cell.borrow_mut() = DecoderInit::Uninitialised;
     });
 }
 
 #[cfg(feature = "nvjpeg2k")]
 fn init_nvjpeg2k() {
     NVJPEG2K_DEC.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if matches!(*slot, DecoderInit::Uninitialised) {
-            match gpu::nvjpeg2k::NvJpeg2kDecoder::new(0) {
-                Ok(dec) => *slot = DecoderInit::Ready(Some(dec)),
-                Err(e) => {
-                    eprintln!(
-                        "pdf_raster: nvJPEG2000 unavailable ({e}); \
-                         JPEG 2000 images will be decoded on CPU for this thread"
-                    );
-                    *slot = DecoderInit::Failed;
-                }
+        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
+            return;
+        }
+        let _guard = DECODER_INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
+            return;
+        }
+        let result = gpu::nvjpeg2k::NvJpeg2kDecoder::new(0);
+        drop(_guard);
+        match result {
+            Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
+            Err(e) => {
+                eprintln!(
+                    "pdf_raster: nvJPEG2000 unavailable ({e}); \
+                     JPEG 2000 images will be decoded on CPU for this thread"
+                );
+                *cell.borrow_mut() = DecoderInit::Failed;
             }
         }
+    });
+}
+
+/// Drop this thread's nvJPEG2000 decoder immediately (same rationale as above).
+#[cfg(feature = "nvjpeg2k")]
+pub(crate) fn release_nvjpeg2k_this_thread() {
+    NVJPEG2K_DEC.with(|cell| {
+        *cell.borrow_mut() = DecoderInit::Uninitialised;
     });
 }
 

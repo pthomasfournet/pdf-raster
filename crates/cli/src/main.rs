@@ -72,6 +72,12 @@ fn main() {
             .collect()
     });
 
+    // Eagerly drop GPU decoders on every worker thread while the CUDA driver is
+    // still fully live, before the pool drops.  Avoids the process-exit teardown
+    // race where all workers call nvjpegJpegStateDestroy concurrently into a
+    // driver that has already started its own atexit shutdown sequence.
+    let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
+
     report_errors(errors);
 }
 
