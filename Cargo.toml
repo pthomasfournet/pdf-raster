@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 version     = "0.1.0"
 edition     = "2024"
-authors     = ["pthomasfournet"]
+authors     = ["Tom"]
 license     = "MIT"
 repository  = "https://github.com/pthomasfournet/pdf-raster"
 homepage    = "https://github.com/pthomasfournet/pdf-raster"
