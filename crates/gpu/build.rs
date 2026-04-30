@@ -113,8 +113,19 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 
-    // Allow overriding the PTX target arch (e.g. CUDA_ARCH=sm_86 for Ampere).
-    // Default is sm_80 which runs on Ampere, Ada, Hopper, and Blackwell.
+    // PTX kernels are only needed when at least one GPU compute feature is active.
+    // Skipping nvcc on CPU-only builds (Intel without CUDA, ARM) avoids requiring
+    // the CUDA toolkit as a build dependency when no GPU features are enabled.
+    let need_ptx = ["CARGO_FEATURE_GPU_AA", "CARGO_FEATURE_GPU_ICC"]
+        .iter()
+        .any(|f| env::var(f).is_ok());
+
+    if !need_ptx {
+        return;
+    }
+
+    // Allow overriding the PTX target arch (e.g. CUDA_ARCH=sm_75 for Turing,
+    // CUDA_ARCH=sm_120 for Blackwell).  Default sm_80 covers Ampere through Blackwell.
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_owned());
 
     for kernel in [
