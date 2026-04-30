@@ -362,7 +362,7 @@ fn append_ccitt_row(
 ///
 /// JPEG CMYK images in PDF store ink densities in *inverted* form: a byte value
 /// of 0 means *full ink*, 255 means *no ink* (the complement of the usual
-/// convention).  `zune-jpeg` returns raw bytes in this form.  We convert to RGB
+/// convention).  The JPEG decoder returns raw bytes in this form.  We convert to RGB
 /// using:
 ///
 /// ```text
@@ -401,16 +401,16 @@ pub(super) fn decode_dct(
         }
     }
 
-    // ── CPU path (zune-jpeg) ──────────────────────────────────────────────────
+    // ── CPU path ──────────────────────────────────────────────────────────────
     // First pass: decode only the JPEG headers to learn the component count,
     // which determines the output colourspace we request on the second decode.
-    // Two passes are necessary because zune-jpeg requires the output colourspace
+    // Two passes are necessary because the decoder requires the output colourspace
     // to be set before `decode()` is called.
     let mut probe = JpegDecoder::new(ZCursor::new(data));
     probe.decode_headers().ok()?;
     let components = probe.info()?.components;
 
-    // Choose the output colorspace zune-jpeg should produce.
+    // Choose the output colorspace to request from the decoder.
     let out_cs = match components {
         1 => ZColorSpace::Luma,
         3 => ZColorSpace::RGB,
@@ -480,7 +480,7 @@ pub(super) fn decode_dct(
             filter: ImageFilter::Raw,
         }),
         ZColorSpace::CMYK => {
-            // zune-jpeg returns JPEG CMYK with inverted convention (0=full ink, 255=no ink).
+            // JPEG CMYK has inverted convention (0=full ink, 255=no ink).
             // Complement to direct convention (255=full ink, 0=no ink) before dispatch.
             let direct: Vec<u8> = pixels.iter().map(|&b| 255 - b).collect();
             // JPEG streams embed their own colour profile; the PDF ICCBased stream
@@ -622,12 +622,10 @@ pub(super) fn cmyk_raw_to_rgb(
 /// When the `nvjpeg2k` feature is active and `gpu` is `Some`, large images
 /// (pixel area ≥ [`super::GPU_JPEG2K_THRESHOLD_PX`]) are decoded on the GPU via
 /// nvJPEG2000.  All other images, and any image for which the GPU path fails
-/// (unsupported component count, CUDA error, etc.), fall through to the CPU
-/// `jpeg2k`/`OpenJPEG` path.
+/// (unsupported component count, CUDA error, etc.), fall through to the CPU path.
 ///
 /// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
-/// format (`.jp2`).  Both the GPU path (nvJPEG2000 via `nvjpeg2kStreamParse`)
-/// and the CPU path (`jpeg2k`/`OpenJPEG`) auto-detect the format from the stream.
+/// format (`.jp2`).  Both paths auto-detect the format from the stream.
 ///
 /// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
 pub(super) fn decode_jpx(
@@ -648,7 +646,7 @@ pub(super) fn decode_jpx(
         }
     }
 
-    // ── CPU path (jpeg2k / OpenJPEG) ─────────────────────────────────────────
+    // ── CPU path ─────────────────────────────────────────────────────────────
     let img = Jp2Image::from_bytes(data)
         .map_err(|e| log::warn!("image: JPXDecode open error: {e}"))
         .ok()?;

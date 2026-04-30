@@ -12,8 +12,8 @@
 //! | `CCITTFaxDecode` (`K=0`, Group 3 1D / T.4) | yes/no | yes |
 //! | `FlateDecode` | yes/no | yes |
 //! | none (raw) | yes/no | yes |
-//! | `DCTDecode` (JPEG) | no | yes (via `zune-jpeg`, or GPU nvJPEG) |
-//! | `JPXDecode` (JPEG 2000) | no | yes (via `jpeg2k`/`OpenJPEG`, or GPU nvJPEG2000) |
+//! | `DCTDecode` (JPEG) | no | yes (CPU software or GPU nvJPEG) |
+//! | `JPXDecode` (JPEG 2000) | no | yes (CPU software or GPU nvJPEG2000) |
 //! | `JBIG2Decode` | yes/no | yes (via `hayro-jbig2`) |
 //! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | — | stub |
 //!
@@ -29,17 +29,17 @@
 //!
 //! When the crate is built with `--features nvjpeg`, `DCTDecode` streams with
 //! pixel area ≥ [`GPU_JPEG_THRESHOLD_PX`] are decoded on the GPU via NVIDIA
-//! nvJPEG instead of `zune-jpeg`.  Pass an [`NvJpegDecoder`] to
+//! nvJPEG instead of the CPU JPEG decoder.  Pass an [`NvJpegDecoder`] to
 //! [`resolve_image`] to enable this path; pass `None` for CPU-only behaviour.
 //!
 //! # nvJPEG2000 acceleration (`nvjpeg2k` feature)
 //!
 //! When the crate is built with `--features nvjpeg2k`, `JPXDecode` streams
 //! with pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`] are decoded on the GPU via
-//! NVIDIA nvJPEG2000 instead of `jpeg2k`/`OpenJPEG`.  Pass an
+//! NVIDIA nvJPEG2000 instead of the CPU JPEG 2000 decoder.  Pass an
 //! [`NvJpeg2kDecoder`] to [`resolve_image`] to enable this path; pass `None`
 //! for CPU-only behaviour.  Only 1- and 3-component images are accelerated;
-//! CMYK and other multi-channel images always fall through to `OpenJPEG`.
+//! CMYK and other multi-channel images always fall through to the CPU path.
 
 use std::borrow::Cow;
 
@@ -66,16 +66,16 @@ pub(crate) mod icc;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
-/// Below this threshold `PCIe` transfer overhead dominates and CPU `zune-jpeg`
+/// Below this threshold `PCIe` transfer overhead dominates and the CPU decoder
 /// is faster.  512 × 512 = 262 144 pixels — empirically the crossover between
-/// nvJPEG (~10 GB/s) and `zune-jpeg` (~1 GB/s) after `PCIe` DMA latency.
+/// nvJPEG (~10 GB/s) and the CPU JPEG path (~1 GB/s) after `PCIe` DMA latency.
 #[cfg(feature = "nvjpeg")]
 pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
 ///
-/// Below this threshold `PCIe` transfer overhead dominates and CPU
-/// `jpeg2k`/`OpenJPEG` is faster.  512 × 512 = 262 144 pixels — same crossover
+/// Below this threshold `PCIe` transfer overhead dominates and the CPU decoder
+/// is faster.  512 × 512 = 262 144 pixels — same crossover
 /// as nvJPEG; JPEG 2000 decode is CPU-bound at similar pixel counts.
 #[cfg(feature = "nvjpeg2k")]
 pub const GPU_JPEG2K_THRESHOLD_PX: u32 = 262_144;

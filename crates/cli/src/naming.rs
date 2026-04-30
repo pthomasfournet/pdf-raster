@@ -1,4 +1,4 @@
-//! Output filename generation, matching pdftoppm naming conventions.
+//! Output filename generation — page-numbered files with configurable separator and zero-padding.
 
 use crate::args::{Args, OutputFormat};
 

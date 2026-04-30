@@ -1,7 +1,7 @@
-//! Radial gradient pattern — `SplashRadialPattern::getColor`.
+//! Radial gradient pattern (PDF §8.7.4.5, type 3).
 //!
 //! Solves the quadratic `|p - (c0 + t·(c1-c0))|² = (r0 + t·(r1-r0))²`
-//! and takes the largest real root (the "outside" intersection, matching poppler).
+//! and takes the largest real root (the "outside" intersection, per PDF §8.7.4.5).
 //! The root is then clamped to `[t0, t1]` or rejected when extension is off.
 //!
 //! # Out-of-range pixels
@@ -117,7 +117,7 @@ impl RadialPattern {
                 return None; // no real intersection
             }
             let sq = disc.sqrt();
-            // Take the larger root — the "outside" intersection (poppler convention).
+            // Take the larger root — the "outside" intersection (PDF §8.7.4.5).
             f64::max((-b + sq) / self.a, (-b - sq) / self.a)
         };
 

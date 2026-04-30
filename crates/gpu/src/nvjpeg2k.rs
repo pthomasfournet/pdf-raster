@@ -7,7 +7,7 @@
 //!
 //! PDF's `JPXDecode` filter embeds either raw `.j2k` codestreams or full JP2
 //! container files; `nvjpeg2kStreamParse` auto-detects both.  CPU
-//! `jpeg2k`/`OpenJPEG` is used as fallback for small images (below
+//! The CPU JPEG 2000 decoder is used as fallback for small images (below
 //! [`GPU_JPEG2K_THRESHOLD_PX`]), when no GPU is available, and always for
 //! inline images in the content stream (which are typically small thumbnails
 //! not worth the `PCIe` dispatch overhead).
@@ -255,7 +255,7 @@ pub enum NvJpeg2kError {
     /// - 100: `cudaErrorNoDevice`
     CudartError(i32),
     /// Component count is not 1 (Gray) or 3 (RGB); CMYK, Gray+Alpha, LAB, and
-    /// N-channel images fall through to the CPU `jpeg2k`/`OpenJPEG` path.
+    /// N-channel images fall through to the CPU JPEG 2000 path.
     UnsupportedComponents(u32),
     /// At least one image component has a smaller width or height than the
     /// full image, indicating sub-sampled chroma (e.g. YUV 4:2:0).  Bare
@@ -551,7 +551,7 @@ impl NvJpeg2k {
             // component at its native dimensions — sub-sampled chroma components are
             // NOT upsampled to the full image size.  Attempting to interleave
             // mis-sized planes would index out of bounds.  Fall through to the CPU
-            // OpenJPEG path which handles sub-sampling correctly.
+            // JPEG 2000 path which handles sub-sampling correctly.
             if ci.component_width != w || ci.component_height != h {
                 return Err(NvJpeg2kError::SubSampledComponents);
             }
@@ -928,7 +928,7 @@ mod tests {
 
     /// Minimal grayscale JPEG 2000 codestream (16×16, luma = 128).
     ///
-    /// To regenerate (requires ImageMagick with OpenJPEG delegate):
+    /// To regenerate (requires a JPEG 2000 encoder, e.g. `convert -size 16x16 xc:gray50 ...`):
     /// ```sh
     /// convert -size 16x16 xc:gray50 -define j2k:format=j2k /tmp/gray16x16.j2k
     /// python3 -c "d=open('/tmp/gray16x16.j2k','rb').read(); print(', '.join(f'0x{b:02x}' for b in d))"

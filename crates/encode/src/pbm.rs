@@ -2,7 +2,7 @@
 //!
 //! PBM stores 1-bit monochrome pixels, MSB first, rows padded to whole bytes.
 //! Only `Gray8` / `Mono8` bitmaps are accepted; 0 maps to white (0 bit),
-//! non-zero maps to black (1 bit), matching pdftoppm's `--mono` convention.
+//! non-zero maps to black (1 bit), per the P4 spec.
 
 use std::io::{self, Write};
 

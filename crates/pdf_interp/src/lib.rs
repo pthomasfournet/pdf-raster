@@ -1,4 +1,4 @@
-//! PDF content stream interpreter — poppler-free render path.
+//! PDF content stream interpreter.
 //!
 //! # Architecture
 //!

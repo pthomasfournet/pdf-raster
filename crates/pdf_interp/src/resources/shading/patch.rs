@@ -15,10 +15,10 @@ use crate::resources::image::ImageColorSpace;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Colour mixing threshold for subdivision: stop when all corner pairs differ
-/// by less than this per component (matches poppler `patchColorDelta`).
+/// by less than this per component (PDF §8.7.4.5 adaptive subdivision).
 pub(super) const COLOR_DELTA: f64 = 3.0 / 255.0;
 
-/// Maximum adaptive subdivision depth (matches poppler `patchMaxDepth`).
+/// Maximum adaptive subdivision depth (PDF §8.7.4.5).
 pub(super) const MAX_PATCH_DEPTH: u8 = 6;
 
 /// PDF-legal values for `BitsPerFlag` in patch mesh shadings (Table 86).
@@ -28,7 +28,7 @@ pub(super) const VALID_FLAG_BITS: &[u8] = &[2, 4, 8];
 
 /// A bicubic patch: 4×4 control points in device space + 2×2 corner colours.
 ///
-/// Grid convention (matches poppler `GfxPatch` / PDF §8.7.4.5.6):
+/// Grid convention (PDF §8.7.4.5.6):
 /// - `xy[row][col]` where row 0 = "first" edge (u=0), row 3 = "last" edge (u=1).
 /// - `color[u_corner][v_corner]` where 0 = min, 1 = max.
 ///
@@ -60,7 +60,7 @@ pub(super) const fn mid2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
 /// Componentwise midpoint of two sRGB corner colours.
 #[inline]
 pub(super) fn mid_color(a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
-    // lerp_u8(a, b, 128) = round((a + b) / 2) — matches poppler's bilinear interp.
+    // lerp_u8(a, b, 128) = round((a + b) / 2) — rounded midpoint.
     use color::convert::lerp_u8;
     [
         lerp_u8(a[0], b[0], 128),
@@ -175,7 +175,7 @@ pub(super) const fn corner_vertex(p: &Patch, u: usize, v: usize) -> GouraudVerte
 /// Adaptively subdivide `patch` into Gouraud triangles and append them to `out`.
 ///
 /// Subdivision stops when all corner colours are within [`COLOR_DELTA`] of each
-/// other or [`MAX_PATCH_DEPTH`] is reached, matching poppler's strategy.
+/// other or [`MAX_PATCH_DEPTH`] is reached (adaptive subdivision per PDF §8.7.4.5).
 /// Uses an explicit work stack (no recursion) to avoid stack overflow.
 #[expect(
     clippy::large_types_passed_by_value,
@@ -330,8 +330,7 @@ pub(super) fn build_patch_type6(pts: &[[f64; 2]], colors: &[[u8; 3]]) -> Patch {
 
 /// Derive the 4 interior control points of a Coons patch from its boundary.
 ///
-/// Formula from poppler `GfxState.cc:5374–5385`, which implements the standard
-/// Coons patch interior derivation (same formula for x and y independently).
+/// Standard Coons patch interior derivation (same formula for x and y independently).
 pub(super) fn fill_type6_interior(p: &mut Patch) {
     for k in 0..2usize {
         // Snapshot boundary values before writing interior — avoids borrow conflict.

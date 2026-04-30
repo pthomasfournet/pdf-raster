@@ -217,7 +217,6 @@ pub fn unpremul(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
 
 /// CMYK → RGB using the simple subtractive model.
 ///
-/// Matches poppler's `cmykToRGBMatrixMultiplication`:
 /// `R = 255 − (C + K)`, clamped to \[0, 255\], and similarly for G and B.
 ///
 /// # Arguments
@@ -286,8 +285,8 @@ fn reflectance_blend(ink: u8, inv_k: u32) -> u8 {
 ///
 /// # Distinction from other CMYK variants
 ///
-/// - [`cmyk_to_rgb`]: simple saturating-subtract `R = 255−(C+K)`, matching
-///   poppler's matrix multiply path.  Faster but less accurate for mid-tones.
+/// - [`cmyk_to_rgb`]: simple saturating-subtract `R = 255−(C+K)`.
+///   Faster but less accurate for mid-tones.
 /// - [`cmyk_to_rgb_bytes`]: takes normalised `f64` inputs per PDF §10.3.3.
 ///
 /// All inputs and outputs in \[0, 255\].
@@ -351,16 +350,12 @@ pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
     rgb_to_bytes(r, g, b)
 }
 
-// ── GfxColorComp fixed-point ──────────────────────────────────────────────────
-//
-// poppler uses `int` with 16.16 fixed-point: gfxColorComp1 = 0x10000.
-// These match GfxState.h:115–158.
+// ── Fixed-point colour component conversions ──────────────────────────────────
 
-/// Convert a `u8` byte to a 16.16 fixed-point `GfxColorComp`.
+/// Convert a `u8` byte to a 16.16 fixed-point colour component.
 ///
 /// Implements `(x << 8) | x`, which equals `x * 257`. This maps 0 → 0 and
-/// 255 → 65535 (`gfxColorComp1`), distributing the 256 steps evenly across
-/// the full 16-bit range.
+/// 255 → 65535, distributing the 256 steps evenly across the full 16-bit range.
 ///
 /// # Output range
 ///
@@ -372,10 +367,9 @@ pub const fn byte_to_col(x: u8) -> i32 {
     (xi << 8) | xi
 }
 
-/// Convert a 16.16 fixed-point `GfxColorComp` to a `u8`, with rounding.
+/// Convert a 16.16 fixed-point colour component to a `u8`, with rounding.
 ///
-/// Matches poppler's `colToByte`: computes `(x + 0x80) >> 8` then clamps to
-/// \[0, 255\].
+/// Computes `(x + 0x80) >> 8` then clamps to \[0, 255\].
 ///
 /// # Valid input range
 ///

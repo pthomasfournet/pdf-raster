@@ -37,8 +37,7 @@ const fn u32_to_usize(v: u32) -> usize {
 /// A typed, top-down pixel buffer.
 ///
 /// `P` determines the in-memory layout. The row stride is `width * P::BYTES`
-/// rounded up to the next multiple of `row_pad` (default 4, matching the C++
-/// `bitmapRowPad = 4` in `pdftoppm.cc`).
+/// rounded up to the next multiple of `row_pad` (default 4).
 ///
 /// The optional alpha plane is always `width * height` bytes, one byte per pixel,
 /// top-down. It is stored separately from the colour data (matching `SplashBitmap`).

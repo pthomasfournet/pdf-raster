@@ -143,7 +143,7 @@ pub struct RenderParams {
     pub antialias: bool,
     /// Enable text anti-aliasing (default true).
     pub text_antialias: bool,
-    /// Enable `FreeType` hinting (default false — matches pdftoppm default).
+    /// Enable `FreeType` hinting (default false).
     pub text_hinting: bool,
 }
 

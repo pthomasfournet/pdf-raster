@@ -1,4 +1,4 @@
-//! Command-line argument definitions — mirrors all pdftoppm flags.
+//! Command-line argument definitions.
 
 use clap::Parser;
 
@@ -14,12 +14,12 @@ fn parse_positive_dpi(s: &str) -> Result<f64, String> {
     }
 }
 
-/// Rust replacement for pdftoppm — renders PDF pages to images.
+/// Renders PDF pages to images.
 #[derive(Parser, Debug)]
 #[command(name = "pdf-raster", about, long_about = None)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "CLI mirrors all pdftoppm flags; each bool maps to a distinct flag"
+    reason = "each bool maps to a distinct CLI flag"
 )]
 pub struct Args {
     /// Input PDF file ("-" for stdin).
@@ -201,7 +201,7 @@ pub enum AaFlag {
 /// Thin-line rendering mode.
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ThinLineMode {
-    /// Default thin-line mode (matches pdftoppm default).
+    /// Default thin-line mode.
     Default,
     /// Force solid thin lines.
     Solid,

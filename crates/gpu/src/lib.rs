@@ -300,7 +300,7 @@ impl GpuCtx {
     /// Tile-parallel analytical fill rasterisation using signed-area integration.
     ///
     /// This is the GPU equivalent of the CPU scanline scanner but uses analytical
-    /// per-pixel coverage (vello-style trapezoid integrals) rather than sampling.
+    /// per-pixel coverage (analytical trapezoid integrals) rather than sampling.
     ///
     /// All coordinates in `records` are already tile-local (produced by
     /// [`build_tile_records`]); no origin offset is applied in the kernel.

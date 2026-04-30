@@ -1,4 +1,4 @@
-//! Render a single PDF page to a PPM file using our native stack (no poppler).
+//! Render a single PDF page to a PPM file using the native render stack.
 //!
 //! Usage: cargo run -p pdf_interp --example render_page -- <pdf> [page] [dpi] [out.ppm]
 

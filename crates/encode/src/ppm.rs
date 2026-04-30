@@ -12,8 +12,7 @@
 //! | `Gray8` / `Mono8` | not supported — use [`write_pgm`][crate::write_pgm] |
 //! | `Mono1` | not supported |
 //!
-//! The output is a standard `P6` header followed by raw RGB bytes, matching
-//! the format produced by poppler's `pdftoppm -r <dpi>`.
+//! The output is a standard `P6` header followed by raw RGB bytes.
 
 use std::io::{self, Write};
 
@@ -128,8 +127,7 @@ fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
 
 /// Simple CMYK → RGB: `R = 255 − C − K`, clamped to `[0, 255]`.
 ///
-/// Matches the naïve ink-density formula used by poppler's `pdftoppm` and
-/// the Splash rasterizer's own CMYK-to-RGB path.
+/// Naïve subtractive ink-density formula (PDF §10.3.3).
 #[inline]
 #[expect(
     clippy::cast_sign_loss,

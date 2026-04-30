@@ -1,4 +1,4 @@
-//! Synthetic fill-path benchmark: our raster crate vs `vello_cpu`.
+//! Synthetic fill-path benchmark comparing rasterizer throughput.
 //!
 //! Renders N star polygons into a 1024×1024 buffer and reports throughput.
 //! Both engines get pre-built path objects; only rasterization is timed.

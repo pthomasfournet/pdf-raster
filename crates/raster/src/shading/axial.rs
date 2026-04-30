@@ -1,4 +1,4 @@
-//! Axial (linear) gradient pattern — `SplashAxialPattern::getColor`.
+//! Axial (linear) gradient pattern (PDF §8.7.4.5, type 2).
 //!
 //! Colour at pixel (x, y) is determined by projecting onto the gradient axis
 //! and linearly interpolating between `color0` and `color1`.
@@ -44,7 +44,7 @@ impl AxialPattern {
     /// # Degenerate case
     ///
     /// When `p0 == p1` (zero-length axis) every pixel returns `None` from
-    /// `t_for`, so `fill_span` writes zeros.  This matches poppler's behaviour.
+    /// `t_for`, so `fill_span` writes zeros (per PDF §8.7.4.5).
     #[must_use]
     #[expect(
         clippy::too_many_arguments,

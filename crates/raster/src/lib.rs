@@ -1,8 +1,7 @@
 //! # raster
 //!
 //! Pure software rasterizer for PDF page content — no I/O, no PDF parsing,
-//! no SIMD (Phase 1). This crate is the direct Rust replacement for poppler's
-//! Splash backend (`splash/Splash.cc` et al.).
+//! no SIMD (Phase 1).
 //!
 //! ## Phase 1 scope
 //! Foundation types only: pixel buffers, path geometry, edge tables, clip

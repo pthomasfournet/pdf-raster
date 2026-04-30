@@ -151,8 +151,7 @@ pub fn render_page(
 
 /// Luma threshold separating dark ink from light paper (inclusive on the light side).
 ///
-/// Matches pdftoppm `--mono`: values below this → 255 (black ink);
-/// values at or above → 0 (white paper).
+/// Values below this → 255 (black ink); values at or above → 0 (white paper).
 const MONO_THRESHOLD: u8 = 128;
 
 /// Threshold a grayscale bitmap to 2-level monochrome at the 50% midpoint.

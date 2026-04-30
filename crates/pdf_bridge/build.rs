@@ -1,17 +1,18 @@
 //! Build script for `pdf_bridge`.
 //!
 //! Compiles `cpp/poppler_shim.cc` against the poppler-cpp headers from the
-//! source tree at `POPPLER_SRC` (default: `/home/tom/pdftoppm`), then links
-//! against the system `libpoppler-cpp`.
+//! source tree at `POPPLER_SRC` (required env var), then links against the
+//! system `libpoppler-cpp`.
 
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    // Locate the poppler source tree.  The environment variable allows CI to
-    // override the default path.
-    let poppler_src = env::var("POPPLER_SRC").unwrap_or_else(|_| "/home/tom/pdftoppm".to_owned());
+    // Locate the poppler source tree.  Set POPPLER_SRC to the directory that
+    // contains the top-level `CMakeLists.txt` and `cpp/` sub-directory.
+    let poppler_src =
+        env::var("POPPLER_SRC").expect("POPPLER_SRC must be set to the poppler source tree root");
     let cpp_include = PathBuf::from(&poppler_src).join("cpp");
 
     // Rerun if the shim or any poppler-cpp header changes.

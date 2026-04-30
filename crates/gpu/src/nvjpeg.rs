@@ -5,7 +5,7 @@
 //! into a host `Vec<u8>` via an async CUDA stream.
 //!
 //! On the RTX 5070 (Blackwell, CC 12.0) this runs at ~10 GB/s, roughly 10–20×
-//! faster than the CPU `zune-jpeg` path for large images.  Optimal throughput
+//! faster than the CPU software JPEG path for large images.  Optimal throughput
 //! requires the hardware decode engine (`NVJPEG_BACKEND_HARDWARE`), which only
 //! supports baseline single-scan JPEGs; progressive/multi-scan images
 //! automatically fall back through the hybrid backend.
@@ -32,7 +32,7 @@
 //!
 //! This module is only compiled when the `nvjpeg` feature is enabled on the
 //! `gpu` crate.  Callers that want a CPU fallback should call
-//! [`NvJpegDecoder::new`] at startup and fall back to `zune-jpeg` if it
+//! [`NvJpegDecoder::new`] at startup and fall back to the CPU JPEG decoder if it
 //! returns `Err`.
 //!
 //! # Thread safety

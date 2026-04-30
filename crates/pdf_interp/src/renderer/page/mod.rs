@@ -304,7 +304,7 @@ impl<'doc> PageRenderer<'doc> {
     ///
     /// When set, `DCTDecode` image streams with pixel area ≥
     /// [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are decoded on the
-    /// GPU via nvJPEG rather than `zune-jpeg`.
+    /// GPU via nvJPEG rather than the CPU JPEG decoder.
     ///
     /// Calling this with `None` detaches any existing decoder (reverts to CPU).
     #[cfg(feature = "nvjpeg")]
@@ -316,7 +316,7 @@ impl<'doc> PageRenderer<'doc> {
     ///
     /// When set, `JPXDecode` image streams with pixel area ≥
     /// [`crate::resources::image::GPU_JPEG2K_THRESHOLD_PX`] are decoded on the
-    /// GPU via nvJPEG2000 rather than `jpeg2k`/`OpenJPEG`.
+    /// GPU via nvJPEG2000 rather than the CPU JPEG 2000 decoder.
     ///
     /// Call with `None` to revert to CPU-only JPEG 2000 decode.
     #[cfg(feature = "nvjpeg2k")]

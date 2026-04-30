@@ -119,7 +119,10 @@ impl Iterator for CMapIter<'_> {
 ///
 /// Returns `None` if the stream contains no recognised directives.  In that
 /// case callers should fall back to an identity mapping or the scalar path.
-#[expect(clippy::too_many_lines, reason = "flat match dispatch; extracting helpers would obscure the PDF spec mapping")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat match dispatch; extracting helpers would obscure the PDF spec mapping"
+)]
 #[must_use]
 pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
     let text = std::str::from_utf8(stream).ok()?;

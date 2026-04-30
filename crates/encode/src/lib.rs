@@ -16,7 +16,7 @@
 //!
 //! Neither PPM nor PNG natively supports CMYK.  [`write_ppm`] converts
 //! CMYK/`DeviceN` to RGB via the naïve ink-density formula
-//! `R = 255 − C − K` (matching poppler's `pdftoppm` output).
+//! `R = 255 − C − K` (naïve subtractive ink-density formula, PDF §10.3.3).
 //! For ICC-accurate colour, convert to `Rgb8` before encoding.
 
 pub mod pbm;

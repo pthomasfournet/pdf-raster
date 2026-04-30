@@ -2,12 +2,6 @@
 //!
 //! Re-exports all [`color`] public types so that downstream modules within
 //! this crate only need `use crate::types::*`.
-//!
-//! # C++ correspondence
-//!
-//! Constants and enums in this module mirror definitions from the Poppler
-//! `splash/SplashTypes.h` and `splash/SplashXPath.h` headers (Poppler ≥ 25).
-//! Each item documents its C++ origin explicitly.
 
 use std::borrow::Cow;
 
@@ -21,11 +15,9 @@ pub use color::{
     convert::*,
 };
 
-// ── Rasterizer constants (from SplashTypes.h / SplashXPath.h) ────────────────
+// ── Rasterizer constants ──────────────────────────────────────────────────────
 
 /// Supersampling factor for anti-aliasing.
-///
-/// C++ origin: `splashAASize = 4` (`splash/SplashTypes.h`).
 ///
 /// The AA buffer is `bitmap_width × AA_SIZE` pixels wide and `AA_SIZE` rows
 /// tall. Changing this value requires corresponding changes to all AA-buffer
@@ -36,8 +28,6 @@ pub const AA_SIZE: i32 = 4;
 
 /// Maximum number of De Casteljau subdivisions when flattening a Bézier curve.
 ///
-/// C++ origin: `splashMaxCurveSplits = 1 << 10` (`splash/SplashXPath.h`).
-///
 /// A value of 1024 gives sub-pixel accuracy for all practical PDF coordinate
 /// ranges. Increasing this value raises stack and array allocation costs
 /// quadratically; decreasing it degrades curve quality.
@@ -46,8 +36,6 @@ pub const AA_SIZE: i32 = 4;
 pub const MAX_CURVE_SPLITS: i32 = 1024;
 
 /// Control-point ratio for approximating a quarter-circle with a cubic Bézier.
-///
-/// C++ origin: `#define bezierCircle (0.55228475)` (`splash/Splash.cc`).
 ///
 /// Derivation: `4 * (√2 − 1) / 3 ≈ 0.552_284_75`. Four cubic Bézier segments
 /// with this control-point ratio approximate a unit circle with a maximum
@@ -58,17 +46,13 @@ pub const BEZIER_CIRCLE: f64 = 0.552_284_75;
 
 /// Number of spot color channels in a [`DeviceN8`] pixel.
 ///
-/// C++ origin: `#define SPOT_NCOMPS 4` (`splash/SplashTypes.h`).
-///
 /// A `DeviceN8` pixel is laid out as `[C, M, Y, K, S0, S1, S2, S3]`, giving
 /// 4 process + 4 spot = 8 bytes per pixel total.
 pub const SPOT_NCOMPS: usize = 4;
 
-// ── Enums matching SplashTypes.h ─────────────────────────────────────────────
+// ── Enums ─────────────────────────────────────────────────────────────────────
 
 /// Thin-line rendering treatment.
-///
-/// C++ origin: `SplashThinLineMode` (`splash/SplashTypes.h`).
 ///
 /// Controls how strokes whose device-space width is less than one pixel are
 /// drawn. The default preserves the hairline width via shape anti-aliasing
@@ -97,8 +81,6 @@ pub enum ThinLineMode {
 
 /// Stroke line-cap style.
 ///
-/// C++ origin: `SplashLineCap` (`splash/SplashTypes.h`).
-///
 /// Determines how open sub-path endpoints are capped. Corresponds directly to
 /// the PDF `lineCap` graphics-state parameter (PDF 32000-1:2008, §8.4.3.3).
 ///
@@ -119,8 +101,6 @@ pub enum LineCap {
 
 /// Stroke line-join style.
 ///
-/// C++ origin: `SplashLineJoin` (`splash/SplashTypes.h`).
-///
 /// Determines how two stroke segments meet at a shared vertex. Corresponds to
 /// the PDF `lineJoin` graphics-state parameter (PDF 32000-1:2008, §8.4.3.4).
 ///
@@ -139,8 +119,6 @@ pub enum LineJoin {
 }
 
 /// Halftone screen type used by [`ScreenParams`].
-///
-/// C++ origin: `SplashScreenType` (`splash/SplashTypes.h`).
 ///
 /// # Extension policy
 ///
@@ -161,8 +139,6 @@ pub enum ScreenType {
 
 /// Parameters for constructing a halftone screen.
 ///
-/// C++ origin: `SplashScreenParams` (`splash/SplashTypes.h`).
-///
 /// # Valid values
 ///
 /// - [`kind`](ScreenParams::kind): any [`ScreenType`] variant.
@@ -177,7 +153,6 @@ pub enum ScreenType {
 ///
 /// # Default
 ///
-/// Matches `defaultParams` in `splash/SplashScreen.cc`:
 /// `{ Dispersed, size: 2, dot_radius: 2 }`.
 #[derive(Copy, Clone, Debug)]
 pub struct ScreenParams {
@@ -196,10 +171,7 @@ pub struct ScreenParams {
 }
 
 impl Default for ScreenParams {
-    /// Returns the default screen parameters.
-    ///
-    /// Matches `defaultParams` in `splash/SplashScreen.cc`:
-    /// `{ splashScreenDispersed, size: 2, dotRadius: 2 }`.
+    /// Returns the default screen parameters: `{ Dispersed, size: 2, dot_radius: 2 }`.
     fn default() -> Self {
         Self {
             kind: ScreenType::Dispersed,
@@ -263,11 +235,7 @@ impl ScreenParams {
 
 /// PDF compositing blend mode (PDF 32000-1:2008, §11.3.5).
 ///
-/// C++ origin: the `GfxBlendMode` enum in `poppler/GfxState.h`, mapped to
-/// `SplashBlendFunc` function pointers in `SplashOutputDev.cc`.
-///
-/// In this implementation blend mode is a typed enum rather than a raw function
-/// pointer; dispatch happens in `pipe::blend`.
+/// Blend mode is a typed enum; dispatch happens in `pipe::blend`.
 ///
 /// # Separable vs. non-separable
 ///
