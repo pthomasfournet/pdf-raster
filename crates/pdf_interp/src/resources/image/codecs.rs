@@ -955,7 +955,9 @@ mod tests {
     #[test]
     fn jbig2_collector_push_pixel_chunk() {
         // Pre-allocate 16 pixels, matching the `n_pixels` pattern used in production.
-        let mut c = Jbig2Collector { data: Vec::with_capacity(16) };
+        let mut c = Jbig2Collector {
+            data: Vec::with_capacity(16),
+        };
         // chunk_count=2 → 16 pixels of white (0xFF each).
         Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
         assert_eq!(c.data.len(), 16);

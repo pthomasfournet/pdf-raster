@@ -226,8 +226,10 @@ fn tokenise(text: &str) -> Vec<&str> {
 
     while i < bytes.len() {
         match bytes[i] {
-            // Skip whitespace.
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            // Skip whitespace and stray `>` (second `>` of `>>` after the
+            // `<..>` arm consumed the first); without the `>` case it falls to
+            // `_`, pushes an empty token, and never advances `i` → hang.
+            b' ' | b'\t' | b'\r' | b'\n' | b'>' => i += 1,
 
             // Strip comments.
             b'%' => {

@@ -469,7 +469,11 @@ impl<'a> BitReader<'a> {
             self.bits_in_buf += 8;
         }
         self.bits_in_buf -= n;
-        let mask = if n == 32 { u64::from(u32::MAX) } else { (1u64 << n) - 1 };
+        let mask = if n == 32 {
+            u64::from(u32::MAX)
+        } else {
+            (1u64 << n) - 1
+        };
         #[expect(
             clippy::cast_possible_truncation,
             reason = "mask is at most u32::MAX; the extracted value fits u32"
@@ -513,7 +517,13 @@ pub(super) fn parse_bits_field(
 /// Logs a warning and returns `None` if the key is absent or the value is not
 /// one of the PDF-legal values {1, 2, 4, 8, 12, 16, 24, 32}.
 pub(super) fn parse_bits_per_coord(sh: &Dictionary, tag: &str) -> Option<u8> {
-    parse_bits_field(sh, b"BitsPerCoordinate", VALID_BITS, "BitsPerCoordinate", tag)
+    parse_bits_field(
+        sh,
+        b"BitsPerCoordinate",
+        VALID_BITS,
+        "BitsPerCoordinate",
+        tag,
+    )
 }
 
 /// Validate and extract `BitsPerComponent` from a mesh shading dictionary.

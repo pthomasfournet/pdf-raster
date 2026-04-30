@@ -43,7 +43,7 @@ fn main() {
     let mut renderer =
         pdf_interp::renderer::PageRenderer::new_scaled(w, h, scale, geom.rotate_cw, &doc, page_id);
     renderer.execute(&ops);
-    let bitmap = renderer.finish();
+    let (bitmap, _diag) = renderer.finish();
 
     let file = std::fs::File::create(&out).expect("create output file");
     let writer = std::io::BufWriter::new(file);

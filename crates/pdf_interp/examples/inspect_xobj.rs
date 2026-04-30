@@ -1,5 +1,5 @@
 fn main() {
-    use lopdf::{Document, Object};
+    use lopdf::Document;
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "tests/fixtures/cryptic-rite.pdf".to_string());
