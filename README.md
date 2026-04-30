@@ -79,14 +79,19 @@ tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 
 ## Performance
 
-Benchmarks vs `pdftoppm` (Ryzen 9900X3D + RTX 5070, GPU features enabled):
+Benchmarks vs a reference renderer (Ryzen 9900X3D + RTX 5070, 150 DPI, GPU features enabled, 5 runs):
 
-| Document | Character | pdf-raster | pdftoppm | Speedup |
-|---|---|---|---|---|
-| 116 KB, 41 pp | Light vector + text | 213 ms | 262 ms | 1.2× |
-| 281 KB, 7 pp | Mixed vector + images | 109 ms | 291 ms | 2.7× |
-| 2.1 MB, 34 pp | Dense vector paths | 495 ms | 1 507 ms | 3.0× |
-| 11 MB | Mixed, image-heavy | 5.2 s | 44.4 s | 8.5× |
-| 50 MB | Scan-heavy JPEG/JPEG2K | 17.2 s | 155.7 s | 9.1× |
+| Document | Size / Pages | Character | pdf-raster | Reference | Speedup |
+|---|---|---|---|---|---|
+| Native text, small | 84 KB / 16 pp | Light text | 217 ms | 252 ms | 1.2× |
+| Native vector + text | 236 KB / 16 pp | Vector paths + text | 256 ms | 268 ms | 1.05× |
+| Native text, dense | 2.1 MB / 254 pp | Dense text layout | 4.3 s | 9.8 s | 2.3× |
+| Ebook, mixed | 16 MB / 358 pp | Mixed content | 7.8 s | 12.4 s | 1.6× |
+| Academic book | 12 MB / 601 pp | Images + vector | 12.8 s | 16.7 s | 1.3× |
+| Modern layout, DCT | 88 MB / 160 pp | JPEG-heavy layout | 11.7 s | 7.3 s | 0.6× |
+| Journal, DCT-heavy | 168 MB / 162 pp | Dense JPEG pages | 3.8 s | 4.9 s | 1.3× |
+| 1927 scan, DCT | 145 MB / 390 pp | Scanned JPEG | 50 s | 279 s | **5.6×** |
+| 1836 scan, DCT | 148 MB / 490 pp | Scanned JPEG | 71 s | 356 s | **5.0×** |
+| Scan, JBIG2+JPX | 50 MB / 576 pp | Scanned JBIG2/JPEG2K | 19.6 s | 148.9 s | **7.6×** |
 
-Largest gains on scan-heavy corpora via nvJPEG + nvJPEG2000 GPU decoding.
+Largest gains on scan-heavy corpora via nvJPEG + nvJPEG2000 GPU decoding. The modern-layout DCT corpus (row 6) is slower due to high parallelism in the reference renderer on that specific layout type.
