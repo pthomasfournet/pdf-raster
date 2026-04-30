@@ -1,7 +1,7 @@
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "tests/fixtures/ritual-14th.pdf".to_string());
+        .unwrap_or_else(|| "tests/fixtures/input.pdf".to_string());
     let doc = pdf_interp::open(&path).unwrap();
     let n = pdf_interp::page_count(&doc);
     for p in 1..=n {

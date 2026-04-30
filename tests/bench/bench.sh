@@ -10,7 +10,7 @@
 # Options:
 #   -r DPIS         Comma-separated DPI values to test (default: 72,150,300)
 #   -f DIR          Fixtures directory (default: tests/fixtures/)
-#   -p PDF          Test only this PDF (basename, e.g. ritual-14th.pdf)
+#   -p PDF          Test only this PDF (basename, e.g. your-document.pdf)
 #   -l PAGE         Last page rendered per run (default: 5, keeps runs short)
 #   -w N            Hyperfine warmup runs per benchmark (default: 1)
 #   -c N            Hyperfine measurement runs per benchmark (default: 5)

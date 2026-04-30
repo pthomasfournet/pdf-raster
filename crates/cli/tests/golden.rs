@@ -1,4 +1,7 @@
 //! Golden-image regression tests.
+// Infrastructure is complete; CASES is empty until fixture PDFs are added.
+// Suppress dead_code warnings on all helpers until cases are registered.
+#![allow(dead_code)]
 //!
 //! For each entry in [`CASES`] the test:
 //!   1. Runs `pdf-raster` on the fixture PDF.
@@ -70,21 +73,30 @@ struct Case {
 ///
 /// **Ordering matters**: the test entry points reference cases by index.
 /// Add new cases at the end and add a corresponding `#[test]` fn.
+///
+/// # Adding fixtures
+///
+/// Place PDF files in `tests/fixtures/`, add a `Case` entry here and a
+/// matching entry in `tests/golden/generate.sh`, then run:
+///
+/// ```bash
+/// cargo build --release -p pdf-raster
+/// bash tests/golden/generate.sh
+/// git add tests/golden/ref/
+/// ```
+///
+/// Fixture PDFs are gitignored — each contributor provides their own.
+/// The reference PPMs in `tests/golden/ref/` are committed once generated.
 const CASES: &[Case] = &[
-    Case {
-        pdf: "cryptic-rite.pdf",
-        ref_prefix: "cryptic-rite-72",
-        first: 1,
-        last: 3,
-        total_pages: 7, // 7 pages → 1-digit padding (e.g. page-1.ppm)
-    },
-    Case {
-        pdf: "ritual-14th.pdf",
-        ref_prefix: "ritual-14th-72",
-        first: 1,
-        last: 3,
-        total_pages: 41, // 41 pages → 2-digit padding (e.g. page-01.ppm)
-    },
+    // Add cases here. Example:
+    //
+    // Case {
+    //     pdf: "my-document.pdf",
+    //     ref_prefix: "my-document-72",
+    //     first: 1,
+    //     last: 3,
+    //     total_pages: 10,
+    // },
 ];
 
 // ── path helpers ──────────────────────────────────────────────────────────────
@@ -334,13 +346,11 @@ fn run_case(case: &Case) {
 }
 
 // ── test entry points ─────────────────────────────────────────────────────────
-
-#[test]
-fn golden_cryptic_rite() {
-    run_case(&CASES[0]);
-}
-
-#[test]
-fn golden_ritual_14th() {
-    run_case(&CASES[1]);
-}
+//
+// Add a #[test] fn for each Case in CASES, referencing it by index.
+// Example:
+//
+// #[test]
+// fn golden_my_document() {
+//     run_case(&CASES[0]);
+// }

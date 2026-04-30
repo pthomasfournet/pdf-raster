@@ -74,7 +74,7 @@ cargo test -p pdf_interp --lib -- resources
 cargo test -p gpu --lib -- icc
 
 # Pixel-diff comparison against pdftoppm (requires release build in PATH)
-tests/compare/compare.sh -r 150 tests/fixtures/ritual-14th.pdf
+tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 ```
 
 ## Performance
@@ -83,10 +83,10 @@ Benchmarks vs `pdftoppm` (Ryzen 9900X3D + RTX 5070, GPU features enabled):
 
 | Document | Character | pdf-raster | pdftoppm | Speedup |
 |---|---|---|---|---|
-| ritual-14th.pdf (116 KB, 41 pp) | Light vector + text | 213 ms | 262 ms | 1.2× |
-| cryptic-rite.pdf (281 KB, 7 pp) | Mixed vector + images | 109 ms | 291 ms | 2.7× |
-| kt-r2000.pdf (2.1 MB, 34 pp) | Dense vector paths | 495 ms | 1 507 ms | 3.0× |
-| xxxii-sr.pdf (11 MB) | Mixed, image-heavy | 5.2 s | 44.4 s | 8.5× |
-| scotch-rite-illustrated.pdf (50 MB) | Scan-heavy JPEG/JPEG2K | 17.2 s | 155.7 s | 9.1× |
+| 116 KB, 41 pp | Light vector + text | 213 ms | 262 ms | 1.2× |
+| 281 KB, 7 pp | Mixed vector + images | 109 ms | 291 ms | 2.7× |
+| 2.1 MB, 34 pp | Dense vector paths | 495 ms | 1 507 ms | 3.0× |
+| 11 MB | Mixed, image-heavy | 5.2 s | 44.4 s | 8.5× |
+| 50 MB | Scan-heavy JPEG/JPEG2K | 17.2 s | 155.7 s | 9.1× |
 
 Largest gains on scan-heavy corpora via nvJPEG + nvJPEG2000 GPU decoding.

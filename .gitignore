@@ -1,40 +1,69 @@
 # Rust build artifacts
 /target/
 **/target/
+*.rlib
+*.rmeta
+*.d
 
-# Cargo lock is committed for binaries, not for libs — keep for now
+# Cargo lock — committed for binaries, not for libs
 # Cargo.lock
 
-# IDE / editor
+# ── IDE / editor ──────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.iml
 *.swp
 *.swo
+*.swn
+*~
 .DS_Store
+Thumbs.db
+.direnv/
+.envrc
 
-# Test / benchmark artifacts
-criterion/
-flamegraph.svg
+# ── Environment / secrets ──────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# ── AI assistant / plugin files ────────────────────────────────────────────────
+.claude/
+.serena/
+CLAUDE.md
+
+# ── Profiling / perf artifacts ─────────────────────────────────────────────────
 perf.data
 perf.data.old
 *.profraw
 *.profdata
+flamegraph.svg
+criterion/
+*.perf
 
-# Temp files
-*.tmp
-*.bak
-*.orig
-
-# Pre-built variant binaries (regenerate with tests/bench/build_variants.sh)
+# ── Test / benchmark generated output ─────────────────────────────────────────
 tests/bench/bins/
-
-# Benchmark result JSON (generated output, not source)
 tests/bench/bench-results.json
 tests/bench/bench-features-results.json
 
-# Binaries produced by tests
-/tmp/
+# ── Stray compiled binaries at repo root ──────────────────────────────────────
+/test_*
+/bench_*
 
-# OS
-Thumbs.db
+# ── Test fixtures and golden references ───────────────────────────────────────
+# Add your own PDFs locally; do not commit fixture documents to the repo.
+tests/fixtures/*.pdf
+tests/golden/ref/*.ppm
+tests/golden/ref/*.png
+tests/bench/bins/
+tests/bench/bench-results.json
+tests/bench/bench-features-results.json
+
+# ── Temp / scratch files ──────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+*.log

@@ -54,9 +54,14 @@ done
 # ── case table ────────────────────────────────────────────────────────────────
 # Format: "pdf_basename  ref_prefix  dpi  first  last"
 # MUST match the CASES array in crates/cli/tests/golden.rs.
+#
+# Fixture PDFs are gitignored — place your own PDFs in tests/fixtures/ and
+# add corresponding entries here and in the CASES array in golden.rs.
+#
+# Example:
+#   "my-document.pdf  my-document-72  72  1  3"
 declare -a CASES=(
-    "cryptic-rite.pdf  cryptic-rite-72  72  1  3"
-    "ritual-14th.pdf   ritual-14th-72   72  1  3"
+    # Add entries here matching the CASES array in crates/cli/tests/golden.rs.
 )
 
 if $DRY_RUN; then

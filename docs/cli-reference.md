@@ -174,7 +174,7 @@ Exit code 0 if all pages are within threshold; 1 if any fail.
 ```bash
 # Example output
 ── Summary ──────────────────────────────────────────────────────────────
-  PDF:       ritual-14th.pdf
+  PDF:       document.pdf
   DPI:       150
   Pages:     5 total, 5 passed, 0 failed
   Avg RMSE:  0.8432 / 255

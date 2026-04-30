@@ -7,7 +7,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let pdf = args
         .next()
-        .unwrap_or_else(|| "tests/fixtures/ritual-14th.pdf".to_string());
+        .unwrap_or_else(|| "tests/fixtures/input.pdf".to_string());
     let page = args.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
     let dpi = args
         .next()

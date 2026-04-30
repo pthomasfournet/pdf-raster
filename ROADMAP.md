@@ -282,17 +282,17 @@ FreeType text rendering is **not** a GPU target — hinting is sequential per gl
 
 | Fixture | Size | Character | pdf-raster | pdftoppm | Speedup |
 |---|---|---|---|---|---|
-| `ritual-14th.pdf` | 116 KB | Light vector + text, 41 pp | 213 ms | 262 ms | **1.2×** |
-| `cryptic-rite.pdf` | 281 KB | Mixed vector + images, 7 pp | 109 ms | 291 ms | **2.7×** |
-| `kt-r2000.pdf` | 2.1 MB | Dense vector / complex paths, 34 pp | 495 ms | 1507 ms | **3.0×** |
-| `xxxii-sr.pdf` | 11 MB | Mixed; image-heavy | 5.2 s | 44.4 s | **8.5×** |
-| `scotch-rite-illustrated.pdf` | 50 MB | Scan-heavy JPEG/JPEG2K | 17.2 s | 155.7 s | **9.1×** |
+| light-vector.pdf | 116 KB | Light vector + text, 41 pp | 213 ms | 262 ms | **1.2×** |
+| mixed-vector.pdf | 281 KB | Mixed vector + images, 7 pp | 109 ms | 291 ms | **2.7×** |
+| dense-vector.pdf | 2.1 MB | Dense vector / complex paths, 34 pp | 495 ms | 1507 ms | **3.0×** |
+| mixed-images.pdf | 11 MB | Mixed; image-heavy | 5.2 s | 44.4 s | **8.5×** |
+| scan-heavy.pdf | 50 MB | Scan-heavy JPEG/JPEG2K | 17.2 s | 155.7 s | **9.1×** |
 
-The scan-heavy corpus (JPEG/JPEG2K) shows the largest gap because nvJPEG + nvJPEG2K GPU decode replaces the CPU libjpeg/OpenJPEG path. The vector-only fixture (ritual-14th) shows the smallest gap — that workload is entirely CPU path-fill and text.
+The scan-heavy corpus (JPEG/JPEG2K) shows the largest gap because nvJPEG + nvJPEG2K GPU decode replaces the CPU libjpeg/OpenJPEG path. The light-vector fixture shows the smallest gap — that workload is entirely CPU path-fill and text.
 
 ### Pixel diff vs poppler
 
-`compare -metric AE` on 3 pages of `ritual-14th` at 150 DPI. Same page dimensions (700×1050 px). AE of 0.9–17% — entirely explained by sub-pixel anti-aliasing differences at glyph edges (amplified diff shows ghosted text, no structural content difference). This is expected for two independent renderers with different AA strategies.
+`compare -metric AE` on 3 pages of a light-vector PDF at 150 DPI. Same page dimensions (700×1050 px). AE of 0.9–17% — entirely explained by sub-pixel anti-aliasing differences at glyph edges (amplified diff shows ghosted text, no structural content difference). This is expected for two independent renderers with different AA strategies.
 
 ### ~~Known gap: page rotation (`/Rotate`)~~ — RESOLVED (commit `82efbe5`)
 
@@ -300,7 +300,7 @@ The scan-heavy corpus (JPEG/JPEG2K) shows the largest gap because nvJPEG + nvJPE
 `CropBox` (falling back to `MediaBox`), normalises `/Rotate` to 0/90/180/270,
 and swaps dimensions for 90°/270° rotations.  `PageRenderer::new_scaled`
 applies the matching CTM so all four rotation values produce correctly-oriented
-output.  `kt-r2000.pdf` page 1 (was `/Rotate: 270` portrait) now renders as
+output.  A landscape PDF with `/Rotate: 270` portrait MediaBox now renders as
 landscape, matching poppler.
 
 ### ~~Known gap: `UserUnit` scaling~~ — RESOLVED (commits 4aa17b5 / ce10242)
@@ -313,13 +313,15 @@ rejected with `RasterError::InvalidPageGeometry`.
 
 ### Fixture inventory
 
-| File | Size | Character |
+Fixture PDFs are gitignored. Provide your own corpus covering these character classes:
+
+| Character | Size range | Notes |
 |---|---|---|
-| `ritual-14th.pdf` | 116 KB | Light vector + text |
-| `cryptic-rite.pdf` | 281 KB | Mixed vector + images |
-| `kt-r2000.pdf` | 2.1 MB | Dense vector / complex paths |
-| `xxxii-sr.pdf` | 11 MB | Mixed; image-heavy pages |
-| `scotch-rite-illustrated.pdf` | 50 MB | Scan-heavy; primary JPEG/JPEG2K workload |
+| Light vector + text | ~100 KB | Minimal render path; baseline for overhead measurement |
+| Mixed vector + images | ~300 KB | Exercises JPEG decode + path fill together |
+| Dense vector / complex paths | ~2 MB | Exercises scanline AA at scale |
+| Mixed; image-heavy | ~10 MB | GPU ICC CLUT path |
+| Scan-heavy JPEG/JPEG2K | ~50 MB | Primary nvJPEG + nvJPEG2K workload |
 
 ### Commands
 
@@ -334,12 +336,12 @@ LD_LIB=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12:/usr/local/cuda-
 
 # Throughput vs pdftoppm
 env $LD_LIB hyperfine --warmup 3 --runs 8 \
-  "$BIN -r 150 tests/fixtures/scotch-rite-illustrated.pdf /tmp/out" \
-  'pdftoppm -r 150 tests/fixtures/scotch-rite-illustrated.pdf /tmp/ref'
+  "$BIN -r 150 tests/fixtures/scan-heavy.pdf /tmp/out" \
+  'pdftoppm -r 150 tests/fixtures/scan-heavy.pdf /tmp/ref'
 
 # Pixel diff vs poppler reference (ImageMagick AE metric)
-pdftoppm -r 150 tests/fixtures/ritual-14th.pdf /tmp/ref
-env $LD_LIB $BIN -r 150 tests/fixtures/ritual-14th.pdf /tmp/out
+pdftoppm -r 150 tests/fixtures/light-vector.pdf /tmp/ref
+env $LD_LIB $BIN -r 150 tests/fixtures/light-vector.pdf /tmp/out
 for i in /tmp/ref-*.ppm; do
   n=$(basename $i .ppm | sed 's/ref-//')
   ae=$(compare -metric AE $i /tmp/out-${n}.ppm /dev/null 2>&1)
@@ -349,7 +351,7 @@ done
 # Flamegraph — find the new bottleneck after GPU image decode is wired
 CARGO_PROFILE_RELEASE_DEBUG=true env $LD_LIB \
 flamegraph -o /tmp/flame.svg -- \
-  $BIN -r 150 tests/fixtures/scotch-rite-illustrated.pdf /tmp/out
+  $BIN -r 150 tests/fixtures/scan-heavy.pdf /tmp/out
 
 # Synthetic fill microbenchmark (raster crate path-fill vs vello_cpu)
 RUSTFLAGS="-C target-cpu=native" cargo run -p bench --release -- --iters 30 --stars 200

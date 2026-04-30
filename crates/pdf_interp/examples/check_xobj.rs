@@ -1,7 +1,7 @@
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "tests/fixtures/scotch-rite-illustrated.pdf".to_string());
+        .unwrap_or_else(|| "tests/fixtures/input.pdf".to_string());
     let page: u32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
