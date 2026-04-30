@@ -45,6 +45,7 @@
 //! mixed-width codes — correct mixed-width parsing requires a trie/state machine
 //! and is deferred.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -359,15 +360,21 @@ fn parse_hex_string(tok: Option<&str>) -> Option<Vec<u8>> {
     let tok = tok?;
     let inner = tok.strip_prefix('<')?.strip_suffix('>')?;
     // PDF spec allows whitespace inside hex strings; strip it.
-    let hex: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+    // Use Cow to avoid an extra allocation when no whitespace is present
+    // (the common case — tokeniser-produced hex strings are already compact).
+    let hex: Cow<'_, str> = if inner.contains(|c: char| c.is_whitespace()) {
+        Cow::Owned(inner.chars().filter(|c| !c.is_whitespace()).collect())
+    } else {
+        Cow::Borrowed(inner)
+    };
     if hex.is_empty() {
         return None;
     }
     // Odd-length hex strings are left-padded with a zero nibble (PDF spec §7.3.4.3).
-    let hex = if hex.len().is_multiple_of(2) {
+    let hex: Cow<'_, str> = if hex.len().is_multiple_of(2) {
         hex
     } else {
-        format!("0{hex}")
+        Cow::Owned(format!("0{hex}"))
     };
     hex.as_bytes()
         .chunks(2)

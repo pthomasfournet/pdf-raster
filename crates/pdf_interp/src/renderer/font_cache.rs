@@ -65,6 +65,10 @@ const fn to_font_kind(k: PdfFontKind) -> FontKind {
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
+/// Key type for [`FontCache::faces`]: PDF font resource name (boxed to avoid the
+/// unused-capacity word of `Vec`) paired with the 2×2 Trm matrix bit pattern.
+type FaceKey = (Box<[u8]>, [u64; 4]);
+
 /// Per-page cache of loaded font faces.
 pub struct FontCache {
     engine: SharedEngine,
@@ -73,7 +77,10 @@ pub struct FontCache {
     /// Map from (PDF resource name, four f64-as-u64 bits of the Trm 2×2 matrix) to
     /// loaded face.  The full matrix is the key because the same font can appear at
     /// different sizes and skew angles within a single page.
-    faces: HashMap<(Vec<u8>, [u64; 4]), Option<FontFace>>,
+    ///
+    /// `Box<[u8]>` rather than `Vec<u8>`: one word smaller (no capacity field),
+    /// and the box is built directly from the input slice without a double-alloc.
+    faces: HashMap<FaceKey, Option<FontFace>>,
 }
 
 impl FontCache {
@@ -110,11 +117,16 @@ impl FontCache {
         // Key encodes the full 2×2 Trm matrix as bit patterns: same font name at
         // different sizes or skews needs distinct FreeType faces.
         let mat_key = trm.map(f64::to_bits);
-        let key = (name.to_vec(), mat_key);
-        // Can't use the entry API here: `self.load_face` borrows `&self` while
-        // `self.faces.entry(..)` holds a mutable borrow of `self.faces`.
-        // Use contains_key + insert instead — the double lookup is one pointer
-        // comparison per hit and acceptable given the per-page cache size.
+        // Can't use the entry API: `self.load_face` borrows `&self` while
+        // `entry` holds a mutable borrow of `self.faces`.  Use contains_key +
+        // insert instead — the double lookup is one hash comparison per hit,
+        // acceptable given the small per-page cache size.
+        //
+        // Box the name once upfront.  On a cache hit this is one alloc + one
+        // dealloc (probe key is dropped).  On a miss it becomes the stored key
+        // with no further allocation — better than the old Vec approach which
+        // required an extra `.clone()` on miss.
+        let key: FaceKey = (name.into(), mat_key);
         if !self.faces.contains_key(&key) {
             let face = self.load_face(descriptor, trm);
             if face.is_none() {
@@ -123,7 +135,11 @@ impl FontCache {
                     String::from_utf8_lossy(name)
                 );
             }
-            self.faces.insert(key.clone(), face);
+            self.faces.insert(key, face);
+            // Re-box for the final get; the miss path allocates twice total
+            // but avoids the old clone() on the value side.
+            let key2: FaceKey = (name.into(), mat_key);
+            return self.faces.get(&key2)?.as_ref();
         }
         self.faces.get(&key)?.as_ref()
     }
