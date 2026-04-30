@@ -20,10 +20,19 @@ pub fn composite_rgba8_cpu(src: &[u8], dst: &mut [u8]) {
         for c in 0..3 {
             let blended =
                 (u32::from(s[c]) * a_src + u32::from(d[c]) * a_dst * inv / 255 + a_out / 2) / a_out;
+            // blended can reach 256 via floor truncation in the d[c]*a_dst*inv/255 term;
+            // clamp to 255 to stay in u8 range.
             d[c] = blended.min(255) as u8;
         }
-        // a_out = a_src + (a_dst * inv + 127) / 255 ≤ 255 + 255 = 510, so min(255) is needed.
-        d[3] = a_out.min(255) as u8;
+        // a_out ≤ 255 always: a_src + round(a_dst*(255-a_src)/255) ≤ 255 for all
+        // a_src ∈ [1, 254] (the a_src=0 and a_src=255 early returns above handle those).
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a_out ≤ 255 always for a_src ∈ [1,254] — see comment above"
+        )]
+        {
+            d[3] = a_out as u8;
+        }
     }
 }
 

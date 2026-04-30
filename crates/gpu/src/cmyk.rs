@@ -207,6 +207,10 @@ pub(super) unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
 /// The `clut = None` path uses AVX-512 (avx512f + avx512bw) when available,
 /// processing 16 pixels per iteration.  Falls back to scalar per-pixel loop.
 #[must_use]
+/// # Panics
+///
+/// Panics if `clut` is `Some((_, grid_n))` and `grid_n < 2`.  A CLUT with
+/// fewer than 2 nodes per axis is degenerate and unusable for interpolation.
 #[expect(
     clippy::too_many_lines,
     reason = "CLUT quadrilinear interpolation + AVX dispatch — cohesion outweighs length"
@@ -265,6 +269,12 @@ pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
             }
         }
         Some((table, grid_n)) => {
+            // grid_n = 0 would cause underflow in `grid_n - 1` and panic via
+            // `g - 1` index arithmetic below.  Public function: guard explicitly.
+            assert!(
+                grid_n >= 2,
+                "icc_cmyk_to_rgb_cpu: grid_n must be ≥ 2, got {grid_n}"
+            );
             let g = grid_n as usize; // grid_n ≤ 255 from caller validation
             let g2 = g * g;
             let g3 = g2 * g;
