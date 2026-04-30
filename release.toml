@@ -1,0 +1,26 @@
+# cargo-release configuration
+# Run:  cargo release minor --execute   (new features)
+#       cargo release patch --execute   (bug fixes)
+
+[workspace]
+# Push tag and commits automatically after release commit
+push = true
+push-remote = "origin"
+
+# Sign tags if GPG is available; set to false if not
+sign-tag = false
+
+# Tag format
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+
+# Run these hooks before the release commit
+pre-release-hook = [
+    "git-cliff", "--output", "CHANGELOG.md", "--tag", "v{{version}}",
+]
+
+# Commit message for the version bump
+pre-release-commit-message = "chore: release v{{version}}"
+
+# Don't publish to crates.io (private project)
+publish = false
