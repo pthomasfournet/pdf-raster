@@ -99,7 +99,7 @@ pub(super) fn aa_coverage_span_scalar(rows: [&[u8]; 4], x0: usize, shape: &mut [
 /// Both the NEON and AVX-512 coverage-span kernels use the same arithmetic;
 /// this function centralises it to avoid drift between the two.
 #[inline]
-fn coverage_chunk_params(x0: usize, n: usize, chunk_bytes: usize) -> (usize, usize) {
+const fn coverage_chunk_params(x0: usize, n: usize, chunk_bytes: usize) -> (usize, usize) {
     let byte_x0 = x0 >> 1;
     // n.div_ceil(2): number of row bytes touched by the span.
     // Integer-divide by chunk_bytes to get complete chunks only.
@@ -247,7 +247,10 @@ unsafe fn popcnt_aa_row_sse(row: &[u8]) -> u32 {
         let word = unsafe { chunk.as_ptr().cast::<u64>().read_unaligned() };
         // _popcnt64 is safe to call within a `#[target_feature(enable = "popcnt")]`
         // function — the feature guarantee makes it non-unsafe in this context.
-        #[expect(clippy::cast_sign_loss, reason = "_popcnt64 returns a non-negative count in 0..=64")]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "_popcnt64 returns a non-negative count in 0..=64"
+        )]
         {
             total += _popcnt64(word.cast_signed()) as u32;
         }
@@ -621,9 +624,15 @@ mod tests {
         // Odd x0=1: SIMD tiers must fall back to scalar; result must still be correct.
         const N: usize = 10;
         let row_bytes = (1 + N).div_ceil(2); // bytes needed for pixels 1..=10
-        let r0: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(0x37)).collect();
-        let r1: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(0x53)).collect();
-        let r2: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(0x17)).collect();
+        let r0: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(0x37))
+            .collect();
+        let r1: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(0x53))
+            .collect();
+        let r2: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(0x17))
+            .collect();
         let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
 
         let mut expected = vec![0u8; N];
@@ -643,9 +652,15 @@ mod tests {
         //            scalar  (full path).
         const N: usize = 300;
         let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(0x37)).collect();
-        let r1: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(0x53)).collect();
-        let r2: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(0x17)).collect();
+        let r0: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(0x37))
+            .collect();
+        let r1: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(0x53))
+            .collect();
+        let r2: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(0x17))
+            .collect();
         let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
 
         let mut expected = vec![0u8; N];
@@ -672,9 +687,15 @@ mod tests {
         }
         const N: usize = 300; // 2 full 64-byte chunks + 22-byte remainder
         let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
-        let r1: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(53).wrapping_add(7)).collect();
-        let r2: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect();
+        let r0: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let r1: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+            .collect();
+        let r2: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
         let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
 
         let mut expected = vec![0u8; N];
@@ -693,9 +714,15 @@ mod tests {
         // 300 output pixels — 9 full 16-byte NEON chunks + 6-byte scalar remainder.
         const N: usize = 300;
         let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
-        let r1: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(53).wrapping_add(7)).collect();
-        let r2: Vec<u8> = (0..row_bytes).map(|i| (i as u8).wrapping_mul(17).wrapping_add(3)).collect();
+        let r0: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let r1: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+            .collect();
+        let r2: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
         let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
 
         let mut expected = vec![0u8; N];
