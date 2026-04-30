@@ -52,8 +52,13 @@ use std::collections::HashMap;
 /// A resolved `CMap`: maps character codes (as `u32`) to CIDs or Unicode
 /// codepoints.
 ///
-/// For `CIDFont` encoding `CMaps` the values are CIDs.  For `ToUnicode` `CMaps` the
-/// values are Unicode codepoints.
+/// For `CIDFont` encoding `CMaps` the values are CIDs.  For `ToUnicode` `CMaps`
+/// the values are Unicode codepoints.
+///
+/// # Invariant
+///
+/// `code_bytes` is always in `1..=4`.  The parser guarantees this; callers that
+/// construct a `CMap` directly must uphold it.
 #[derive(Debug, Clone)]
 pub struct CMap {
     /// Number of bytes per character code (1–4, derived from `codespacerange`).
@@ -65,10 +70,15 @@ pub struct CMap {
 impl CMap {
     /// Decode all character codes from `bytes`, yielding `(char_code, mapped_value)`.
     ///
-    /// Reads `self.code_bytes` bytes at a time.  Codes absent from the map
-    /// are yielded with `mapped_value = 0` (maps to GID 0 = `.notdef`).
+    /// Reads `self.code_bytes` bytes at a time.  Codes absent from the map are
+    /// yielded with `mapped_value = 0` (maps to GID 0 = `.notdef`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.code_bytes == 0`, which violates the type invariant.
     #[must_use]
-    pub const fn iter_codes<'a>(&'a self, bytes: &'a [u8]) -> CMapIter<'a> {
+    pub fn iter_codes<'a>(&'a self, bytes: &'a [u8]) -> CMapIter<'a> {
+        assert!(self.code_bytes >= 1, "CMap::code_bytes must be ≥ 1");
         CMapIter {
             cmap: self,
             bytes,
@@ -77,7 +87,7 @@ impl CMap {
     }
 }
 
-/// Iterator over character codes in a byte string.
+/// Iterator over character codes in a byte string, produced by [`CMap::iter_codes`].
 pub struct CMapIter<'a> {
     cmap: &'a CMap,
     bytes: &'a [u8],
@@ -89,14 +99,9 @@ impl Iterator for CMapIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let w = usize::from(self.cmap.code_bytes);
-        if self.pos + w > self.bytes.len() {
-            return None;
-        }
+        let chunk = self.bytes.get(self.pos..self.pos + w)?;
         // Assemble code big-endian (PDF CMaps are always big-endian).
-        let mut code = 0u32;
-        for &b in &self.bytes[self.pos..self.pos + w] {
-            code = (code << 8) | u32::from(b);
-        }
+        let code = chunk.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
         self.pos += w;
         let mapped = self.cmap.map.get(&code).copied().unwrap_or(0);
         Some((code, mapped))
@@ -134,13 +139,7 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                     ) {
                         // First codespace entry determines the byte width.
                         if code_bytes == 0 {
-                            #[expect(
-                                clippy::cast_possible_truncation,
-                                reason = "clamped to 1..=4, always fits u8"
-                            )]
-                            {
-                                code_bytes = lo_bytes.len().clamp(1, 4) as u8;
-                            }
+                            code_bytes = u8::try_from(lo_bytes.len().clamp(1, 4)).unwrap_or(4);
                         }
                         i += 2;
                     } else {
@@ -150,7 +149,15 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
             }
             "begincidchar" | "beginbfchar" => {
                 i += 1;
-                while i < tokens.len() && tokens[i] != "endcidchar" && tokens[i] != "endbfchar" {
+                while i < tokens.len()
+                    && tokens[i] != "endcidchar"
+                    && tokens[i] != "endbfchar"
+                    && tokens[i] != "begincidrange"
+                    && tokens[i] != "beginbfrange"
+                    && tokens[i] != "begincidchar"
+                    && tokens[i] != "beginbfchar"
+                    && tokens[i] != "endcmap"
+                {
                     // <code> value
                     if let (Some(code_bytes_v), Some(val)) = (
                         parse_hex_string(tokens.get(i).copied()),
@@ -163,10 +170,26 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                         i += 1;
                     }
                 }
+                // Consume the closing keyword if present so the outer loop's
+                // `i += 1` at the bottom lands on the next section header.
+                if tokens
+                    .get(i)
+                    .is_some_and(|t| *t == "endcidchar" || *t == "endbfchar")
+                {
+                    // leave i pointing at the end-keyword; outer i+=1 skips it
+                }
             }
             "begincidrange" | "beginbfrange" => {
                 i += 1;
-                while i < tokens.len() && tokens[i] != "endcidrange" && tokens[i] != "endbfrange" {
+                while i < tokens.len()
+                    && tokens[i] != "endcidrange"
+                    && tokens[i] != "endbfrange"
+                    && tokens[i] != "begincidchar"
+                    && tokens[i] != "beginbfchar"
+                    && tokens[i] != "begincidrange"
+                    && tokens[i] != "beginbfrange"
+                    && tokens[i] != "endcmap"
+                {
                     // <lo> <hi> base_value
                     // For bfrange, base_value may be a hex string (start Unicode).
                     if let (Some(lo_b), Some(hi_b), Some(base)) = (
@@ -177,14 +200,11 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                         let lo = bytes_to_u32(&lo_b);
                         let hi = bytes_to_u32(&hi_b);
                         // Guard against malformed CMaps where hi < lo or the
-                        // range is implausibly large.
+                        // range is implausibly large (PDF spec allows max 100
+                        // entries per block; 0x10000 is a generous ceiling).
                         if hi >= lo && hi - lo < 0x1_0000 {
-                            for (offset, code) in (lo..=hi).enumerate() {
-                                #[expect(
-                                    clippy::cast_possible_truncation,
-                                    reason = "offset bounded by hi-lo < 0x10000, which fits u32"
-                                )]
-                                map.insert(code, base.saturating_add(offset as u32));
+                            for offset in 0u32..=(hi - lo) {
+                                map.insert(lo + offset, base.saturating_add(offset));
                             }
                         } else {
                             log::warn!("cmap: ignoring degenerate range {lo:04X}–{hi:04X}");
@@ -204,7 +224,7 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
         return None;
     }
 
-    // Default to single-byte if no codespace range was found.
+    // Default to single-byte if no codespacerange was found.
     if code_bytes == 0 {
         code_bytes = 1;
     }
@@ -227,8 +247,9 @@ fn tokenise(text: &str) -> Vec<&str> {
     while i < bytes.len() {
         match bytes[i] {
             // Skip whitespace and stray `>` (second `>` of `>>` after the
-            // `<..>` arm consumed the first); without the `>` case it falls to
-            // `_`, pushes an empty token, and never advances `i` → hang.
+            // `<..>` arm consumed the first).  Without the `>` case, it falls
+            // to `_`, which pushes an empty-string token and never advances
+            // `i` → infinite loop.
             b' ' | b'\t' | b'\r' | b'\n' | b'>' => i += 1,
 
             // Strip comments.
@@ -251,10 +272,10 @@ fn tokenise(text: &str) -> Vec<&str> {
                 tokens.push(&text[start..i]);
             }
 
-            // PostScript literal string (...) — include as opaque token.
+            // PostScript literal string (...) — captured as an opaque token.
             b'(' => {
                 let start = i;
-                let mut depth = 0i32;
+                let mut depth = 0u32;
                 while i < bytes.len() {
                     match bytes[i] {
                         b'(' => {
@@ -268,18 +289,19 @@ fn tokenise(text: &str) -> Vec<&str> {
                                 break;
                             }
                         }
-                        b'\\' => i += 2, // skip escaped char
+                        // Skip escaped character; guard against EOF after `\`.
+                        b'\\' => i += if i + 1 < bytes.len() { 2 } else { 1 },
                         _ => i += 1,
                     }
                 }
                 tokens.push(&text[start..i]);
             }
 
-            // Array literal [...] — include as single token (not yet decoded).
-            // Track nesting depth so `[[a] b]` is consumed as one token.
+            // Array literal [...] — captured as an opaque token.
+            // Depth tracking handles `[[a] b]` as a single token.
             b'[' => {
                 let start = i;
-                let mut depth = 0i32;
+                let mut depth = 0u32;
                 while i < bytes.len() {
                     match bytes[i] {
                         b'[' => {
@@ -299,7 +321,7 @@ fn tokenise(text: &str) -> Vec<&str> {
                 tokens.push(&text[start..i]);
             }
 
-            // Keyword or number.
+            // Keyword or decimal integer.
             _ => {
                 let start = i;
                 while i < bytes.len()
@@ -319,7 +341,9 @@ fn tokenise(text: &str) -> Vec<&str> {
                 {
                     i += 1;
                 }
-                tokens.push(&text[start..i]);
+                if i > start {
+                    tokens.push(&text[start..i]);
+                }
             }
         }
     }
@@ -329,36 +353,38 @@ fn tokenise(text: &str) -> Vec<&str> {
 
 // ── Token parsers ─────────────────────────────────────────────────────────────
 
-/// Parse a `<hex>` token into raw bytes.  Returns `None` for non-hex tokens.
+/// Parse a `<hex>` token into raw bytes.  Returns `None` for non-hex tokens or
+/// tokens containing non-hex characters.
 fn parse_hex_string(tok: Option<&str>) -> Option<Vec<u8>> {
     let tok = tok?;
     let inner = tok.strip_prefix('<')?.strip_suffix('>')?;
-    // Ignore whitespace in the hex string.
+    // PDF spec allows whitespace inside hex strings; strip it.
     let hex: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
     if hex.is_empty() {
         return None;
     }
-    // Pad to even length (hex strings must have an even number of nibbles).
+    // Odd-length hex strings are left-padded with a zero nibble (PDF spec §7.3.4.3).
     let hex = if hex.len().is_multiple_of(2) {
         hex
     } else {
         format!("0{hex}")
     };
-    let bytes: Option<Vec<u8>> = hex
-        .as_bytes()
+    hex.as_bytes()
         .chunks(2)
         .map(|pair| {
+            // Both bytes are guaranteed ASCII by the whitespace filter above;
+            // from_utf8 cannot fail here.
             let s = std::str::from_utf8(pair).ok()?;
             u8::from_str_radix(s, 16).ok()
         })
-        .collect();
-    bytes.filter(|b| !b.is_empty())
+        .collect::<Option<Vec<u8>>>()
+        .filter(|b| !b.is_empty())
 }
 
-/// Parse a `value` token: either a decimal integer or a hex string `<...>`.
+/// Parse a value token: either a decimal integer or a hex string `<...>`.
 ///
-/// For bfrange base values that are hex strings, the hex is interpreted as a
-/// big-endian Unicode codepoint.
+/// Hex strings (used as bfrange base values) are interpreted as big-endian
+/// Unicode codepoints.
 fn parse_value(tok: Option<&str>) -> Option<u32> {
     let tok = tok?;
     if tok.starts_with('<') {
@@ -368,10 +394,10 @@ fn parse_value(tok: Option<&str>) -> Option<u32> {
     }
 }
 
-/// Interpret `bytes` as a big-endian unsigned integer.
+/// Interpret `bytes` as a big-endian unsigned integer (at most 4 bytes).
 ///
-/// Only the first 4 bytes are consumed; longer inputs are silently truncated.
-/// PDF char codes are at most 4 bytes (PDF spec §9.7.6), so this is safe.
+/// Longer inputs are silently truncated to the first 4 bytes — PDF character
+/// codes are at most 4 bytes wide (PDF spec §9.7.6).
 fn bytes_to_u32(bytes: &[u8]) -> u32 {
     bytes
         .iter()
@@ -387,6 +413,8 @@ mod tests {
 
     #[test]
     fn parse_cid_char_single_byte() {
+        // Full CMap stream with a `<<...>>` dict literal — exercises the `>`
+        // skip fix in the tokeniser.
         let stream = br#"
 /CIDInit /ProcSet findresource begin
 12 dict begin
@@ -475,8 +503,8 @@ endcodespacerange
 <0050> <0040> 0
 endcidrange
         "#;
-        // hi < lo: should parse successfully but produce no entries.
-        let cmap = parse_cmap(stream).expect("should parse (empty map)");
+        // hi < lo: codespace is valid but range block is empty.
+        let cmap = parse_cmap(stream).expect("should parse with empty map");
         assert!(cmap.map.is_empty());
     }
 
@@ -491,7 +519,6 @@ endcodespacerange
 endcidrange
         "#;
         let cmap = parse_cmap(stream).expect("should parse");
-        // Encode three characters as 2-byte big-endian codes.
         let bytes: &[u8] = &[0x00, 0x41, 0x00, 0x42, 0x00, 0x43];
         let decoded: Vec<(u32, u32)> = cmap.iter_codes(bytes).collect();
         assert_eq!(decoded, vec![(0x0041, 10), (0x0042, 11), (0x0043, 12)]);
@@ -516,5 +543,45 @@ endcidchar
     #[test]
     fn empty_stream_returns_none() {
         assert!(parse_cmap(b"").is_none());
+    }
+
+    #[test]
+    fn missing_end_keyword_does_not_consume_next_section() {
+        // A truncated stream with no endcidchar — the parser must not eat the
+        // begincidrange block that follows.
+        let stream = br#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+1 begincidchar
+<0041> 10
+begincidrange
+<0042> <0043> 20
+endcidrange
+        "#;
+        let cmap = parse_cmap(stream).expect("should parse");
+        // <0041> from cidchar block
+        assert_eq!(cmap.map.get(&0x0041), Some(&10));
+        // <0042>/<0043> from cidrange block — must not have been swallowed
+        assert_eq!(cmap.map.get(&0x0042), Some(&20));
+        assert_eq!(cmap.map.get(&0x0043), Some(&21));
+    }
+
+    #[test]
+    fn escaped_backslash_at_eof_does_not_panic() {
+        // A PS string ending with a lone backslash — must not advance past
+        // the end of the byte slice.
+        let stream = b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 begincidchar\n<20> 32\nendcidchar\n(test\\";
+        // Should not panic; the trailing `(\` is an unterminated PS string token.
+        let cmap = parse_cmap(stream).expect("should parse");
+        assert_eq!(cmap.map.get(&0x20), Some(&32));
+    }
+
+    #[test]
+    fn odd_length_hex_string_left_padded() {
+        // <1> should be treated as <01> per PDF spec §7.3.4.3.
+        let stream = b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 begincidchar\n<1> 99\nendcidchar\n";
+        let cmap = parse_cmap(stream).expect("should parse");
+        assert_eq!(cmap.map.get(&0x01), Some(&99));
     }
 }
