@@ -22,6 +22,12 @@ use super::PageRenderer;
 pub(super) fn render_annotations(renderer: &mut PageRenderer<'_>, page_id: ObjectId) {
     let doc = renderer.resources.doc();
     let Ok(page_dict) = doc.get_dictionary(page_id) else {
+        log::warn!(
+            "pdf_interp: render_annotations: page object ({}, {}) is not a dictionary — \
+             skipping annotations",
+            page_id.0,
+            page_id.1
+        );
         return;
     };
 
@@ -30,13 +36,20 @@ pub(super) fn render_annotations(renderer: &mut PageRenderer<'_>, page_id: Objec
         let arr = match page_dict.get(b"Annots") {
             Ok(Object::Array(a)) => a.clone(),
             Ok(Object::Reference(id)) => {
-                match doc
+                if let Some(a) = doc
                     .get_object(*id)
                     .ok()
                     .and_then(|o| o.as_array().ok().cloned())
                 {
-                    Some(a) => a,
-                    None => return,
+                    a
+                } else {
+                    log::warn!(
+                        "pdf_interp: render_annotations: /Annots reference ({}, {}) \
+                         did not resolve to an array — skipping annotations",
+                        id.0,
+                        id.1
+                    );
+                    return;
                 }
             }
             _ => return,
@@ -62,20 +75,32 @@ pub(super) fn render_one_annotation(renderer: &mut PageRenderer<'_>, annot_id: O
     let doc = renderer.resources.doc();
 
     let Ok(annot_dict) = doc.get_dictionary(annot_id) else {
+        log::warn!(
+            "pdf_interp: annotation ({}, {}) object missing or not a dictionary — skipping",
+            annot_id.0,
+            annot_id.1
+        );
         return;
     };
 
-    // Annotation rect in page user space: [llx, lly, urx, ury].
-    let Some(rect) = read_rect(annot_dict) else {
-        return;
-    };
-
-    // Resolve AP/N appearance stream.
+    // Check for AP/N before Rect — annotations with no AP stream have no visible
+    // appearance (e.g. Link) and are expected to be absent silently.
     let Some(ap_dict) = annot_dict.get(b"AP").ok().and_then(|o| match o {
         Object::Dictionary(d) => Some(d),
         Object::Reference(id) => doc.get_dictionary(*id).ok(),
         _ => None,
     }) else {
+        return;
+    };
+
+    // Annotation rect in page user space: [llx, lly, urx, ury].
+    // Warn when AP exists but Rect is absent/malformed — visible annotation dropped.
+    let Some(rect) = read_rect(annot_dict) else {
+        log::warn!(
+            "pdf_interp: annotation ({}, {}) has AP/N stream but missing or malformed Rect — skipping",
+            annot_id.0,
+            annot_id.1
+        );
         return;
     };
 

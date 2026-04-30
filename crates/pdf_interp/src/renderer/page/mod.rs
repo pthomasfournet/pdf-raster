@@ -550,13 +550,19 @@ impl<'doc> PageRenderer<'doc> {
                 }
             }
             Operator::Rectangle(x, y, w, h) => {
+                // PDF §8.5.2.1: `re` defines four corners in user space.
+                // All four must be independently transformed — mixing device-space
+                // coordinates from two corners produces the wrong shape under a
+                // sheared CTM.
                 let (x0, y0) = self.to_device(*x, *y);
-                let (x1, y1) = self.to_device(*x + *w, *y + *h);
+                let (x1, y1) = self.to_device(*x + *w, *y);
+                let (x2, y2) = self.to_device(*x + *w, *y + *h);
+                let (x3, y3) = self.to_device(*x, *y + *h);
                 let b = self.path_builder();
                 let _ = b.move_to(x0, y0);
-                let _ = b.line_to(x1, y0);
                 let _ = b.line_to(x1, y1);
-                let _ = b.line_to(x0, y1);
+                let _ = b.line_to(x2, y2);
+                let _ = b.line_to(x3, y3);
                 let _ = b.close(true);
             }
 
@@ -778,6 +784,7 @@ impl<'doc> PageRenderer<'doc> {
                 horiz_scaling,
                 rise,
                 do_paint,
+                do_clip,
             );
             return;
         }
@@ -986,7 +993,14 @@ impl<'doc> PageRenderer<'doc> {
         horiz_scaling: f64,
         rise: f64,
         do_paint: bool,
+        do_clip: bool,
     ) {
+        if do_clip {
+            log::warn!(
+                "pdf_interp: text-clip mode (render_mode ≥ 4) is not supported for Type 3 \
+                 fonts — clip ignored"
+            );
+        }
         for &byte in bytes {
             let Some(glyph) = t3.glyph(byte) else {
                 // No CharProc for this code — advance by zero width, continue.
@@ -996,7 +1010,12 @@ impl<'doc> PageRenderer<'doc> {
                 continue;
             };
 
-            if do_paint && self.form_depth < MAX_FORM_DEPTH {
+            if do_paint && self.form_depth >= MAX_FORM_DEPTH {
+                log::warn!(
+                    "pdf_interp: Type 3 CharProc depth {MAX_FORM_DEPTH} exceeded — \
+                     skipping glyph 0x{byte:02X}"
+                );
+            } else if do_paint {
                 // Build the CharProc CTM:
                 //   Tm_rise = Tm with rise shift applied (PDF §9.4.4)
                 //   TRM     = [fs·fm[0], fs·fm[1], fs·fm[2], fs·fm[3], tx, ty]
@@ -1354,6 +1373,14 @@ impl<'doc> PageRenderer<'doc> {
         let sx = (pat_ctm[0].hypot(pat_ctm[1])).abs();
         let sy = (pat_ctm[2].hypot(pat_ctm[3])).abs();
 
+        if !sx.is_finite() || !sy.is_finite() {
+            log::warn!(
+                "pdf_interp: Pattern /{} CTM scale is non-finite ({sx}, {sy}) — skipping",
+                String::from_utf8_lossy(name)
+            );
+            return None;
+        }
+
         if sx < 0.5 || sy < 0.5 {
             log::debug!(
                 "pdf_interp: Pattern /{} tile scale ({sx:.2}, {sy:.2}) too small — skipping",
@@ -1385,6 +1412,14 @@ impl<'doc> PageRenderer<'doc> {
         let page_h = f64::from(self.height);
         let (ox, oy_pdf) = ctm_transform(&pat_ctm, 0.0, 0.0);
         let oy = page_h - oy_pdf;
+
+        if !ox.is_finite() || !oy.is_finite() {
+            log::warn!(
+                "pdf_interp: Pattern /{} origin is non-finite ({ox}, {oy}) — skipping",
+                String::from_utf8_lossy(name)
+            );
+            return None;
+        }
 
         let phase_x = ox.round() as i32;
         let phase_y = oy.round() as i32;
@@ -1602,7 +1637,8 @@ impl<'doc> PageRenderer<'doc> {
 
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "device coords bounded by page dimensions"
+                reason = "f64→i32 cast saturates in Rust ≥ 1.45 (no UB); \
+                          begin_group clamps GroupParams to bitmap bounds"
             )]
             let params = GroupParams {
                 x_min: left as i32,
