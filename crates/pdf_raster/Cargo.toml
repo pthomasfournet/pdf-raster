@@ -1,7 +1,15 @@
 [package]
-name    = "pdf_raster"
-version = "0.1.0"
-edition = "2024"
+name        = "pdf_raster"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+readme.workspace     = true
+description = "PDF to grayscale pixel buffer — zero subprocess, zero Leptonica, Tesseract-ready"
+keywords    = ["pdf", "raster", "ocr", "tesseract", "image"]
+categories  = ["multimedia::images", "rendering", "parser-implementations"]
 
 [features]
 # GPU-accelerated AA fill and tile fill.

@@ -1,7 +1,15 @@
 [package]
-name    = "pdf_interp"
-version = "0.1.0"
-edition = "2024"
+name        = "pdf_interp"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+readme.workspace     = true
+description = "Native PDF content-stream interpreter — poppler-free render path"
+keywords    = ["pdf", "interpreter", "renderer", "fonts", "images"]
+categories  = ["parser-implementations", "rendering", "multimedia::images"]
 
 [features]
 # Enable GPU-accelerated JPEG decoding via nvJPEG for DCTDecode streams.

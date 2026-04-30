@@ -46,19 +46,28 @@ Until a platform tier is implemented, attempting to use it will result in a comp
 
 ## Installation
 
-Add `pdf_raster` to your `Cargo.toml`:
+Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { path = "../pdf_raster" }  # path dependency until published
+pdf_raster = { git = "https://github.com/tom/pdf-raster", tag = "v0.1.0" }
 ```
 
 For GPU acceleration (CUDA 12 required):
 
 ```toml
 [dependencies]
-pdf_raster = { path = "../pdf_raster", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+pdf_raster = { git = "https://github.com/tom/pdf-raster", tag = "v0.1.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
 ```
+
+To track the latest commit on `master` instead of a pinned tag:
+
+```toml
+[dependencies]
+pdf_raster = { git = "https://github.com/tom/pdf-raster", branch = "master" }
+```
+
+Pin to a tag for reproducible builds. Run `cargo update -p pdf_raster` to advance to a newer tag when one is released.
 
 ## Quickstart
 

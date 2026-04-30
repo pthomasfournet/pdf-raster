@@ -4,6 +4,11 @@ Pure Rust PDF → pixels pipeline. Zero Poppler, zero subprocesses, zero Leptoni
 
 Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tesseract OCR or any other downstream consumer. No intermediate files.
 
+```toml
+# Cargo.toml
+pdf_raster = { git = "https://github.com/tom/pdf-raster", tag = "v0.1.0" }
+```
+
 ```rust
 use pdf_raster::{RasterOptions, raster_pdf};
 
