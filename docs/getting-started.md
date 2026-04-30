@@ -6,6 +6,34 @@ pdf-raster converts PDF pages to pixel buffers in pure Rust. No subprocesses, no
 
 Given a PDF file, pdf-raster renders each page to an 8-bit grayscale buffer in memory. The primary use case is feeding pages directly into Tesseract OCR without writing any intermediate files.
 
+## Hardware requirements
+
+### CPU
+
+**Supported:** x86-64 processors with AMD or Intel silicon.
+
+- AVX2 is used when available (runtime-detected, scalar fallback otherwise).
+- AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and related extensions) is used when the binary is built with `-C target-cpu=native` on a compatible CPU. The project is developed and benchmarked on an AMD Ryzen 9900X3D.
+- **ARM / Apple Silicon are not supported.** NEON SIMD paths have not been implemented. The code will not compile for `aarch64` targets. There is no Apple Metal backend.
+
+### GPU (optional)
+
+All GPU features require an **NVIDIA GPU with CUDA 12**.
+
+| Feature | Minimum GPU | Library required |
+|---|---|---|
+| `nvjpeg` | Any CUDA 12-capable NVIDIA GPU | `libnvjpeg.so` (ships with CUDA 12) |
+| `nvjpeg2k` | Any CUDA 12-capable NVIDIA GPU | `libnvjpeg2k.so` (separate download) |
+| `gpu-aa` | Any CUDA 12-capable NVIDIA GPU | CUDA runtime |
+| `gpu-icc` | Any CUDA 12-capable NVIDIA GPU | CUDA runtime |
+| `gpu-deskew` | Any CUDA 12-capable NVIDIA GPU | CUDA NPP (`libnppig.so`, `libnppc.so`) |
+
+**AMD/Radeon GPUs are not supported.** ROCm / HIP backends have not been implemented.
+
+**Intel GPUs (Arc, Iris Xe) are not supported.** There is no oneAPI / Level Zero backend.
+
+If no NVIDIA GPU is present, or if CUDA initialisation fails at runtime, all GPU features fall back to CPU automatically — a warning is printed to stderr but no error is returned. The CPU path is fully functional on its own.
+
 ## Installation
 
 Add `pdf_raster` to your `Cargo.toml`:

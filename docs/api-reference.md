@@ -298,6 +298,31 @@ Implements `std::error::Error`. `InterpError::Pdf(e)` chains to `lopdf::Error`.
 
 ---
 
+## Hardware compatibility
+
+### CPU
+
+**Supported:** x86-64 (AMD and Intel) only.
+
+- AVX2 SIMD blend and fill paths are runtime-detected with a scalar fallback.
+- AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and related sub-extensions) is activated by building with `-C target-cpu=native` on a compatible CPU. Developed and benchmarked on an AMD Ryzen 9900X3D.
+- **ARM is not supported.** NEON paths have not been implemented; the codebase does not compile for `aarch64`. Apple Silicon (M-series) is also unsupported — there is no Apple Metal backend.
+- Intel x86-64 CPUs run correctly on the CPU path but GPU features are NVIDIA-only (see below).
+
+### GPU
+
+All GPU features are **NVIDIA-only via CUDA 12**. There is no ROCm/HIP path for AMD/Radeon GPUs and no oneAPI/Level Zero path for Intel GPUs.
+
+| Feature flag | Minimum requirement | Notes |
+|---|---|---|
+| `nvjpeg` | CUDA 12-capable NVIDIA GPU | `libnvjpeg.so` ships with CUDA 12 toolkit |
+| `nvjpeg2k` | CUDA 12-capable NVIDIA GPU | `libnvjpeg2k.so` is a separate download |
+| `gpu-aa` | CUDA 12-capable NVIDIA GPU | CUDA runtime only |
+| `gpu-icc` | CUDA 12-capable NVIDIA GPU | CUDA runtime only |
+| `gpu-deskew` | CUDA 12-capable NVIDIA GPU | Requires CUDA NPP: `libnppig.so` + `libnppc.so` |
+
+GPU initialisation failures at runtime print a warning to stderr and fall back to CPU — no error is returned, rendering continues normally.
+
 ## Feature flags
 
 ### `pdf_raster` features
