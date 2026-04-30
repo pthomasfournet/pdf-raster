@@ -306,12 +306,12 @@ Implements `std::error::Error`. `InterpError::Pdf(e)` chains to `lopdf::Error`.
 
 - AVX2 SIMD blend and fill paths are runtime-detected with a scalar fallback.
 - AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and related sub-extensions) is activated by building with `-C target-cpu=native` on a compatible CPU. Developed and benchmarked on an AMD Ryzen 9900X3D.
-- **ARM is not supported.** NEON paths have not been implemented; the codebase does not compile for `aarch64`. Apple Silicon (M-series) is also unsupported — there is no Apple Metal backend.
+- **ARM is not yet supported.** NEON paths have not been implemented; the codebase does not compile for `aarch64`. Apple Silicon (M-series) is also unsupported — there is no Apple Metal backend. Both are planned.
 - Intel x86-64 CPUs run correctly on the CPU path but GPU features are NVIDIA-only (see below).
 
 ### GPU
 
-All GPU features are **NVIDIA-only via CUDA 12**. There is no ROCm/HIP path for AMD/Radeon GPUs and no oneAPI/Level Zero path for Intel GPUs.
+All GPU features are currently **NVIDIA-only via CUDA 12**. AMD/Radeon (ROCm/HIP), Intel (oneAPI), and cross-vendor Vulkan backends are planned but not yet implemented.
 
 | Feature flag | Minimum requirement | Notes |
 |---|---|---|
@@ -322,6 +322,14 @@ All GPU features are **NVIDIA-only via CUDA 12**. There is no ROCm/HIP path for 
 | `gpu-deskew` | CUDA 12-capable NVIDIA GPU | Requires CUDA NPP: `libnppig.so` + `libnppc.so` |
 
 GPU initialisation failures at runtime print a warning to stderr and fall back to CPU — no error is returned, rendering continues normally.
+
+### Planned platform support
+
+Support is planned in this order:
+
+1. **ARM NEON + Apple Metal** — `aarch64` CPU SIMD and Apple Silicon GPU via Metal.
+2. **Intel CPU tuning + Intel GPU (Arc / Iris Xe)** — Intel AVX-512 VNNI and a oneAPI / Level Zero GPU backend.
+3. **Vulkan compute + AMD/Radeon (ROCm)** — cross-vendor GPU via Vulkan, plus a dedicated ROCm/HIP path for AMD.
 
 ## Feature flags
 

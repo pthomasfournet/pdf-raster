@@ -44,9 +44,11 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 
 ## Hardware compatibility
 
-**CPU:** x86-64 only (AMD and Intel). AVX2 used when available; AVX-512 enabled with `-C target-cpu=native`. ARM / Apple Silicon / NEON are not supported — there is no `aarch64` build and no Apple Metal backend.
+**CPU:** x86-64 only (AMD and Intel). AVX2 used when available; AVX-512 enabled with `-C target-cpu=native`. ARM / Apple Silicon / NEON are not yet supported — there is no `aarch64` build and no Apple Metal backend.
 
-**GPU:** NVIDIA only via CUDA 12. AMD/Radeon (ROCm/HIP) and Intel (oneAPI) GPU backends are not implemented. If no NVIDIA GPU is present, all GPU features fall back to CPU automatically.
+**GPU:** NVIDIA only via CUDA 12. AMD/Radeon (ROCm/HIP) and Intel (oneAPI) GPU backends are not yet implemented. If no NVIDIA GPU is present, all GPU features fall back to CPU automatically.
+
+**Planned:** ARM NEON + Apple Metal → Intel CPU/GPU → Vulkan + AMD/Radeon. See [getting-started.md](docs/getting-started.md#planned-platform-support) for the roadmap.
 
 ## Build
 

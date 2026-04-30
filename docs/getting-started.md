@@ -14,11 +14,11 @@ Given a PDF file, pdf-raster renders each page to an 8-bit grayscale buffer in m
 
 - AVX2 is used when available (runtime-detected, scalar fallback otherwise).
 - AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and related extensions) is used when the binary is built with `-C target-cpu=native` on a compatible CPU. The project is developed and benchmarked on an AMD Ryzen 9900X3D.
-- **ARM / Apple Silicon are not supported.** NEON SIMD paths have not been implemented. The code will not compile for `aarch64` targets. There is no Apple Metal backend.
+- **ARM / Apple Silicon are not yet supported.** NEON SIMD paths have not been implemented. The code will not compile for `aarch64` targets. There is no Apple Metal backend. ARM/NEON and Apple Metal support is planned (see [Planned platform support](#planned-platform-support) below).
 
 ### GPU (optional)
 
-All GPU features require an **NVIDIA GPU with CUDA 12**.
+All GPU features currently require an **NVIDIA GPU with CUDA 12**.
 
 | Feature | Minimum GPU | Library required |
 |---|---|---|
@@ -28,11 +28,21 @@ All GPU features require an **NVIDIA GPU with CUDA 12**.
 | `gpu-icc` | Any CUDA 12-capable NVIDIA GPU | CUDA runtime |
 | `gpu-deskew` | Any CUDA 12-capable NVIDIA GPU | CUDA NPP (`libnppig.so`, `libnppc.so`) |
 
-**AMD/Radeon GPUs are not supported.** ROCm / HIP backends have not been implemented.
+**AMD/Radeon GPUs are not yet supported.** ROCm / HIP and Vulkan backends are planned.
 
-**Intel GPUs (Arc, Iris Xe) are not supported.** There is no oneAPI / Level Zero backend.
+**Intel GPUs (Arc, Iris Xe) are not yet supported.** oneAPI / Level Zero backend is planned.
 
 If no NVIDIA GPU is present, or if CUDA initialisation fails at runtime, all GPU features fall back to CPU automatically — a warning is printed to stderr but no error is returned. The CPU path is fully functional on its own.
+
+## Planned platform support
+
+The following platforms are unimplemented and untested today. Support is planned in this order:
+
+1. **ARM NEON + Apple Metal** — `aarch64` CPU SIMD (NEON) and Apple Silicon GPU acceleration via Metal. This enables native macOS support and mobile/embedded deployment.
+2. **Intel CPU (AVX-512 VNNI) + Intel GPU (Arc / Iris Xe)** — Intel-specific AVX-512 tuning and a oneAPI / Level Zero GPU backend.
+3. **Vulkan compute + AMD/Radeon (ROCm)** — cross-vendor GPU compute via Vulkan (covering AMD, Intel, and NVIDIA), plus a dedicated ROCm/HIP path for AMD.
+
+Until a platform tier is implemented, attempting to use it will result in a compile error (`aarch64`) or missing feature flag. There is no silent wrong-answer fallback.
 
 ## Installation
 
