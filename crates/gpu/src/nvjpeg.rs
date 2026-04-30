@@ -125,7 +125,10 @@ const NVJPEG_BACKEND_GPU_HYBRID: nvjpegBackend_t = 2;
 /// single-threaded baseline JPEG; serialises across all concurrent callers so it
 /// is slower than `GPU_HYBRID` in multi-threaded workloads.
 /// Retained as a named constant for documentation; not used in production code paths.
-#[expect(dead_code, reason = "documents the HARDWARE backend value; not used in production")]
+#[expect(
+    dead_code,
+    reason = "documents the HARDWARE backend value; not used in production"
+)]
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;
 
 /// Maximum number of colour plane pointers in `nvjpegImage_t`.
