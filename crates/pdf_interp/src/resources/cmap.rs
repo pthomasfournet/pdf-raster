@@ -119,6 +119,7 @@ impl Iterator for CMapIter<'_> {
 ///
 /// Returns `None` if the stream contains no recognised directives.  In that
 /// case callers should fall back to an identity mapping or the scalar path.
+#[expect(clippy::too_many_lines, reason = "flat match dispatch; extracting helpers would obscure the PDF spec mapping")]
 #[must_use]
 pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
     let text = std::str::from_utf8(stream).ok()?;
@@ -180,8 +181,16 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                         i += 1;
                     }
                 }
-                // i now points at the end-keyword (or a sentinel / end of tokens).
-                // The outer i += 1 will advance past it.
+                // If the loop stopped at an end-keyword, the outer i += 1 will
+                // skip it.  If it stopped at a section-start sentinel (missing
+                // endcidchar), i already points at the next keyword and must NOT
+                // be advanced — use `continue` to bypass the outer increment.
+                if tokens
+                    .get(i)
+                    .is_none_or(|t| *t != "endcidchar" && *t != "endbfchar")
+                {
+                    continue;
+                }
             }
             "begincidrange" | "beginbfrange" => {
                 i += 1;
@@ -218,8 +227,14 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                         i += 1;
                     }
                 }
-                // i now points at the end-keyword (or a sentinel / end of tokens).
-                // The outer i += 1 will advance past it.
+                // Same sentinel logic as begincidchar: skip outer i += 1 when
+                // we stopped at a section-start rather than an end-keyword.
+                if tokens
+                    .get(i)
+                    .is_none_or(|t| *t != "endcidrange" && *t != "endbfrange")
+                {
+                    continue;
+                }
             }
             _ => {}
         }
@@ -256,11 +271,13 @@ fn tokenise(text: &str) -> Vec<&str> {
 
     while i < bytes.len() {
         match bytes[i] {
-            // Skip whitespace and stray `>` (second `>` of `>>` after the
-            // `<..>` arm consumed the first).  Without the `>` case, it falls
-            // to `_`, which pushes an empty-string token and never advances
-            // `i` → infinite loop.
-            b' ' | b'\t' | b'\r' | b'\n' | b'>' => i += 1,
+            // Skip whitespace, stray `>` (second `>` of `>>`), PostScript
+            // procedure braces `{}`, and stray `)` / `]` outside their container
+            // contexts (e.g. unbalanced PS strings).  All of these must be
+            // skipped explicitly: the `_` arm stops immediately on any of these
+            // (they're in the keyword stop-set), pushes an empty token, and
+            // never advances `i` → infinite loop.
+            b' ' | b'\t' | b'\r' | b'\n' | b'>' | b')' | b']' | b'{' | b'}' => i += 1,
 
             // Strip comments (% to end of line).
             b'%' => {
