@@ -52,18 +52,46 @@ Both binaries built **without GPU features** (`--backend cpu`). This isolates th
 | 05 | Academic book | 601 | 4 318 ms | 7 532 ms | **1.7×** | 3 423 ms | 13 158 ms | **3.8×** |
 | 06 | Modern layout, DCT | 160 | 2 856 ms | 6 479 ms | **2.3×** | 12 109 ms | 11 515 ms | 0.95× |
 | 07 | Journal, DCT-heavy | 162 | 813 ms | 5 273 ms | **6.5×** | 1 460 ms | 8 379 ms | **5.7×** |
-| 08 | 1927 scan, DCT | 390 | 19 112 ms | 387 636 ms | **20.3×** | — | — | — |
+| 08 | 1927 scan, DCT | 390 | 19 112 ms | 387 636 ms | **20.3×** | 47 582 ms | 601 639 ms | **12.6×** |
 | 09 | 1836 scan, DCT | 490 | 58 012 ms | 389 933 ms | **6.7×** | — | — | — |
 | 10 | Scan, JBIG2+JPX | 576 | 21 573 ms | 151 170 ms | **7.0×** | — | — | — |
 
-_Intel 08–10 pending (large scan PDFs, ~15–30 min each on 12 threads)._
+_Intel 09–10 pending (large scan PDFs still running)._
 
 ### Notes
 
 - **Short PDFs (01–02):** The AVX2 build is slower than pdftoppm on the Intel box. These are 16-page documents where startup overhead and font subsystem init dominate. pdf-raster's startup path is not optimised for sub-100ms workloads.
 - **DCT-heavy (07–09):** The 6–20× gains come from SIMD-accelerated JPEG decoding in the interpreter hot path, not GPU acceleration — this is pure CPU work on both machines.
-- **Corpus 09 (490 pages):** The apparent variance between the two measurements for corpus-09 on the AVX-512 machine (58 s vs pdftoppm's 390 s) is genuine — pdftoppm serialises its JPEG decode path differently.
-- **AVX-512 vs AVX2 (corpus 01–07):** The Ryzen machine wins clearly on text-dense and DCT-heavy workloads where the AVX-512 fill and composite kernels in the `raster` crate engage. On very short documents the difference is masked by fixed startup costs.
+- **AVX-512 vs AVX2:** The Ryzen machine wins clearly on text-dense and DCT-heavy workloads where the AVX-512 fill and composite kernels in the `raster` crate engage. On very short documents the difference is masked by fixed startup costs. Corpus 08 shows 20× on AVX-512 vs 12.6× on AVX2 — roughly 1.6× uplift from the wider SIMD width alone.
+
+---
+
+## VA-API iGPU: Ryzen 9 9900X3D integrated Radeon (RDNA 2)
+
+The Ryzen 9 9900X3D includes an integrated Radeon GPU (raphael/mendocino RDNA 2) accessible via VA-API on `/dev/dri/renderD129`. This is a first functional test of the VA-API JPEG decode path against the CPU-only baseline on the same machine.
+
+**Build:** `--features pdf_raster/vaapi`, `--backend vaapi --vaapi-device /dev/dri/renderD129`
+
+| # | Document | Pages | VA-API (iGPU) | CPU-only | vs CPU |
+|---|---|---|---|---|---|
+| 01 | Native text, small | 16 | 102 ms | 41 ms | 0.40× |
+| 02 | Native vector + text | 16 | 182 ms | 123 ms | 0.68× |
+| 03 | Native text, dense | 254 | 655 ms | 569 ms | 0.87× |
+| 04 | Ebook, mixed | 358 | 3 177 ms | 5 348 ms | **1.68×** |
+| 05 | Academic book | 601 | 5 248 ms | 4 984 ms | 0.95× |
+| 06 | Modern layout, DCT | 160 | 3 099 ms | 2 776 ms | 0.90× |
+| 07 | Journal, DCT-heavy | 162 | 1 626 ms | 1 896 ms | **1.17×** |
+| 08 | 1927 scan, DCT | 390 | 17 861 ms | 57 040 ms | **3.19×** |
+| 09 | 1836 scan, DCT | 490 | 101 900 ms | 74 688 ms | 0.73× |
+| 10 | Scan, JBIG2+JPX | 576 | 22 211 ms | 22 173 ms | 1.00× |
+
+### Notes
+
+- **Short PDFs (01–03):** VA-API is slower than CPU-only. Per-thread VA-API context init overhead (~60 ms) dominates when pages are few and lightweight.
+- **Corpus 08 (3.19×):** Strong win — 390 large JPEG scan pages where iGPU JPEG decode saturates the VA-API pipeline. The RDNA 2 VCN decoder handles these well.
+- **Corpus 09 (0.73×):** Slower than CPU-only despite similar page count and file character to corpus 08. Likely cause: the 1836 scan uses higher-resolution JPEG tiles that exceed the iGPU VCN decode throughput, causing the VA-API path to stall while the CPU path benefits from AVX-512 parallel decode across all 24 threads. This warrants investigation.
+- **Corpus 10 (1.00×):** JBIG2 and JPEG2000 streams are not VA-API-decodable; the iGPU path falls through to CPU for those, resulting in parity.
+- **Overall:** The iGPU VA-API path is not a general-purpose speedup on this workload mix. It excels on large JPEG-heavy scan documents (corpus 08 class) and is neutral-to-negative on everything else. Dedicated discrete GPU (nvJPEG) is a better fit for consistent gains.
 
 ---
 
@@ -88,6 +116,12 @@ GPU gains are largest on scan-heavy corpora where nvJPEG and nvJPEG2000 offload 
 
 ---
 
+## GPU-accelerated: Intel i7-8700K + RTX 2080 Super (Turing, sm_75)
+
+_Pending — build and benchmark in progress._
+
+---
+
 ## Reproducing
 
 ```bash
@@ -97,6 +131,12 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster
 # Time a single PDF against pdftoppm
 time ./target/release/pdf-raster --backend cpu -r 150 input.pdf /tmp/out
 time pdftoppm -r 150 input.pdf /tmp/ref
+
+# VA-API iGPU (Linux, AMD/Intel iGPU with VA-API support)
+RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster \
+  --features "pdf_raster/vaapi"
+./target/release/pdf-raster --backend vaapi --vaapi-device /dev/dri/renderD129 \
+  -r 150 input.pdf /tmp/out
 
 # Full pixel-diff comparison (verifies correctness, not just speed)
 tests/compare/compare.sh -r 150 input.pdf
