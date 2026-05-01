@@ -14,6 +14,16 @@ pub mod content;
 pub mod renderer;
 pub mod resources;
 
+/// Thin re-exports of codec functions for fuzz targets.
+///
+/// Only compiled when `--cfg fuzzing` is set (cargo-fuzz sets this automatically).
+/// Not part of the public API.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz_helpers {
+    pub use crate::resources::image::fuzz_entry::{decode_ccitt, decode_jbig2};
+}
+
 use std::path::Path;
 
 use lopdf::Document;

@@ -1,0 +1,31 @@
+[package]
+name = "pdf-raster-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pdf_interp    = { path = "../crates/pdf_interp" }
+lopdf         = "0.40"
+
+# Direct dependency so we can fuzz hayro-jbig2 both through pdf_interp
+# and standalone (raw segment data without a PDF wrapper).
+hayro-jbig2 = { version = "0.3.0", default-features = false }
+
+[[bin]]
+name = "fuzz_ccitt"
+path = "fuzz_targets/fuzz_ccitt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_jbig2"
+path = "fuzz_targets/fuzz_jbig2.rs"
+test = false
+doc = false
+bench = false

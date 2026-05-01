@@ -91,6 +91,38 @@ pub(crate) mod inline;
 
 pub use inline::decode_inline_image;
 
+/// Thin fuzz-only wrappers that forward to the `pub(super)` codec functions.
+#[cfg(fuzzing)]
+pub mod fuzz_entry {
+    use lopdf::{Document, Object};
+
+    use super::codecs;
+    use super::ImageDescriptor;
+
+    #[doc(hidden)]
+    pub fn decode_ccitt(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        is_mask: bool,
+        parms: Option<&Object>,
+    ) -> Option<ImageDescriptor> {
+        codecs::decode_ccitt(data, width, height, is_mask, parms)
+    }
+
+    #[doc(hidden)]
+    pub fn decode_jbig2(
+        doc: &Document,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        is_mask: bool,
+        parms: Option<&Object>,
+    ) -> Option<ImageDescriptor> {
+        codecs::decode_jbig2(doc, data, width, height, is_mask, parms)
+    }
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Colour space of the decoded image pixels.
