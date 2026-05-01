@@ -34,6 +34,15 @@ secrets/
 .claude/
 .serena/
 CLAUDE.md
+# Superpowers plugin runtime dirs (plans, memory, etc.)
+superpowers/
+# Serena MCP memory and cache dirs
+.serena/cache/
+.serena/memories/
+# Any other plugin runtime directories
+.aider/
+.continue/
+.codeium/
 
 # ── Profiling / perf artifacts ─────────────────────────────────────────────────
 perf.data
