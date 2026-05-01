@@ -45,23 +45,24 @@ Both binaries built **without GPU features** (`--backend cpu`). This isolates th
 
 | # | Document | Pages | pdf-raster (AVX-512) | pdftoppm | Speedup | pdf-raster (AVX2) | pdftoppm | Speedup |
 |---|---|---|---|---|---|---|---|---|
-| 01 | Native text, small | 16 | 48 ms | 154 ms | **3.2×** | 347 ms | 316 ms | 0.91× |
-| 02 | Native vector + text | 16 | 129 ms | 148 ms | **1.1×** | 680 ms | 397 ms | 0.58× |
-| 03 | Native text, dense | 254 | 592 ms | 3 853 ms | **6.5×** | 2 314 ms | 6 755 ms | **2.9×** |
-| 04 | Ebook, mixed | 358 | 3 155 ms | 4 922 ms | **1.6×** | 8 518 ms | 7 416 ms | 0.87× |
-| 05 | Academic book | 601 | 4 318 ms | 7 532 ms | **1.7×** | 3 209 ms | 11 486 ms | **3.6×** |
-| 06 | Modern layout, DCT | 160 | 2 856 ms | 6 479 ms | **2.3×** | 12 503 ms | 11 228 ms | 0.90× |
-| 07 | Journal, DCT-heavy | 162 | 813 ms | 5 273 ms | **6.5×** | 1 847 ms | 8 128 ms | **4.4×** |
-| 08 | 1927 scan, DCT | 390 | 19 112 ms | 387 636 ms | **20.3×** | 9 947 ms | 465 157 ms | **46.8×** |
-| 09 | 1836 scan, DCT | 490 | 58 012 ms | 389 933 ms | **6.7×** | 12 287 ms | 625 917 ms | **50.9×** |
-| 10 | Scan, JBIG2+JPX | 576 | 21 573 ms | 151 170 ms | **7.0×** | 57 713 ms | 307 878 ms | **5.3×** |
+| 01 | Native text, small | 16 | 44 ms | 151 ms | **3.4×** | 320 ms | 461 ms | 0.69× |
+| 02 | Native vector + text | 16 | 121 ms | 146 ms | **1.2×** | 466 ms | 428 ms | 0.92× |
+| 03 | Native text, dense | 254 | 558 ms | 3 612 ms | **6.5×** | 2 220 ms | 6 999 ms | **3.2×** |
+| 04 | Ebook, mixed | 358 | 1 722 ms | 3 787 ms | **2.2×** | 8 256 ms | 7 411 ms | 0.90× |
+| 05 | Academic book | 601 | 707 ms | 5 896 ms | **8.3×** | 2 953 ms | 11 485 ms | **3.9×** |
+| 06 | Modern layout, DCT | 160 | 2 495 ms | 5 831 ms | **2.3×** | 11 967 ms | 10 632 ms | 0.89× |
+| 07 | Journal, DCT-heavy | 162 | 478 ms | 4 853 ms | **10.1×** | 1 682 ms | 8 221 ms | **4.9×** |
+| 08 | 1927 scan, DCT | 390 | 10 954 ms | 251 079 ms | **22.9×** | 10 878 ms | 458 768 ms | **42.2×** |
+| 09 | 1836 scan, DCT | 490 | 15 772 ms | 339 646 ms | **21.5×** | 11 872 ms | 625 288 ms | **52.7×** |
+| 10 | Scan, JBIG2+JPX | 576 | 19 782 ms | 152 353 ms | **7.7×** | 55 349 ms | 309 050 ms | **5.6×** |
 
 ### Notes
 
-- **Short PDFs (01–02):** The AVX2 build is slower than pdftoppm on the Intel box. These are 16-page documents where startup overhead and font subsystem init dominate. pdf-raster's startup path is not optimised for sub-100ms workloads.
-- **Scan-heavy (08–09):** The 47–51× gains on Intel are the headline result of this benchmark run. Both corpora embed progressive JPEG streams which pdftoppm decodes serially; pdf-raster's parallel zune-jpeg path across 12 threads (6C/12T) dominates. The prior Intel numbers (12.6× / 15.0×) were from a stale binary run on a warm-cache machine; these figures are from a clean rebuild.
-- **AVX-512 vs AVX2 on scans:** AVX-512 (Ryzen) shows 20.3× on corpus 08 vs 46.8× on AVX2 (Intel) — the Intel machine actually wins here because the i7-8700K has 12 threads fully saturated on decode while the Ryzen number reflects an earlier run that may have had contention. The Ryzen AVX-512 advantage is clearer on text-dense workloads (corpus 03: 6.5× vs 2.9×).
-- **Corpus 10 (JBIG2+JPX):** 7.0× on AVX-512, 5.3× on AVX2 — consistent across both machines, driven by the native JBIG2/JPEG2000 decoder vs Poppler's single-threaded path.
+- **Short PDFs (01–02):** Ryzen AVX-512 is 3–3.4× faster than pdftoppm. AVX2 Intel shows 0.69–0.92× — startup overhead and font subsystem init dominate sub-200ms workloads.
+- **Corpus 05 (Academic book, 8.3× / 3.9×):** Strong result on both machines. Dense embedded JPEG images (SOF0 baseline) where parallel Rayon IDCT dominates over pdftoppm's single-threaded decode.
+- **Corpus 07 (Journal DCT, 10.1× / 4.9×):** Dense JPEG pages decoded in parallel — 24 Rayon threads (Ryzen) / 12 threads (Intel) vs pdftoppm single-threaded.
+- **Scan-heavy (08–09):** The headline results. Intel AVX2 hits **42–53×** on scan corpora — 490 independent progressive JPEG page decodes across 12 threads vs pdftoppm's single-threaded path. Ryzen shows 22–22× because pdftoppm is faster on Ryzen (same-generation pdftoppm; Ryzen has fewer free threads relative to its clock speed advantage over the Intel box).
+- **Corpus 10 (JBIG2+JPX):** 7.7× Ryzen / 5.6× Intel — native JBIG2/JPEG2000 decoder vs Poppler's single-threaded path. Intel slower here because JBIG2 decode is more compute-bound and benefits less from the thread count advantage.
 
 ---
 

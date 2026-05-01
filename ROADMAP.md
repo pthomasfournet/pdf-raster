@@ -581,6 +581,56 @@ Phase 6 closes the remaining gaps before the first production integration.
 
 ---
 
+## Phase 7 — Heterogeneous dispatch hub
+
+**Goal:** dynamic per-page work routing across CPU threads, GPU decoders, and iGPU (VA-API) based on page content type, JPEG variant, and image size — rather than the current static pixel-area threshold.
+
+### Motivation
+
+Benchmarking revealed that the current threshold-only dispatch leaves significant wins on the table:
+
+- **Progressive JPEG (SOF2)** falls through VA-API entirely (VAEntrypointVLD supports baseline only) — but nvJPEG handles progressive JPEG natively. Detecting the JPEG type at parse time and routing to nvJPEG instead of CPU would recover the GPU decode win on scan corpora 08–09.
+- **Corpus 09 (490 progressive JPEG pages):** our CPU path finishes in ~12s (24 threads) while Poppler takes 10+ minutes single-threaded. A GPU path (nvJPEG progressive) would reduce this further.
+- **Mixed workloads** waste GPU dispatch overhead on small images. A smarter router that inspects content type before dispatch avoids the penalty on dense-image-small corpora (corpus 06 is currently 0.6× on GPU).
+
+### Design
+
+**Content-aware dispatch signals** (inspected at parse time, zero extra I/O):
+
+| Signal | Source | Routing hint |
+|---|---|---|
+| JPEG variant (SOF0 vs SOF2) | JPEG SOF marker | SOF2 → nvJPEG (not VA-API); SOF0 → VA-API eligible |
+| Image pixel area | PDF dict Width×Height | Below threshold → CPU always |
+| Page image count | Accumulate during parse | Many small images → CPU batch; few large → GPU |
+| Dominant filter | `PageDiagnostics.dominant_filter` | DCT-heavy → prefer GPU; Flate/CCITT → CPU |
+
+**Work-stealing queue:**
+
+Replace the current Rayon page-parallel split with a dynamic queue where each page is a task. GPU decoder slots (nvJPEG, nvJPEG2k, VA-API) are resources claimed per-task. CPU threads take tasks when GPU slots are full. This gives:
+- GPU handles progressive/large JPEG pages
+- CPU handles text/vector pages concurrently
+- No idle time waiting for GPU if CPU work is available
+
+**JPEG type detection in `decode_dct`:**
+
+Read the SOF marker byte before dispatch:
+- `0xC0` (SOF0, baseline) → VA-API eligible, nvJPEG eligible
+- `0xC2` (SOF2, progressive) → nvJPEG only (VA-API skipped, no wasted parse attempt)
+- `0xC1`, `0xC3` (extended/lossless) → CPU only
+
+Currently every progressive JPEG incurs a full VA-API header parse + `BadJpeg` error + fallthrough. Detecting SOF type in ~3 bytes eliminates this overhead and routes correctly.
+
+### Work items
+
+- [ ] Extract SOF marker detection into `jpeg_parser::jpeg_sof_type()` (3-byte peek, no full parse)
+- [ ] Add `JpegVariant { Baseline, Progressive, Other }` to dispatch signal
+- [ ] Update `decode_dct` dispatch: check `JpegVariant` before `GPU_JPEG_THRESHOLD_PX`; skip VA-API for progressive; prefer nvJPEG for progressive
+- [ ] Work-stealing page queue: `crossbeam::deque` or Rayon `scope` with dynamic task injection; GPU slot semaphore per decoder type
+- [ ] `PageDiagnostics` pre-scan pass: lightweight content stream scan (no render) to classify page before full render; used to pre-route page to CPU vs GPU worker
+- [ ] Benchmark: re-run full corpus with heterogeneous dispatch; target corpus 08/09 GPU speedup ≥ 5× over current CPU path
+
+---
+
 ## Testing strategy
 
 ### proptest — property-based testing for geometric primitives
