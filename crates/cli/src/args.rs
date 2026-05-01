@@ -246,7 +246,35 @@ impl Args {
         self.resolution_y.or(self.resolution).unwrap_or(150.0)
     }
 
+    /// Validate mutually-exclusive output-format flags.
+    ///
+    /// Returns `Err` with a human-readable message if any incompatible
+    /// combination is present.  Call this once at startup.
+    pub fn validate_format_flags(&self) -> Result<(), String> {
+        if self.jpeg && self.jpegcmyk {
+            return Err("--jpeg and --jpegcmyk are mutually exclusive".to_owned());
+        }
+        if self.mono && self.gray {
+            return Err("--mono and --gray are mutually exclusive".to_owned());
+        }
+        // Count exclusive format flags; at most one may be set.
+        let format_count = usize::from(self.png)
+            + usize::from(self.jpeg)
+            + usize::from(self.jpegcmyk)
+            + usize::from(self.tiff);
+        if format_count > 1 {
+            return Err(
+                "at most one output format flag may be used (--png, --jpeg, --jpegcmyk, --tiff)"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     /// Resolved output format.
+    ///
+    /// Assumes [`validate_format_flags`](Self::validate_format_flags) has
+    /// already been called — conflicting flags are not possible here.
     pub const fn output_format(&self) -> OutputFormat {
         if self.png {
             OutputFormat::Png
@@ -321,9 +349,15 @@ pub enum BackendArg {
 impl Args {
     /// Build a [`SessionConfig`] from the `--backend` / `--vaapi-device` flags.
     ///
-    /// Also validates that `--vaapi-device` is not used with `--backend cpu` or
-    /// `--backend cuda` (those modes never open the VA-API device).
-    /// Returns `Err` with a human-readable message if the combination is invalid.
+    /// Rejects `--vaapi-device` when combined with `--backend cpu` or
+    /// `--backend cuda` — those modes never touch the DRM node, so allowing
+    /// the combination would silently ignore a user expectation.
+    ///
+    /// Note: detection is heuristic — we compare against the default path
+    /// (`/dev/dri/renderD128`).  A user who explicitly passes that default
+    /// value alongside `--backend cpu` will not get the error; this is an
+    /// acceptable trade-off given that clap does not expose an `is_present`
+    /// flag for options with defaults.
     pub fn session_config(&self) -> Result<SessionConfig, String> {
         let policy = match self.backend {
             BackendArg::Auto => BackendPolicy::Auto,
@@ -332,18 +366,17 @@ impl Args {
             BackendArg::Vaapi => BackendPolicy::ForceVaapi,
         };
 
-        // Warn clearly when --vaapi-device is supplied but will never be used.
         if self.vaapi_device != "/dev/dri/renderD128"
             && matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceCuda)
         {
+            let backend_name = match policy {
+                BackendPolicy::CpuOnly => "cpu",
+                BackendPolicy::ForceCuda => "cuda",
+                _ => unreachable!("matched CpuOnly | ForceCuda above"),
+            };
             return Err(format!(
-                "--vaapi-device has no effect with --backend {}.\n\
-                 VA-API is only used with --backend auto or --backend vaapi.",
-                match policy {
-                    BackendPolicy::CpuOnly => "cpu",
-                    BackendPolicy::ForceCuda => "cuda",
-                    _ => unreachable!(),
-                }
+                "--vaapi-device has no effect with --backend {backend_name}.\n\
+                 VA-API is only used with --backend auto or --backend vaapi."
             ));
         }
 

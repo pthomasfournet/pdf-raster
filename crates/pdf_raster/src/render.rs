@@ -168,7 +168,12 @@ pub fn open_session(
 ) -> Result<RasterSession, RasterError> {
     let doc = pdf_interp::open(path).map_err(RasterError::from)?;
     let pages = doc.get_pages();
-    let total_pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+    let total_pages = u32::try_from(pages.len()).map_err(|_| {
+        RasterError::InvalidPageGeometry(format!(
+            "document has {} pages which exceeds u32::MAX — this is not a valid PDF",
+            pages.len()
+        ))
+    })?;
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     let gpu_ctx = init_gpu_ctx(config.policy)?;
@@ -189,7 +194,7 @@ pub fn open_session(
 /// Initialise the CUDA GPU context for AA fill and ICC colour transforms.
 ///
 /// Returns `None` on `CpuOnly`; errors loudly on `ForceCuda` if init fails;
-/// silently returns `None` on `Auto`/`ForceVaapi` if init fails.
+/// logs a warning and returns `None` on `Auto`/`ForceVaapi` if init fails.
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
     if matches!(policy, BackendPolicy::CpuOnly) {
@@ -204,7 +209,7 @@ fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, Raste
                      Verify with `nvidia-smi` that the driver is loaded."
                 )))
             } else {
-                eprintln!(
+                log::warn!(
                     "pdf_raster: GPU initialisation failed ({e}); \
                      falling back to CPU. Run `nvidia-smi` to verify the driver is loaded."
                 );
@@ -331,13 +336,14 @@ fn lend_decoders(
     session: &RasterSession,
     renderer: &mut pdf_interp::renderer::PageRenderer,
 ) -> Result<(), RasterError> {
-    // `renderer` is only used inside `#[cfg]`-gated blocks; suppress the
-    // unused-variable warning in CPU-only builds.
-    let _ = renderer;
     let policy = session.policy;
     if matches!(policy, BackendPolicy::CpuOnly) {
         return Ok(());
     }
+    // `renderer` is used inside `#[cfg]`-gated blocks below; suppress the
+    // unused-variable warning in CPU-only / no-GPU-decoder builds.
+    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
+    let _ = renderer;
 
     #[cfg(feature = "nvjpeg")]
     if !matches!(policy, BackendPolicy::ForceVaapi) {
@@ -379,6 +385,7 @@ fn lend_decoders(
     reason = "body varies with GPU feature flags"
 )]
 fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
+    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
     let _ = renderer;
     #[cfg(feature = "nvjpeg")]
     gpu_init::NVJPEG_DEC.with(|cell| {

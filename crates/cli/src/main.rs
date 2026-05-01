@@ -20,6 +20,10 @@ fn main() {
         eprintln!("pdf-raster: --odd and --even are mutually exclusive");
         std::process::exit(1);
     }
+    if let Err(e) = args.validate_format_flags() {
+        eprintln!("pdf-raster: {e}");
+        std::process::exit(1);
+    }
 
     let session_config = args.session_config().unwrap_or_else(|e| {
         eprintln!("pdf-raster: {e}");
@@ -37,20 +41,7 @@ fn main() {
 
     let session = pdf_raster::open_session(std::path::Path::new(&args.input), &session_config)
         .unwrap_or_else(|e| {
-            if matches!(e, pdf_raster::RasterError::BackendUnavailable(_)) {
-                eprintln!("pdf-raster: {e}");
-                eprintln!(
-                    "  hint: use --backend auto to fall back to CPU when GPU is unavailable,"
-                );
-                eprintln!("        or --backend cpu to force CPU-only mode.");
-            } else {
-                eprintln!("pdf-raster: failed to open PDF: {e}");
-                let mut src = std::error::Error::source(&e);
-                while let Some(cause) = src {
-                    eprintln!("  caused by: {cause}");
-                    src = cause.source();
-                }
-            }
+            report_open_error(&e, &args);
             std::process::exit(1);
         });
 
@@ -176,6 +167,51 @@ fn report_progress(args: &Args, done: &AtomicU32, n_pages: usize, start: &Instan
         "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
          {elapsed:.1}s elapsed  ~{eta_s:.1}s remaining"
     );
+}
+
+/// Print a human-readable error (and actionable hints) when `open_session` fails.
+fn report_open_error(e: &pdf_raster::RasterError, args: &Args) {
+    if matches!(e, pdf_raster::RasterError::BackendUnavailable(_)) {
+        eprintln!("pdf-raster: {e}");
+        print_backend_hint(args);
+    } else {
+        eprintln!("pdf-raster: failed to open PDF: {e}");
+        let mut src = std::error::Error::source(e);
+        while let Some(cause) = src {
+            eprintln!("  caused by: {cause}");
+            src = cause.source();
+        }
+    }
+}
+
+/// Print a backend-specific hint after a `BackendUnavailable` error.
+fn print_backend_hint(args: &Args) {
+    match args.backend {
+        args::BackendArg::Cuda => {
+            eprintln!("  hint: --backend cuda requires a working CUDA driver and GPU.");
+            eprintln!("        Run `nvidia-smi` to verify the driver is loaded.");
+            eprintln!(
+                "        Use --backend auto to fall back to CPU silently, or \
+                 --backend cpu to skip GPU entirely."
+            );
+        }
+        args::BackendArg::Vaapi => {
+            eprintln!(
+                "  hint: --backend vaapi could not open the DRM device ({}).",
+                args.vaapi_device
+            );
+            eprintln!("        Verify the device exists and is readable by your user.");
+            eprintln!("        Use --vaapi-device PATH to specify an alternate render node.");
+            eprintln!(
+                "        Use --backend auto to fall back to CPU silently, or \
+                 --backend cpu to skip GPU entirely."
+            );
+        }
+        _ => {
+            eprintln!("  hint: use --backend auto to fall back to CPU when GPU is unavailable,");
+            eprintln!("        or --backend cpu to force CPU-only mode.");
+        }
+    }
 }
 
 fn report_errors(mut errors: Vec<(i32, render::RenderError)>) {

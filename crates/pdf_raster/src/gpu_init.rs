@@ -57,29 +57,20 @@ thread_local! {
 #[cfg(feature = "nvjpeg")]
 pub(crate) fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
     NVJPEG_DEC.with(|cell| {
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return match &*cell.borrow() {
-                DecoderInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
-                    Err("nvJPEG decoder failed to initialise on a previous attempt".to_owned())
-                }
-                _ => Ok(()),
-            };
+        // TLS is per-thread — only this thread writes this slot, so a single
+        // check is sufficient before acquiring the construction lock.
+        match *cell.borrow() {
+            DecoderInit::Uninitialised => {}
+            DecoderInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
+                return Err("nvJPEG decoder failed to initialise on a previous attempt".to_owned());
+            }
+            _ => return Ok(()),
         }
 
+        // Serialise construction across threads — nvjpegCreateEx is not thread-safe.
         let _guard = DECODER_INIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Re-check after acquiring the lock (another thread may have raced).
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            drop(_guard);
-            return match &*cell.borrow() {
-                DecoderInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
-                    Err("nvJPEG decoder failed to initialise on a previous attempt".to_owned())
-                }
-                _ => Ok(()),
-            };
-        }
-
         let result = gpu::nvjpeg::NvJpegDecoder::new(0);
         drop(_guard);
 
@@ -93,7 +84,7 @@ pub(crate) fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
                 if matches!(policy, BackendPolicy::ForceCuda) {
                     Err(format!("nvJPEG unavailable: {e}"))
                 } else {
-                    eprintln!(
+                    log::warn!(
                         "pdf_raster: nvJPEG unavailable ({e}); \
                          JPEG images will be decoded on CPU for this thread"
                     );
@@ -108,28 +99,19 @@ pub(crate) fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
 #[cfg(feature = "nvjpeg2k")]
 pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
     NVJPEG2K_DEC.with(|cell| {
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return match &*cell.borrow() {
-                DecoderInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
-                    Err("nvJPEG2000 decoder failed to initialise on a previous attempt".to_owned())
-                }
-                _ => Ok(()),
-            };
+        match *cell.borrow() {
+            DecoderInit::Uninitialised => {}
+            DecoderInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
+                return Err(
+                    "nvJPEG2000 decoder failed to initialise on a previous attempt".to_owned(),
+                );
+            }
+            _ => return Ok(()),
         }
 
         let _guard = DECODER_INIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            drop(_guard);
-            return match &*cell.borrow() {
-                DecoderInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
-                    Err("nvJPEG2000 decoder failed to initialise on a previous attempt".to_owned())
-                }
-                _ => Ok(()),
-            };
-        }
-
         let result = gpu::nvjpeg2k::NvJpeg2kDecoder::new(0);
         drop(_guard);
 
@@ -143,7 +125,7 @@ pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
                 if matches!(policy, BackendPolicy::ForceCuda) {
                     Err(format!("nvJPEG2000 unavailable: {e}"))
                 } else {
-                    eprintln!(
+                    log::warn!(
                         "pdf_raster: nvJPEG2000 unavailable ({e}); \
                          JPEG 2000 images will be decoded on CPU for this thread"
                     );
@@ -158,28 +140,19 @@ pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
 #[cfg(feature = "vaapi")]
 pub(crate) fn ensure_vaapi(drm_node: &str, policy: BackendPolicy) -> Result<(), String> {
     VAAPI_JPEG_DEC.with(|cell| {
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return match &*cell.borrow() {
-                DecoderInit::Failed if matches!(policy, BackendPolicy::ForceVaapi) => {
-                    Err("VA-API JPEG decoder failed to initialise on a previous attempt".to_owned())
-                }
-                _ => Ok(()),
-            };
+        match *cell.borrow() {
+            DecoderInit::Uninitialised => {}
+            DecoderInit::Failed if matches!(policy, BackendPolicy::ForceVaapi) => {
+                return Err(
+                    "VA-API JPEG decoder failed to initialise on a previous attempt".to_owned(),
+                );
+            }
+            _ => return Ok(()),
         }
 
         let _guard = DECODER_INIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            drop(_guard);
-            return match &*cell.borrow() {
-                DecoderInit::Failed if matches!(policy, BackendPolicy::ForceVaapi) => {
-                    Err("VA-API JPEG decoder failed to initialise on a previous attempt".to_owned())
-                }
-                _ => Ok(()),
-            };
-        }
-
         let result = gpu::vaapi::VapiJpegDecoder::new(drm_node);
         drop(_guard);
 
@@ -193,7 +166,7 @@ pub(crate) fn ensure_vaapi(drm_node: &str, policy: BackendPolicy) -> Result<(), 
                 if matches!(policy, BackendPolicy::ForceVaapi) {
                     Err(format!("VA-API unavailable on {drm_node}: {e}"))
                 } else {
-                    log::info!(
+                    log::warn!(
                         "pdf_raster: VA-API JPEG unavailable ({e}); \
                          JPEG images will be decoded on CPU for this thread"
                     );
