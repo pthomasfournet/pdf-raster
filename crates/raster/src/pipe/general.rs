@@ -149,17 +149,13 @@ fn render_span_general_inner<'src>(
                 let soft_v = u32::from(soft_mask_at(i));
 
                 // Source alpha (PDF spec §11.3.6 eq 11.1).
-                let a_src = if pipe.soft_mask.is_some() {
-                    if shape.is_some() {
-                        u32::from(div255(u32::from(div255(a_input * soft_v)) * shape_v))
-                    } else {
-                        u32::from(div255(a_input * soft_v))
-                    }
-                } else if shape.is_some() {
-                    u32::from(div255(a_input * shape_v))
-                } else {
-                    a_input
-                };
+                let a_src = compute_a_src(
+                    a_input,
+                    soft_v,
+                    shape_v,
+                    pipe.soft_mask.is_some(),
+                    shape.is_some(),
+                );
 
                 // Non-isolated group colour correction (PDF spec §11.4.8).
                 // c_src_corrected = c_src + (c_src - c_dst) * (a_dst * 255 / shape - a_dst) / 255.
@@ -266,17 +262,13 @@ fn render_span_general_inner<'src>(
                 let shape_v = u32::from(shape_at(i));
                 let soft_v = u32::from(soft_mask_at(i));
 
-                let a_src = if pipe.soft_mask.is_some() {
-                    if shape.is_some() {
-                        u32::from(div255(u32::from(div255(a_input * soft_v)) * shape_v))
-                    } else {
-                        u32::from(div255(a_input * soft_v))
-                    }
-                } else if shape.is_some() {
-                    u32::from(div255(a_input * shape_v))
-                } else {
-                    a_input
-                };
+                let a_src = compute_a_src(
+                    a_input,
+                    soft_v,
+                    shape_v,
+                    pipe.soft_mask.is_some(),
+                    shape.is_some(),
+                );
 
                 let mut c_blend: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 if pipe.blend_mode != BlendMode::Normal {
@@ -319,6 +311,32 @@ fn render_span_general_inner<'src>(
                 }
             }
         }
+    }
+}
+
+/// Compute the effective source alpha for one pixel (PDF spec §11.3.6 eq 11.1).
+///
+/// Combines `a_input` with the soft mask and/or shape coverage according to the
+/// rules: soft mask and shape are multiplied together via `div255`; if either is
+/// absent its default is 1.0 (== 0xFF).
+#[inline]
+fn compute_a_src(
+    a_input: u32,
+    soft_v: u32,
+    shape_v: u32,
+    has_soft_mask: bool,
+    has_shape: bool,
+) -> u32 {
+    if has_soft_mask {
+        if has_shape {
+            u32::from(div255(u32::from(div255(a_input * soft_v)) * shape_v))
+        } else {
+            u32::from(div255(a_input * soft_v))
+        }
+    } else if has_shape {
+        u32::from(div255(a_input * shape_v))
+    } else {
+        a_input
     }
 }
 
@@ -469,6 +487,30 @@ fn apply_overprint(pipe: &PipeState<'_>, dst_px: &mut [u8], src_px: &[u8], ncomp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_a_src_no_mask_no_shape_returns_a_input() {
+        assert_eq!(compute_a_src(200, 0xFF, 0xFF, false, false), 200);
+    }
+
+    #[test]
+    fn compute_a_src_shape_zero_gives_zero() {
+        assert_eq!(compute_a_src(255, 0xFF, 0, false, true), 0);
+    }
+
+    #[test]
+    fn compute_a_src_soft_mask_scales_alpha() {
+        let result = compute_a_src(255, 128, 0xFF, true, false);
+        let expected = u32::from(div255(255 * 128));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn compute_a_src_soft_and_shape_combines_both() {
+        let result = compute_a_src(255, 128, 128, true, true);
+        let expected = u32::from(div255(u32::from(div255(255 * 128)) * 128));
+        assert_eq!(result, expected);
+    }
     use crate::pipe::{PipeSrc, PipeState};
     use crate::state::TransferSet;
     use color::{Gray8, Rgb8};
