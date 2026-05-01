@@ -3,7 +3,8 @@
 use lopdf::{Dictionary, Document, Object};
 
 use super::codecs::{decode_ccitt, decode_dct, decode_jbig2, decode_jpx};
-use super::{ImageDescriptor, ImageFilter, decode_raw, filter_name, validated_dims};
+use super::raw::decode_raw;
+use super::{ImageDescriptor, ImageFilter, filter_name, validated_dims};
 use crate::resources::dict_ext::DictExt;
 
 #[cfg(feature = "nvjpeg")]
