@@ -1,4 +1,4 @@
-//! CMYK→RGB CPU conversion paths (AVX-512, NEON, and scalar fallback).
+//! CMYK→RGB CPU conversion paths (AVX-512, AVX2, NEON, and scalar fallback).
 
 use color::convert::cmyk_to_rgb_reflectance;
 
@@ -192,6 +192,123 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
     }
 }
 
+// ── AVX2 CMYK→RGB ────────────────────────────────────────────────────────────
+//
+// Vectorised subtractive complement: R=(255−C)*(255−K)/255 (rounded).
+// Processes 8 pixels per call using 256-bit u16 arithmetic.
+//
+// AoS→SoA: scalar gather into 8-byte arrays (same approach as NEON — AVX2
+// VPSHUFB is lane-local and cannot cross the 128-bit boundary, so a full
+// 32-byte shuffle is not possible without extra permutes; scalar gather at
+// 8px/iter is negligible overhead).
+//
+// _mm_loadl_epi64 loads 8 u8 values; _mm256_cvtepu8_epi16 widens to u16.
+// _mm256_mullo_epi16 multiplies: max 255*255 = 65025 < 65536 ✓.
+// div255 identity: (n + (n>>8) + 1) >> 8, n = prod + 127.
+// _mm256_packus_epi16 narrows to u8; _mm_storel_epi64 stores 8 bytes.
+
+/// Convert 8 CMYK pixels to RGB using AVX2 u16 arithmetic.
+///
+/// `cmyk` must be exactly 32 bytes (8 pixels × 4 channels).
+/// `rgb` must be at least 24 bytes (8 pixels × 3 channels).
+///
+/// # Safety
+///
+/// Caller must ensure `avx2` is available at runtime.
+/// `cmyk.len() == 32` and `rgb.len() >= 24` must hold.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn cmyk_to_rgb_avx2(cmyk: &[u8; 32], rgb: &mut [u8]) {
+    use std::arch::x86_64::{
+        _mm_loadl_epi64, _mm_storel_epi64, _mm256_add_epi16, _mm256_castsi256_si128,
+        _mm256_cvtepu8_epi16, _mm256_mullo_epi16, _mm256_packus_epi16, _mm256_permute4x64_epi64,
+        _mm256_set1_epi16, _mm256_srli_epi16, _mm256_sub_epi16,
+    };
+
+    debug_assert!(rgb.len() >= 24);
+
+    // Scalar gather: deinterleave 8 CMYK pixels into per-channel arrays.
+    // (AVX2 VPSHUFB is lane-local; scalar gather at 8px is negligible overhead.)
+    let mut c_arr = [0u8; 8];
+    let mut m_arr = [0u8; 8];
+    let mut y_arr = [0u8; 8];
+    let mut k_arr = [0u8; 8];
+    for i in 0..8 {
+        c_arr[i] = cmyk[i * 4];
+        m_arr[i] = cmyk[i * 4 + 1];
+        y_arr[i] = cmyk[i * 4 + 2];
+        k_arr[i] = cmyk[i * 4 + 3];
+    }
+
+    // Load 8 u8 values via _mm_loadl_epi64 (64-bit load), then zero-extend to 8 × u16.
+    // SAFETY: arrays are exactly 8 bytes; _mm_loadl_epi64 reads 8 bytes with 1-byte alignment.
+    let c_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(c_arr.as_ptr().cast()) });
+    let m_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(m_arr.as_ptr().cast()) });
+    let y_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(y_arr.as_ptr().cast()) });
+    let k_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(k_arr.as_ptr().cast()) });
+
+    // inv_ch = 255 − ch  (u16, max 255, no overflow)
+    let v255 = _mm256_set1_epi16(255_i16);
+    let inv_c = _mm256_sub_epi16(v255, c_u16);
+    let inv_m = _mm256_sub_epi16(v255, m_u16);
+    let inv_y = _mm256_sub_epi16(v255, y_u16);
+    let inv_k = _mm256_sub_epi16(v255, k_u16);
+
+    // prod = inv_ch * inv_k  (u16, max 255*255 = 65025 < 65536)
+    let prod_r = _mm256_mullo_epi16(inv_c, inv_k);
+    let prod_g = _mm256_mullo_epi16(inv_m, inv_k);
+    let prod_b = _mm256_mullo_epi16(inv_y, inv_k);
+
+    // Exact ⌊(x + 127) / 255⌋ = (n + (n>>8) + 1) >> 8, n = x + 127.
+    // Same identity as the AVX-512 path; valid for n ≤ 65152 (max 65025+127=65152 ✓).
+    let v127 = _mm256_set1_epi16(127_i16);
+    let v1 = _mm256_set1_epi16(1_i16);
+    macro_rules! div255 {
+        ($x:expr) => {{
+            let n = _mm256_add_epi16($x, v127);
+            _mm256_srli_epi16(
+                _mm256_add_epi16(_mm256_add_epi16(n, _mm256_srli_epi16(n, 8)), v1),
+                8,
+            )
+        }};
+    }
+    let r_u16 = div255!(prod_r);
+    let g_u16 = div255!(prod_g);
+    let b_u16 = div255!(prod_b);
+
+    // Narrow u16 → u8 via packus_epi16(v, v) then extract the low 64 bits.
+    // packus_epi16(v, v) → [v[0..7] v[0..7] | v[0..7] v[0..7]] in 256 bits.
+    // permute4x64(x, 0x88) packs the two unique 64-bit halves to the low 128 bits.
+    // _mm256_castsi256_si128 + _mm_storel_epi64 stores the 8 result bytes.
+    macro_rules! narrow8 {
+        ($v:expr) => {
+            _mm256_castsi256_si128(_mm256_permute4x64_epi64(
+                _mm256_packus_epi16($v, $v),
+                0x88_i32,
+            ))
+        };
+    }
+    let r8 = narrow8!(r_u16);
+    let g8 = narrow8!(g_u16);
+    let b8 = narrow8!(b_u16);
+
+    // Extract 8 bytes per channel and interleave into RGB output.
+    let mut r_arr = [0u8; 8];
+    let mut g_arr = [0u8; 8];
+    let mut b_arr = [0u8; 8];
+    // SAFETY: r_arr/g_arr/b_arr are exactly 8 bytes; _mm_storel_epi64 stores 8 bytes.
+    unsafe {
+        _mm_storel_epi64(r_arr.as_mut_ptr().cast(), r8);
+        _mm_storel_epi64(g_arr.as_mut_ptr().cast(), g8);
+        _mm_storel_epi64(b_arr.as_mut_ptr().cast(), b8);
+    }
+    for i in 0..8 {
+        rgb[i * 3] = r_arr[i];
+        rgb[i * 3 + 1] = g_arr[i];
+        rgb[i * 3 + 2] = b_arr[i];
+    }
+}
+
 // ── ARM NEON CMYK→RGB ─────────────────────────────────────────────────────────
 //
 // Vectorised subtractive complement: R=(255−C)*(255−K)/255 (rounded).
@@ -294,7 +411,7 @@ unsafe fn cmyk_to_rgb_neon(cmyk: &[u8; 32], rgb: &mut [u8]) {
 
 // ── Scalar CMYK→RGB ───────────────────────────────────────────────────────────
 
-#[inline(always)]
+#[inline]
 fn cmyk_to_rgb_scalar(cmyk: &[u8], rgb: &mut [u8]) {
     for (src, dst) in cmyk.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
         let (r, g, b) = cmyk_to_rgb_reflectance(src[0], src[1], src[2], src[3]);
@@ -306,12 +423,13 @@ fn cmyk_to_rgb_scalar(cmyk: &[u8], rgb: &mut [u8]) {
 
 // ── Per-arch dispatch ─────────────────────────────────────────────────────────
 
-/// x86-64: runtime-detect AVX-512; scalar fallback when unavailable.
+/// x86-64: runtime-detect AVX-512 → AVX2 → scalar.
 ///
-/// Uses `is_x86_feature_detected!` so the same binary works on both
-/// AVX-512 machines (Ryzen 9000, Sapphire Rapids) and consumer Intel without
-/// AVX-512.  A compile-time `#[cfg(target_feature)]` gate would compile out
-/// the scalar path on native builds, causing SIGILL on non-AVX-512 hosts.
+/// Uses `is_x86_feature_detected!` so the same binary works on AVX-512
+/// machines (Ryzen 9000, Sapphire Rapids), consumer Intel (AVX2 only), and
+/// older hardware (scalar fallback).  A compile-time `#[cfg(target_feature)]`
+/// gate would compile out fallback paths on native builds, causing SIGILL on
+/// machines that lack the compile-time feature.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn dispatch_cmyk_matrix(cmyk: &[u8], rgb: &mut [u8]) {
@@ -331,6 +449,22 @@ fn dispatch_cmyk_matrix(cmyk: &[u8], rgb: &mut [u8]) {
             out_off += 48;
         }
         // Scalar tail for remaining pixels (< 16).
+        cmyk_to_rgb_scalar(chunks.remainder(), &mut rgb[out_off..]);
+    } else if is_x86_feature_detected!("avx2") {
+        let mut chunks = cmyk.chunks_exact(32);
+        let mut out_off = 0usize;
+        for chunk in chunks.by_ref() {
+            // SAFETY: avx2 confirmed; chunk is exactly 32 bytes;
+            // rgb[out_off..] has ≥ 24 bytes remaining.
+            unsafe {
+                cmyk_to_rgb_avx2(
+                    chunk.try_into().expect("chunk is exactly 32 bytes"),
+                    &mut rgb[out_off..],
+                );
+            }
+            out_off += 24;
+        }
+        // Scalar tail for remaining pixels (< 8).
         cmyk_to_rgb_scalar(chunks.remainder(), &mut rgb[out_off..]);
     } else {
         cmyk_to_rgb_scalar(cmyk, rgb);
@@ -376,7 +510,7 @@ fn dispatch_cmyk_matrix(cmyk: &[u8], rgb: &mut [u8]) {
 /// quadrilinear interpolation — the same algorithm as the GPU kernel.
 ///
 /// The `clut = None` path uses the best SIMD available at runtime:
-/// - x86-64: AVX-512 (16 px/iter) when avx512f+avx512bw are present, else scalar
+/// - x86-64: AVX-512 (16 px/iter) → AVX2 (8 px/iter) → scalar
 /// - aarch64: NEON (8 px/iter) — mandatory on all ARMv8-A targets
 /// - other: scalar per-pixel loop
 ///
@@ -385,10 +519,6 @@ fn dispatch_cmyk_matrix(cmyk: &[u8], rgb: &mut [u8]) {
 /// Panics if `clut` is `Some((_, grid_n))` and `grid_n < 2`.  A CLUT with
 /// fewer than 2 nodes per axis is degenerate and unusable for interpolation.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "CLUT quadrilinear interpolation — cohesion outweighs length"
-)]
 pub fn icc_cmyk_to_rgb_cpu(cmyk: &[u8], clut: Option<(&[u8], u32)>) -> Vec<u8> {
     let n = cmyk.len() / 4;
     let mut rgb = vec![0u8; n * 3];
@@ -636,6 +766,43 @@ mod tests {
             dst[2] = b;
         }
         assert_eq!(icc_cmyk_to_rgb_cpu(&cmyk, None), scalar_rgb);
+    }
+
+    /// AVX2-specific: 8 pixels exactly — one full AVX2 chunk.
+    /// Runtime-skipped on machines without AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn icc_cmyk_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let cmyk: Vec<u8> = (0u8..8)
+            .flat_map(|i| {
+                [
+                    i.wrapping_mul(30),
+                    i.wrapping_mul(20),
+                    i.wrapping_mul(10),
+                    i.wrapping_mul(5),
+                ]
+            })
+            .collect();
+        assert_eq!(cmyk.len(), 32);
+        let mut expected = vec![0u8; 24];
+        for (src, dst) in cmyk.chunks_exact(4).zip(expected.chunks_exact_mut(3)) {
+            let (r, g, b) = color::convert::cmyk_to_rgb_reflectance(src[0], src[1], src[2], src[3]);
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
+        }
+        let mut got = vec![0u8; 24];
+        // SAFETY: avx2 confirmed present above; cmyk is 32 bytes; got is 24 bytes.
+        unsafe {
+            super::cmyk_to_rgb_avx2(
+                cmyk.as_slice().try_into().expect("exactly 32 bytes"),
+                &mut got,
+            )
+        };
+        assert_eq!(got, expected, "AVX2 CMYK→RGB mismatch");
     }
 
     #[test]
