@@ -28,7 +28,7 @@ const fn digit_width(n: i32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::{AaFlag, Args, ThinLineMode};
+    use crate::args::{AaFlag, Args, BackendArg, ThinLineMode};
 
     fn make_args(prefix: &str, sep: char, force: Option<usize>) -> Args {
         Args {
@@ -68,6 +68,8 @@ mod tests {
             separator: sep,
             force_num_digits: force,
             progress: false,
+            backend: BackendArg::Auto,
+            vaapi_device: "/dev/dri/renderD128".into(),
         }
     }
 

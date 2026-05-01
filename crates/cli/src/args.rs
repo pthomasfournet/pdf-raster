@@ -1,6 +1,7 @@
 //! Command-line argument definitions.
 
 use clap::Parser;
+use pdf_raster::{BackendPolicy, SessionConfig};
 
 /// Parser that rejects non-positive or non-finite DPI values at the CLI boundary.
 fn parse_positive_dpi(s: &str) -> Result<f64, String> {
@@ -187,6 +188,31 @@ pub struct Args {
     /// Print progress to stderr: pages done, elapsed time, and ETA.
     #[arg(short = 'P', long = "progress")]
     pub progress: bool,
+
+    // ── Backend selection ─────────────────────────────────────────────────────
+    /// Compute backend for image decoding and GPU fills.
+    ///
+    /// `auto`  — GPU when available, CPU fallback (default).
+    /// `cpu`   — CPU only; all GPU init is skipped.
+    /// `cuda`  — Require CUDA (nvJPEG/AA fill/ICC); exit with error if unavailable.
+    /// `vaapi` — Require VA-API JPEG; exit with error if the DRM device cannot be opened.
+    #[arg(
+        long = "backend",
+        value_name = "BACKEND",
+        default_value = "auto",
+        verbatim_doc_comment
+    )]
+    pub backend: BackendArg,
+
+    /// VA-API DRM render node (default: /dev/dri/renderD128).
+    ///
+    /// Only used when `--backend vaapi` or `--backend auto` with VA-API enabled.
+    #[arg(
+        long = "vaapi-device",
+        value_name = "PATH",
+        default_value = "/dev/dri/renderD128"
+    )]
+    pub vaapi_device: String,
 }
 
 /// Yes/no flag for anti-aliasing options.
@@ -274,5 +300,56 @@ impl OutputFormat {
             (Self::Jpeg, _, _) => "jpg",
             (Self::Tiff, _, _) => "tif",
         }
+    }
+}
+
+// ── Backend selection ─────────────────────────────────────────────────────────
+
+/// `--backend` argument value parsed by clap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendArg {
+    /// GPU when available, silent CPU fallback (default).
+    Auto,
+    /// Skip all GPU init; use CPU paths only.
+    Cpu,
+    /// Require CUDA — error loudly if CUDA / nvJPEG is unavailable.
+    Cuda,
+    /// Require VA-API JPEG — error loudly if the DRM device cannot be opened.
+    Vaapi,
+}
+
+impl Args {
+    /// Build a [`SessionConfig`] from the `--backend` / `--vaapi-device` flags.
+    ///
+    /// Also validates that `--vaapi-device` is not used with `--backend cpu` or
+    /// `--backend cuda` (those modes never open the VA-API device).
+    /// Returns `Err` with a human-readable message if the combination is invalid.
+    pub fn session_config(&self) -> Result<SessionConfig, String> {
+        let policy = match self.backend {
+            BackendArg::Auto => BackendPolicy::Auto,
+            BackendArg::Cpu => BackendPolicy::CpuOnly,
+            BackendArg::Cuda => BackendPolicy::ForceCuda,
+            BackendArg::Vaapi => BackendPolicy::ForceVaapi,
+        };
+
+        // Warn clearly when --vaapi-device is supplied but will never be used.
+        if self.vaapi_device != "/dev/dri/renderD128"
+            && matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceCuda)
+        {
+            return Err(format!(
+                "--vaapi-device has no effect with --backend {}.\n\
+                 VA-API is only used with --backend auto or --backend vaapi.",
+                match policy {
+                    BackendPolicy::CpuOnly => "cpu",
+                    BackendPolicy::ForceCuda => "cuda",
+                    _ => unreachable!(),
+                }
+            ));
+        }
+
+        Ok(SessionConfig {
+            policy,
+            vaapi_device: self.vaapi_device.clone(),
+        })
     }
 }

@@ -44,6 +44,7 @@
 //! ```
 
 pub mod deskew;
+pub(crate) mod gpu_init;
 mod render;
 
 use std::path::Path;
@@ -70,9 +71,60 @@ pub use render::{
 )]
 pub fn release_gpu_decoders() {
     #[cfg(feature = "nvjpeg")]
-    render::release_nvjpeg_this_thread();
+    gpu_init::release_nvjpeg_this_thread();
     #[cfg(feature = "nvjpeg2k")]
-    render::release_nvjpeg2k_this_thread();
+    gpu_init::release_nvjpeg2k_this_thread();
+}
+
+// ── Backend policy ────────────────────────────────────────────────────────────
+
+/// Controls which compute backend is used for image decoding and GPU fills.
+///
+/// The default is [`Auto`](BackendPolicy::Auto), which matches the behaviour
+/// prior to v0.3.1: GPU is used when available and silently skipped otherwise.
+/// The `Force*` variants turn silent fallbacks into hard errors so you can tell
+/// immediately whether the expected hardware path is actually being taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendPolicy {
+    /// GPU if available, CPU otherwise — silent fallback (default).
+    #[default]
+    Auto,
+    /// CPU only.  All GPU init is skipped; no CUDA or VA-API calls are made.
+    CpuOnly,
+    /// Require CUDA (nvJPEG, nvJPEG2000, GPU AA fill, ICC CLUT).
+    /// Returns [`RasterError::BackendUnavailable`] if CUDA initialisation fails
+    /// rather than falling back to CPU.
+    ForceCuda,
+    /// Require VA-API JPEG decoding.
+    /// Returns [`RasterError::BackendUnavailable`] if the VA-API device cannot
+    /// be opened rather than falling back to CPU.
+    ForceVaapi,
+}
+
+// ── Session configuration ─────────────────────────────────────────────────────
+
+/// Configuration for opening a [`RasterSession`].
+///
+/// Passed to [`open_session`].  Use [`Default::default()`] for the behaviour
+/// that was unconditional before v0.3.1 (GPU auto-detected, default DRM node).
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Backend selection policy.
+    pub policy: BackendPolicy,
+    /// VA-API DRM render node.  Default: `/dev/dri/renderD128`.
+    ///
+    /// Only relevant when the `vaapi` feature is enabled and `policy` is not
+    /// [`CpuOnly`](BackendPolicy::CpuOnly) or [`ForceCuda`](BackendPolicy::ForceCuda).
+    pub vaapi_device: String,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            policy: BackendPolicy::Auto,
+            vaapi_device: "/dev/dri/renderD128".to_owned(),
+        }
+    }
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -146,17 +198,6 @@ impl RenderedPage {
     /// Delegates to [`PageDiagnostics::suggested_dpi`].  Returns `None` for pages
     /// with no raster images (vector/text-only pages should just use the caller's
     /// default DPI).
-    ///
-    /// Typical usage in an OCR pipeline:
-    /// ```rust,ignore
-    /// let opts = RasterOptions { dpi: 300.0, ..Default::default() };
-    /// let page = render_one_page(path, page_num, &opts)?;
-    /// if let Some(native_dpi) = page.suggested_dpi(150.0, 300.0) {
-    ///     if (native_dpi - opts.dpi).abs() > 10.0 {
-    ///         // Re-render at native resolution to avoid upsampling.
-    ///     }
-    /// }
-    /// ```
     #[must_use]
     pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32> {
         self.diagnostics.suggested_dpi(min_dpi, max_dpi)
@@ -171,25 +212,18 @@ impl RenderedPage {
 /// for each page in `opts.first_page..=opts.last_page`.  A per-page error does
 /// not abort remaining pages — the caller decides whether to skip or propagate.
 ///
-/// Pages are rendered in ascending page-number order.  GPU resources are
-/// initialised lazily on first use and reused across pages.
+/// GPU resources are initialised lazily on first use and reused across pages.
+/// Backend selection follows [`BackendPolicy::Auto`] (GPU if available, silent
+/// CPU fallback).  Use [`open_session`] + [`render_page_rgb`] directly when you
+/// need [`SessionConfig`] control.
 ///
 /// # Errors
 ///
-/// - [`RasterError::InvalidOptions`] if `opts` violates documented constraints
-///   (e.g. `dpi ≤ 0`, `first_page > last_page`).
-/// - [`RasterError::Pdf`] if the document cannot be opened or parsed.
-/// - [`RasterError::PageOutOfRange`] if a requested page exceeds the document.
-/// - [`RasterError::PageDegenerate`] / [`RasterError::PageTooLarge`] for
-///   malformed page geometry.
-/// - [`RasterError::Deskew`] if deskew rotation fails (rare; falls back
-///   gracefully when possible).
-///
-/// # Panics
-///
-/// Panics only on GPU driver bugs where a CUDA or nvJPEG function reports
-/// success but returns a null handle — this cannot be triggered by valid input
-/// or malformed PDFs, only by a faulty driver.
+/// - [`RasterError::InvalidOptions`] — `opts` violates documented constraints.
+/// - [`RasterError::Pdf`] — document cannot be opened or parsed.
+/// - [`RasterError::PageOutOfRange`] — requested page exceeds the document.
+/// - [`RasterError::PageDegenerate`] / [`RasterError::PageTooLarge`] — malformed geometry.
+/// - [`RasterError::Deskew`] — deskew rotation failed.
 pub fn raster_pdf(
     path: &Path,
     opts: &RasterOptions,
@@ -208,31 +242,11 @@ pub fn raster_pdf(
 /// while the previous is being OCR-processed).  `capacity = 0` is silently
 /// raised to `1`.
 ///
-/// # Usage
-///
-/// ```rust,no_run
-/// # use std::path::Path;
-/// # use pdf_raster::{RasterOptions, render_channel};
-/// let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 100, deskew: true };
-/// let rx = render_channel(Path::new("scan.pdf"), &opts, 4);
-///
-/// for (page_num, result) in rx {
-///     match result {
-///         Ok(page) => { /* pass page.pixels to Tesseract */ }
-///         Err(e)   => eprintln!("page {page_num}: {e}"),
-///     }
-/// }
-/// ```
-///
 /// # Errors delivered through the channel
 ///
 /// - Invalid options → `(1, Err(RasterError::InvalidOptions(...)))`, channel closes.
 /// - File open failure → `(1, Err(RasterError::Pdf(...)))`, channel closes.
 /// - Per-page failures → `(page_num, Err(...))`, rendering of subsequent pages continues.
-///
-/// # Panics
-///
-/// Same conditions as [`raster_pdf`].
 #[must_use]
 pub fn render_channel(
     path: &Path,

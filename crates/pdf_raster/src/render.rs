@@ -1,14 +1,14 @@
 //! Core render pipeline: PDF page → pixel buffer.
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
-use std::cell::RefCell;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 
 use color::{Gray8, Rgb8};
 use raster::Bitmap;
 
-use crate::{RasterOptions, RenderedPage};
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+use crate::gpu_init;
+use crate::{BackendPolicy, RasterOptions, RenderedPage, SessionConfig};
 
 // ── Safety limit ──────────────────────────────────────────────────────────────
 
@@ -17,155 +17,6 @@ use crate::{RasterOptions, RenderedPage};
 /// Prevents absurdly large allocations from malformed or adversarial documents.
 /// 32 768 px at 150 DPI corresponds to roughly 366 inches (~9.3 metres).
 pub const MAX_PX_DIMENSION: u32 = 32_768;
-
-// ── Per-thread GPU image decoders ─────────────────────────────────────────────
-//
-// Send but not Sync: each rayon worker thread owns exactly one instance, created
-// lazily on first use.  DecoderInit<T> prevents retry-and-spam after a one-time
-// init failure.  RefCell gives interior mutability; thread_local prevents races.
-
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
-#[derive(Default)]
-enum DecoderInit<T> {
-    #[default]
-    Uninitialised,
-    Ready(Option<T>),
-    Failed,
-}
-
-// nvjpegCreateEx is not safe to call concurrently from multiple threads —
-// simultaneous calls race inside the library and can null-deref.  This mutex
-// serialises all decoder construction calls across threads.
-// VA-API init (vaInitialize) is also serialised here out of caution.
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
-static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(feature = "nvjpeg")]
-thread_local! {
-    static NVJPEG_DEC: RefCell<DecoderInit<gpu::nvjpeg::NvJpegDecoder>> =
-        const { RefCell::new(DecoderInit::Uninitialised) };
-}
-
-#[cfg(feature = "nvjpeg2k")]
-thread_local! {
-    static NVJPEG2K_DEC: RefCell<DecoderInit<gpu::nvjpeg2k::NvJpeg2kDecoder>> =
-        const { RefCell::new(DecoderInit::Uninitialised) };
-}
-
-#[cfg(feature = "vaapi")]
-thread_local! {
-    static VAAPI_JPEG_DEC: RefCell<DecoderInit<gpu::vaapi::VapiJpegDecoder>> =
-        const { RefCell::new(DecoderInit::Uninitialised) };
-}
-
-#[cfg(feature = "nvjpeg")]
-fn init_nvjpeg() {
-    // nvjpegCreateEx races if called concurrently from multiple threads; lock serialises it.
-    NVJPEG_DEC.with(|cell| {
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return;
-        }
-        let guard = DECODER_INIT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return;
-        }
-        let result = gpu::nvjpeg::NvJpegDecoder::new(0);
-        drop(guard);
-        match result {
-            Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
-            Err(e) => {
-                eprintln!(
-                    "pdf_raster: nvJPEG unavailable ({e}); \
-                     JPEG images will be decoded on CPU for this thread"
-                );
-                *cell.borrow_mut() = DecoderInit::Failed;
-            }
-        }
-    });
-}
-
-/// Drop this thread's nvJPEG decoder immediately.
-///
-/// Called via `rayon::broadcast` before the pool is dropped, so TLS
-/// destructors at process exit see `Uninitialised` and become no-ops.
-/// This avoids the process-exit teardown race where all worker threads call
-/// `nvjpegJpegStateDestroy` concurrently into an already-shutting-down driver.
-#[cfg(feature = "nvjpeg")]
-pub(crate) fn release_nvjpeg_this_thread() {
-    NVJPEG_DEC.with(|cell| {
-        *cell.borrow_mut() = DecoderInit::Uninitialised;
-    });
-}
-
-#[cfg(feature = "nvjpeg2k")]
-fn init_nvjpeg2k() {
-    NVJPEG2K_DEC.with(|cell| {
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return;
-        }
-        let guard = DECODER_INIT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return;
-        }
-        let result = gpu::nvjpeg2k::NvJpeg2kDecoder::new(0);
-        drop(guard);
-        match result {
-            Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
-            Err(e) => {
-                eprintln!(
-                    "pdf_raster: nvJPEG2000 unavailable ({e}); \
-                     JPEG 2000 images will be decoded on CPU for this thread"
-                );
-                *cell.borrow_mut() = DecoderInit::Failed;
-            }
-        }
-    });
-}
-
-/// Drop this thread's nvJPEG2000 decoder immediately (same rationale as above).
-#[cfg(feature = "nvjpeg2k")]
-pub(crate) fn release_nvjpeg2k_this_thread() {
-    NVJPEG2K_DEC.with(|cell| {
-        *cell.borrow_mut() = DecoderInit::Uninitialised;
-    });
-}
-
-/// Default DRM render node used when the `vaapi` feature is active.
-///
-/// Override by rebuilding with a different path if your setup differs.
-#[cfg(feature = "vaapi")]
-const VAAPI_DRM_NODE: &str = "/dev/dri/renderD128";
-
-#[cfg(feature = "vaapi")]
-fn init_vaapi_jpeg() {
-    VAAPI_JPEG_DEC.with(|cell| {
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return;
-        }
-        let guard = DECODER_INIT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
-            return;
-        }
-        let result = gpu::vaapi::VapiJpegDecoder::new(VAAPI_DRM_NODE);
-        drop(guard);
-        match result {
-            Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
-            Err(e) => {
-                log::info!(
-                    "pdf_raster: VA-API JPEG unavailable ({e}); \
-                     JPEG images will be decoded on CPU for this thread"
-                );
-                *cell.borrow_mut() = DecoderInit::Failed;
-            }
-        }
-    });
-}
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -203,6 +54,8 @@ pub enum RasterError {
     /// A Page dictionary entry is structurally valid but outside permitted range
     /// (e.g. `UserUnit` outside `[0.1, 10.0]`).
     InvalidPageGeometry(String),
+    /// A backend was required via [`BackendPolicy`] but could not be initialised.
+    BackendUnavailable(String),
 }
 
 impl std::fmt::Display for RasterError {
@@ -228,6 +81,7 @@ impl std::fmt::Display for RasterError {
             ),
             Self::Deskew(msg) => write!(f, "deskew failed: {msg}"),
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
+            Self::BackendUnavailable(msg) => write!(f, "backend unavailable: {msg}"),
         }
     }
 }
@@ -269,6 +123,13 @@ pub struct RasterSession {
     /// Page-number → object-ID map, built once at construction.
     pub(crate) pages: std::collections::BTreeMap<u32, lopdf::ObjectId>,
     pub(crate) total_pages: u32,
+    pub(crate) policy: BackendPolicy,
+    /// VA-API DRM render node.  Only accessed when the `vaapi` feature is active.
+    #[expect(
+        dead_code,
+        reason = "accessed only when the `vaapi` feature is enabled"
+    )]
+    pub(crate) vaapi_device: String,
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     pub(crate) gpu_ctx: Option<Arc<gpu::GpuCtx>>,
 }
@@ -283,8 +144,6 @@ impl RasterSession {
 
 // Compile-time assertions: RasterSession must be Sync (shared across rayon threads) and
 // Send (moved into the rayon::spawn closure in render_channel).
-// If lopdf::Document ever becomes !Sync / !Send this will fail here rather than at a
-// confusing downstream call site.
 const _: fn() = || {
     const fn assert_sync<T: Sync>() {}
     const fn assert_send<T: Send>() {}
@@ -294,59 +153,85 @@ const _: fn() = || {
 
 /// Open a PDF and create a [`RasterSession`] for rendering.
 ///
-/// Eagerly builds the page-ID map so repeated per-page calls are O(1) lookups
-/// rather than O(n) rebuilds.
+/// Eagerly builds the page-ID map so repeated per-page calls are O(1) lookups.
+/// GPU context (AA/ICC) is initialised here; JPEG decoders are initialised
+/// lazily per rayon worker thread on first page render.
 ///
 /// # Errors
 ///
-/// Returns [`RasterError::Pdf`] if the file cannot be opened or parsed.
-pub fn open_session(path: &std::path::Path) -> Result<RasterSession, RasterError> {
+/// - [`RasterError::Pdf`] if the file cannot be opened or parsed.
+/// - [`RasterError::BackendUnavailable`] if `config.policy` is `ForceCuda` or
+///   `ForceVaapi` and the required GPU context fails to initialise.
+pub fn open_session(
+    path: &std::path::Path,
+    config: &SessionConfig,
+) -> Result<RasterSession, RasterError> {
     let doc = pdf_interp::open(path).map_err(RasterError::from)?;
-    // Build the page map once; derive total_pages from it to avoid a second get_pages() call.
     let pages = doc.get_pages();
     let total_pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
-    let gpu_ctx = match gpu::GpuCtx::init() {
-        Ok(ctx) => Some(Arc::new(ctx)),
-        Err(e) => {
-            eprintln!(
-                "pdf_raster: GPU initialisation failed ({e}); \
-                 falling back to CPU. Run `nvidia-smi` to verify the driver is loaded."
-            );
-            None
-        }
-    };
+    let gpu_ctx = init_gpu_ctx(config.policy)?;
+
+    let vaapi_device = config.vaapi_device.clone();
 
     Ok(RasterSession {
         doc,
         pages,
         total_pages,
+        policy: config.policy,
+        vaapi_device,
         #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
         gpu_ctx,
     })
 }
 
+/// Initialise the CUDA GPU context for AA fill and ICC colour transforms.
+///
+/// Returns `None` on `CpuOnly`; errors loudly on `ForceCuda` if init fails;
+/// silently returns `None` on `Auto`/`ForceVaapi` if init fails.
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
+    if matches!(policy, BackendPolicy::CpuOnly) {
+        return Ok(None);
+    }
+    match gpu::GpuCtx::init() {
+        Ok(ctx) => Ok(Some(Arc::new(ctx))),
+        Err(e) => {
+            if matches!(policy, BackendPolicy::ForceCuda) {
+                Err(RasterError::BackendUnavailable(format!(
+                    "CUDA GPU context required but unavailable: {e}. \
+                     Verify with `nvidia-smi` that the driver is loaded."
+                )))
+            } else {
+                eprintln!(
+                    "pdf_raster: GPU initialisation failed ({e}); \
+                     falling back to CPU. Run `nvidia-smi` to verify the driver is loaded."
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// Render one page to an RGB bitmap.
 ///
-/// The caller is responsible for any colour conversion (e.g. `rgb_to_gray`)
-/// and file output.  GPU image decoders are initialised lazily per calling
-/// thread and reused across pages — safe to call from multiple rayon threads
+/// GPU image decoders are initialised lazily per calling thread on first use
+/// and reused across pages — safe to call from multiple rayon threads
 /// concurrently.
 ///
 /// `scale` is the pixel-per-point multiplier: `dpi / 72.0` for square-pixel
-/// rendering, or `(x_dpi/72 · y_dpi/72).sqrt()` for the geometric-mean when
+/// rendering, or `(x_dpi/72 · y_dpi/72).sqrt()` for the geometric mean when
 /// horizontal and vertical DPI differ.  Must be a positive finite number.
 ///
 /// # Errors
 ///
 /// - [`RasterError::InvalidOptions`] if `scale` is ≤ 0 or non-finite.
-/// - [`RasterError::InvalidPageGeometry`] if the page has a malformed `UserUnit`.
-/// - [`RasterError::PageDegenerate`] if the page `MediaBox` has zero area.
-/// - [`RasterError::PageTooLarge`] if the computed pixel dimensions exceed
-///   [`MAX_PX_DIMENSION`].
-/// - [`RasterError::PageOutOfRange`] if `page_num` is not in the document.
-/// - [`RasterError::Pdf`] if the page content stream cannot be parsed.
+/// - [`RasterError::BackendUnavailable`] if a forced backend fails to init on
+///   this thread.
+/// - [`RasterError::InvalidPageGeometry`] / [`RasterError::PageDegenerate`] /
+///   [`RasterError::PageTooLarge`] / [`RasterError::PageOutOfRange`] /
+///   [`RasterError::Pdf`] as documented on the error variants.
 pub fn render_page_rgb(
     session: &RasterSession,
     page_num: u32,
@@ -357,17 +242,12 @@ pub fn render_page_rgb(
 }
 
 /// Inner implementation shared by [`render_page_rgb`] and [`render_one`].
-/// Accepts a pre-resolved [`PageGeometry`] to avoid a second dict lookup when
-/// the caller already has it (e.g. to read `user_unit` for `effective_dpi`).
-/// Returns the bitmap and the [`PageDiagnostics`] collected during rendering.
 fn render_page_rgb_with_geom(
     session: &RasterSession,
     page_num: u32,
     scale: f64,
     geom: pdf_interp::PageGeometry,
 ) -> Result<(Bitmap<Rgb8>, pdf_interp::renderer::PageDiagnostics), RasterError> {
-    // A non-positive or non-finite scale is a caller error; return InvalidOptions
-    // so callers can distinguish this from a genuinely malformed page MediaBox.
     if !scale.is_finite() || scale <= 0.0 {
         return Err(RasterError::InvalidOptions(format!(
             "scale must be a positive finite number, got {scale}"
@@ -429,74 +309,105 @@ fn render_page_rgb_with_geom(
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     renderer.set_gpu_ctx(session.gpu_ctx.as_ref().map(Arc::clone));
 
+    lend_decoders(session, &mut renderer)?;
+    renderer.execute(&ops);
+    renderer.render_annotations(page_id);
+    reclaim_decoders(&mut renderer);
+
+    Ok(renderer.finish())
+}
+
+/// Lend per-thread GPU JPEG decoders to the renderer for one page.
+///
+/// Decoders are initialised lazily on first call.  On `CpuOnly` this is a
+/// no-op.  On `ForceCuda`/`ForceVaapi` init failure is returned as
+/// `RasterError::BackendUnavailable` rather than silently falling back.
+#[expect(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "body and return type vary with GPU feature flags; wraps is necessary in GPU builds"
+)]
+fn lend_decoders(
+    session: &RasterSession,
+    renderer: &mut pdf_interp::renderer::PageRenderer,
+) -> Result<(), RasterError> {
+    // `renderer` is only used inside `#[cfg]`-gated blocks; suppress the
+    // unused-variable warning in CPU-only builds.
+    let _ = renderer;
+    let policy = session.policy;
+    if matches!(policy, BackendPolicy::CpuOnly) {
+        return Ok(());
+    }
+
     #[cfg(feature = "nvjpeg")]
-    {
-        init_nvjpeg();
-        NVJPEG_DEC.with(|cell| {
-            if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+    if !matches!(policy, BackendPolicy::ForceVaapi) {
+        gpu_init::ensure_nvjpeg(policy).map_err(RasterError::BackendUnavailable)?;
+        gpu_init::NVJPEG_DEC.with(|cell| {
+            if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
                 renderer.set_nvjpeg(slot.take());
             }
         });
     }
+
     #[cfg(feature = "nvjpeg2k")]
-    {
-        init_nvjpeg2k();
-        NVJPEG2K_DEC.with(|cell| {
-            if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+    if !matches!(policy, BackendPolicy::ForceVaapi) {
+        gpu_init::ensure_nvjpeg2k(policy).map_err(RasterError::BackendUnavailable)?;
+        gpu_init::NVJPEG2K_DEC.with(|cell| {
+            if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
                 renderer.set_nvjpeg2k(slot.take());
             }
         });
     }
 
     #[cfg(feature = "vaapi")]
-    {
-        init_vaapi_jpeg();
-        VAAPI_JPEG_DEC.with(|cell| {
-            if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+    if !matches!(policy, BackendPolicy::ForceCuda) {
+        gpu_init::ensure_vaapi(&session.vaapi_device, policy)
+            .map_err(RasterError::BackendUnavailable)?;
+        gpu_init::VAAPI_JPEG_DEC.with(|cell| {
+            if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
                 renderer.set_vaapi_jpeg(slot.take());
             }
         });
     }
 
-    renderer.execute(&ops);
-    renderer.render_annotations(page_id);
+    Ok(())
+}
 
+/// Return GPU JPEG decoders from the renderer back into TLS slots for reuse.
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "body varies with GPU feature flags"
+)]
+fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
+    let _ = renderer;
     #[cfg(feature = "nvjpeg")]
-    NVJPEG_DEC.with(|cell| {
-        if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+    gpu_init::NVJPEG_DEC.with(|cell| {
+        if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_nvjpeg();
         }
     });
     #[cfg(feature = "nvjpeg2k")]
-    NVJPEG2K_DEC.with(|cell| {
-        if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+    gpu_init::NVJPEG2K_DEC.with(|cell| {
+        if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_nvjpeg2k();
         }
     });
-
     #[cfg(feature = "vaapi")]
-    VAAPI_JPEG_DEC.with(|cell| {
-        if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+    gpu_init::VAAPI_JPEG_DEC.with(|cell| {
+        if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_vaapi_jpeg();
         }
     });
-
-    Ok(renderer.finish())
 }
 
 // ── Sequential iterator ───────────────────────────────────────────────────────
 
-/// State shared across all pages rendered in one `raster_pdf` call.
 struct RenderState {
     session: RasterSession,
     opts: RasterOptions,
     current_page: u32,
 }
 
-/// Validate [`RasterOptions`], returning the first violated constraint as an error.
-///
-/// Returns `None` when all constraints are satisfied.  Used by both
-/// [`render_pages`] and [`render_channel`] to share identical validation logic.
 fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
     if opts.dpi <= 0.0 || !opts.dpi.is_finite() {
         return Some(RasterError::InvalidOptions(format!(
@@ -528,7 +439,7 @@ pub fn render_pages(
         };
     }
 
-    let state = open_session(path).map(|session| RenderState {
+    let state = open_session(path, &SessionConfig::default()).map(|session| RenderState {
         current_page: opts.first_page,
         session,
         opts: opts.clone(),
@@ -538,7 +449,6 @@ pub fn render_pages(
 }
 
 struct PageIter {
-    // `None` once the iterator is exhausted or a document-open error has been yielded.
     state: Option<Result<RenderState, RasterError>>,
 }
 
@@ -548,8 +458,6 @@ impl Iterator for PageIter {
     fn next(&mut self) -> Option<Self::Item> {
         match self.state.as_mut()? {
             Err(_) => {
-                // Document-open error: take it out (sets state → None), yield once.
-                // Use page 1 as a placeholder; the caller cares about the Err, not the number.
                 let Err(e) = self.state.take()? else {
                     unreachable!("matched Err arm above")
                 };
@@ -573,30 +481,8 @@ impl Iterator for PageIter {
     }
 }
 
-// ── Channel-based render (bounded, backpressure, Rayon-spawned producer) ─────
+// ── Channel-based render ──────────────────────────────────────────────────────
 
-/// Render pages in the background and stream them through a bounded sync channel.
-///
-/// Spawns one Rayon task that renders pages in ascending order and sends each
-/// `(page_num, Result<RenderedPage, RasterError>)` to the returned
-/// [`Receiver`](std::sync::mpsc::Receiver) as it completes.  The channel is
-/// bounded to `capacity` items (minimum 1): if the consumer falls behind, the
-/// producer blocks on [`SyncSender::send`](std::sync::mpsc::SyncSender::send),
-/// providing natural backpressure.
-///
-/// # Error contract
-///
-/// - Options validation failure: sent as `(1, Err(e))` synchronously before
-///   the Rayon task is spawned; channel closes immediately.
-/// - Session-open failure: sent as `(1, Err(e))` from the producer; channel
-///   closes immediately.
-/// - Per-page render errors: sent as `(page_num, Err(e))`; subsequent pages
-///   continue rendering (same contract as [`render_pages`]).
-///
-/// # Disconnect
-///
-/// If the [`Receiver`](std::sync::mpsc::Receiver) is dropped before the
-/// producer finishes, the producer exits cleanly on its next `send`.
 #[must_use]
 pub fn render_channel(
     path: &std::path::Path,
@@ -605,33 +491,21 @@ pub fn render_channel(
 ) -> std::sync::mpsc::Receiver<(u32, Result<RenderedPage, RasterError>)> {
     use std::sync::mpsc;
 
-    // sync_channel(0) is a rendezvous channel: the first send blocks until someone
-    // calls recv().  Sending an error in the fast-path below (before the caller can
-    // call recv()) would deadlock.  Clamp to 1 to guarantee at least one buffered slot.
     let capacity = capacity.max(1);
     let (tx, rx) = mpsc::sync_channel(capacity);
 
-    // Validate synchronously on the calling thread — the error is available
-    // immediately without waiting for Rayon scheduling.
     if let Some(e) = validate_opts(opts) {
-        // Receiver has been returned to the caller but not yet polled.  The send
-        // will always succeed (capacity ≥ 1).  We discard the Result because the
-        // channel closing on `return` is itself the end-of-stream signal.
         let _sent = tx.send((1, Err(e)));
         return rx;
     }
 
-    // rayon::spawn requires 'static closures, so both path and opts must be owned.
     let path_owned: std::path::PathBuf = path.to_owned();
     let opts_owned: RasterOptions = opts.clone();
 
     rayon::spawn(move || {
-        let session = match open_session(&path_owned) {
+        let session = match open_session(&path_owned, &SessionConfig::default()) {
             Ok(s) => s,
             Err(e) => {
-                // Receiver may already be dropped (caller called drop(rx) before
-                // the Rayon task started).  Discard SendError — channel closing is
-                // the end-of-stream signal either way.
                 let _sent = tx.send((1, Err(e)));
                 return;
             }
@@ -643,18 +517,14 @@ pub fn render_channel(
             opts: opts_owned,
         };
 
-        // Clamp last_page to actual document length (mirrors the iterator).
         let last = state.opts.last_page.min(state.session.total_pages);
 
         for page_num in state.opts.first_page..=last {
             let result = render_one(&state, page_num);
-            // SyncSender::send blocks when the channel is full (backpressure).
-            // Returns Err when the Receiver has been dropped — exit cleanly.
             if tx.send((page_num, result)).is_err() {
                 return;
             }
         }
-        // tx drops here → channel closes → Receiver::recv returns Err(RecvError).
     });
 
     rx
@@ -666,7 +536,6 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
     let dpi = state.opts.dpi;
     let scale = f64::from(dpi) / 72.0;
 
-    // Resolve geometry first to obtain UserUnit before rendering.
     let geom = pdf_interp::page_size_pts(&state.session.doc, page_num)?;
 
     let (rgb, diagnostics) = render_page_rgb_with_geom(&state.session, page_num, scale, geom)?;
@@ -678,10 +547,6 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
 
     let pixels = bitmap_to_vec(&gray);
 
-    // effective_dpi accounts for UserUnit: a UserUnit:2.0 page has user-space units
-    // twice as large (each unit = 2/72 inch), so the rendered pixels cover twice the
-    // physical area — effective DPI is doubled.  For the common case (UserUnit = 1.0)
-    // effective_dpi == dpi.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "dpi is an f32 (≤ ~3400 in practice); user_unit is validated to [0.1, 10.0]; \
@@ -703,8 +568,6 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
 // ── Pixel helpers ─────────────────────────────────────────────────────────────
 
 /// Convert an RGB bitmap to grayscale using BT.709 luminance coefficients.
-///
-/// Output is 0 = black, 255 = white, matching the input convention.
 #[must_use]
 pub fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
     let mut dst = Bitmap::<Gray8>::new(src.width, src.height, 1, false);
@@ -713,9 +576,6 @@ pub fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
         let src_row = &src.row_bytes(y)[..w * 3];
         let dst_row = &mut dst.row_bytes_mut(y)[..w];
         for (dst_px, rgb) in dst_row.iter_mut().zip(src_row.chunks_exact(3)) {
-            // BT.709: Y = 0.2126·R + 0.7152·G + 0.0722·B
-            // Integer: (2126·R + 7152·G + 722·B + 5000) / 10000
-            // Max numerator = 10000·255 + 5000 = 2 555 000 < u32::MAX.
             let (r, g, b) = (u32::from(rgb[0]), u32::from(rgb[1]), u32::from(rgb[2]));
             #[expect(
                 clippy::cast_possible_truncation,
@@ -729,10 +589,6 @@ pub fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8> {
     dst
 }
 
-/// Flatten a `Bitmap<Gray8>` into a tightly-packed `Vec<u8>`.
-///
-/// The bitmap may have internal row padding (stride > width); this strips it
-/// so the returned buffer has exactly `width * height` bytes.
 fn bitmap_to_vec(bmp: &Bitmap<Gray8>) -> Vec<u8> {
     let w = bmp.width as usize;
     let mut out = Vec::with_capacity(w * bmp.height as usize);
@@ -790,25 +646,17 @@ mod channel_tests {
 
     #[test]
     fn receiver_drop_does_not_panic() {
-        // Dropping the Receiver before the producer finishes must not panic.
-        // The producer's send loop returns on SendError rather than unwrapping,
-        // so the Rayon task exits cleanly.  No sleep: a Rayon thread panic would
-        // propagate as a test failure on the next rayon barrier, not here — the
-        // absence of an immediate panic plus the structural guarantee (is_err check
-        // in the loop) is sufficient.
         let rx = render_channel(Path::new("/no_such_file_xyz.pdf"), &valid_opts(), 1);
         drop(rx);
     }
 
     #[test]
     fn capacity_zero_raised_to_one_no_deadlock() {
-        // capacity=0 would be a rendezvous; the error fast-path must not deadlock.
         let bad = RasterOptions {
             dpi: 0.0,
             ..valid_opts()
         };
         let rx = render_channel(Path::new("/irrelevant"), &bad, 0);
-        // Must receive the error item without blocking forever.
         assert!(
             rx.recv().is_ok(),
             "error item must be delivered even with capacity=0"

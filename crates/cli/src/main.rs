@@ -21,6 +21,11 @@ fn main() {
         std::process::exit(1);
     }
 
+    let session_config = args.session_config().unwrap_or_else(|e| {
+        eprintln!("pdf-raster: {e}");
+        std::process::exit(1);
+    });
+
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)
         .thread_name(|i| format!("raster-worker-{i}"))
@@ -30,15 +35,24 @@ fn main() {
         .build()
         .expect("failed to build thread pool");
 
-    let session = pdf_raster::open_session(std::path::Path::new(&args.input)).unwrap_or_else(|e| {
-        eprintln!("pdf-raster: failed to open PDF: {e}");
-        let mut src = std::error::Error::source(&e);
-        while let Some(cause) = src {
-            eprintln!("  caused by: {cause}");
-            src = cause.source();
-        }
-        std::process::exit(1);
-    });
+    let session = pdf_raster::open_session(std::path::Path::new(&args.input), &session_config)
+        .unwrap_or_else(|e| {
+            if matches!(e, pdf_raster::RasterError::BackendUnavailable(_)) {
+                eprintln!("pdf-raster: {e}");
+                eprintln!(
+                    "  hint: use --backend auto to fall back to CPU when GPU is unavailable,"
+                );
+                eprintln!("        or --backend cpu to force CPU-only mode.");
+            } else {
+                eprintln!("pdf-raster: failed to open PDF: {e}");
+                let mut src = std::error::Error::source(&e);
+                while let Some(cause) = src {
+                    eprintln!("  caused by: {cause}");
+                    src = cause.source();
+                }
+            }
+            std::process::exit(1);
+        });
 
     let n = session.total_pages();
     if n == 0 {

@@ -112,6 +112,36 @@ DPI values must be positive finite numbers; non-positive values are rejected at 
 
 ---
 
+## Backend selection
+
+| Flag | Default | Description |
+|---|---|---|
+| `--backend auto\|cpu\|cuda\|vaapi` | `auto` | Compute backend for image decoding and GPU fills. |
+| `--vaapi-device PATH` | `/dev/dri/renderD128` | VA-API DRM render node (only used with `auto` or `vaapi`). |
+
+**`auto`** — GPU when available, silent CPU fallback (same as pre-v0.3.1).
+
+**`cpu`** — CPU only. All GPU init is skipped entirely. Use this for benchmarking, debugging, or on machines without a GPU.
+
+**`cuda`** — Require CUDA. Exits with an error if nvJPEG or the GPU context cannot be initialised. Use this to confirm the GPU path is actually active rather than silently falling back.
+
+**`vaapi`** — Require VA-API JPEG decoding. Exits with an error if the DRM device cannot be opened. Use this to confirm iGPU/dGPU decoding is active.
+
+`--vaapi-device` has no effect with `--backend cpu` or `--backend cuda` — pdf-raster will reject the combination with a clear error rather than silently ignoring it.
+
+```bash
+# Confirm CUDA is active (fails loudly if no NVIDIA GPU)
+pdf-raster --backend cuda -r 150 document.pdf out
+
+# Force CPU-only (useful for benchmarking without GPU)
+pdf-raster --backend cpu -r 150 document.pdf out
+
+# Use VA-API on a non-default render node
+pdf-raster --backend vaapi --vaapi-device /dev/dri/renderD129 document.pdf out
+```
+
+---
+
 ## Exit codes
 
 | Code | Meaning |

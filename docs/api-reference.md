@@ -65,10 +65,10 @@ If the `Receiver` is dropped before the producer finishes, the producer exits cl
 Lower-level API for parallel consumers (e.g. the CLI uses this with Rayon).
 
 ```rust
-pub fn open_session(path: &Path) -> Result<RasterSession, RasterError>
+pub fn open_session(path: &Path, config: &SessionConfig) -> Result<RasterSession, RasterError>
 ```
 
-Opens the PDF and builds an O(1) page-ID map. Also initialises the shared GPU context (for `gpu-aa` / `gpu-icc` features). Errors with `RasterError::Pdf` if the file is unreadable, corrupt, or contains JavaScript.
+Opens the PDF and builds an O(1) page-ID map. Also initialises the shared GPU context (for `gpu-aa` / `gpu-icc` features) according to `config.policy`. Errors with `RasterError::Pdf` if the file is unreadable, corrupt, or contains JavaScript. Errors with `RasterError::BackendUnavailable` if `config.policy` is `ForceCuda` or `ForceVaapi` and the required GPU cannot be initialised.
 
 ```rust
 pub fn render_page_rgb(
@@ -190,6 +190,38 @@ if !page.diagnostics.has_images && page.diagnostics.has_vector_text {
 
 ---
 
+### `BackendPolicy`
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendPolicy {
+    Auto,       // GPU when available, silent CPU fallback (default)
+    CpuOnly,    // Skip all GPU init entirely
+    ForceCuda,  // Require CUDA; error if unavailable
+    ForceVaapi, // Require VA-API JPEG; error if unavailable
+}
+```
+
+Controls which compute backend is used. `Auto` matches pre-v0.3.1 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active.
+
+---
+
+### `SessionConfig`
+
+```rust
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub policy: BackendPolicy,
+    pub vaapi_device: String,  // default: "/dev/dri/renderD128"
+}
+
+impl Default for SessionConfig { /* Auto policy, default DRM node */ }
+```
+
+Passed to `open_session`. Use `SessionConfig::default()` for the automatic behaviour. Set `vaapi_device` to override the VA-API DRM render node (useful when `/dev/dri/renderD128` is not the correct device on your system).
+
+---
+
 ### `RasterError`
 
 ```rust
@@ -201,10 +233,11 @@ pub enum RasterError {
     PageTooLarge { width: u32, height: u32 },
     Deskew(String),
     InvalidPageGeometry(String),
+    BackendUnavailable(String),  // forced backend failed to init
 }
 ```
 
-Implements `std::error::Error` with a `source()` chain. `RasterError::Pdf(e)` has `e` as its source for chained error reporting.
+Implements `std::error::Error` with a `source()` chain. `RasterError::Pdf(e)` has `e` as its source for chained error reporting. `BackendUnavailable` is only returned when `SessionConfig.policy` is `ForceCuda` or `ForceVaapi`.
 
 ---
 
