@@ -387,17 +387,16 @@ pub const fn byte_to_col(x: u8) -> i32 {
 ///
 /// # Panics
 ///
-/// Never panics in practice. The `expect` is a compile-time documentation
-/// device: `.clamp(0, 255)` makes the `try_from` infallible by construction.
+/// Never panics. Saturating add guards against i32 overflow on extreme inputs.
 #[inline]
 #[must_use]
 pub fn col_to_byte(x: i32) -> u8 {
-    // After clamp the value is guaranteed to be in [0, 255], so try_from
-    // always succeeds. We use expect rather than unwrap_or to make the
-    // infallibility explicit and to panic loudly (in debug builds) if the
-    // invariant were ever violated by a future refactor.
-    u8::try_from(((x + 0x80) >> 8).clamp(0, 255))
-        .expect("clamp(0, 255) guarantees value fits in u8")
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "clamp(0, 255) guarantees non-negative"
+    )]
+    let v = (x.saturating_add(0x80) >> 8).clamp(0, 255) as u8;
+    v
 }
 
 // ── Geometry rounding (matching SplashMath.h portable fallbacks) ──────────────
@@ -657,6 +656,14 @@ mod tests {
         // NaN — treated as non-positive (returns i32::MIN)
         assert_eq!(splash_floor(f64::NAN), i32::MIN);
         assert_eq!(splash_ceil(f64::NAN), i32::MIN);
+    }
+
+    #[test]
+    fn col_to_byte_clamps_extremes() {
+        assert_eq!(col_to_byte(0), 0u8);
+        assert_eq!(col_to_byte(0xffff), 255u8);
+        assert_eq!(col_to_byte(i32::MIN), 0u8);
+        assert_eq!(col_to_byte(i32::MAX), 255u8);
     }
 
     #[test]
