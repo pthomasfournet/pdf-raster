@@ -27,8 +27,11 @@
 //! 3. **`popcnt`**: 8 B/iter via the scalar hardware `POPCNT` instruction.
 //! 4. **Scalar**: `u8::count_ones` per byte.
 //!
-//! ## aarch64
-//! 1. **NEON `vcntq_u8`**: hardware byte popcount, 16 B/iter.
+//! ## aarch64 (most to least preferred)
+//! 1. **SVE2** (`nightly-sve2` feature + `sve2` target feature): `svcnt_u8_z` + `svaddv_u8`,
+//!    `svcntb()` B/iter (16 B on fixed-128 M4/Graviton4; up to 256 B on wide SVE2 cores).
+//!    Requires nightly Rust (`stdarch_aarch64_sve` feature gate) and `sve2` CPU feature.
+//! 2. **NEON `vcntq_u8`**: hardware byte popcount, 16 B/iter.
 //!    Result narrowed with `vpaddlq_u8` (→ u16) then summed with `vaddvq_u16`.
 //!    NEON is mandatory on all ARMv8-A cores; no runtime detection is needed.
 //!
@@ -40,8 +43,10 @@
 //! 2. **AVX2** (`avx2`): VPSHUFB nibble lookup, 64 output pixels per 32-byte iteration.
 //! 3. **Scalar**: byte-by-byte nibble lookup via `NIBBLE_POP` table.
 //!
-//! ## aarch64
-//! 1. **NEON**: nibble-isolated `vcntq_u8`, 32 output pixels per 16-byte iteration.
+//! ## aarch64 (most to least preferred)
+//! 1. **SVE2** (`nightly-sve2` feature + `sve2` target feature): nibble-isolated `svcnt_u8_z`,
+//!    `svcntb()*2` output pixels per iteration. Requires nightly Rust and `sve2` CPU feature.
+//! 2. **NEON**: nibble-isolated `vcntq_u8`, 32 output pixels per 16-byte iteration.
 //!    High/low nibbles extracted with `vshrq_n_u8` + `vandq_u8`; four-row
 //!    accumulation in u8 (max 16 ≤ 255); interleaved into `shape` via `vst2q_u8`.
 //!    NEON is mandatory on all ARMv8-A cores; no runtime detection is needed.
@@ -224,6 +229,160 @@ unsafe fn aa_coverage_span_neon(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
     let scalar_start = n_chunks * 32;
     if scalar_start < n {
         aa_coverage_span_scalar(rows, x0 + scalar_start, &mut shape[scalar_start..]);
+    }
+}
+
+// ── aarch64 SVE2 tiers ───────────────────────────────────────────────────────
+//
+// Requires:
+//   - Cargo feature `nightly-sve2`
+//   - Rust nightly (stdarch_aarch64_sve is not yet stable)
+//   - CPU `sve2` target feature at runtime
+//
+// On fixed-128-bit SVE2 (Apple M4, Graviton4 at 128b mode) svcntb() == 16,
+// giving the same throughput as NEON. On wide-SVE2 server chips (Graviton4 at
+// full width, Neoverse V2) svcntb() may be 32–64, giving 2–4× NEON throughput.
+
+#[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
+/// SVE2 tier for `popcnt_aa_row`.
+///
+/// Processes `svcntb()` bytes per iteration using `svcnt_u8_z` (the SVE2
+/// equivalent of NEON `vcntq_u8`) with the all-true predicate. On 128-bit SVE2
+/// (Apple M4, Graviton4 fixed width) this equals the NEON throughput; on wider
+/// server SVE2 implementations the vector length is larger.
+///
+/// # Safety
+///
+/// Caller must ensure the `sve2` CPU feature is available.
+#[target_feature(enable = "sve2")]
+unsafe fn popcnt_aa_row_sve2(row: &[u8]) -> u32 {
+    use std::arch::aarch64::{svaddv_u8, svcnt_u8_z, svcntb, svld1_u8, svptrue_b8};
+
+    // SAFETY: sve2 feature guaranteed by #[target_feature].
+    unsafe {
+        // svcntb() returns u64; aarch64 is always 64-bit so the cast to usize is lossless.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "aarch64 is 64-bit; svcntb() ≤ 256 fits in usize"
+        )]
+        let vl = svcntb() as usize; // bytes per SVE2 vector (16–256)
+        let pg = svptrue_b8(); // all-true predicate
+
+        let mut total = 0u32;
+        let mut i = 0usize;
+
+        while i + vl <= row.len() {
+            let v = svld1_u8(pg, row.as_ptr().add(i));
+            // svcnt_u8_z: popcount each byte lane, zeroing where predicate is false.
+            // With svptrue_b8() all lanes are active.
+            let cnt = svcnt_u8_z(pg, v);
+            // svaddv_u8: horizontal reduction to scalar u64.
+            // Max value: 256 lanes × 8 bits = 2048 ≤ u32::MAX.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "svaddv_u8 sum ≤ vl*8 ≤ 2048, fits in u32"
+            )]
+            {
+                total += svaddv_u8(pg, cnt) as u32;
+            }
+            i += vl;
+        }
+
+        // Scalar tail (< vl bytes remaining).
+        for &b in &row[i..] {
+            total += b.count_ones();
+        }
+        total
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
+/// SVE2 tier for `aa_coverage_span`.
+///
+/// Each SVE2 vector of `vl` row bytes encodes `vl * 2` output pixels as
+/// nibble pairs. High nibbles (even pixels) and low nibbles (odd pixels) are
+/// extracted and popcounted independently with `svcnt_u8_z`. The two result
+/// vectors are then scattered into `shape` by interleaving.
+///
+/// Odd `x0` is redirected to scalar by the caller (nibble boundaries are
+/// byte-aligned).
+///
+/// # Safety
+///
+/// Caller must ensure the `sve2` CPU feature is available.
+#[target_feature(enable = "sve2")]
+unsafe fn aa_coverage_span_sve2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
+    use std::arch::aarch64::{
+        svand_u8_z, svcnt_u8_z, svcntb, svdup_n_u8, svld1_u8, svlsr_u8_z, svptrue_b8, svst1_u8,
+    };
+
+    debug_assert!(x0 & 1 == 0, "aa_coverage_span_sve2: x0={x0} must be even");
+
+    // SAFETY: sve2 feature guaranteed by #[target_feature].
+    unsafe {
+        use std::arch::aarch64::svadd_u8_z;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "aarch64 is 64-bit; svcntb() ≤ 256 fits in usize"
+        )]
+        let vl = svcntb() as usize;
+        let pg = svptrue_b8();
+        let mask_lo = svdup_n_u8(0x0F);
+        let shift4 = svdup_n_u8(4u8);
+
+        let n = shape.len();
+        let (byte_x0, n_chunks) = coverage_chunk_params(x0, n, vl);
+
+        for chunk_idx in 0..n_chunks {
+            let byte_off = byte_x0 + chunk_idx * vl;
+
+            let zero = svdup_n_u8(0u8);
+            let mut acc_hi = zero;
+            let mut acc_lo = zero;
+
+            for row in rows {
+                assert!(
+                    byte_off + vl <= row.len(),
+                    "aa_coverage_span_sve2: row too short: \
+                     need {} bytes at offset {byte_off}, have {}",
+                    byte_off + vl,
+                    row.len(),
+                );
+                let v = svld1_u8(pg, row.as_ptr().add(byte_off));
+                // High nibble: logical shift right by 4, mask to low 4 bits.
+                let hi = svand_u8_z(pg, svlsr_u8_z(pg, v, shift4), mask_lo);
+                // Low nibble: mask directly.
+                let lo = svand_u8_z(pg, v, mask_lo);
+                acc_hi = svadd_u8_z(pg, acc_hi, svcnt_u8_z(pg, hi));
+                acc_lo = svadd_u8_z(pg, acc_lo, svcnt_u8_z(pg, lo));
+            }
+
+            // Write hi and lo vectors to staging buffers, then interleave into shape.
+            // Each source byte k → shape[out_base + k*2] (even) and shape[out_base + k*2+1] (odd).
+            let mut hi_buf = vec![0u8; vl];
+            let mut lo_buf = vec![0u8; vl];
+            svst1_u8(pg, hi_buf.as_mut_ptr(), acc_hi);
+            svst1_u8(pg, lo_buf.as_mut_ptr(), acc_lo);
+
+            let out_base = chunk_idx * vl * 2;
+            for k in 0..vl {
+                let even_px = out_base + k * 2;
+                let odd_px = even_px + 1;
+                if even_px < n {
+                    shape[even_px] = hi_buf[k];
+                }
+                if odd_px < n {
+                    shape[odd_px] = lo_buf[k];
+                }
+            }
+        }
+
+        // Scalar remainder for pixels not covered by complete SVE2 chunks.
+        let scalar_start = n_chunks * vl * 2;
+        if scalar_start < n {
+            aa_coverage_span_scalar(rows, x0 + scalar_start, &mut shape[scalar_start..]);
+        }
     }
 }
 
@@ -588,6 +747,11 @@ fn dispatch_popcnt(row: &[u8]) -> u32 {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn dispatch_popcnt(row: &[u8]) -> u32 {
+    #[cfg(feature = "nightly-sve2")]
+    if std::arch::is_aarch64_feature_detected!("sve2") {
+        // SAFETY: sve2 feature confirmed present.
+        return unsafe { popcnt_aa_row_sve2(row) };
+    }
     // NEON is mandatory on all ARMv8-A targets (no runtime detection needed).
     // SAFETY: aarch64 always has NEON.
     unsafe { popcnt_aa_row_neon(row) }
@@ -644,8 +808,14 @@ fn dispatch_coverage(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
 #[inline]
 fn dispatch_coverage(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
     if x0 & 1 != 0 {
-        // Odd x0: fall back to scalar (NEON kernel requires even x0).
+        // Odd x0: nibble boundaries are byte-aligned; SIMD paths require even x0.
         aa_coverage_span_scalar(rows, x0, shape);
+        return;
+    }
+    #[cfg(feature = "nightly-sve2")]
+    if std::arch::is_aarch64_feature_detected!("sve2") {
+        // SAFETY: sve2 feature confirmed present.
+        unsafe { aa_coverage_span_sve2(rows, x0, shape) };
         return;
     }
     // NEON is mandatory on all ARMv8-A targets.
@@ -928,6 +1098,49 @@ mod tests {
         unsafe { aa_coverage_span_avx2([&r0, &r1, &r2, &r3], 0, &mut got) };
 
         assert_eq!(got, expected, "AVX2 coverage mismatch vs scalar");
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
+    #[test]
+    fn sve2_popcnt_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("sve2") {
+            return;
+        }
+        // 270 bytes — exercises full SVE2 chunks and a scalar remainder.
+        let row: Vec<u8> = (0u8..=255).chain(0u8..14).collect();
+        assert_eq!(row.len(), 270);
+        // SAFETY: sve2 confirmed present above.
+        let got = unsafe { popcnt_aa_row_sve2(&row) };
+        assert_eq!(got, popcnt_aa_row_scalar(&row), "SVE2 popcnt mismatch");
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
+    #[test]
+    fn sve2_coverage_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("sve2") {
+            return;
+        }
+        const N: usize = 300;
+        let row_bytes = N.div_ceil(2);
+        let r0: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let r1: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+            .collect();
+        let r2: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+
+        let mut expected = vec![0u8; N];
+        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+
+        let mut got = vec![0u8; N];
+        // SAFETY: sve2 confirmed present above.
+        unsafe { aa_coverage_span_sve2([&r0, &r1, &r2, &r3], 0, &mut got) };
+
+        assert_eq!(got, expected, "SVE2 coverage mismatch vs scalar");
     }
 
     #[cfg(target_arch = "aarch64")]

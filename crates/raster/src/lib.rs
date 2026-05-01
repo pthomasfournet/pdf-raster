@@ -1,3 +1,11 @@
+// Enable SVE2 intrinsics when the `nightly-sve2` feature is active.
+// This is a no-op on stable (the cfg is false); the feature gate only fires
+// on nightly when a caller explicitly opts in with `--features nightly-sve2`.
+#![cfg_attr(
+    all(target_arch = "aarch64", feature = "nightly-sve2"),
+    feature(stdarch_aarch64_sve)
+)]
+
 //! # raster
 //!
 //! Pure software rasterizer for PDF page content — no I/O, no PDF parsing,

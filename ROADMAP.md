@@ -142,7 +142,7 @@ Targeted use of AVX-512 extensions that LLVM does not auto-vectorize to. All pat
 
 - [x] **`avx512bw` ICC CMYK→RGB matrix** (`gpu/src/lib.rs`, `cmyk_to_rgb_avx512`) — processes 16 pixels per call using `_mm256_mullo_epi16` u16 arithmetic. VNNI (`_mm512_dpbusds_epi32`) was ruled out: it requires one operand to be compile-time constant weights, but the subtractive formula `(255−C)*(255−K)/255` has both operands as runtime pixel data. AoS→SoA via `_mm512_shuffle_epi8` gather + `permute4x64` + `shuffle_epi8` compact; exact `⌊(x+127)/255⌋` divide via `(n+(n>>8)+1)>>8`. Scalar fallback for tail and non-AVX-512 targets.
 
-- [ ] **`cat_l3` / `cdp_l3` cache partitioning** — deployment note: Linux `resctrl` to reserve a fixed L3 partition for edge tables in batch/server context.
+- [x] **`cat_l3` / `cdp_l3` cache partitioning** — deployment note documented in `ROADMAP_INTEL.md` (Deployment notes section): `resctrl` on Xeon/EPYC; not available on Intel consumer CPUs; no code change required.
 
 ---
 

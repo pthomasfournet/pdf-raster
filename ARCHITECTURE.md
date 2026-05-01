@@ -153,12 +153,13 @@ into the parent using the group's blend mode and opacity. Knockout groups suppor
 **SIMD module** (`simd/`)
 Per-arch dispatch helpers; each arch gets its own function, not a cfg/return chain:
 ```
-blend_solid_rgb8 / blend_solid_gray8  (movdir64b → AVX2 → scalar → NEON)
-composite_aa_rgb8                     (AVX-512 → scalar → NEON)
-popcnt_aa_row                         (AVX-512 VPOPCNTDQ → popcnt → NEON → scalar)
-aa_coverage_span                      (AVX-512 BITALG → NEON → scalar)
-unpack_mono_row                       (SSE2 → scalar)
+blend_solid_rgb8 / blend_solid_gray8  (movdir64b → AVX2 → NEON → scalar)
+composite_aa_rgb8                     (AVX-512 → scalar)
+popcnt_aa_row                         (AVX-512 VPOPCNTDQ → AVX2 → popcnt → SVE2 → NEON → scalar)
+aa_coverage_span                      (AVX-512 BITALG → AVX2 → SVE2 → NEON → scalar)
+unpack_mono_row                       (SSE2 → NEON → scalar)
 ```
+SVE2 tier requires `nightly-sve2` Cargo feature (nightly Rust + `stdarch_aarch64_sve`).
 
 **Parallel fill** (feature: `rayon`)
 `fill_parallel` / `eo_fill_parallel` split the bitmap into horizontal bands above
@@ -267,9 +268,10 @@ as `cudarc` modules. Shared via `Arc<GpuCtx>`.
 **CPU fallbacks** — every GPU function has a pure-Rust CPU counterpart. The
 dispatch logic is in the same function; the threshold is the only branch.
 
-**CMYK CPU path** — AVX-512 (avx512f+avx512bw, compile-time gate) or scalar.
-On x86 without AVX-512 (all Intel consumer), only the scalar path fires today.
-An AVX2 tier is planned (ROADMAP_INTEL.md §A4).
+**CMYK CPU path** — three tiers: AVX-512 (`avx512f+avx512bw`, runtime detection),
+AVX2 (`_mm256_mullo_epi16`, runtime detection), scalar. All three are compiled in
+on x86-64; the correct tier is selected at runtime. ARM uses `vmull_u8` + `vshrn_n_u16`
+(NEON, always-on on aarch64).
 
 ### 3.7 `pdf_raster`
 
@@ -325,6 +327,7 @@ gpu-validation     →                    →                    → gpu-validat
 raster features (orthogonal, no cross-crate effect):
   simd-avx2        default on; enables blend/fill AVX2 paths
   simd-avx512      implies simd-avx2; adds VPOPCNTDQ AA counter
+  nightly-sve2     aarch64 only; SVE2 popcount tier (requires nightly Rust)
   rayon            enables fill_parallel / eo_fill_parallel
 ```
 
@@ -347,7 +350,12 @@ pub fn popcnt_aa_row(row: &[u8]) -> u32 { dispatch_popcnt(row) }
 fn dispatch_popcnt(row: &[u8]) -> u32 { /* avx512 → popcnt → scalar */ }
 
 #[cfg(target_arch = "aarch64")]
-fn dispatch_popcnt(row: &[u8]) -> u32 { unsafe { popcnt_aa_row_neon(row) } }
+fn dispatch_popcnt(row: &[u8]) -> u32 {
+    // SVE2 tier above NEON when `nightly-sve2` feature is active
+    #[cfg(feature = "nightly-sve2")]
+    if is_aarch64_feature_detected!("sve2") { return unsafe { popcnt_aa_row_sve2(row) }; }
+    unsafe { popcnt_aa_row_neon(row) }
+}
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn dispatch_popcnt(row: &[u8]) -> u32 { popcnt_aa_row_scalar(row) }
@@ -355,15 +363,17 @@ fn dispatch_popcnt(row: &[u8]) -> u32 { popcnt_aa_row_scalar(row) }
 
 ### Coverage by operation and platform
 
-| Operation | File | Ryzen (AVX-512) | Intel consumer (AVX2) | ARM (NEON) |
-|---|---|---|---|---|
-| AA row popcount | `raster/simd/popcnt.rs` | VPOPCNTDQ | scalar | `vcntq_u8` ✓ |
-| AA coverage span | `raster/simd/popcnt.rs` | BITALG | scalar | `vcntq_u8` + `vst2q_u8` ✓ |
-| Solid fill (RGB) | `raster/simd/blend.rs` | `movdir64b` → AVX2 | AVX2 | pending |
-| Solid fill (Gray) | `raster/simd/blend.rs` | AVX2 | AVX2 | pending |
-| AA composite | `raster/simd/composite.rs` | AVX-512 | scalar | pending |
-| Glyph unpack | `raster/simd/glyph_unpack.rs` | SSE2 | SSE2 | pending |
-| CMYK→RGB | `gpu/src/cmyk.rs` | AVX-512 | scalar | pending |
+| Operation | File | Ryzen (AVX-512) | Intel consumer (AVX2) | ARM NEON | ARM SVE2 |
+|---|---|---|---|---|---|
+| AA row popcount | `raster/simd/popcnt.rs` | VPOPCNTDQ | AVX2 VPSHUFB | `vcntq_u8` | `svcnt_u8_z` † |
+| AA coverage span | `raster/simd/popcnt.rs` | BITALG | AVX2 VPSHUFB | `vcntq_u8` + `vst2q_u8` | `svcnt_u8_z` † |
+| Solid fill (RGB) | `raster/simd/blend.rs` | `movdir64b` → AVX2 | AVX2 | `vst3q_u8` | (NEON sufficient) |
+| Solid fill (Gray) | `raster/simd/blend.rs` | AVX2 | AVX2 | `vst1q_u8` | (NEON sufficient) |
+| AA composite | `raster/simd/composite.rs` | AVX-512 | scalar | scalar | scalar |
+| Glyph unpack | `raster/simd/glyph_unpack.rs` | SSE2 | SSE2 | `vtstq_u8` | (NEON sufficient) |
+| CMYK→RGB | `gpu/src/cmyk.rs` | AVX-512 | AVX2 | `vmull_u8` + `vshrn_n_u16` | (NEON sufficient) |
+
+† SVE2 tier requires `nightly-sve2` Cargo feature.
 
 ### Key platform facts
 
@@ -372,8 +382,9 @@ fn dispatch_popcnt(row: &[u8]) -> u32 { popcnt_aa_row_scalar(row) }
   disabled on Arrow Lake; disabled by microcode on Raptor. No current Intel consumer
   CPU has usable AVX-512 — Xeon only.
 - `movdir64b` is present on i9-14900K and Core Ultra 9 285K; absent on i7-8700K.
-- The AVX2 popcount tier (VPSHUFB trick) for AA coverage is the highest-value
-  pending Intel work item.
+- The AVX2 popcount tier (VPSHUFB trick) for AA coverage is implemented
+  (`popcnt_aa_row_avx2`, `aa_coverage_span_avx2`). All Intel consumer CPUs now
+  have a vectorised path.
 
 **ARM / aarch64**
 - NEON is mandatory on all ARMv8-A. No runtime detection needed — `#[cfg(target_arch = "aarch64")]` is sufficient.
@@ -381,7 +392,10 @@ fn dispatch_popcnt(row: &[u8]) -> u32 { popcnt_aa_row_scalar(row) }
   Never use `__builtin_popcountll` on ARM — it compiles to a software sequence.
 - `STNP` is an allocation hint only, not a cache-bypass guarantee. For zero-fill use
   `DC ZVA` (zeros full cacheline without read). For non-zero solid fill: `vst1q_u8`.
-- Apple M4 has SVE (128-bit fixed width) — effectively a NEON alias for our workloads.
+- Apple M4 has SVE2 (128-bit fixed width). An SVE2 popcount tier is implemented
+  behind the `nightly-sve2` feature (`svcnt_u8_z` + `svadd_u8_z`). At 128-bit
+  width it matches NEON throughput; on wide-SVE2 server chips (Graviton4 full
+  width) it gives up to 4× NEON throughput.
 
 ### iGPU / integrated compute
 
