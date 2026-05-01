@@ -220,6 +220,11 @@ pub struct PageRenderer<'doc> {
     /// Present when `gpu-aa` or `gpu-icc` features are enabled.
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     gpu_ctx: Option<Arc<GpuCtx>>,
+    /// Per-page cache of baked ICC CMYK→RGB CLUT tables.  Keyed by a hash of the
+    /// raw ICC profile bytes so that repeated images sharing the same profile (the
+    /// common case in press PDFs) only pay the bake cost once per page.
+    #[cfg(feature = "gpu-icc")]
+    icc_clut_cache: crate::resources::image::IccClutCache,
 }
 
 impl<'doc> PageRenderer<'doc> {
@@ -305,6 +310,8 @@ impl<'doc> PageRenderer<'doc> {
             nvjpeg2k: None,
             #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
             gpu_ctx: None,
+            #[cfg(feature = "gpu-icc")]
+            icc_clut_cache: crate::resources::image::IccClutCache::new(),
         }
     }
 
@@ -709,6 +716,8 @@ impl<'doc> PageRenderer<'doc> {
                     self.nvjpeg2k.as_mut(),
                     #[cfg(feature = "gpu-icc")]
                     self.gpu_ctx.as_deref(),
+                    #[cfg(feature = "gpu-icc")]
+                    Some(&mut self.icc_clut_cache),
                 ) {
                     self.blit_image(&img);
                 } else {
@@ -1527,6 +1536,8 @@ impl<'doc> PageRenderer<'doc> {
             self.nvjpeg2k.as_mut(),
             #[cfg(feature = "gpu-icc")]
             self.gpu_ctx.as_deref(),
+            #[cfg(feature = "gpu-icc")]
+            Some(&mut self.icc_clut_cache),
         );
         if let Some(img) = img {
             self.blit_image(&img);

@@ -19,6 +19,9 @@ use gpu::vaapi::VapiJpegDecoder;
 #[cfg(feature = "gpu-icc")]
 use gpu::GpuCtx;
 
+#[cfg(feature = "gpu-icc")]
+use super::icc::IccClutCache;
+
 #[cfg(test)]
 use super::ImageColorSpace;
 
@@ -42,6 +45,11 @@ use super::ImageColorSpace;
 ///
 /// Returns `None` if the parameter block is unparseable, dimensions are
 /// degenerate, or the filter is unsupported.
+#[expect(
+    clippy::too_many_lines,
+    reason = "GPU dispatch paths (nvjpeg, vaapi) plus all filter branches are each short; \
+              combining them in one function keeps the fallback logic visible"
+)]
 #[must_use]
 pub fn decode_inline_image(
     doc: &Document,
@@ -51,6 +59,7 @@ pub fn decode_inline_image(
     #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
     let dict = parse_inline_params(params);
 
@@ -83,6 +92,8 @@ pub fn decode_inline_image(
             &dict,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         Some("FlateDecode") => {
             use lopdf::Stream;
@@ -98,6 +109,8 @@ pub fn decode_inline_image(
                     &dict,
                     #[cfg(feature = "gpu-icc")]
                     gpu_ctx,
+                    #[cfg(feature = "gpu-icc")]
+                    clut_cache,
                 ),
                 Err(e) => {
                     log::warn!("inline image: FlateDecode failed: {e}");
@@ -122,6 +135,8 @@ pub fn decode_inline_image(
                 vaapi,
                 #[cfg(feature = "gpu-icc")]
                 gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
             )
         }
         Some("JPXDecode") => {
@@ -150,6 +165,8 @@ pub fn decode_inline_image(
                 &dict,
                 #[cfg(feature = "gpu-icc")]
                 gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
             )
         }
         Some(other) => {
@@ -499,6 +516,8 @@ mod tests {
             None,
             #[cfg(feature = "gpu-icc")]
             None,
+            #[cfg(feature = "gpu-icc")]
+            None,
         )
         .expect("decode should succeed");
         assert_eq!(img.width, 2);
@@ -523,6 +542,8 @@ mod tests {
             #[cfg(feature = "vaapi")]
             None,
             #[cfg(feature = "nvjpeg2k")]
+            None,
+            #[cfg(feature = "gpu-icc")]
             None,
             #[cfg(feature = "gpu-icc")]
             None,
@@ -551,6 +572,8 @@ mod tests {
                 None,
                 #[cfg(feature = "gpu-icc")]
                 None,
+                #[cfg(feature = "gpu-icc")]
+                None,
             )
             .is_none()
         );
@@ -571,6 +594,8 @@ mod tests {
                 #[cfg(feature = "vaapi")]
                 None,
                 #[cfg(feature = "nvjpeg2k")]
+                None,
+                #[cfg(feature = "gpu-icc")]
                 None,
                 #[cfg(feature = "gpu-icc")]
                 None,

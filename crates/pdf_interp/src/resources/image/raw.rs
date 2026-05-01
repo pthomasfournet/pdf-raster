@@ -14,6 +14,8 @@ use crate::resources::dict_ext::DictExt as _;
 #[cfg(feature = "gpu-icc")]
 use super::colorspace::extract_icc_bytes;
 #[cfg(feature = "gpu-icc")]
+use super::icc::IccClutCache;
+#[cfg(feature = "gpu-icc")]
 use gpu::GpuCtx;
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -29,6 +31,14 @@ use gpu::GpuCtx;
 ///
 /// `Indexed` images with bpc 1/2/4 unpack the sub-byte palette indices first.
 /// CMYK images (bpc 8/16) are converted to RGB inline.
+#[cfg_attr(
+    feature = "gpu-icc",
+    expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct, non-groupable parameter; \
+                  the extra gpu-icc args push the count over the limit"
+    )
+)]
 pub(super) fn decode_raw(
     doc: &Document,
     data: &[u8],
@@ -37,6 +47,7 @@ pub(super) fn decode_raw(
     is_mask: bool,
     dict: &Dictionary,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
     let bpc = dict.get_i64(b"BitsPerComponent").unwrap_or(8);
 
@@ -100,6 +111,8 @@ pub(super) fn decode_raw(
                 gpu_ctx,
                 #[cfg(feature = "gpu-icc")]
                 icc_bytes.as_deref(),
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
             )
         }
         2 => decode_raw_8bpp(
@@ -111,6 +124,8 @@ pub(super) fn decode_raw(
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
             icc_bytes.as_deref(),
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         4 => decode_raw_8bpp(
             &expand_nbpp::<4>(data, width, height, resolved.components())?,
@@ -121,6 +136,8 @@ pub(super) fn decode_raw(
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
             icc_bytes.as_deref(),
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         8 => decode_raw_8bpp(
             data,
@@ -131,6 +148,8 @@ pub(super) fn decode_raw(
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
             icc_bytes.as_deref(),
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         16 => decode_raw_8bpp(
             &downsample_16bpp(data, width, height, resolved.components())?,
@@ -141,6 +160,8 @@ pub(super) fn decode_raw(
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
             icc_bytes.as_deref(),
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
@@ -204,6 +225,7 @@ fn decode_raw_8bpp(
     resolved: ResolvedCs,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
+    #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
     use super::codecs::cmyk_raw_to_rgb;
 
@@ -229,6 +251,8 @@ fn decode_raw_8bpp(
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
             icc_bytes,
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         )?;
         Some(ImageDescriptor {
             width,
@@ -344,6 +368,8 @@ mod tests {
             &dict,
             #[cfg(feature = "gpu-icc")]
             None,
+            #[cfg(feature = "gpu-icc")]
+            None,
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Gray);
@@ -364,6 +390,8 @@ mod tests {
             1,
             false,
             &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
             #[cfg(feature = "gpu-icc")]
             None,
         )
@@ -388,6 +416,8 @@ mod tests {
             &dict,
             #[cfg(feature = "gpu-icc")]
             None,
+            #[cfg(feature = "gpu-icc")]
+            None,
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Mask);
@@ -408,6 +438,8 @@ mod tests {
             1,
             false,
             &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
             #[cfg(feature = "gpu-icc")]
             None,
         )
@@ -433,6 +465,8 @@ mod tests {
                 false,
                 &dict,
                 #[cfg(feature = "gpu-icc")]
+                None,
+                #[cfg(feature = "gpu-icc")]
                 None
             )
             .is_none()
@@ -454,6 +488,8 @@ mod tests {
             1,
             false,
             &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
             #[cfg(feature = "gpu-icc")]
             None,
         )
@@ -478,6 +514,8 @@ mod tests {
             1,
             false,
             &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
             #[cfg(feature = "gpu-icc")]
             None,
         )

@@ -11,9 +11,19 @@
 /// and produces a 17^4 × 3 = 250 563-byte table. 33 nodes give higher accuracy
 /// at 33^4 × 3 ≈ 3.4 MB — too large for L2 residency on most GPUs.
 /// Default is 17, matching the ICC/PDF standard minimum.
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+use std::sync::Arc;
+
 use moxcms::{CmsError, ColorProfile, Layout, TransformOptions};
 
 pub const DEFAULT_GRID_N: u32 = 17;
+
+/// Per-page cache of baked CMYK CLUT tables, keyed by a hash of the raw ICC profile bytes.
+///
+/// Most press PDFs embed the same profile in every image, so the first image pays the bake cost
+/// (a few ms) and all subsequent images get an `Arc` clone.
+pub type IccClutCache = HashMap<u64, Arc<[u8]>>;
 
 /// Error returned by [`bake_cmyk_clut`].
 #[derive(Debug)]
@@ -165,6 +175,36 @@ pub fn bake_cmyk_clut(icc_bytes: &[u8], grid_n: u32) -> Result<Vec<u8>, BakeErro
         }
     }
 
+    Ok(table)
+}
+
+/// Hash `icc_bytes` to a `u64` key for use in [`IccClutCache`].
+fn hash_icc(icc_bytes: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    icc_bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Bake a CMYK ICC profile CLUT, returning a cached `Arc` when the same profile
+/// has already been baked during this page render.
+///
+/// On a cache hit the bake is skipped entirely.  On a miss the table is baked,
+/// stored in `cache`, and returned as an `Arc`.
+///
+/// # Errors
+///
+/// Propagates [`BakeError`] from [`bake_cmyk_clut`] on a cache miss.
+pub fn bake_cmyk_clut_cached(
+    icc_bytes: &[u8],
+    grid_n: u32,
+    cache: &mut IccClutCache,
+) -> Result<Arc<[u8]>, BakeError> {
+    let key = hash_icc(icc_bytes);
+    if let Some(arc) = cache.get(&key) {
+        return Ok(Arc::clone(arc));
+    }
+    let table: Arc<[u8]> = bake_cmyk_clut(icc_bytes, grid_n)?.into();
+    cache.insert(key, Arc::clone(&table));
     Ok(table)
 }
 

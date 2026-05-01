@@ -29,7 +29,7 @@ use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
 use gpu::GpuCtx;
 
 #[cfg(feature = "gpu-icc")]
-use super::icc;
+use super::icc::{self, IccClutCache};
 
 // ── CCITTFaxDecode ─────────────────────────────────────────────────────────────
 
@@ -388,6 +388,7 @@ pub(super) fn decode_dct(
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
     use zune_core::bytestream::ZCursor;
     use zune_core::colorspace::ColorSpace as ZColorSpace;
@@ -512,6 +513,8 @@ pub(super) fn decode_dct(
                 gpu_ctx,
                 #[cfg(feature = "gpu-icc")]
                 None,
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
             )?;
             Some(ImageDescriptor {
                 width: jw,
@@ -638,6 +641,7 @@ pub(super) fn cmyk_raw_to_rgb(
     pixels: &[u8],
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
+    #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<Vec<u8>> {
     // GPU path: delegate to GpuCtx which handles the dispatch-threshold check and
     // CPU fallback internally.  When ICC bytes are present, bake a CLUT for
@@ -645,15 +649,29 @@ pub(super) fn cmyk_raw_to_rgb(
     // baking fails (e.g. corrupt profile or wrong colour space).
     #[cfg(feature = "gpu-icc")]
     if let Some(ctx) = gpu_ctx {
-        let clut_data: Option<Vec<u8>> = icc_bytes.and_then(|bytes| {
-            icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
-                .map_err(|e| log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}"))
-                .ok()
+        let clut_arc: Option<std::sync::Arc<[u8]>> = icc_bytes.and_then(|bytes| {
+            clut_cache.map_or_else(
+                || {
+                    icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
+                        .map_err(|e| {
+                            log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
+                        })
+                        .ok()
+                        .map(std::convert::Into::into)
+                },
+                |cache| {
+                    icc::bake_cmyk_clut_cached(bytes, icc::DEFAULT_GRID_N, cache)
+                        .map_err(|e| {
+                            log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
+                        })
+                        .ok()
+                },
+            )
         });
 
         match ctx.icc_cmyk_to_rgb(
             pixels,
-            clut_data.as_deref().map(|t| (t, icc::DEFAULT_GRID_N)),
+            clut_arc.as_deref().map(|t| (t, icc::DEFAULT_GRID_N)),
         ) {
             Ok(rgb) => return Some(rgb),
             Err(e) => log::warn!("image: GPU CMYK→RGB failed, falling back to CPU: {e}"),

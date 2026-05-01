@@ -67,6 +67,9 @@ use gpu::GpuCtx;
 #[path = "../icc.rs"]
 pub(crate) mod icc;
 
+#[cfg(feature = "gpu-icc")]
+pub use icc::IccClutCache;
+
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
 /// Below this threshold transfer and decode setup overhead dominates and the
@@ -199,6 +202,11 @@ pub struct ImageDescriptor {
 /// - the object is not an image (`Subtype != Image`),
 /// - the filter is unsupported (a warning is logged), or
 /// - any decoding error occurs.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each filter variant is a short dispatch arm; combining them keeps the fallback \
+              chain visible in one place"
+)]
 #[must_use]
 pub fn resolve_image(
     doc: &Document,
@@ -208,6 +216,7 @@ pub fn resolve_image(
     #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+    #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
     use codecs::{decode_ccitt, decode_dct, decode_jbig2, decode_jpx};
     use raw::decode_raw;
@@ -252,6 +261,8 @@ pub fn resolve_image(
             &stream.dict,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         Some("FlateDecode") => match stream.decompressed_content() {
             Ok(data) => decode_raw(
@@ -263,6 +274,8 @@ pub fn resolve_image(
                 &stream.dict,
                 #[cfg(feature = "gpu-icc")]
                 gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
             ),
             Err(e) => {
                 log::warn!("image: FlateDecode decompression failed: {e}");
@@ -283,6 +296,8 @@ pub fn resolve_image(
             vaapi,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         ),
         Some("JPXDecode") => {
             #[cfg(feature = "nvjpeg2k")]

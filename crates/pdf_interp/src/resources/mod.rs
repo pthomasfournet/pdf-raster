@@ -258,6 +258,7 @@ impl<'doc> PageResources<'doc> {
         #[cfg(feature = "vaapi")] vaapi: Option<&mut gpu::vaapi::VapiJpegDecoder>,
         #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut gpu::nvjpeg2k::NvJpeg2kDecoder>,
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
+        #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut image::IccClutCache>,
     ) -> Option<image::ImageDescriptor> {
         let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
         image::resolve_image(
@@ -272,6 +273,8 @@ impl<'doc> PageResources<'doc> {
             gpu_j2k,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
+            #[cfg(feature = "gpu-icc")]
+            clut_cache,
         )
     }
 
