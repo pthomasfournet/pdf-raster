@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-05-01
+
+### Bug Fixes
+
+- Fix three CI failures — rustfmt, SVE2 unsafe blocks, aarch64 dead_code
+- Hardening pass on image submodules — 17 bugs fixed
+- Hardening pass round 2 — 8 bugs fixed
+- Hardening pass — 6 bugs fixed
+- 3 correctness bugs + bench hardening
+
+### Chores
+
+- Cargo fmt --all
+- Remove unused smallvec dependency
+- Remove unused proptest/tempfile dependencies; fix golden tempdir
+
+### Documentation
+
+- Update all docs for v0.2.0 — ARM/aarch64 and VA-API now supported
+- Add proptest testing strategy section
+- Pre-release documentation update for v0.3.0
+
+### Features
+
+- Add cargo-fuzz targets for CCITTFaxDecode and JBIG2Decode
+- Name rayon workers and increase stack size to 8 MiB
+
+### Other
+
+- Cargo fmt
+
+### Performance
+
+- Use Compression::Fast for PNG output
+- Cache baked CMYK CLUT tables per page render
+- Panic=abort, inline(always) on transfer hot path, black_box bench
+
+### Refactor
+
+- Replace match-with-return-arm with let-else
+- Replace #[allow] with #[expect] throughout
+- Replace DashMap+lru with quick_cache for glyph cache
+- Split 1500-line image/mod.rs into focused submodules
+
 ## [0.2.0] - 2026-05-01
 
 ### Bug Fixes
@@ -18,6 +62,8 @@ All notable changes to this project will be documented in this file.
 - Add versioning tooling — cargo-release + git-cliff
 - Gitignore ROADMAP_INTEL.md
 - Cargo fmt
+- Update CHANGELOG.md and release config for v0.2.0
+- Release v0.2.0
 
 ### Documentation
 
