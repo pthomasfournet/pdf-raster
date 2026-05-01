@@ -545,3 +545,36 @@ Phase 6 closes the remaining gaps before the first production integration.
   and `NvJpeg2kDecoder::new` maps it to `NvJpeg2kError::CudaError(code)`.
   The module is unconditionally compiled; `#[cfg_attr]` guards suppress dead-code
   lints when neither GPU feature is active.
+
+---
+
+## Testing strategy
+
+### proptest — property-based testing for geometric primitives
+
+`proptest` is the right tool for algorithmic correctness in the raster and path layers.
+Shrinking finds the minimal failing input automatically, which is valuable for geometric
+edge cases that are hard to construct by hand.
+
+**High-value targets:**
+
+| Area | What to test | Why |
+|---|---|---|
+| Path flattening | Arbitrary Bézier control points including degenerate (coincident, collinear, zero-length) | Recursive subdivision blows the stack or produces NaN coordinates on degenerate input |
+| Clipping | Random clip rect × path combinations; assert output is subset of input bbox | Clip intersection logic has winding-number edge cases |
+| Transformation matrix composition | Arbitrary CTM chains; assert round-trip inverse within ε | Accumulated floating-point error in nested Form XObjects |
+| `cmyk_to_rgb_reflectance` | All 256⁴ is too large; proptest over random (C,M,Y,K) tuples; assert output ∈ [0,255]³ | Overflow/underflow in the subtractive formula |
+| `grid_to_u8` in icc.rs | `i ∈ [0, grid_n-1]`, assert endpoints map exactly to 0 and 255 | Off-by-one at boundary nodes corrupts CLUT edges |
+
+**Where fuzzing beats proptest** (already covered by `crates/fuzz`):
+
+- PDF stream parsing — coverage-guided fuzzing finds parser bugs that proptest's
+  random generation misses; shrinking is less valuable when the bug is a specific
+  byte sequence
+- CCITTFaxDecode / JBIG2Decode — malformed bitstreams need coverage guidance, not
+  algebraic shrinking
+
+**To add proptest:** reinstate `proptest = { workspace = true }` in the relevant
+crate's `[dev-dependencies]` when writing the tests. The workspace declaration was
+removed (commit 4334283) because it was unused; add it back alongside the actual
+test code.
