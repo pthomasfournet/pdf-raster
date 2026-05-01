@@ -438,7 +438,7 @@ pub fn splash_floor(x: f64) -> i32 {
     // exact-integer range. Casting to i64 is well-defined for any finite f64
     // whose magnitude fits in i64 (which covers all practical PDF coordinates).
     // The subsequent try_from saturates for the rare case of very large floats.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation, reason = "floor() result cast to i64; try_from saturates for out-of-range values on the next line")]
     let v = x.floor() as i64;
     i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
 }
@@ -469,7 +469,7 @@ pub fn splash_ceil(x: f64) -> i32 {
             i32::MIN
         };
     }
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation, reason = "ceil() result cast to i64; try_from saturates for out-of-range values on the next line")]
     let v = x.ceil() as i64;
     i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
 }

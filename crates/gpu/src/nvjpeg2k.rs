@@ -449,7 +449,7 @@ impl NvJpeg2k {
     /// # Errors
     ///
     /// Returns an error if parsing, decode, or memory allocation fails.
-    #[allow(clippy::too_many_lines)] // CUDA/FFI decode pipeline — phases are sequential and cannot be split without fragmenting the flow
+    #[expect(clippy::too_many_lines, reason = "CUDA/FFI decode pipeline — phases are sequential and cannot be split without fragmenting the flow")]
     fn decode(&mut self, data: &[u8], cu_stream: CUstream) -> Result<DecodedJpeg2k> {
         // Fast-path: the library returns BAD_JPEG (3) on empty input, but an FFI
         // call for a trivially-invalid input is unnecessary noise.
