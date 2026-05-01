@@ -42,6 +42,9 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
 
     debug_assert!(rgb.len() >= 48);
 
+    // All intrinsics in this body are unsafe; the caller is responsible for
+    // verifying avx512f+avx512bw, valid pointers, and minimum slice lengths.
+    // One block rather than per-call wrappers keeps the SIMD pipeline readable.
     unsafe {
         // Load all 16 CMYK pixels (64 bytes) into one 512-bit register.
         let raw: __m512i = _mm512_loadu_si512(cmyk.as_ptr().cast());
@@ -51,33 +54,33 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
         // to bytes 0..3 of the lane (zeros elsewhere), giving 4 lanes × 4 bytes =
         // 16 channel values spread across the 512-bit register.
         #[rustfmt::skip]
-        let mask_c: [u8; 64] = [
-            0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-        ];
+    let mask_c: [u8; 64] = [
+        0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        0, 4, 8,12, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+    ];
         #[rustfmt::skip]
-        let mask_m: [u8; 64] = [
-            1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-        ];
+    let mask_m: [u8; 64] = [
+        1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        1, 5, 9,13, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+    ];
         #[rustfmt::skip]
-        let mask_y: [u8; 64] = [
-            2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-        ];
+    let mask_y: [u8; 64] = [
+        2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        2, 6,10,14, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+    ];
         #[rustfmt::skip]
-        let mask_k: [u8; 64] = [
-            3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-            3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-        ];
+    let mask_k: [u8; 64] = [
+        3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+        3, 7,11,15, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+    ];
         let shuf_c: __m512i = _mm512_loadu_si512(mask_c.as_ptr().cast());
         let shuf_m: __m512i = _mm512_loadu_si512(mask_m.as_ptr().cast());
         let shuf_y: __m512i = _mm512_loadu_si512(mask_y.as_ptr().cast());
@@ -95,9 +98,9 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
         // unpacklo_epi64 joins the lo and hi halves → 16 contiguous u8.
         // cvtepu8_epi16 zero-extends to 16 u16.
         #[rustfmt::skip]
-        let compact2: [u8; 16] = [
-            0,1,2,3, 8,9,10,11, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-        ];
+    let compact2: [u8; 16] = [
+        0,1,2,3, 8,9,10,11, 0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
+    ];
         let compact2_128 = _mm_loadu_si128(compact2.as_ptr().cast());
 
         macro_rules! compact_to_u16 {
@@ -189,7 +192,7 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
             rgb[i * 3 + 1] = g_arr[i];
             rgb[i * 3 + 2] = b_arr[i];
         }
-    }
+    } // unsafe
 }
 
 // ── AVX2 CMYK→RGB ────────────────────────────────────────────────────────────
@@ -240,73 +243,75 @@ unsafe fn cmyk_to_rgb_avx2(cmyk: &[u8; 32], rgb: &mut [u8]) {
         k_arr[i] = cmyk[i * 4 + 3];
     }
 
-    // Load 8 u8 values via _mm_loadl_epi64 (64-bit load), then zero-extend to 8 × u16.
-    // SAFETY: arrays are exactly 8 bytes; _mm_loadl_epi64 reads 8 bytes with 1-byte alignment.
-    let c_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(c_arr.as_ptr().cast()) });
-    let m_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(m_arr.as_ptr().cast()) });
-    let y_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(y_arr.as_ptr().cast()) });
-    let k_u16 = _mm256_cvtepu8_epi16(unsafe { _mm_loadl_epi64(k_arr.as_ptr().cast()) });
-
-    // inv_ch = 255 − ch  (u16, max 255, no overflow)
-    let v255 = _mm256_set1_epi16(255_i16);
-    let inv_c = _mm256_sub_epi16(v255, c_u16);
-    let inv_m = _mm256_sub_epi16(v255, m_u16);
-    let inv_y = _mm256_sub_epi16(v255, y_u16);
-    let inv_k = _mm256_sub_epi16(v255, k_u16);
-
-    // prod = inv_ch * inv_k  (u16, max 255*255 = 65025 < 65536)
-    let prod_r = _mm256_mullo_epi16(inv_c, inv_k);
-    let prod_g = _mm256_mullo_epi16(inv_m, inv_k);
-    let prod_b = _mm256_mullo_epi16(inv_y, inv_k);
-
-    // Exact ⌊(x + 127) / 255⌋ = (n + (n>>8) + 1) >> 8, n = x + 127.
-    // Same identity as the AVX-512 path; valid for n ≤ 65152 (max 65025+127=65152 ✓).
-    let v127 = _mm256_set1_epi16(127_i16);
-    let v1 = _mm256_set1_epi16(1_i16);
-    macro_rules! div255 {
-        ($x:expr) => {{
-            let n = _mm256_add_epi16($x, v127);
-            _mm256_srli_epi16(
-                _mm256_add_epi16(_mm256_add_epi16(n, _mm256_srli_epi16(n, 8)), v1),
-                8,
-            )
-        }};
-    }
-    let r_u16 = div255!(prod_r);
-    let g_u16 = div255!(prod_g);
-    let b_u16 = div255!(prod_b);
-
-    // Narrow u16 → u8 via packus_epi16(v, v) then extract the low 64 bits.
-    // packus_epi16(v, v) → [v[0..7] v[0..7] | v[0..7] v[0..7]] in 256 bits.
-    // permute4x64(x, 0x88) packs the two unique 64-bit halves to the low 128 bits.
-    // _mm256_castsi256_si128 + _mm_storel_epi64 stores the 8 result bytes.
-    macro_rules! narrow8 {
-        ($v:expr) => {
-            _mm256_castsi256_si128(_mm256_permute4x64_epi64(
-                _mm256_packus_epi16($v, $v),
-                0x88_i32,
-            ))
-        };
-    }
-    let r8 = narrow8!(r_u16);
-    let g8 = narrow8!(g_u16);
-    let b8 = narrow8!(b_u16);
-
-    // Extract 8 bytes per channel and interleave into RGB output.
-    let mut r_arr = [0u8; 8];
-    let mut g_arr = [0u8; 8];
-    let mut b_arr = [0u8; 8];
-    // SAFETY: r_arr/g_arr/b_arr are exactly 8 bytes; _mm_storel_epi64 stores 8 bytes.
+    // All intrinsics below are unsafe; caller guarantees avx2, valid pointers, and slice bounds.
+    // One block keeps the SIMD pipeline readable rather than scattering per-call wrappers.
     unsafe {
+        // Load 8 u8 values via _mm_loadl_epi64 (64-bit load), then zero-extend to 8 × u16.
+        // Arrays are exactly 8 bytes; _mm_loadl_epi64 requires only 1-byte alignment.
+        let c_u16 = _mm256_cvtepu8_epi16(_mm_loadl_epi64(c_arr.as_ptr().cast()));
+        let m_u16 = _mm256_cvtepu8_epi16(_mm_loadl_epi64(m_arr.as_ptr().cast()));
+        let y_u16 = _mm256_cvtepu8_epi16(_mm_loadl_epi64(y_arr.as_ptr().cast()));
+        let k_u16 = _mm256_cvtepu8_epi16(_mm_loadl_epi64(k_arr.as_ptr().cast()));
+
+        // inv_ch = 255 − ch  (u16, max 255, no overflow)
+        let v255 = _mm256_set1_epi16(255_i16);
+        let inv_c = _mm256_sub_epi16(v255, c_u16);
+        let inv_m = _mm256_sub_epi16(v255, m_u16);
+        let inv_y = _mm256_sub_epi16(v255, y_u16);
+        let inv_k = _mm256_sub_epi16(v255, k_u16);
+
+        // prod = inv_ch * inv_k  (u16, max 255*255 = 65025 < 65536)
+        let prod_r = _mm256_mullo_epi16(inv_c, inv_k);
+        let prod_g = _mm256_mullo_epi16(inv_m, inv_k);
+        let prod_b = _mm256_mullo_epi16(inv_y, inv_k);
+
+        // Exact ⌊(x + 127) / 255⌋ = (n + (n>>8) + 1) >> 8, n = x + 127.
+        // Same identity as the AVX-512 path; valid for n ≤ 65152 (max 65025+127=65152 ✓).
+        let v127 = _mm256_set1_epi16(127_i16);
+        let v1 = _mm256_set1_epi16(1_i16);
+        macro_rules! div255 {
+            ($x:expr) => {{
+                let n = _mm256_add_epi16($x, v127);
+                _mm256_srli_epi16(
+                    _mm256_add_epi16(_mm256_add_epi16(n, _mm256_srli_epi16(n, 8)), v1),
+                    8,
+                )
+            }};
+        }
+        let r_u16 = div255!(prod_r);
+        let g_u16 = div255!(prod_g);
+        let b_u16 = div255!(prod_b);
+
+        // Narrow u16 → u8 via packus_epi16(v, v) then extract the low 64 bits.
+        // packus_epi16(v, v) → [v[0..7] v[0..7] | v[0..7] v[0..7]] in 256 bits.
+        // permute4x64(x, 0x88) packs the two unique 64-bit halves to the low 128 bits.
+        // _mm256_castsi256_si128 + _mm_storel_epi64 stores the 8 result bytes.
+        macro_rules! narrow8 {
+            ($v:expr) => {
+                _mm256_castsi256_si128(_mm256_permute4x64_epi64(
+                    _mm256_packus_epi16($v, $v),
+                    0x88_i32,
+                ))
+            };
+        }
+        let r8 = narrow8!(r_u16);
+        let g8 = narrow8!(g_u16);
+        let b8 = narrow8!(b_u16);
+
+        // Extract 8 bytes per channel and interleave into RGB output.
+        // Arrays are stack-allocated [u8; 8]; _mm_storel_epi64 stores exactly 8 bytes.
+        let mut r_arr = [0u8; 8];
+        let mut g_arr = [0u8; 8];
+        let mut b_arr = [0u8; 8];
         _mm_storel_epi64(r_arr.as_mut_ptr().cast(), r8);
         _mm_storel_epi64(g_arr.as_mut_ptr().cast(), g8);
         _mm_storel_epi64(b_arr.as_mut_ptr().cast(), b8);
-    }
-    for i in 0..8 {
-        rgb[i * 3] = r_arr[i];
-        rgb[i * 3 + 1] = g_arr[i];
-        rgb[i * 3 + 2] = b_arr[i];
-    }
+        for i in 0..8 {
+            rgb[i * 3] = r_arr[i];
+            rgb[i * 3 + 1] = g_arr[i];
+            rgb[i * 3 + 2] = b_arr[i];
+        }
+    } // unsafe
 }
 
 // ── ARM NEON CMYK→RGB ─────────────────────────────────────────────────────────
@@ -338,15 +343,14 @@ unsafe fn cmyk_to_rgb_avx2(cmyk: &[u8; 32], rgb: &mut [u8]) {
 #[target_feature(enable = "neon")]
 unsafe fn cmyk_to_rgb_neon(cmyk: &[u8; 32], rgb: &mut [u8]) {
     use std::arch::aarch64::{
-        uint8x8_t, uint8x8x3_t, uint16x8_t, vaddq_u16, vdup_n_u8, vld1_u8, vmull_u8, vshrn_n_u16,
-        vsraq_n_u16, vst3_u8, vsub_u8,
+        uint8x8_t, uint8x8x3_t, uint16x8_t, vaddq_u16, vdup_n_u8, vdupq_n_u16, vld1_u8, vmull_u8,
+        vshrn_n_u16, vsraq_n_u16, vst3_u8, vsub_u8,
     };
 
     debug_assert!(rgb.len() >= 24);
 
-    // Load 8 CMYK pixels (32 bytes) and deinterleave channels via scalar gather,
-    // then load each 8-element array into a NEON register. The bottleneck is
-    // multiply, not load; scalar gather at 8px/iter is negligible overhead.
+    // Scalar gather: deinterleave 8 CMYK pixels into per-channel arrays.
+    // Bottleneck is multiply; gather at 8px/iter is negligible overhead.
     let mut c_arr = [0u8; 8];
     let mut m_arr = [0u8; 8];
     let mut y_arr = [0u8; 8];
@@ -358,55 +362,52 @@ unsafe fn cmyk_to_rgb_neon(cmyk: &[u8; 32], rgb: &mut [u8]) {
         k_arr[i] = cmyk[i * 4 + 3];
     }
 
-    // vld1_u8 is the 64-bit (8-byte) load; vld1q_u8 would read 16 bytes from
-    // an 8-byte array, which is UB.  vdup_n_u8 avoids the load entirely for
-    // the constant 255 vector.
-    // SAFETY: each array is exactly 8 bytes; vld1_u8 requires only 1-byte alignment.
-    let v255: uint8x8_t = vdup_n_u8(255);
-    let c_v: uint8x8_t = unsafe { vld1_u8(c_arr.as_ptr()) };
-    let m_v: uint8x8_t = unsafe { vld1_u8(m_arr.as_ptr()) };
-    let y_v: uint8x8_t = unsafe { vld1_u8(y_arr.as_ptr()) };
-    let k_v: uint8x8_t = unsafe { vld1_u8(k_arr.as_ptr()) };
+    // All intrinsics below are unsafe; caller guarantees neon and valid slice bounds.
+    // One block keeps the SIMD pipeline readable rather than scattering per-call wrappers.
+    unsafe {
+        // vld1_u8 is the 64-bit (8-byte) load; vld1q_u8 would read 16 bytes, which is UB here.
+        // vdup_n_u8 / vdupq_n_u16 splat scalar constants without any memory access.
+        // Each c/m/y/k array is exactly 8 bytes; vld1_u8 requires only 1-byte alignment.
+        let v255: uint8x8_t = vdup_n_u8(255);
+        let c_v: uint8x8_t = vld1_u8(c_arr.as_ptr());
+        let m_v: uint8x8_t = vld1_u8(m_arr.as_ptr());
+        let y_v: uint8x8_t = vld1_u8(y_arr.as_ptr());
+        let k_v: uint8x8_t = vld1_u8(k_arr.as_ptr());
 
-    // inv_ch = 255 − ch. vsub_u8 wraps on underflow; ch ≤ 255 so no underflow.
-    let inv_c: uint8x8_t = vsub_u8(v255, c_v);
-    let inv_m: uint8x8_t = vsub_u8(v255, m_v);
-    let inv_y: uint8x8_t = vsub_u8(v255, y_v);
-    let inv_k: uint8x8_t = vsub_u8(v255, k_v);
+        // inv_ch = 255 − ch. vsub_u8 wraps on underflow; ch ≤ 255 so no underflow.
+        let inv_c: uint8x8_t = vsub_u8(v255, c_v);
+        let inv_m: uint8x8_t = vsub_u8(v255, m_v);
+        let inv_y: uint8x8_t = vsub_u8(v255, y_v);
+        let inv_k: uint8x8_t = vsub_u8(v255, k_v);
 
-    // prod = inv_ch * inv_k, widened to u16. max = 255*255 = 65025 < 65536 ✓.
-    let prod_r: uint16x8_t = vmull_u8(inv_c, inv_k);
-    let prod_g: uint16x8_t = vmull_u8(inv_m, inv_k);
-    let prod_b: uint16x8_t = vmull_u8(inv_y, inv_k);
+        // prod = inv_ch * inv_k, widened to u16. max = 255*255 = 65025 < 65536 ✓.
+        let prod_r: uint16x8_t = vmull_u8(inv_c, inv_k);
+        let prod_g: uint16x8_t = vmull_u8(inv_m, inv_k);
+        let prod_b: uint16x8_t = vmull_u8(inv_y, inv_k);
 
-    // Exact ⌊(x + 127) / 255⌋ = (n + (n>>8) + 1) >> 8, n = x + 127.
-    // vsraq_n_u16(a, b, n) = a + (b >> n); gives n + (n>>8) in one instruction.
-    let v127: uint16x8_t = unsafe {
-        let a = [127u16; 8];
-        std::arch::aarch64::vld1q_u16(a.as_ptr())
-    };
-    let v1: uint16x8_t = unsafe {
-        let a = [1u16; 8];
-        std::arch::aarch64::vld1q_u16(a.as_ptr())
-    };
+        // Exact ⌊(x + 127) / 255⌋ = (n + (n>>8) + 1) >> 8, n = x + 127.
+        // vsraq_n_u16(a, b, n) = a + (b >> n); gives n + (n>>8) in one instruction.
+        let v127: uint16x8_t = vdupq_n_u16(127);
+        let v1: uint16x8_t = vdupq_n_u16(1);
 
-    macro_rules! div255 {
-        ($prod:expr) => {{
-            let n: uint16x8_t = vaddq_u16($prod, v127);
-            let shifted: uint16x8_t = vsraq_n_u16(n, n, 8);
-            let rounded: uint16x8_t = vaddq_u16(shifted, v1);
-            vshrn_n_u16(rounded, 8)
-        }};
-    }
+        macro_rules! div255 {
+            ($prod:expr) => {{
+                let n: uint16x8_t = vaddq_u16($prod, v127);
+                let shifted: uint16x8_t = vsraq_n_u16(n, n, 8);
+                let rounded: uint16x8_t = vaddq_u16(shifted, v1);
+                vshrn_n_u16(rounded, 8)
+            }};
+        }
 
-    let r8: uint8x8_t = div255!(prod_r);
-    let g8: uint8x8_t = div255!(prod_g);
-    let b8: uint8x8_t = div255!(prod_b);
+        let r8: uint8x8_t = div255!(prod_r);
+        let g8: uint8x8_t = div255!(prod_g);
+        let b8: uint8x8_t = div255!(prod_b);
 
-    // vst3_u8 interleaves three uint8x8_t into 24 bytes of packed RGB.
-    let out = uint8x8x3_t(r8, g8, b8);
-    // SAFETY: rgb.len() >= 24 (debug_assert above); pointer is valid.
-    unsafe { vst3_u8(rgb.as_mut_ptr(), out) };
+        // vst3_u8 interleaves three uint8x8_t into 24 bytes of packed RGB.
+        // rgb.len() >= 24 (debug_assert above); pointer is valid.
+        let out = uint8x8x3_t(r8, g8, b8);
+        vst3_u8(rgb.as_mut_ptr(), out);
+    } // unsafe
 }
 
 // ── Scalar CMYK→RGB ───────────────────────────────────────────────────────────
