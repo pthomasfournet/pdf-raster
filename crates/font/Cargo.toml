@@ -11,11 +11,16 @@ color    = { path = "../color" }
 raster   = { path = "../raster" }
 # freetype-rs 0.38 wraps FreeType 2.x with a safe API; the system library
 # is linked via pkg-config (libfreetype-dev must be installed).
-freetype-rs = "0.38"
+freetype-rs = { version = "0.38", default-features = false }
 # quick_cache gives a sharded concurrent LRU cache where reads do not
 # require write locks (unlike dashmap + lru::LruCache, where get() takes
 # &mut self and therefore serializes reads within each shard).
 quick_cache = "0.6.21"
+
+[features]
+# Build FreeType from source instead of linking the system library.
+# Required for cross-compilation (CI aarch64 check) and static builds.
+bundled = ["freetype-rs/bundled"]
 
 [lints]
 workspace = true

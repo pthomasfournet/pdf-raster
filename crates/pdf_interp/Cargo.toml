@@ -31,6 +31,8 @@ gpu-aa  = ["dep:gpu"]
 # Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU subtractive complement
 # when no GPU context is set or the image is below the dispatch threshold.
 gpu-icc = ["dep:gpu"]
+# Build FreeType from source (cross-compilation, static builds).
+bundled = ["font/bundled"]
 
 [dependencies]
 raster = { path = "../raster" }

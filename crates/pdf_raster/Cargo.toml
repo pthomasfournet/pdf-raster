@@ -27,6 +27,8 @@ gpu-icc = ["dep:gpu", "pdf_interp/gpu-icc"]
 gpu-deskew = ["dep:gpu", "gpu/gpu-deskew"]
 # Enable GPU vs CPU parity tests (requires a CUDA device at test time).
 gpu-validation = ["gpu/gpu-validation"]
+# Build FreeType from source (cross-compilation, static builds).
+bundled = ["pdf_interp/bundled"]
 
 [dependencies]
 pdf_interp  = { path = "../pdf_interp" }
