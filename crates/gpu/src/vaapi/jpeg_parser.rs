@@ -275,7 +275,9 @@ impl JpegHeaders {
                     // Scan data runs from here to the EOI marker (last 0xFF 0xD9).
                     let eoi_pos = data.windows(2).rposition(|w| w == [0xFF, 0xD9]);
                     if eoi_pos.is_none() {
-                        log::warn!("VA-API JPEG parser: no EOI marker found — stream may be truncated");
+                        log::warn!(
+                            "VA-API JPEG parser: no EOI marker found — stream may be truncated"
+                        );
                     }
                     let eoi = eoi_pos.unwrap_or(data.len());
                     scan_data_size = eoi.saturating_sub(pos);

@@ -54,6 +54,14 @@
 // ── Scalar helpers ────────────────────────────────────────────────────────────
 
 /// Count set bits in `row` one byte at a time.
+// On aarch64 the NEON dispatch always runs; scalar is only used in tests.
+#[cfg_attr(
+    target_arch = "aarch64",
+    expect(
+        dead_code,
+        reason = "aarch64 dispatch uses NEON; scalar is test-only on this arch"
+    )
+)]
 #[inline]
 pub(super) fn popcnt_aa_row_scalar(row: &[u8]) -> u32 {
     row.iter().map(|b| b.count_ones()).sum()
@@ -274,7 +282,8 @@ unsafe fn popcnt_aa_row_sve2(row: &[u8]) -> u32 {
     let mut i = 0usize;
 
     while i + vl <= row.len() {
-        let v = svld1_u8(pg, row.as_ptr().add(i));
+        // SAFETY: caller guarantees sve2 is available; ptr is in-bounds (loop guard).
+        let v = unsafe { svld1_u8(pg, row.as_ptr().add(i)) };
         // svcnt_u8_z: popcount each byte lane with all-true predicate.
         let cnt = svcnt_u8_z(pg, v);
         // svaddv_u8: horizontal reduction to scalar u64.
@@ -350,7 +359,8 @@ unsafe fn aa_coverage_span_sve2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
                 byte_off + vl,
                 row.len(),
             );
-            let v = svld1_u8(pg, row.as_ptr().add(byte_off));
+            // SAFETY: caller guarantees sve2 is available; ptr is in-bounds (assert above).
+            let v = unsafe { svld1_u8(pg, row.as_ptr().add(byte_off)) };
             // High nibble: shift right 4, mask to low 4 bits.
             let hi = svand_u8_z(pg, svlsr_u8_z(pg, v, shift4), mask_lo);
             // Low nibble: mask directly.
@@ -362,8 +372,11 @@ unsafe fn aa_coverage_span_sve2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
 
         // Store to staging buffers and interleave into shape:
         // shape[out_base + k*2] = hi_buf[k] (even pixel), shape[out_base + k*2+1] = lo_buf[k] (odd).
-        svst1_u8(pg, hi_buf.as_mut_ptr(), acc_hi);
-        svst1_u8(pg, lo_buf.as_mut_ptr(), acc_lo);
+        // SAFETY: caller guarantees sve2 is available; bufs are vl bytes, matching pg width.
+        unsafe {
+            svst1_u8(pg, hi_buf.as_mut_ptr(), acc_hi);
+            svst1_u8(pg, lo_buf.as_mut_ptr(), acc_lo);
+        }
 
         let out_base = chunk_idx * vl * 2;
         for k in 0..vl {
