@@ -23,8 +23,9 @@
 //!
 //! ## x86-64 (most to least preferred)
 //! 1. **AVX-512 VPOPCNTDQ** (`avx512vpopcntdq` + `avx512bw`): 64 B/iter via `_mm512_popcnt_epi8`.
-//! 2. **`popcnt`**: 8 B/iter via the scalar hardware `POPCNT` instruction.
-//! 3. **Scalar**: `u8::count_ones` per byte.
+//! 2. **AVX2** (`avx2`): VPSHUFB 16-entry nibble lookup, 32 B/iter.
+//! 3. **`popcnt`**: 8 B/iter via the scalar hardware `POPCNT` instruction.
+//! 4. **Scalar**: `u8::count_ones` per byte.
 //!
 //! ## aarch64
 //! 1. **NEON `vcntq_u8`**: hardware byte popcount, 16 B/iter.
@@ -36,7 +37,8 @@
 //! ## x86-64 (most to least preferred)
 //! 1. **AVX-512 BITALG** (`avx512bitalg` + `avx512bw`): `_mm512_popcnt_epi8` on
 //!    nibble-isolated bytes, 128 output pixels per 64-byte iteration.
-//! 2. **Scalar**: byte-by-byte nibble lookup via `NIBBLE_POP` table.
+//! 2. **AVX2** (`avx2`): VPSHUFB nibble lookup, 64 output pixels per 32-byte iteration.
+//! 3. **Scalar**: byte-by-byte nibble lookup via `NIBBLE_POP` table.
 //!
 //! ## aarch64
 //! 1. **NEON**: nibble-isolated `vcntq_u8`, 32 output pixels per 16-byte iteration.
@@ -291,6 +293,176 @@ unsafe fn popcnt_aa_row_avx512(row: &[u8]) -> u32 {
     total
 }
 
+// ── x86-64 AVX2 tiers ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+/// AVX2 tier for `popcnt_aa_row`: 32 B/iter using the VPSHUFB nibble trick.
+///
+/// VPSHUFB (`_mm256_shuffle_epi8`) acts as a 16-entry parallel lookup table:
+/// - Load a 32-byte chunk into a YMM register.
+/// - Isolate the low 4 bits of each byte (nibble mask `0x0F`).
+/// - `VPSHUFB(lut, nibble)` → per-lane popcount of each nibble.
+/// - Sum the nibble popcounts (2 per source byte) to get the full byte popcount.
+/// - Horizontal sum with `_mm256_sad_epu8` → 4 partial sums in a u64 lane;
+///   extract and accumulate.
+///
+/// # Safety
+///
+/// Caller must ensure the `avx2` CPU feature is available.
+#[target_feature(enable = "avx2")]
+unsafe fn popcnt_aa_row_avx2(row: &[u8]) -> u32 {
+    use std::arch::x86_64::{
+        _mm256_add_epi64, _mm256_and_si256, _mm256_extract_epi64, _mm256_loadu_si256,
+        _mm256_sad_epu8, _mm256_set_epi8, _mm256_set1_epi8, _mm256_setzero_si256,
+        _mm256_shuffle_epi8, _mm256_srli_epi16,
+    };
+
+    // Nibble popcount LUT: lut[n] = popcount(n) for n in 0..16.
+    // Broadcast to both 128-bit lanes of the YMM register.
+    // SAFETY: intrinsics are valid within a #[target_feature(enable = "avx2")] fn.
+    let lut = _mm256_set_epi8(
+        4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0, // high lane (indices 16-31)
+        4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0, // low lane  (indices 0-15)
+    );
+    let mask_lo = _mm256_set1_epi8(0x0F_u8.cast_signed());
+    let mut acc = _mm256_setzero_si256();
+
+    let mut chunks = row.chunks_exact(32);
+    for chunk in chunks.by_ref() {
+        // SAFETY: chunk is exactly 32 bytes.
+        let v = unsafe { _mm256_loadu_si256(chunk.as_ptr().cast()) };
+        // Low nibble of each byte.
+        let lo = _mm256_and_si256(v, mask_lo);
+        // High nibble shifted down to bits 3:0.
+        let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_lo);
+        // Popcount each nibble via VPSHUFB table lookup.
+        let pcnt_lo = _mm256_shuffle_epi8(lut, lo);
+        let pcnt_hi = _mm256_shuffle_epi8(lut, hi);
+        // Sum nibble popcounts pairwise → byte popcounts.
+        // (We keep them separate and add to acc via SAD, same as gzip/zlib popcount style.)
+        // _mm256_sad_epu8: sum 8 byte-lanes vs 0 → four u64 partial sums.
+        let zero = _mm256_setzero_si256();
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(pcnt_lo, zero));
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(pcnt_hi, zero));
+    }
+
+    // Extract four 64-bit partial sums and accumulate.
+    // _mm256_extract_epi64 is safe to call within a #[target_feature(enable = "avx2")] fn.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "_mm256_extract_epi64 returns a non-negative sum of byte-level popcounts"
+    )]
+    let total = _mm256_extract_epi64(acc, 0) as u64
+        + _mm256_extract_epi64(acc, 1) as u64
+        + _mm256_extract_epi64(acc, 2) as u64
+        + _mm256_extract_epi64(acc, 3) as u64;
+
+    // Scalar tail for any bytes not covered by complete 32-byte chunks.
+    let mut tail_total = total;
+    for &b in chunks.remainder() {
+        tail_total += u64::from(b.count_ones());
+    }
+
+    // Total fits in u32: max bits = row.len() × 8 ≤ (bitmap_width / 8) × 8 ≤ 32768 × 8 = 262144 ≤ u32::MAX.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "total popcount ≤ row.len() * 8 ≤ 32768 * 8 = 262144 — fits in u32"
+    )]
+    {
+        tail_total as u32
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// AVX2 tier for `aa_coverage_span`: 64 output pixels (32 row bytes) per iteration.
+///
+/// Each row byte encodes two consecutive pixels as nibbles.  VPSHUFB is used as
+/// a 16-entry parallel lookup table for nibble popcounts — the same trick as
+/// `popcnt_aa_row_avx2`.  Accumulation across the four rows stays in u8 (max
+/// 4 rows × 4 bits/nibble = 16 ≤ 255).
+///
+/// After the four-row accumulation, the 32-element `hi` (even pixels) and
+/// `lo` (odd pixels) u8 vectors are interleaved into `shape` by extracting
+/// 128-bit lanes and storing via a staging buffer.
+///
+/// Odd `x0` is redirected to scalar by the caller.
+///
+/// # Safety
+///
+/// Caller must ensure the `avx2` CPU feature is available.
+#[target_feature(enable = "avx2")]
+unsafe fn aa_coverage_span_avx2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
+    use std::arch::x86_64::{
+        _mm256_add_epi8, _mm256_and_si256, _mm256_loadu_si256, _mm256_set_epi8, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
+    };
+
+    debug_assert!(x0 & 1 == 0, "aa_coverage_span_avx2: x0={x0} must be even");
+
+    let n = shape.len();
+    let (byte_x0, n_chunks) = coverage_chunk_params(x0, n, 32);
+
+    // Nibble popcount LUT broadcast to both 128-bit lanes.
+    let lut = _mm256_set_epi8(
+        4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0, 4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1,
+        1, 0,
+    );
+    let mask_lo = _mm256_set1_epi8(0x0F_u8.cast_signed());
+
+    for chunk_idx in 0..n_chunks {
+        let byte_off = byte_x0 + chunk_idx * 32;
+
+        let (mut acc_hi, mut acc_lo) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+
+        for row in rows {
+            assert!(
+                byte_off + 32 <= row.len(),
+                "aa_coverage_span_avx2: row too short: \
+                 need {} bytes at offset {byte_off}, have {}",
+                byte_off + 32,
+                row.len(),
+            );
+            // SAFETY: byte_off + 32 ≤ row.len() asserted above.
+            let v = unsafe { _mm256_loadu_si256(row[byte_off..].as_ptr().cast()) };
+            // High nibble → bits 3:0 via right-shift, then mask.
+            let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_lo);
+            // Low nibble → bits 3:0 directly.
+            let lo = _mm256_and_si256(v, mask_lo);
+            // VPSHUFB lookup: nibble → popcount(nibble).
+            acc_hi = _mm256_add_epi8(acc_hi, _mm256_shuffle_epi8(lut, hi));
+            acc_lo = _mm256_add_epi8(acc_lo, _mm256_shuffle_epi8(lut, lo));
+        }
+
+        // Write the 32-element hi and lo vectors to a staging buffer, then
+        // interleave into shape: shape[out_base + 2k] = hi[k], shape[out_base + 2k+1] = lo[k].
+        let mut hi_buf = [0u8; 32];
+        let mut lo_buf = [0u8; 32];
+        // SAFETY: hi_buf / lo_buf are exactly 32 bytes.
+        unsafe {
+            _mm256_storeu_si256(hi_buf.as_mut_ptr().cast(), acc_hi);
+            _mm256_storeu_si256(lo_buf.as_mut_ptr().cast(), acc_lo);
+        }
+
+        let out_base = chunk_idx * 64;
+        for k in 0..32 {
+            let even_px = out_base + k * 2;
+            let odd_px = even_px + 1;
+            if even_px < n {
+                shape[even_px] = hi_buf[k];
+            }
+            if odd_px < n {
+                shape[odd_px] = lo_buf[k];
+            }
+        }
+    }
+
+    // Scalar remainder for any output pixels not covered by complete 32-byte chunks.
+    let scalar_start = n_chunks * 64;
+    if scalar_start < n {
+        aa_coverage_span_scalar(rows, x0 + scalar_start, &mut shape[scalar_start..]);
+    }
+}
+
 // ── aa_coverage_span AVX-512 BITALG tier ─────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -402,6 +574,10 @@ fn dispatch_popcnt(row: &[u8]) -> u32 {
         // SAFETY: both features confirmed present.
         return unsafe { popcnt_aa_row_avx512(row) };
     }
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: avx2 confirmed present.
+        return unsafe { popcnt_aa_row_avx2(row) };
+    }
     if is_x86_feature_detected!("popcnt") {
         // SAFETY: `popcnt` feature confirmed present.
         return unsafe { popcnt_aa_row_sse(row) };
@@ -456,6 +632,9 @@ fn dispatch_coverage(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
     if is_x86_feature_detected!("avx512bitalg") && is_x86_feature_detected!("avx512bw") {
         // SAFETY: both features confirmed present.
         unsafe { aa_coverage_span_avx512(rows, x0, shape) };
+    } else if is_x86_feature_detected!("avx2") {
+        // SAFETY: avx2 confirmed present.
+        unsafe { aa_coverage_span_avx2(rows, x0, shape) };
     } else {
         aa_coverage_span_scalar(rows, x0, shape);
     }
@@ -704,6 +883,51 @@ mod tests {
         unsafe { aa_coverage_span_avx512([&r0, &r1, &r2, &r3], 0, &mut got) };
 
         assert_eq!(got, expected, "AVX-512 coverage mismatch vs scalar");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_popcnt_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // 270 bytes: 8 full 32-byte chunks + 14-byte scalar remainder.
+        let row: Vec<u8> = (0u8..=255).chain(0u8..14).collect();
+        assert_eq!(row.len(), 270);
+        // SAFETY: avx2 confirmed present above.
+        let got = unsafe { popcnt_aa_row_avx2(&row) };
+        assert_eq!(got, popcnt_aa_row_scalar(&row), "AVX2 popcnt mismatch");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_coverage_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // 300 output pixels: 4 full 32-byte chunks (128 px each) + 44-byte scalar remainder
+        // ... actually 300 / 64 = 4 full chunks (256 px) + 44-px scalar remainder.
+        const N: usize = 300;
+        let row_bytes = N.div_ceil(2);
+        let r0: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let r1: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+            .collect();
+        let r2: Vec<u8> = (0..row_bytes)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+
+        let mut expected = vec![0u8; N];
+        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+
+        let mut got = vec![0u8; N];
+        // SAFETY: avx2 confirmed present above.
+        unsafe { aa_coverage_span_avx2([&r0, &r1, &r2, &r3], 0, &mut got) };
+
+        assert_eq!(got, expected, "AVX2 coverage mismatch vs scalar");
     }
 
     #[cfg(target_arch = "aarch64")]
