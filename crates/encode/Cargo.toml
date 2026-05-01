@@ -13,9 +13,5 @@ raster = { path = "../raster" }
 # PNG output — pure Rust, no system libs required.
 png = "0.17"
 
-[dev-dependencies]
-# tempfile for integration tests that write real files.
-tempfile = "3"
-
 [lints]
 workspace = true

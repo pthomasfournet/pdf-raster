@@ -234,8 +234,11 @@ fn run_case(case: &Case) {
     // Pad width matches pdf-raster's digit_width(total_pages) in naming.rs.
     let pad_width = case.total_pages.to_string().len();
 
-    // Render into a temp directory.
-    let tmp = tempfile::tempdir().expect("failed to create tempdir for golden test");
+    // Render into a temp directory co-located with the fixtures so that both
+    // live on the same filesystem (avoids cross-device rename issues and
+    // ensures the temp dir is not on a size-limited tmpfs mount).
+    let tmp = tempfile::tempdir_in(fixtures_dir())
+        .expect("failed to create tempdir alongside test fixtures");
     let out_prefix = tmp.path().join("page");
 
     let dpi_str = DPI.to_string();

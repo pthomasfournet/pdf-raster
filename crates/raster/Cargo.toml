@@ -19,8 +19,5 @@ bytemuck = { workspace = true }
 bitflags = { workspace = true }
 rayon    = { version = "1", optional = true }
 
-[dev-dependencies]
-proptest = { workspace = true }
-
 [lints]
 workspace = true

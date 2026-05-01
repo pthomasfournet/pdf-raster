@@ -9,8 +9,5 @@ repository.workspace = true
 [dependencies]
 bytemuck = { workspace = true }
 
-[dev-dependencies]
-proptest = { workspace = true }
-
 [lints]
 workspace = true
