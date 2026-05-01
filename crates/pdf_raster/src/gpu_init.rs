@@ -1,4 +1,8 @@
 //! Per-thread GPU decoder lifecycle: init, lend-to-renderer, reclaim, release.
+// `pub(crate)` items inside a `pub(crate)` module trigger clippy::redundant_pub_crate
+// when nursery lints are enabled, but the explicitness aids readability in a module
+// that is only conditionally compiled and accessed from a single call site.
+#![allow(clippy::redundant_pub_crate)]
 //!
 //! Each rayon worker thread owns one instance of each decoder type via
 //! `thread_local!`.  `DecoderInit<T>` is a three-state machine that prevents
@@ -68,11 +72,11 @@ pub(crate) fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
         }
 
         // Serialise construction across threads — nvjpegCreateEx is not thread-safe.
-        let _guard = DECODER_INIT_LOCK
+        let guard = DECODER_INIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = gpu::nvjpeg::NvJpegDecoder::new(0);
-        drop(_guard);
+        drop(guard);
 
         match result {
             Ok(dec) => {
@@ -109,11 +113,11 @@ pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
             _ => return Ok(()),
         }
 
-        let _guard = DECODER_INIT_LOCK
+        let guard = DECODER_INIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = gpu::nvjpeg2k::NvJpeg2kDecoder::new(0);
-        drop(_guard);
+        drop(guard);
 
         match result {
             Ok(dec) => {
@@ -150,11 +154,11 @@ pub(crate) fn ensure_vaapi(drm_node: &str, policy: BackendPolicy) -> Result<(), 
             _ => return Ok(()),
         }
 
-        let _guard = DECODER_INIT_LOCK
+        let guard = DECODER_INIT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = gpu::vaapi::VapiJpegDecoder::new(drm_node);
-        drop(_guard);
+        drop(guard);
 
         match result {
             Ok(dec) => {

@@ -125,9 +125,12 @@ pub struct RasterSession {
     pub(crate) total_pages: u32,
     pub(crate) policy: BackendPolicy,
     /// VA-API DRM render node.  Only accessed when the `vaapi` feature is active.
-    #[expect(
-        dead_code,
-        reason = "accessed only when the `vaapi` feature is enabled"
+    #[cfg_attr(
+        not(feature = "vaapi"),
+        expect(
+            dead_code,
+            reason = "accessed only when the `vaapi` feature is enabled"
+        )
     )]
     pub(crate) vaapi_device: String,
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
@@ -327,10 +330,13 @@ fn render_page_rgb_with_geom(
 /// Decoders are initialised lazily on first call.  On `CpuOnly` this is a
 /// no-op.  On `ForceCuda`/`ForceVaapi` init failure is returned as
 /// `RasterError::BackendUnavailable` rather than silently falling back.
-#[expect(
-    clippy::missing_const_for_fn,
-    clippy::unnecessary_wraps,
-    reason = "body and return type vary with GPU feature flags; wraps is necessary in GPU builds"
+#[cfg_attr(
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")),
+    expect(
+        clippy::unnecessary_wraps,
+        clippy::missing_const_for_fn,
+        reason = "return type and body vary with GPU feature flags"
+    )
 )]
 fn lend_decoders(
     session: &RasterSession,
@@ -380,9 +386,12 @@ fn lend_decoders(
 }
 
 /// Return GPU JPEG decoders from the renderer back into TLS slots for reuse.
-#[expect(
-    clippy::missing_const_for_fn,
-    reason = "body varies with GPU feature flags"
+#[cfg_attr(
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "non-const only in GPU-decoder builds"
+    )
 )]
 fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
     #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
