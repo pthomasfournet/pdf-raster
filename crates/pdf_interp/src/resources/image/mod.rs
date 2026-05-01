@@ -1062,10 +1062,8 @@ pub(super) fn extract_icc_bytes(doc: &Document, cs_obj: &Object) -> Option<Vec<u
         return None;
     }
     let stream_ref = arr.get(1)?;
-    let id = match stream_ref {
-        Object::Reference(id) => *id,
-        _ => return None,
-    };
+    let Object::Reference(id) = stream_ref else { return None };
+    let id = *id;
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     stream
         .decompressed_content()

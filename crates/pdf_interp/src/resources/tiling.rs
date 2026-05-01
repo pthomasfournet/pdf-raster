@@ -63,15 +63,14 @@ pub fn resolve_tiling(
     let pat_dict = resolve_dict(doc, res.get(b"Pattern").ok()?)?;
     let pat_obj = pat_dict.get(name).ok()?;
 
-    let stream_id = if let Object::Reference(id) = pat_obj {
-        *id
-    } else {
+    let Object::Reference(id) = pat_obj else {
         log::debug!(
             "pdf_interp: Pattern /{} is not a reference — skipping",
             String::from_utf8_lossy(name)
         );
         return None;
     };
+    let stream_id = *id;
 
     let stream = doc.get_object(stream_id).ok()?.as_stream().ok()?;
 
