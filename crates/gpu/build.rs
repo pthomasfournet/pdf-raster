@@ -121,6 +121,23 @@ fn main() {
         .any(|f| env::var(f).is_ok());
 
     if !need_ptx {
+        // Write empty placeholder PTX files so that the unconditional `include_str!`
+        // macros in src/lib.rs compile successfully on CPU-only builds (Intel without
+        // CUDA, ARM, CI runners without a GPU).  The placeholders are never loaded;
+        // GpuCtx::init() fails with a CUDA error before any kernel is invoked.
+        for kernel in [
+            "composite_rgba8",
+            "apply_soft_mask",
+            "aa_fill",
+            "tile_fill",
+            "icc_clut",
+        ] {
+            let ptx = out_dir.join(format!("{kernel}.ptx"));
+            if !ptx.exists() {
+                std::fs::write(&ptx, "")
+                    .unwrap_or_else(|e| panic!("failed to write placeholder {kernel}.ptx: {e}"));
+            }
+        }
         return;
     }
 
