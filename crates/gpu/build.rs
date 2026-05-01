@@ -10,14 +10,14 @@ use std::process::Command;
 /// If none of the directories exist, emit a build warning and let the linker
 /// search its default paths (handles non-standard install locations).
 fn link_lib_in_dir(dirs: &[&str], lib: &str, warn_context: &str) {
-    let found = dirs.iter().any(|dir| {
+    let mut found = false;
+    for dir in dirs {
         if std::path::Path::new(dir).exists() {
             println!("cargo:rustc-link-search=native={dir}");
-            true
-        } else {
-            false
+            found = true;
+            break;
         }
-    });
+    }
     if !found {
         println!(
             "cargo:warning={warn_context} directory not found; linker will search default paths."
@@ -26,12 +26,25 @@ fn link_lib_in_dir(dirs: &[&str], lib: &str, warn_context: &str) {
     println!("cargo:rustc-link-lib=dylib={lib}");
 }
 
+/// CUDA compute kernels compiled to PTX by nvcc.
+///
+/// Listed once here to ensure the placeholder-write and the nvcc-compile loops
+/// stay in sync — adding a new kernel only requires updating this list.
+const KERNELS: &[&str] = &[
+    "composite_rgba8",
+    "apply_soft_mask",
+    "aa_fill",
+    "tile_fill",
+    "icc_clut",
+];
+
 /// Candidate directories for CUDA toolkit libraries, in preference order.
 ///
 /// Covers versioned installs (cuda-12.8, cuda-12), the generic symlink
 /// (`/usr/local/cuda`), and the legacy flat layout (`/usr/local/cuda/lib64`).
 /// All GPU feature blocks use this same list so they all benefit from a
 /// cuda-12.8 install even when that version was added after the others.
+/// Note: paths are x86-64-specific; GPU features are only supported on x86-64.
 const CUDA_LIB_DIRS: &[&str] = &[
     "/usr/local/cuda-12.8/targets/x86_64-linux/lib",
     "/usr/local/cuda-12/targets/x86_64-linux/lib",
@@ -125,18 +138,13 @@ fn main() {
         // macros in src/lib.rs compile successfully on CPU-only builds (Intel without
         // CUDA, ARM, CI runners without a GPU).  The placeholders are never loaded;
         // GpuCtx::init() fails with a CUDA error before any kernel is invoked.
-        for kernel in [
-            "composite_rgba8",
-            "apply_soft_mask",
-            "aa_fill",
-            "tile_fill",
-            "icc_clut",
-        ] {
+        //
+        // Always written (no existence check) because OUT_DIR is fresh on each
+        // clean build and cargo guarantees this script only runs when inputs change.
+        for kernel in KERNELS {
             let ptx = out_dir.join(format!("{kernel}.ptx"));
-            if !ptx.exists() {
-                std::fs::write(&ptx, "")
-                    .unwrap_or_else(|e| panic!("failed to write placeholder {kernel}.ptx: {e}"));
-            }
+            std::fs::write(&ptx, "")
+                .unwrap_or_else(|e| panic!("failed to write placeholder {kernel}.ptx: {e}"));
         }
         return;
     }
@@ -145,13 +153,7 @@ fn main() {
     // CUDA_ARCH=sm_120 for Blackwell).  Default sm_80 covers Ampere through Blackwell.
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_owned());
 
-    for kernel in [
-        "composite_rgba8",
-        "apply_soft_mask",
-        "aa_fill",
-        "tile_fill",
-        "icc_clut",
-    ] {
+    for kernel in KERNELS {
         let src = kernels_dir.join(format!("{kernel}.cu"));
         let ptx = out_dir.join(format!("{kernel}.ptx"));
 

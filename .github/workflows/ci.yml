@@ -43,11 +43,10 @@ jobs:
             ${{ runner.os }}-cargo-cpu-
 
       - name: Build CLI (CPU-only, release)
-        working-directory: crates/cli
-        run: cargo build --release
+        run: cargo build --release -p cli
 
       - name: Test pdf_interp (resource decoding, CPU paths)
-        run: cargo test -p pdf_interp --lib -- resources
+        run: cargo test -p pdf_interp --lib
 
       - name: Test raster (full unit suite — SIMD dispatch, fill, blend, popcnt)
         run: cargo test -p raster --lib
@@ -55,11 +54,11 @@ jobs:
       - name: Test gpu (CMYK matrix — AVX2 and scalar parity)
         run: cargo test -p gpu --lib -- cmyk
 
-      - name: Test pdf_raster (deskew rotate, render helpers)
-        run: cargo test -p pdf_raster --lib -- deskew
+      - name: Test pdf_raster (deskew, render helpers)
+        run: cargo test -p pdf_raster --lib
 
       - name: Clippy (no GPU features)
-        run: cargo clippy -p pdf_interp -p raster -p pdf_raster -- -D warnings
+        run: cargo clippy -p pdf_interp -p raster -p gpu -p pdf_raster -- -D warnings
 
   # ── Format check ──────────────────────────────────────────────────────────
   fmt:
