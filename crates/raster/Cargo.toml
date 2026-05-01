@@ -16,7 +16,6 @@ rayon       = ["dep:rayon"]        # tile-level rayon parallelism for fill
 [dependencies]
 color    = { path = "../color" }
 bytemuck = { workspace = true }
-smallvec = { workspace = true }
 bitflags = { workspace = true }
 rayon    = { version = "1", optional = true }
 
