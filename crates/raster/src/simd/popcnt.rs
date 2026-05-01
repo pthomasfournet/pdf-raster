@@ -241,8 +241,6 @@ unsafe fn popcnt_aa_row_sse(row: &[u8]) -> u32 {
     let mut chunks = row.chunks_exact(8);
     for chunk in chunks.by_ref() {
         // SAFETY: chunk is exactly 8 bytes; read_unaligned handles any alignment.
-        // The `popcnt` feature is guaranteed by `#[target_feature]`.
-        // SAFETY: chunk is exactly 8 bytes; read_unaligned handles any alignment.
         // `popcnt` CPU feature guaranteed by `#[target_feature]`.
         let word = unsafe { chunk.as_ptr().cast::<u64>().read_unaligned() };
         // _popcnt64 is safe to call within a `#[target_feature(enable = "popcnt")]`
@@ -434,7 +432,7 @@ fn dispatch_popcnt(row: &[u8]) -> u32 {
 ///
 /// - `x0 + shape.len() ≤ bitmap_width` — span must not exceed the bitmap row.
 /// - `x0` should be **even** for the SIMD tiers to be used.  An odd `x0` is
-///   silently handled by the scalar tier (correct output, slower).
+///   correctly handled by the scalar tier (full precision, lower throughput).
 ///
 /// # Panics
 ///

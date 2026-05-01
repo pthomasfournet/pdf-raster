@@ -221,8 +221,8 @@ unsafe fn cmyk_to_rgb_avx512(cmyk: &[u8; 64], rgb: &mut [u8]) {
 #[target_feature(enable = "neon")]
 unsafe fn cmyk_to_rgb_neon(cmyk: &[u8; 32], rgb: &mut [u8]) {
     use std::arch::aarch64::{
-        uint8x8_t, uint8x8x3_t, uint16x8_t, vaddq_u16, vget_low_u8, vld1q_u8, vmull_u8,
-        vshrn_n_u16, vsraq_n_u16, vst3_u8,
+        uint8x8_t, uint8x8x3_t, uint16x8_t, vaddq_u16, vdup_n_u8, vld1_u8, vmull_u8, vshrn_n_u16,
+        vsraq_n_u16, vst3_u8, vsub_u8,
     };
 
     debug_assert!(rgb.len() >= 24);
@@ -241,16 +241,17 @@ unsafe fn cmyk_to_rgb_neon(cmyk: &[u8; 32], rgb: &mut [u8]) {
         k_arr[i] = cmyk[i * 4 + 3];
     }
 
-    let all255 = [255u8; 8];
-    // SAFETY: pointer is valid and aligned; arrays are exactly 8 bytes.
-    let v255: uint8x8_t = vget_low_u8(unsafe { vld1q_u8(all255.as_ptr()) });
-    let c_v: uint8x8_t = vget_low_u8(unsafe { vld1q_u8(c_arr.as_ptr()) });
-    let m_v: uint8x8_t = vget_low_u8(unsafe { vld1q_u8(m_arr.as_ptr()) });
-    let y_v: uint8x8_t = vget_low_u8(unsafe { vld1q_u8(y_arr.as_ptr()) });
-    let k_v: uint8x8_t = vget_low_u8(unsafe { vld1q_u8(k_arr.as_ptr()) });
+    // vld1_u8 is the 64-bit (8-byte) load; vld1q_u8 would read 16 bytes from
+    // an 8-byte array, which is UB.  vdup_n_u8 avoids the load entirely for
+    // the constant 255 vector.
+    // SAFETY: each array is exactly 8 bytes; vld1_u8 requires only 1-byte alignment.
+    let v255: uint8x8_t = vdup_n_u8(255);
+    let c_v: uint8x8_t = unsafe { vld1_u8(c_arr.as_ptr()) };
+    let m_v: uint8x8_t = unsafe { vld1_u8(m_arr.as_ptr()) };
+    let y_v: uint8x8_t = unsafe { vld1_u8(y_arr.as_ptr()) };
+    let k_v: uint8x8_t = unsafe { vld1_u8(k_arr.as_ptr()) };
 
     // inv_ch = 255 − ch. vsub_u8 wraps on underflow; ch ≤ 255 so no underflow.
-    use std::arch::aarch64::vsub_u8;
     let inv_c: uint8x8_t = vsub_u8(v255, c_v);
     let inv_m: uint8x8_t = vsub_u8(v255, m_v);
     let inv_y: uint8x8_t = vsub_u8(v255, y_v);
@@ -378,11 +379,12 @@ fn dispatch_cmyk_matrix(cmyk: &[u8], rgb: &mut [u8]) {
 /// - x86-64: AVX-512 (16 px/iter) when avx512f+avx512bw are present, else scalar
 /// - aarch64: NEON (8 px/iter) — mandatory on all ARMv8-A targets
 /// - other: scalar per-pixel loop
-#[must_use]
+///
 /// # Panics
 ///
 /// Panics if `clut` is `Some((_, grid_n))` and `grid_n < 2`.  A CLUT with
 /// fewer than 2 nodes per axis is degenerate and unusable for interpolation.
+#[must_use]
 #[expect(
     clippy::too_many_lines,
     reason = "CLUT quadrilinear interpolation — cohesion outweighs length"

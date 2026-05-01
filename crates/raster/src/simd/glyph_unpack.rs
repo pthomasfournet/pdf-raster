@@ -123,11 +123,10 @@ unsafe fn unpack_mono_row_sse2(packed: &[u8], width: usize, out: &mut [u8]) {
         unsafe { expand_two_bytes_sse2(b0, b1, &mut out[px..]) };
         px += 16;
     }
-    // Scalar tail for the remaining pixels.
-    for i in px..width {
-        let byte = packed[i / 8];
-        let bit = 7 - (i % 8);
-        out[i] = if (byte >> bit) & 1 != 0 { 0xFF } else { 0x00 };
+    // px is always a multiple of 16, so px/8 is a clean byte boundary.
+    // Delegate the tail to the scalar implementation rather than duplicating it.
+    if px < width {
+        unpack_mono_row_scalar(&packed[px / 8..], width - px, &mut out[px..]);
     }
 }
 
@@ -194,11 +193,9 @@ unsafe fn unpack_mono_row_neon(packed: &[u8], width: usize, out: &mut [u8]) {
         unsafe { expand_two_bytes_neon(b0, b1, &mut out[px..]) };
         px += 16;
     }
-    // Scalar tail for the remaining pixels.
-    for i in px..width {
-        let byte = packed[i / 8];
-        let bit = 7 - (i % 8);
-        out[i] = if (byte >> bit) & 1 != 0 { 0xFF } else { 0x00 };
+    // px is always a multiple of 16, so px/8 is a clean byte boundary.
+    if px < width {
+        unpack_mono_row_scalar(&packed[px / 8..], width - px, &mut out[px..]);
     }
 }
 
