@@ -146,12 +146,17 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 
-    // PTX kernels are only needed when at least one GPU compute feature is active.
-    // Skipping nvcc on CPU-only builds (Intel without CUDA, ARM) avoids requiring
-    // the CUDA toolkit as a build dependency when no GPU features are enabled.
-    let need_ptx = ["CARGO_FEATURE_GPU_AA", "CARGO_FEATURE_GPU_ICC"]
-        .iter()
-        .any(|f| env::var(f).is_ok());
+    // PTX kernels are needed whenever any CUDA feature is active.
+    // CARGO_FEATURE_GPU_AA / GPU_ICC are features of pdf_interp, not gpu, so
+    // they are never set in the gpu crate's build script. Use the gpu-crate
+    // features that are actually propagated here instead.
+    let need_ptx = [
+        "CARGO_FEATURE_NVJPEG",
+        "CARGO_FEATURE_NVJPEG2K",
+        "CARGO_FEATURE_GPU_DESKEW",
+    ]
+    .iter()
+    .any(|f| env::var(f).is_ok());
 
     if !need_ptx {
         // Write empty placeholder PTX files so that the unconditional `include_str!`
