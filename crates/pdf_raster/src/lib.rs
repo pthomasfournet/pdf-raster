@@ -64,6 +64,10 @@ pub use render::{
 ///
 /// After this call the TLS slots hold `Uninitialised`, so their own destructors
 /// at process exit are no-ops.
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "body is non-empty (calls non-const fns) when nvjpeg/nvjpeg2k features are enabled"
+)]
 pub fn release_gpu_decoders() {
     #[cfg(feature = "nvjpeg")]
     render::release_nvjpeg_this_thread();

@@ -7,8 +7,15 @@
 //! # Implementation
 //!
 //! **CPU path** (always available): per-output-pixel inverse mapping with
-//! bilinear interpolation.  Inner loop is written for auto-vectorisation:
-//! simple scalar arithmetic that LLVM lowers to AVX-512 on `-C target-cpu=native`.
+//! bilinear interpolation.  The inner loop is written in the per-arch dispatch
+//! pattern used throughout the codebase:
+//!
+//! - **aarch64**: `rotate_row_neon` processes 4 output pixels per iteration
+//!   using `vmlaq_f32` for coordinate stepping and `vcvtmq_s32_f32` for floor.
+//!   Any pixel whose source coordinates are out-of-bounds is handled by the
+//!   scalar fallback within the same loop.
+//! - **x86-64 / other**: scalar per-pixel loop; LLVM auto-vectorises to
+//!   AVX-512 on `-C target-cpu=native` (Ryzen).
 //!
 //! **GPU path** (`gpu-deskew` feature, optional): CUDA NPP `nppiRotate_8u_C1R_Ctx`
 //! with hardware bilinear via texture units.  ~0.3–0.5 ms for a 2550×3300 image
@@ -48,6 +55,283 @@ pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), Des
     Ok(())
 }
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Parameters shared between the scalar and NEON inner loops.
+///
+/// Passed by value to avoid threading individual scalars through dispatch helpers.
+struct RowParams {
+    cos_a: f32,
+    sin_a: f32,
+    sx_base: f32,
+    sy_base: f32,
+    sx_max: i32,
+    sy_max: i32,
+}
+
+/// Bilinear interpolation at source `(sx, sy)` given pre-floored origin `(x0, y0)`.
+///
+/// `x0` and `y0` must already be bounds-checked (`0 ≤ x0 ≤ sx_max`, `0 ≤ y0 ≤ sy_max`).
+#[inline]
+fn bilinear_sample(src: &Bitmap<Gray8>, x0: usize, y0: usize, fx: f32, fy: f32) -> u8 {
+    // y0 ≤ sy_max ≤ h-2 and y0+1 ≤ h-1 ≤ 32767 — safe casts.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "y0 ≤ h-2 ≤ 32766 and y0+1 ≤ h-1 ≤ 32767; both fit in u32"
+    )]
+    let (r0, r1) = (src.row_bytes(y0 as u32), src.row_bytes((y0 + 1) as u32));
+
+    let p00 = f32::from(r0[x0]);
+    let p10 = f32::from(r0[x0 + 1]);
+    let p01 = f32::from(r1[x0]);
+    let p11 = f32::from(r1[x0 + 1]);
+
+    let top = (p10 - p00).mul_add(fx, p00);
+    let bot = (p11 - p01).mul_add(fx, p01);
+    let val = (bot - top).mul_add(fy, top);
+
+    // Bilinear of values in [0, 255] stays in [0, 255].
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bilinear of [0,255] inputs stays in [0,255]; rounding keeps it non-negative"
+    )]
+    {
+        val.round() as u8
+    }
+}
+
+/// Compute a single output pixel at column `ox`.
+///
+/// Returns 255 (white) when the source coordinates are out of the valid
+/// bilinear-sampling range.
+#[inline]
+fn rotate_pixel_scalar(src: &Bitmap<Gray8>, ox: f32, p: &RowParams) -> u8 {
+    let sx = p.cos_a.mul_add(ox, p.sx_base);
+    let sy = p.sin_a.mul_add(ox, p.sy_base);
+
+    // floor() → i32: coordinates bounded by ≤ 32768·√2 ≈ 46341 — fits in i32.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "image coordinates bounded by rotated extent ≤ 32768 * sqrt(2) ≈ 46341; fits in i32"
+    )]
+    let x0 = sx.floor() as i32;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "image coordinates bounded by rotated extent ≤ 32768 * sqrt(2) ≈ 46341; fits in i32"
+    )]
+    let y0 = sy.floor() as i32;
+
+    if x0 < 0 || y0 < 0 || x0 > p.sx_max || y0 > p.sy_max {
+        return 255;
+    }
+
+    // x0 ≥ 0, y0 ≥ 0 verified above.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x0 ≥ 0 and y0 ≥ 0 verified by the guard above"
+    )]
+    let (x0u, y0u) = (x0 as usize, y0 as usize);
+    // x0 ≤ 46341 ≤ 2^23 — exactly representable in f32; subtraction is exact.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "x0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
+    )]
+    let fx = sx - x0 as f32;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "y0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
+    )]
+    let fy = sy - y0 as f32;
+
+    bilinear_sample(src, x0u, y0u, fx, fy)
+}
+
+// ── Per-arch row implementations ──────────────────────────────────────────────
+
+/// NEON inner-loop: process one output row using `vmlaq_f32` coordinate stepping.
+///
+/// Handles 4 output pixels per iteration.  For any group of 4 where at least one
+/// pixel's source coordinates are out-of-bounds, the entire group is processed
+/// pixel-by-pixel via `rotate_pixel_scalar` (which fills OOB pixels with white).
+/// A scalar tail handles any remaining pixels at the end of the row.
+///
+/// # Safety
+///
+/// NEON is mandatory on all ARMv8-A targets; no runtime check is needed.
+/// `dst_row.len() == w` must hold (caller guarantees this via `row_bytes_mut`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rotate_row_neon(dst_row: &mut [u8], src: &Bitmap<Gray8>, p: &RowParams, w: usize) {
+    use std::arch::aarch64::{
+        vandq_u32, vcgeq_f32, vcleq_f32, vcvtmq_s32_f32, vdupq_n_f32, vgetq_lane_f32,
+        vgetq_lane_s32, vmaxvq_u32, vmlaq_f32, vmvnq_u32,
+    };
+
+    // Lane offsets [0.0, 1.0, 2.0, 3.0]: dx[i] = ox + i for i in 0..4.
+    let v_offsets = unsafe { std::arch::aarch64::vld1q_f32([0.0f32, 1.0, 2.0, 3.0].as_ptr()) };
+
+    let v_cos = vdupq_n_f32(p.cos_a);
+    let v_sin = vdupq_n_f32(p.sin_a);
+    let v_sx_base = vdupq_n_f32(p.sx_base);
+    let v_sy_base = vdupq_n_f32(p.sy_base);
+    let v_zero = vdupq_n_f32(0.0);
+    // sx_max / sy_max ≤ 32766 ≤ 2^23 — exactly representable in f32.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sx_max / sy_max ≤ 32766 ≤ 2^23 — exactly representable in f32"
+    )]
+    let v_sx_max = vdupq_n_f32(p.sx_max as f32);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sy_max ≤ 32766 ≤ 2^23 — exactly representable in f32"
+    )]
+    let v_sy_max = vdupq_n_f32(p.sy_max as f32);
+
+    let mut ox = 0usize;
+
+    while ox + 4 <= w {
+        // dx = [ox, ox+1, ox+2, ox+3] as f32.
+        // ox ≤ 32768; exact in f32.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "ox ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+        )]
+        let v_dx = unsafe { std::arch::aarch64::vaddq_f32(vdupq_n_f32(ox as f32), v_offsets) };
+
+        // sx[i] = sx_base + cos_a * dx[i]
+        // sy[i] = sy_base + sin_a * dx[i]
+        let v_sx = unsafe { vmlaq_f32(v_sx_base, v_cos, v_dx) };
+        let v_sy = unsafe { vmlaq_f32(v_sy_base, v_sin, v_dx) };
+
+        // in_bounds[i] = sx[i] ∈ [0, sx_max] && sy[i] ∈ [0, sy_max].
+        // vcgeq_f32 / vcleq_f32: lane = 0xFFFF_FFFF if true, 0 if false.
+        let in_bounds = unsafe {
+            vandq_u32(
+                vandq_u32(vcgeq_f32(v_sx, v_zero), vcleq_f32(v_sx, v_sx_max)),
+                vandq_u32(vcgeq_f32(v_sy, v_zero), vcleq_f32(v_sy, v_sy_max)),
+            )
+        };
+
+        // all_in: vmvnq_u32 flips: OOB lane → 0xFFFF_FFFF, IB lane → 0.
+        // vmaxvq_u32 == 0 iff every lane was IB (flipped to 0).
+        let all_in = unsafe { vmaxvq_u32(vmvnq_u32(in_bounds)) == 0 };
+
+        if all_in {
+            // All 4 source coords are in-bounds: SIMD floor + scalar gather + bilinear.
+            // vcvtmq_s32_f32: floor f32 → i32 (round toward −∞).
+            let v_x0 = unsafe { vcvtmq_s32_f32(v_sx) };
+            let v_y0 = unsafe { vcvtmq_s32_f32(v_sy) };
+
+            // vgetq_lane_* requires a const lane index — extract all 8 values explicitly.
+            let x0_0 = unsafe { vgetq_lane_s32(v_x0, 0) };
+            let x0_1 = unsafe { vgetq_lane_s32(v_x0, 1) };
+            let x0_2 = unsafe { vgetq_lane_s32(v_x0, 2) };
+            let x0_3 = unsafe { vgetq_lane_s32(v_x0, 3) };
+            let y0_0 = unsafe { vgetq_lane_s32(v_y0, 0) };
+            let y0_1 = unsafe { vgetq_lane_s32(v_y0, 1) };
+            let y0_2 = unsafe { vgetq_lane_s32(v_y0, 2) };
+            let y0_3 = unsafe { vgetq_lane_s32(v_y0, 3) };
+
+            let sx_0 = unsafe { vgetq_lane_f32(v_sx, 0) };
+            let sx_1 = unsafe { vgetq_lane_f32(v_sx, 1) };
+            let sx_2 = unsafe { vgetq_lane_f32(v_sx, 2) };
+            let sx_3 = unsafe { vgetq_lane_f32(v_sx, 3) };
+            let sy_0 = unsafe { vgetq_lane_f32(v_sy, 0) };
+            let sy_1 = unsafe { vgetq_lane_f32(v_sy, 1) };
+            let sy_2 = unsafe { vgetq_lane_f32(v_sy, 2) };
+            let sy_3 = unsafe { vgetq_lane_f32(v_sy, 3) };
+
+            // x0 ≥ 0 (all_in), x0 ≤ sx_max ≤ 32766 ≤ 46341 ≤ 2^23: safe sign-loss and precision casts.
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "x0 ≥ 0 and y0 ≥ 0 verified by the all_in OOB check"
+            )]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "x0 / y0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
+            )]
+            {
+                dst_row[ox] = bilinear_sample(
+                    src,
+                    x0_0 as usize,
+                    y0_0 as usize,
+                    sx_0 - x0_0 as f32,
+                    sy_0 - y0_0 as f32,
+                );
+                dst_row[ox + 1] = bilinear_sample(
+                    src,
+                    x0_1 as usize,
+                    y0_1 as usize,
+                    sx_1 - x0_1 as f32,
+                    sy_1 - y0_1 as f32,
+                );
+                dst_row[ox + 2] = bilinear_sample(
+                    src,
+                    x0_2 as usize,
+                    y0_2 as usize,
+                    sx_2 - x0_2 as f32,
+                    sy_2 - y0_2 as f32,
+                );
+                dst_row[ox + 3] = bilinear_sample(
+                    src,
+                    x0_3 as usize,
+                    y0_3 as usize,
+                    sx_3 - x0_3 as f32,
+                    sy_3 - y0_3 as f32,
+                );
+            }
+        } else {
+            // At least one OOB lane — fall back to per-pixel scalar for all 4.
+            // rotate_pixel_scalar handles OOB with white fill.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "ox ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+            )]
+            for i in 0..4usize {
+                dst_row[ox + i] = rotate_pixel_scalar(src, (ox + i) as f32, p);
+            }
+        }
+
+        ox += 4;
+    }
+
+    // Scalar tail: remaining pixels where ox + 4 > w.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "i ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+    )]
+    for i in ox..w {
+        dst_row[i] = rotate_pixel_scalar(src, i as f32, p);
+    }
+}
+
+// ── Per-arch dispatch ─────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dispatch_rotate_row(dst_row: &mut [u8], src: &Bitmap<Gray8>, p: &RowParams) {
+    let w = dst_row.len();
+    // SAFETY: NEON mandatory on all ARMv8-A targets.
+    unsafe { rotate_row_neon(dst_row, src, p, w) }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dispatch_rotate_row(dst_row: &mut [u8], src: &Bitmap<Gray8>, p: &RowParams) {
+    for (ox, dst_px) in dst_row.iter_mut().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "ox ≤ MAX_PX_DIMENSION = 32768; exact in f32"
+        )]
+        {
+            *dst_px = rotate_pixel_scalar(src, ox as f32, p);
+        }
+    }
+}
+
+// ── Public CPU path ───────────────────────────────────────────────────────────
+
 /// CPU bilinear rotation (clockwise-positive).
 ///
 /// Uses inverse mapping: for each output pixel `(ox, oy)`, compute the
@@ -61,10 +345,6 @@ pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), Des
 #[expect(
     clippy::similar_names,
     reason = "sx_*/sy_* are paired coordinate variables; renaming would obscure the symmetry"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "bilinear rotation is a single coherent algorithm; splitting would fragment the coordinate math"
 )]
 pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     let w = src.width as usize;
@@ -111,7 +391,8 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
             reason = "oy < h ≤ MAX_PX_DIMENSION = 32768; fits in u32"
         )]
         let dst_row = dst.row_bytes_mut(oy as u32);
-        // Pre-compute the y-dependent terms outside the x loop.
+
+        // Pre-compute y-dependent terms outside the x loop.
         // oy ≤ 32768; exact in f32.
         #[expect(
             clippy::cast_precision_loss,
@@ -121,87 +402,15 @@ pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
         let sx_base = cos_a.mul_add(-cx, -(sin_a * dy)) + cx;
         let sy_base = sin_a.mul_add(-cx, cos_a * dy) + cy;
 
-        for (ox, dst_px) in dst_row.iter_mut().enumerate() {
-            // ox ≤ 32768; exact in f32.
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "ox ≤ MAX_PX_DIMENSION = 32768; exact in f32"
-            )]
-            let dx = ox as f32;
-            let sx = cos_a.mul_add(dx, sx_base);
-            let sy = sin_a.mul_add(dx, sy_base);
-
-            // floor() → i32: sx/sy are image coordinates bounded by the rotated image
-            // extent, which is ≤ ~46341 px (32768 * sqrt(2)) at worst — fits in i32.
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "image coordinates bounded by rotated extent ≤ 32768 * sqrt(2) ≈ 46341; fits in i32"
-            )]
-            let x0 = sx.floor() as i32;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "image coordinates bounded by rotated extent ≤ 32768 * sqrt(2) ≈ 46341; fits in i32"
-            )]
-            let y0 = sy.floor() as i32;
-
-            if x0 < 0 || y0 < 0 || x0 > sx_max || y0 > sy_max {
-                *dst_px = 255;
-                continue;
-            }
-
-            // x0 ≥ 0 and y0 ≥ 0 checked above; safe to cast to usize.
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "x0 ≥ 0 and y0 ≥ 0 verified by the guard above"
-            )]
-            let x0u = x0 as usize;
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "x0 ≥ 0 and y0 ≥ 0 verified by the guard above"
-            )]
-            let y0u = y0 as usize;
-            // x0, y0 fit in i32 (≤ 46341); x0 as f32 / y0 as f32 exact (24-bit mantissa).
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "x0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
-            )]
-            let fx = sx - x0 as f32;
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "y0 ≤ 46341 ≤ 2^23 — exactly representable in f32"
-            )]
-            let fy = sy - y0 as f32;
-
-            // y0u < h ≤ 32768; y0u + 1 ≤ 32768 (sx_max/sy_max guard ensures y0 ≤ h-2).
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "y0u ≤ h - 2 ≤ 32766; fits in u32"
-            )]
-            let r0 = src.row_bytes(y0u as u32);
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "y0u + 1 ≤ h - 1 ≤ 32767; fits in u32"
-            )]
-            let r1 = src.row_bytes((y0u + 1) as u32);
-
-            let p00 = f32::from(r0[x0u]);
-            let p10 = f32::from(r0[x0u + 1]);
-            let p01 = f32::from(r1[x0u]);
-            let p11 = f32::from(r1[x0u + 1]);
-
-            let top = (p10 - p00).mul_add(fx, p00);
-            let bot = (p11 - p01).mul_add(fx, p01);
-            let val = (bot - top).mul_add(fy, top);
-
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "bilinear of values in [0,255] stays in [0,255]"
-            )]
-            {
-                *dst_px = val.round() as u8;
-            }
-        }
+        let params = RowParams {
+            cos_a,
+            sin_a,
+            sx_base,
+            sy_base,
+            sx_max,
+            sy_max,
+        };
+        dispatch_rotate_row(dst_row, src, &params);
     }
 
     dst
