@@ -538,4 +538,41 @@ mod tests {
         }
         assert!(max_diff <= 2, "GPU 0° rotation max diff {max_diff} > 2");
     }
+
+    /// Timing smoke-test: `rotate_cpu` on an 8.4 MP image (2900×2900) should
+    /// complete in < 5 ms on modern hardware.  The test always passes — the time
+    /// is printed for manual inspection.  Run with `--nocapture` to see it.
+    ///
+    /// A4 at 300 DPI ≈ 2480×3508 (8.7 MP); 2900×2900 is a round-number proxy.
+    /// Baseline (Apr 2026, Ryzen 9 9900X3D, release build): ~0.6 ms.
+    /// Target for Intel i7-8700K (Coffee Lake): < 5 ms.
+    #[test]
+    #[ignore]
+    fn rotate_cpu_8mp_timing() {
+        let w = 2900u32;
+        let h = 2900u32;
+        let mut src = Bitmap::<Gray8>::new(w, h, 1, false);
+        for y in 0..h {
+            let row = src.row_bytes_mut(y);
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = ((x + y as usize * 3) % 256) as u8;
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let _ = rotate_cpu(&src, 1.5);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "rotate_cpu 2900×2900 ({:.1} MP): {elapsed_ms:.2} ms",
+            f64::from(w) * f64::from(h) / 1_000_000.0,
+        );
+        // Soft threshold: warn rather than fail so CI on slow machines doesn't flake.
+        if elapsed_ms > 5.0 {
+            eprintln!(
+                "WARN: rotate_cpu exceeded 5 ms target ({elapsed_ms:.2} ms) — \
+                 check SIMD auto-vectorisation on this machine"
+            );
+        }
+    }
 }
