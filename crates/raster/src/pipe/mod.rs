@@ -203,7 +203,11 @@ pub fn render_span<P: Pixel>(
 ///
 /// Both slices must have the same length and match the pixel mode:
 /// 1 byte → gray, 3 → RGB, 4 → CMYK/XBGR, 8 → `DeviceN`.
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "called per-pixel in the innermost compositing loop; 10-15 instructions, must inline across crate boundary"
+)]
+#[inline(always)]
 pub(crate) fn apply_transfer_pixel(pipe: &PipeState<'_>, src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(
         src.len(),
@@ -237,7 +241,11 @@ pub(crate) fn apply_transfer_pixel(pipe: &PipeState<'_>, src: &[u8], dst: &mut [
 }
 
 /// Apply transfer LUTs in-place to a single pixel slice.
-#[inline]
+#[expect(
+    clippy::inline_always,
+    reason = "called per-pixel in the innermost compositing loop; delegates to apply_transfer_pixel, must inline"
+)]
+#[inline(always)]
 pub(crate) fn apply_transfer_in_place(pipe: &PipeState<'_>, px: &mut [u8]) {
     // Avoid allocating: for ncomps ≤ 8 copy into a stack buffer, apply, copy back.
     let n = px.len();

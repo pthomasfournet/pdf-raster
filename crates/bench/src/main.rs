@@ -6,6 +6,7 @@
 //! Run: cargo run -p bench --release -- [--iters N] [--stars N]
 
 use std::f64::consts::PI;
+use std::hint::black_box;
 use std::time::Instant;
 
 use vello_cpu::{
@@ -239,7 +240,7 @@ fn bench_ours(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
         for (i, path) in paths.iter().enumerate() {
             let color = RASTER_COLORS[i % RASTER_COLORS.len()];
             fill::<Rgb8>(
-                &mut bitmap,
+                black_box(&mut bitmap),
                 &clip,
                 path,
                 &pipe,
@@ -249,6 +250,7 @@ fn bench_ours(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
                 true,
             );
         }
+        let _ = black_box(bitmap);
     }
     t0.elapsed().as_secs_f64() * 1000.0 / f64::from(cfg.iters)
 }
