@@ -390,13 +390,12 @@ pub const fn byte_to_col(x: u8) -> i32 {
 /// Never panics. Saturating add guards against i32 overflow on extreme inputs.
 #[inline]
 #[must_use]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "clamp(0, 255) guarantees non-negative"
+)]
 pub fn col_to_byte(x: i32) -> u8 {
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "clamp(0, 255) guarantees non-negative"
-    )]
-    let v = (x.saturating_add(0x80) >> 8).clamp(0, 255) as u8;
-    v
+    (x.saturating_add(0x80) >> 8).clamp(0, 255) as u8
 }
 
 // ── Geometry rounding (matching SplashMath.h portable fallbacks) ──────────────

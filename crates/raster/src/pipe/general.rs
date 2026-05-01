@@ -138,6 +138,9 @@ fn render_span_general_inner<'src>(
     soft_mask_at: &dyn Fn(usize) -> u8,
     alpha0_at: &dyn Fn(usize) -> Option<u8>,
 ) {
+    let has_soft_mask = pipe.soft_mask.is_some();
+    let has_shape = shape.is_some();
+
     match dst_alpha {
         Some(dst_alpha) => {
             debug_assert_eq!(dst_alpha.len(), count);
@@ -149,20 +152,12 @@ fn render_span_general_inner<'src>(
                 let soft_v = u32::from(soft_mask_at(i));
 
                 // Source alpha (PDF spec §11.3.6 eq 11.1).
-                let a_src = compute_a_src(
-                    a_input,
-                    soft_v,
-                    shape_v,
-                    pipe.soft_mask.is_some(),
-                    shape.is_some(),
-                );
+                let a_src = compute_a_src(a_input, soft_v, shape_v, has_soft_mask, has_shape);
 
                 // Non-isolated group colour correction (PDF spec §11.4.8).
                 // c_src_corrected = c_src + (c_src - c_dst) * (a_dst * 255 / shape - a_dst) / 255.
                 let mut c_src_corr: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 let c_src: &[u8] = if pipe.non_isolated_group && shape_v != 0 {
-                    // shape_v != 0 is confirmed by the enclosing condition.
-                    debug_assert!(shape_v > 0, "divide by shape_v requires shape_v > 0");
                     let t = (a_dst * 255) / shape_v - a_dst;
                     #[expect(
                         clippy::cast_possible_wrap,
@@ -262,13 +257,7 @@ fn render_span_general_inner<'src>(
                 let shape_v = u32::from(shape_at(i));
                 let soft_v = u32::from(soft_mask_at(i));
 
-                let a_src = compute_a_src(
-                    a_input,
-                    soft_v,
-                    shape_v,
-                    pipe.soft_mask.is_some(),
-                    shape.is_some(),
-                );
+                let a_src = compute_a_src(a_input, soft_v, shape_v, has_soft_mask, has_shape);
 
                 let mut c_blend: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 if pipe.blend_mode != BlendMode::Normal {

@@ -1,6 +1,6 @@
 //! Text rendering — `show_text` and `show_text_type3`.
 
-use super::super::gstate::mat2x2_mul;
+use super::super::gstate::{ctm_multiply, mat2x2_mul};
 use super::super::text::TextState;
 use super::MAX_FORM_DEPTH;
 use super::PageRenderer;
@@ -298,7 +298,6 @@ impl PageRenderer<'_> {
         do_paint: bool,
         do_clip: bool,
     ) {
-        use super::super::gstate::ctm_multiply;
         if do_clip {
             log::warn!(
                 "pdf_interp: text-clip mode (render_mode ≥ 4) is not supported for Type 3 \

@@ -1,6 +1,7 @@
 //! PDF operator dispatch — `execute_one`.
 
 use super::super::color::RasterColor;
+use super::super::gstate::ctm_multiply;
 use super::{PageRenderer, components_to_color, int_to_cap, int_to_join};
 use crate::content::{Operator, TextArrayElement};
 
@@ -41,7 +42,6 @@ impl PageRenderer<'_> {
             Operator::Restore => self.gstate.restore(),
 
             Operator::ConcatMatrix(m) => {
-                use super::super::gstate::ctm_multiply;
                 let old = self.gstate.current().ctm;
                 self.gstate.current_mut().ctm = ctm_multiply(&old, m);
             }
