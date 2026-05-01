@@ -34,8 +34,10 @@ use std::fmt;
 /// Unified error returned by all GPU decoder and compute trait methods.
 ///
 /// The inner `Box<dyn std::error::Error + Send + Sync>` carries the original
-/// backend-specific error and can be inspected with [`std::error::Error::source`]
-/// or downcast with [`Box::downcast`].
+/// backend-specific error.  [`Display`](fmt::Display) delegates to the inner
+/// error directly; [`std::error::Error::source`] returns `None` because the
+/// inner message is already included in the `Display` output — exposing it via
+/// `source` would cause `{:#}` alternate-display to print the message twice.
 #[derive(Debug)]
 pub struct GpuDecodeError(Box<dyn std::error::Error + Send + Sync + 'static>);
 
@@ -48,15 +50,12 @@ impl GpuDecodeError {
 
 impl fmt::Display for GpuDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GPU decode error: {}", self.0)
+        // Delegate directly — no prefix — so the inner message is the full message.
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
-impl std::error::Error for GpuDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref())
-    }
-}
+impl std::error::Error for GpuDecodeError {}
 
 // ── Decoded image result ──────────────────────────────────────────────────────
 
@@ -64,6 +63,7 @@ impl std::error::Error for GpuDecodeError {
 ///
 /// Pixels are always interleaved: 1 byte/pixel for gray, 3 bytes/pixel for RGB.
 /// CMYK images are not decoded through this path — they fall through to the CPU.
+#[derive(Debug)]
 pub struct DecodedImage {
     /// Pixel bytes (interleaved, 8-bit per channel).
     pub data: Vec<u8>,
@@ -167,6 +167,29 @@ pub trait GpuCompute: Send + Sync {
 
 // ── NvJpegDecoder impl ────────────────────────────────────────────────────────
 
+/// Error for dimension mismatch between PDF dict and JPEG SOF markers.
+#[cfg(feature = "nvjpeg")]
+#[derive(Debug)]
+struct DimensionMismatch {
+    expected: (u32, u32),
+    actual: (u32, u32),
+}
+
+#[cfg(feature = "nvjpeg")]
+impl fmt::Display for DimensionMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (ew, eh) = self.expected;
+        let (aw, ah) = self.actual;
+        write!(
+            f,
+            "JPEG dimensions mismatch: PDF declared {ew}×{eh}, decoder returned {aw}×{ah}"
+        )
+    }
+}
+
+#[cfg(feature = "nvjpeg")]
+impl std::error::Error for DimensionMismatch {}
+
 #[cfg(feature = "nvjpeg")]
 impl GpuJpegDecoder for crate::nvjpeg::NvJpegDecoder {
     fn decode_jpeg(
@@ -185,7 +208,7 @@ impl GpuJpegDecoder for crate::nvjpeg::NvJpegDecoder {
         }
         let components = match decoded.color_space {
             crate::nvjpeg::JpegColorSpace::Gray => 1,
-            _ => 3,
+            crate::nvjpeg::JpegColorSpace::Rgb => 3,
         };
         Ok(DecodedImage {
             data: decoded.data,
@@ -204,7 +227,7 @@ impl GpuJpeg2kDecoder for crate::nvjpeg2k::NvJpeg2kDecoder {
         let decoded = self.decode_sync(data).map_err(GpuDecodeError::new)?;
         let components = match decoded.color_space {
             crate::nvjpeg2k::Jpeg2kColorSpace::Gray => 1,
-            _ => 3,
+            crate::nvjpeg2k::Jpeg2kColorSpace::Rgb => 3,
         };
         Ok(DecodedImage {
             data: decoded.data,
@@ -230,8 +253,15 @@ impl GpuCompute for crate::GpuCtx {
         let rgb = self
             .icc_cmyk_to_rgb(pixels, Some((clut, u32::from(grid_n))))
             .map_err(|e| GpuDecodeError::new(IccClutError(e.to_string())))?;
-        // icc_cmyk_to_rgb returns a new Vec; swap it in and update dims.
-        let expected = (width as usize) * (height as usize) * 3;
+        // icc_cmyk_to_rgb returns a new Vec; swap it in after validating length.
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| {
+                GpuDecodeError::new(IccClutError(format!(
+                    "pixel count overflow: {width}×{height}×3 exceeds usize::MAX"
+                )))
+            })?;
         if rgb.len() != expected {
             return Err(GpuDecodeError::new(IccClutError(format!(
                 "ICC CLUT output length {got} ≠ {expected} (w={width} h={height})",
@@ -244,27 +274,6 @@ impl GpuCompute for crate::GpuCtx {
 }
 
 // ── Internal error helpers ────────────────────────────────────────────────────
-
-/// Error for dimension mismatch between PDF dict and JPEG SOF markers.
-#[cfg_attr(not(feature = "nvjpeg"), allow(dead_code))]
-#[derive(Debug)]
-struct DimensionMismatch {
-    expected: (u32, u32),
-    actual: (u32, u32),
-}
-
-impl fmt::Display for DimensionMismatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (ew, eh) = self.expected;
-        let (aw, ah) = self.actual;
-        write!(
-            f,
-            "JPEG dimensions mismatch: PDF declared {ew}×{eh}, decoder returned {aw}×{ah}"
-        )
-    }
-}
-
-impl std::error::Error for DimensionMismatch {}
 
 /// Error string wrapper for ICC CLUT transform failures.
 #[derive(Debug)]
