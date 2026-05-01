@@ -43,7 +43,7 @@ jobs:
             ${{ runner.os }}-cargo-cpu-
 
       - name: Build CLI (CPU-only, release)
-        run: cargo build --release -p cli
+        run: cargo build --release -p pdf-raster
 
       - name: Test pdf_interp (resource decoding, CPU paths)
         run: cargo test -p pdf_interp --lib
@@ -100,7 +100,7 @@ jobs:
         run: cargo check -p raster --target aarch64-unknown-linux-gnu
 
       - name: Check raster (nightly, NEON + SVE2)
-        run: cargo +nightly check -p raster --target aarch64-unknown-linux-gnu --features raster/nightly-sve2
+        run: cargo +nightly check -p raster --target aarch64-unknown-linux-gnu --features nightly-sve2
 
       - name: Check gpu (stable, NEON CMYK path)
         run: cargo check -p gpu --target aarch64-unknown-linux-gnu
@@ -108,7 +108,7 @@ jobs:
       # pdf_raster pulls in FreeType + libz C deps that require a cross C
       # compiler (gcc-aarch64-linux-gnu). Install it and check the full crate.
       - name: Install aarch64 cross C toolchain
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
 
       - name: Check pdf_raster (stable, NEON deskew path)
         run: cargo check -p pdf_raster --target aarch64-unknown-linux-gnu
