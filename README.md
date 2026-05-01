@@ -32,6 +32,7 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 | [Getting Started](docs/getting-started.md) | Installation, quickstart, Tesseract integration, DPI guidance, error handling, security |
 | [API Reference](docs/api-reference.md) | Full signatures for `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage`, `RasterError`, `PageDiagnostics`, feature flags, GPU dispatch thresholds |
 | [CLI Reference](docs/cli-reference.md) | All `pdf-raster` command-line flags, output format matrix, examples, pixel-diff comparison |
+| [Benchmarks](docs/benchmarks.md) | Methodology, 10-document corpus results, CPU-only AVX-512 vs AVX2, GPU-accelerated, reproduction steps |
 
 ## Crate map
 
@@ -79,19 +80,26 @@ tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 
 ## Performance
 
-Benchmarks vs a reference renderer (Ryzen 9900X3D + RTX 5070, 150 DPI, GPU features enabled, 5 runs):
+Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full methodology, hardware details, and AVX2 vs AVX-512 comparison in **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-| Document | Size / Pages | Character | pdf-raster | Reference | Speedup |
-|---|---|---|---|---|---|
-| Native text, small | 84 KB / 16 pp | Light text | 217 ms | 252 ms | 1.2× |
-| Native vector + text | 236 KB / 16 pp | Vector paths + text | 256 ms | 268 ms | 1.05× |
-| Native text, dense | 2.1 MB / 254 pp | Dense text layout | 4.3 s | 9.8 s | 2.3× |
-| Ebook, mixed | 16 MB / 358 pp | Mixed content | 7.8 s | 12.4 s | 1.6× |
-| Academic book | 12 MB / 601 pp | Images + vector | 12.8 s | 16.7 s | 1.3× |
-| Modern layout, DCT | 88 MB / 160 pp | JPEG-heavy layout | 11.7 s | 7.3 s | 0.6× |
-| Journal, DCT-heavy | 168 MB / 162 pp | Dense JPEG pages | 3.8 s | 4.9 s | 1.3× |
-| 1927 scan, DCT | 145 MB / 390 pp | Scanned JPEG | 50 s | 279 s | **5.6×** |
-| 1836 scan, DCT | 148 MB / 490 pp | Scanned JPEG | 71 s | 356 s | **5.0×** |
-| Scan, JBIG2+JPX | 50 MB / 576 pp | Scanned JBIG2/JPEG2K | 19.6 s | 148.9 s | **7.6×** |
+**CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512:**
 
-Largest gains on scan-heavy corpora via nvJPEG + nvJPEG2000 GPU decoding. The modern-layout DCT corpus (row 6) is slower due to high parallelism in the reference renderer on that specific layout type.
+| Document | Pages | pdf-raster | pdftoppm | Speedup |
+|---|---|---|---|---|
+| Native text, small | 16 | 48 ms | 154 ms | 3.2× |
+| Native text, dense | 254 | 592 ms | 3 853 ms | **6.5×** |
+| Journal, DCT-heavy | 162 | 813 ms | 5 273 ms | **6.5×** |
+| 1927 scan, DCT | 390 | 19 s | 388 s | **20×** |
+| 1836 scan, DCT | 490 | 58 s | 390 s | 6.7× |
+| Scan, JBIG2+JPX | 576 | 22 s | 151 s | 7.0× |
+
+**GPU-accelerated (nvJPEG + nvJPEG2000), same machine + RTX 5070:**
+
+| Document | Pages | pdf-raster | pdftoppm | Speedup |
+|---|---|---|---|---|
+| Native text, dense | 254 | 4.3 s | 9.8 s | 2.3× |
+| 1927 scan, DCT | 390 | 50 s | 279 s | **5.6×** |
+| 1836 scan, DCT | 490 | 71 s | 356 s | **5.0×** |
+| Scan, JBIG2+JPX | 576 | 19.6 s | 148.9 s | **7.6×** |
+
+Largest gains on scan-heavy corpora where SIMD JPEG decoding (CPU) and nvJPEG/nvJPEG2000 (GPU) dominate. Short native-text PDFs are startup-bound and show modest gains. See [docs/benchmarks.md](docs/benchmarks.md) for the full table including an Intel i7-8700K (AVX2-only) comparison.
