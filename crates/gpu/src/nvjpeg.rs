@@ -102,13 +102,7 @@ const NVJPEG_OUTPUT_Y: nvjpegOutputFormat_t = 2;
 /// `NVJPEG_OUTPUT_RGBI` — interleaved RGB output to `channel[0]`, 3 bytes per pixel.
 const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 
-/// Backend selection for `nvjpegCreateEx`.
-///
-/// `NVJPEG_BACKEND_HARDWARE` uses the on-die JPEG engine present on Turing+
-/// GPUs (including Blackwell RTX 5070).  It only supports baseline single-scan
-/// JPEGs; the library returns `NVJPEG_STATUS_JPEG_NOT_SUPPORTED` for progressive
-/// or multi-scan streams, which the caller catches and retries with the DEFAULT
-/// backend.
+/// Backend selector passed as the first argument to `nvjpegCreateEx`.
 #[expect(
     non_camel_case_types,
     reason = "C FFI type alias; must match the nvJPEG ABI name"
@@ -242,13 +236,7 @@ unsafe extern "C" {
 }
 
 const NVJPEG_STATUS_SUCCESS: nvjpegStatus_t = 0;
-/// JPEG encoding not supported by the chosen backend (e.g. progressive JPEG on HARDWARE backend).
-const NVJPEG_STATUS_JPEG_NOT_SUPPORTED: nvjpegStatus_t = 4;
-/// Bitstream is truncated or incomplete.
-#[expect(
-    dead_code,
-    reason = "named in NvJpegError::Display match arm as integer 10; kept as readable documentation"
-)]
+/// Bitstream truncated or incomplete.
 const NVJPEG_STATUS_INCOMPLETE_BITSTREAM: nvjpegStatus_t = 10;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -301,7 +289,9 @@ impl std::fmt::Display for NvJpegError {
                     7 => "NVJPEG_STATUS_ARCH_MISMATCH",
                     8 => "NVJPEG_STATUS_INTERNAL_ERROR",
                     9 => "NVJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED",
-                    10 => "NVJPEG_STATUS_INCOMPLETE_BITSTREAM",
+                    x if x == NVJPEG_STATUS_INCOMPLETE_BITSTREAM => {
+                        "NVJPEG_STATUS_INCOMPLETE_BITSTREAM"
+                    }
                     _ => "NVJPEG_STATUS_UNKNOWN",
                 };
                 write!(f, "nvJPEG error {code} ({name})")
@@ -372,7 +362,7 @@ impl PinnedBuf {
     fn alloc(len: usize) -> std::result::Result<Self, NvJpegError> {
         let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: cuMemAllocHost writes to `raw`; `len` is the allocation size.
-        let result = unsafe { cuMemAllocHost(std::ptr::addr_of_mut!(raw), len) };
+        let result = unsafe { cuMemAllocHost(&raw mut raw, len) };
         if result != 0 {
             return Err(NvJpegError::CudaError(result));
         }
@@ -503,7 +493,7 @@ impl NvJpeg {
         let handle = Self::create_handle()?;
         let mut state: nvjpegJpegState_t = ptr::null_mut();
         // SAFETY: handle is valid; nvjpegJpegStateCreate allocates per-decode buffers.
-        let status = unsafe { nvjpegJpegStateCreate(handle, ptr::addr_of_mut!(state)) };
+        let status = unsafe { nvjpegJpegStateCreate(handle, &raw mut state) };
         if status != NVJPEG_STATUS_SUCCESS {
             // Destroy the handle before propagating the error.
             // SAFETY: handle is valid; state was never initialised.
@@ -519,39 +509,29 @@ impl NvJpeg {
 
     /// Try `GPU_HYBRID` first; fall back to `DEFAULT`.
     fn create_handle() -> Result<nvjpegHandle_t> {
+        Self::try_backend(NVJPEG_BACKEND_GPU_HYBRID).or_else(|e| {
+            log::debug!("nvJPEG GPU_HYBRID backend unavailable ({e}), falling back to DEFAULT");
+            Self::try_backend(NVJPEG_BACKEND_DEFAULT)
+        })
+    }
+
+    /// Attempt to open an nvJPEG library handle with the given `backend`.
+    ///
+    /// Returns the handle on success, or `NvjpegStatus` on failure.
+    /// NULL allocator pointers request the default CUDA device/pinned allocators.
+    /// `flags` must be 0 (reserved).
+    fn try_backend(backend: nvjpegBackend_t) -> Result<nvjpegHandle_t> {
         let mut handle: nvjpegHandle_t = ptr::null_mut();
         // SAFETY: nvjpegCreateEx initialises a fresh library handle.
-        // NULL allocator pointers request the default CUDA device/pinned allocators.
-        // flags must be 0 (reserved; any other value returns NVJPEG_STATUS_INVALID_PARAMETER).
-        let hybrid_status = unsafe {
-            nvjpegCreateEx(
-                NVJPEG_BACKEND_GPU_HYBRID,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                0,
-                ptr::addr_of_mut!(handle),
-            )
-        };
-        if hybrid_status == NVJPEG_STATUS_SUCCESS {
-            assert!(
-                !handle.is_null(),
-                "nvjpegCreateEx(GPU_HYBRID) succeeded but returned null handle"
-            );
-            return Ok(handle);
-        }
-
-        log::debug!(
-            "nvJPEG GPU_HYBRID backend unavailable ({hybrid_status}), falling back to DEFAULT"
-        );
-        handle = ptr::null_mut();
-        // SAFETY: same as above; NVJPEG_BACKEND_DEFAULT with default allocators.
+        // NULL allocator pointers request default CUDA allocators.
+        // flags = 0 is the only valid value (reserved field).
         let status = unsafe {
             nvjpegCreateEx(
-                NVJPEG_BACKEND_DEFAULT,
+                backend,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                ptr::addr_of_mut!(handle),
+                &raw mut handle,
             )
         };
         if status != NVJPEG_STATUS_SUCCESS {
@@ -559,7 +539,7 @@ impl NvJpeg {
         }
         assert!(
             !handle.is_null(),
-            "nvjpegCreateEx(DEFAULT) succeeded but returned null handle"
+            "nvjpegCreateEx succeeded but returned null handle"
         );
         Ok(handle)
     }
@@ -569,11 +549,6 @@ impl NvJpeg {
     /// The GPU is still writing when this returns; the caller must synchronise
     /// `stream` before calling `PendingDecode::into_decoded_jpeg`.
     fn decode(&mut self, data: &[u8], stream: CUstream) -> Result<PendingDecode> {
-        self.decode_inner(data, stream)
-    }
-
-    /// Inner decode — calls nvJPEG API directly, no retry logic.
-    fn decode_inner(&mut self, data: &[u8], stream: CUstream) -> Result<PendingDecode> {
         // ── Phase 1: inspect headers ──────────────────────────────────────────
         let mut n_components: i32 = 0;
         // Required out-parameter for `nvjpegGetImageInfo`; value is not used —
@@ -589,8 +564,8 @@ impl NvJpeg {
                 self.handle,
                 data.as_ptr(),
                 data.len(),
-                ptr::addr_of_mut!(n_components),
-                ptr::addr_of_mut!(subsampling_out),
+                &raw mut n_components,
+                &raw mut subsampling_out,
                 widths.as_mut_ptr(),
                 heights.as_mut_ptr(),
             )
@@ -646,7 +621,7 @@ impl NvJpeg {
                 data.as_ptr(),
                 data.len(),
                 out_fmt,
-                ptr::addr_of_mut!(img),
+                &raw mut img,
                 stream,
             )
         };
@@ -677,19 +652,11 @@ impl Drop for NvJpeg {
         // Ignore error codes on teardown — if the device is gone there is nothing
         // meaningful we can do, and panicking in Drop is unsound.
         //
-        // Null-check both handles: `reinit_default_backend` sets them to null
-        // before creating the replacement pair, so a mid-reinit failure leaves
-        // nulls in the struct.  The nvJPEG API does not document null as a no-op,
-        // so we guard explicitly.
-        //
-        // SAFETY: non-null handles are valid and exclusively owned; no aliases exist.
+        // SAFETY: handle and state are valid (new() asserts both non-null before
+        // storing them); no other references exist at drop time.
         unsafe {
-            if !self.state.is_null() {
-                let _ = nvjpegJpegStateDestroy(self.state);
-            }
-            if !self.handle.is_null() {
-                let _ = nvjpegDestroy(self.handle);
-            }
+            let _ = nvjpegJpegStateDestroy(self.state);
+            let _ = nvjpegDestroy(self.handle);
         }
     }
 }
@@ -758,7 +725,7 @@ impl NvJpegDecoder {
         // CUDA_ERROR_INVALID_DEVICE = 101.
         let ordinal_i32 = i32::try_from(ordinal).map_err(|_| NvJpegError::CudaError(101))?;
         let mut device: i32 = 0;
-        let r = unsafe { cuDeviceGet(ptr::addr_of_mut!(device), ordinal_i32) };
+        let r = unsafe { cuDeviceGet(&raw mut device, ordinal_i32) };
         if r != 0 {
             return Err(NvJpegError::CudaError(r));
         }
@@ -777,7 +744,7 @@ impl NvJpegDecoder {
         for attempt in 0..3_u32 {
             cu_ctx = ptr::null_mut();
             // SAFETY: cuDevicePrimaryCtxRetain writes to cu_ctx.
-            let r = unsafe { cuDevicePrimaryCtxRetain(ptr::addr_of_mut!(cu_ctx), device) };
+            let r = unsafe { cuDevicePrimaryCtxRetain(&raw mut cu_ctx, device) };
             if r != 0 {
                 if attempt < 2 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -790,7 +757,7 @@ impl NvJpegDecoder {
             let mut _ver: u32 = 0;
             // SAFETY: cu_ctx is non-null (Retain succeeded); cuCtxGetApiVersion is a
             // read-only probe that does not modify driver state.
-            let probe = unsafe { cuCtxGetApiVersion(cu_ctx, ptr::addr_of_mut!(_ver)) };
+            let probe = unsafe { cuCtxGetApiVersion(cu_ctx, &raw mut _ver) };
             if probe == 0 {
                 ctx_ready = true;
                 break;
@@ -798,12 +765,16 @@ impl NvJpegDecoder {
             log::debug!(
                 "nvJPEG: primary context not ready (attempt {attempt}, probe={probe}), retrying"
             );
-            // SAFETY: we just retained it; release before retrying.
+            // SAFETY: we just retained it; release before next attempt or final failure.
             let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
         if !ctx_ready {
-            return Err(NvJpegError::CudaError(700)); // CUDA_ERROR_UNKNOWN
+            // All three probe attempts failed; the context was never initialised.
+            // CUDA_ERROR_NOT_INITIALIZED = 3.  The release already ran on the last iteration.
+            return Err(NvJpegError::CudaError(3));
         }
 
         // Bind the now-verified primary context to the calling thread.
@@ -818,7 +789,7 @@ impl NvJpegDecoder {
         // and not to any internal context that NvJpeg::new() might push.
         let mut stream: CUstream = ptr::null_mut();
         // SAFETY: cuStreamCreate writes to `stream`; flags = 0 is default.
-        let r = unsafe { cuStreamCreate(ptr::addr_of_mut!(stream), 0) };
+        let r = unsafe { cuStreamCreate(&raw mut stream, 0) };
         if r != 0 {
             let _ = unsafe { cuDevicePrimaryCtxRelease(device) };
             return Err(NvJpegError::CudaError(r));
