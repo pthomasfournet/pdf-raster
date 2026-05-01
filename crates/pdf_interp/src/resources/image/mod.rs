@@ -91,15 +91,18 @@ pub(crate) mod inline;
 
 pub use inline::decode_inline_image;
 
-/// Thin fuzz-only wrappers that forward to the `pub(super)` codec functions.
+// Visible only when cargo-fuzz sets `--cfg fuzzing`.  Not part of the public API.
+// `pub(super)` codec functions cannot be re-exported across the crate boundary,
+// so these thin wrappers bridge the visibility gap without widening it in normal
+// builds.
 #[cfg(fuzzing)]
+#[doc(hidden)]
 pub mod fuzz_entry {
     use lopdf::{Document, Object};
 
-    use super::codecs;
     use super::ImageDescriptor;
+    use super::codecs;
 
-    #[doc(hidden)]
     pub fn decode_ccitt(
         data: &[u8],
         width: u32,
@@ -110,7 +113,6 @@ pub mod fuzz_entry {
         codecs::decode_ccitt(data, width, height, is_mask, parms)
     }
 
-    #[doc(hidden)]
     pub fn decode_jbig2(
         doc: &Document,
         data: &[u8],

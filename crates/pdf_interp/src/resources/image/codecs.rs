@@ -1,8 +1,9 @@
 //! Compressed-image codec decoders: CCITT, DCT (JPEG), JPX (JPEG 2000), JBIG2.
 //!
-//! All functions are `pub(super)` — they are called exclusively from
-//! `super` (the image `mod.rs`) and, transitively, from `inline.rs` via
-//! the re-exports in `mod.rs`.
+//! All functions are `pub(super)` — called exclusively from `super` (`image/mod.rs`)
+//! and transitively from `inline.rs`.  Under `cfg(fuzzing)`, `decode_ccitt` and
+//! `decode_jbig2` are additionally reachable through the `fuzz_entry` wrappers in
+//! `image/mod.rs`, which bridge the visibility gap without widening it in normal builds.
 
 use hayro_jbig2::Decoder as Jbig2Decoder;
 use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};

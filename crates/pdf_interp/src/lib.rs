@@ -14,7 +14,7 @@ pub mod content;
 pub mod renderer;
 pub mod resources;
 
-/// Thin re-exports of codec functions for fuzz targets.
+/// Entry points for fuzz targets — forwards to codec wrappers in `image::fuzz_entry`.
 ///
 /// Only compiled when `--cfg fuzzing` is set (cargo-fuzz sets this automatically).
 /// Not part of the public API.
