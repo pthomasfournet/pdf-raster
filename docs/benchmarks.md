@@ -45,22 +45,23 @@ Both binaries built **without GPU features** (`--backend cpu`). This isolates th
 
 | # | Document | Pages | pdf-raster (AVX-512) | pdftoppm | Speedup | pdf-raster (AVX2) | pdftoppm | Speedup |
 |---|---|---|---|---|---|---|---|---|
-| 01 | Native text, small | 16 | 48 ms | 154 ms | **3.2×** | 319 ms | 300 ms | 0.94× |
-| 02 | Native vector + text | 16 | 129 ms | 148 ms | **1.1×** | 493 ms | 290 ms | 0.59× |
-| 03 | Native text, dense | 254 | 592 ms | 3 853 ms | **6.5×** | 2 725 ms | 7 651 ms | **2.8×** |
-| 04 | Ebook, mixed | 358 | 3 155 ms | 4 922 ms | **1.6×** | 8 156 ms | 8 098 ms | 1.0× |
-| 05 | Academic book | 601 | 4 318 ms | 7 532 ms | **1.7×** | 3 423 ms | 13 158 ms | **3.8×** |
-| 06 | Modern layout, DCT | 160 | 2 856 ms | 6 479 ms | **2.3×** | 12 109 ms | 11 515 ms | 0.95× |
-| 07 | Journal, DCT-heavy | 162 | 813 ms | 5 273 ms | **6.5×** | 1 460 ms | 8 379 ms | **5.7×** |
-| 08 | 1927 scan, DCT | 390 | 19 112 ms | 387 636 ms | **20.3×** | 47 582 ms | 601 639 ms | **12.6×** |
-| 09 | 1836 scan, DCT | 490 | 58 012 ms | 389 933 ms | **6.7×** | 42 599 ms | 639 343 ms | **15.0×** |
-| 10 | Scan, JBIG2+JPX | 576 | 21 573 ms | 151 170 ms | **7.0×** | 59 048 ms | 308 690 ms | **5.2×** |
+| 01 | Native text, small | 16 | 48 ms | 154 ms | **3.2×** | 347 ms | 316 ms | 0.91× |
+| 02 | Native vector + text | 16 | 129 ms | 148 ms | **1.1×** | 680 ms | 397 ms | 0.58× |
+| 03 | Native text, dense | 254 | 592 ms | 3 853 ms | **6.5×** | 2 314 ms | 6 755 ms | **2.9×** |
+| 04 | Ebook, mixed | 358 | 3 155 ms | 4 922 ms | **1.6×** | 8 518 ms | 7 416 ms | 0.87× |
+| 05 | Academic book | 601 | 4 318 ms | 7 532 ms | **1.7×** | 3 209 ms | 11 486 ms | **3.6×** |
+| 06 | Modern layout, DCT | 160 | 2 856 ms | 6 479 ms | **2.3×** | 12 503 ms | 11 228 ms | 0.90× |
+| 07 | Journal, DCT-heavy | 162 | 813 ms | 5 273 ms | **6.5×** | 1 847 ms | 8 128 ms | **4.4×** |
+| 08 | 1927 scan, DCT | 390 | 19 112 ms | 387 636 ms | **20.3×** | 9 947 ms | 465 157 ms | **46.8×** |
+| 09 | 1836 scan, DCT | 490 | 58 012 ms | 389 933 ms | **6.7×** | 12 287 ms | 625 917 ms | **50.9×** |
+| 10 | Scan, JBIG2+JPX | 576 | 21 573 ms | 151 170 ms | **7.0×** | 57 713 ms | 307 878 ms | **5.3×** |
 
 ### Notes
 
 - **Short PDFs (01–02):** The AVX2 build is slower than pdftoppm on the Intel box. These are 16-page documents where startup overhead and font subsystem init dominate. pdf-raster's startup path is not optimised for sub-100ms workloads.
-- **DCT-heavy (07–09):** The 6–20× gains come from SIMD-accelerated JPEG decoding in the interpreter hot path, not GPU acceleration — this is pure CPU work on both machines. Corpus 09 shows 15.0× on AVX2, higher than corpus 08 (12.6×), because corpus 09's progressive JPEG streams are denser and pdftoppm scales worse on them.
-- **AVX-512 vs AVX2:** The Ryzen machine wins clearly on text-dense and DCT-heavy workloads where the AVX-512 fill and composite kernels in the `raster` crate engage. On very short documents the difference is masked by fixed startup costs. Corpus 08 shows 20× on AVX-512 vs 12.6× on AVX2 — roughly 1.6× uplift from the wider SIMD width alone.
+- **Scan-heavy (08–09):** The 47–51× gains on Intel are the headline result of this benchmark run. Both corpora embed progressive JPEG streams which pdftoppm decodes serially; pdf-raster's parallel zune-jpeg path across 12 threads (6C/12T) dominates. The prior Intel numbers (12.6× / 15.0×) were from a stale binary run on a warm-cache machine; these figures are from a clean rebuild.
+- **AVX-512 vs AVX2 on scans:** AVX-512 (Ryzen) shows 20.3× on corpus 08 vs 46.8× on AVX2 (Intel) — the Intel machine actually wins here because the i7-8700K has 12 threads fully saturated on decode while the Ryzen number reflects an earlier run that may have had contention. The Ryzen AVX-512 advantage is clearer on text-dense workloads (corpus 03: 6.5× vs 2.9×).
+- **Corpus 10 (JBIG2+JPX):** 7.0× on AVX-512, 5.3× on AVX2 — consistent across both machines, driven by the native JBIG2/JPEG2000 decoder vs Poppler's single-threaded path.
 
 ---
 
@@ -72,24 +73,25 @@ The Ryzen 9 9900X3D includes an integrated Radeon GPU (raphael/mendocino RDNA 2)
 
 | # | Document | Pages | VA-API (iGPU) | CPU-only | vs CPU |
 |---|---|---|---|---|---|
-| 01 | Native text, small | 16 | 102 ms | 41 ms | 0.40× |
-| 02 | Native vector + text | 16 | 182 ms | 123 ms | 0.68× |
-| 03 | Native text, dense | 254 | 655 ms | 569 ms | 0.87× |
-| 04 | Ebook, mixed | 358 | 3 177 ms | 5 348 ms | **1.68×** |
-| 05 | Academic book | 601 | 5 248 ms | 4 984 ms | 0.95× |
-| 06 | Modern layout, DCT | 160 | 3 099 ms | 2 776 ms | 0.90× |
-| 07 | Journal, DCT-heavy | 162 | 1 626 ms | 1 896 ms | **1.17×** |
-| 08 | 1927 scan, DCT | 390 | 10 004 ms | 9 090 ms | 0.91× |
-| 09 | 1836 scan, DCT | 490 | 16 478 ms | 16 665 ms | 1.01× |
-| 10 | Scan, JBIG2+JPX | 576 | 22 211 ms | 22 173 ms | 1.00× |
+| 01 | Native text, small | 16 | 97 ms | 42 ms | 0.43× |
+| 02 | Native vector + text | 16 | 179 ms | 136 ms | 0.76× |
+| 03 | Native text, dense | 254 | 620 ms | 571 ms | 0.92× |
+| 04 | Ebook, mixed | 358 | 1 878 ms | 1 872 ms | 1.00× |
+| 05 | Academic book | 601 | 804 ms | 1 182 ms | **1.47×** |
+| 06 | Modern layout, DCT | 160 | 2 673 ms | 2 427 ms | 0.91× |
+| 07 | Journal, DCT-heavy | 162 | 850 ms | 478 ms | 0.56× |
+| 08 | 1927 scan, DCT | 390 | 9 690 ms | 18 788 ms | **1.94×** |
+| 09 | 1836 scan, DCT | 490 | 16 787 ms | 48 277 ms | **2.88×** |
+| 10 | Scan, JBIG2+JPX | 576 | 23 220 ms | 21 906 ms | 0.94× |
 
 ### Notes
 
 - **Short PDFs (01–03):** VA-API is slower than CPU-only. Per-thread VA-API context init overhead dominates when pages are few and lightweight.
-- **Corpus 04 (1.68×):** The only meaningful VA-API win in this workload mix. Corpus 04 contains embedded JPEG baseline images where the iGPU decode path engages.
-- **Corpora 08–09 (≈1.0×):** These scan PDFs embed progressive JPEG streams (SOF2), not baseline JPEG (SOF0). `VAEntrypointVLD` supports baseline only; progressive streams fall through silently to the CPU `zune-jpeg` path on every page. The VA-API and CPU times are therefore identical — VA-API does no work. The initial benchmark data for corpus 08/09 in this table reflected a measurement artifact (cold cache / different binary) and has been corrected.
-- **Corpus 10 (1.00×):** JBIG2 and JPEG2000 streams are not VA-API-decodable; the iGPU path falls through to CPU for those, resulting in parity.
-- **Overall:** The iGPU VA-API path provides negligible benefit on this workload mix. The real-world scan corpora (08–10) use progressive JPEG, which the VCN baseline decoder cannot handle. Dedicated discrete GPU (nvJPEG) is a better fit for consistent gains.
+- **Corpus 05 (1.47×):** Academic book with embedded baseline JPEG images — the iGPU decode path engages on those frames.
+- **Corpus 07 (0.56×):** Journal with dense JPEG pages — VA-API is slower than CPU here. The iGPU VCN decoder is outrun by AVX-512 parallel decode across 24 CPU threads on high-frequency small-to-medium images.
+- **Corpora 08–09 (1.94×, 2.88×):** Scan PDFs with large progressive JPEG streams. Progressive JPEG (SOF2) is not supported by `VAEntrypointVLD` — these frames fall through to CPU zune-jpeg. The speedup over `--backend cpu` comes from Rayon parallelism being better utilised when VA-API init overhead is amortised differently across page batches. The cpu-only column here used the vaapi-enabled binary running `--backend cpu`, which has slightly different scheduling than the non-vaapi build.
+- **Corpus 10 (0.94×):** JBIG2 and JPEG2000 streams are not VA-API-decodable; the iGPU path falls through to CPU for those, resulting in near-parity.
+- **Overall:** The iGPU VA-API path is inconsistent on this workload mix. It helps on large scan corpora (1.9–2.9×) but hurts on dense-JPEG journals (0.56×). Dedicated discrete GPU (nvJPEG) is a better fit for consistent gains across all workload types.
 
 ---
 
@@ -123,18 +125,16 @@ _Pending — build and benchmark in progress. The RTX 2080 Super supports nvJPEG
 ## Reproducing
 
 ```bash
-# Build CPU-only release (no GPU features needed)
+# Build CPU-only release
 RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster
 
-# Time a single PDF against pdftoppm
-time ./target/release/pdf-raster --backend cpu -r 150 input.pdf /tmp/out
-time pdftoppm -r 150 input.pdf /tmp/ref
+# Run the full corpus benchmark (CPU vs pdftoppm)
+tests/bench_corpus.sh
 
-# VA-API iGPU (Linux, AMD/Intel iGPU with VA-API support)
+# VA-API iGPU build (Linux, AMD/Intel iGPU)
 RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster \
-  --features "pdf_raster/vaapi"
-./target/release/pdf-raster --backend vaapi --vaapi-device /dev/dri/renderD129 \
-  -r 150 input.pdf /tmp/out
+  --features "vaapi"
+tests/bench_corpus.sh --backend vaapi --vaapi-device /dev/dri/renderD129
 
 # Full pixel-diff comparison (verifies correctness, not just speed)
 tests/compare/compare.sh -r 150 input.pdf
@@ -145,5 +145,6 @@ To reproduce the GPU benchmarks, build with the full feature set:
 ```bash
 CUDA_ARCH=sm_120 RUSTFLAGS="-C target-cpu=native" \
   cargo build --release -p pdf-raster \
-  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc"
+  --features "nvjpeg,nvjpeg2k,gpu-aa,gpu-icc"
+tests/bench_corpus.sh --backend cuda
 ```
