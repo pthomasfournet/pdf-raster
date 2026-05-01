@@ -79,22 +79,21 @@ The Ryzen 9 9900X3D includes an integrated Radeon GPU (raphael/mendocino RDNA 2)
 | 03 | Native text, dense | 254 | 591 ms | 586 ms | 0.99× |
 | 04 | Ebook, mixed | 358 | 1 832 ms | 1 788 ms | 0.98× |
 | 05 | Academic book | 601 | 752 ms | 705 ms | 0.94× |
-| 06 | Modern layout, DCT | 160 | 2 673 ms | 2 427 ms | 0.91× |
-| 07 | Journal, DCT-heavy | 162 | 850 ms | 478 ms | 0.56× |
-| 08 | 1927 scan, DCT | 390 | 9 690 ms | 18 788 ms | **1.94×** |
-| 09 | 1836 scan, DCT | 490 | 16 787 ms | 48 277 ms | **2.88×** |
-| 10 | Scan, JBIG2+JPX | 576 | 23 220 ms | 21 906 ms | 0.94× |
+| 06 | Modern layout, DCT | 160 | 2 785 ms | 2 818 ms | 1.01× |
+| 07 | Journal, DCT-heavy | 162 | 889 ms | 827 ms | 0.93× |
+| 08 | 1927 scan, DCT | 390 | 9 979 ms | 10 312 ms | 1.03× |
+| 09 | 1836 scan, DCT | 490 | 17 278 ms | 41 694 ms | **2.41×** |
+| 10 | Scan, JBIG2+JPX | 576 | 20 899 ms | 21 235 ms | 1.02× |
 
-_Corpora 01–05: fresh uncontested run. Corpora 06–10: from prior run (re-run pending)._
+_All corpora: fresh uncontested cold-cache runs._
 
 ### Notes
 
-- **Short PDFs (01–02):** VA-API is significantly slower than CPU-only. Corpus-01 (16 pages, 473 ms vs 43 ms) shows the VA-API context init cost dominates completely on small workloads — each page requires a fresh `VAContext` + `VASurface` allocation.
-- **Corpora 03–05 (~0.94–0.99×):** Near-parity. VA-API engages on embedded SOF0 baseline JPEG images but the overhead of context creation per image roughly cancels the decode speedup at this scale.
-- **Corpus 07 (0.56×):** Journal with dense JPEG pages — VA-API is slower than CPU here. The iGPU VCN decoder is outrun by AVX-512 parallel decode across 24 CPU threads on high-frequency small-to-medium images.
-- **Corpora 08–09 (1.94×, 2.88×):** Scan PDFs with large progressive JPEG streams. Progressive JPEG (SOF2) is not supported by `VAEntrypointVLD` — these frames fall through to CPU zune-jpeg. The speedup over `--backend cpu` comes from Rayon parallelism being better utilised when VA-API init overhead is amortised differently across page batches. The cpu-only column used the vaapi-enabled binary running `--backend cpu`.
-- **Corpus 10 (0.94×):** JBIG2 and JPEG2000 streams are not VA-API-decodable; the iGPU path falls through to CPU for those, resulting in near-parity.
-- **Overall:** The iGPU VA-API path yields no benefit on corpora 01–05. The per-image context init cost is too high for the workload density. Wins only appear on the large scan corpora (08–09) where the comparison baseline is already slow. Dedicated discrete GPU (nvJPEG) is a better fit.
+- **Short PDFs (01–02):** VA-API is significantly slower than CPU-only. Corpus-01 (473 ms vs 43 ms) shows the VA-API context init cost dominating completely — each page requires a fresh `VAContext` + `VASurface` allocation.
+- **Corpora 03–05 (~0.94–0.99×):** Near-parity. VA-API engages on embedded SOF0 baseline JPEG images but context creation overhead cancels the decode speedup.
+- **Corpora 06–08, 10 (~1.0×):** Essentially neutral. VA-API falls through to CPU for progressive JPEG (SOF2) and JBIG2/JPX streams; any marginal win from VA-API on SOF0 images is offset by init overhead.
+- **Corpus 09 (2.41×):** Largest scan corpus (490 pages). The VA-API path amortises init cost better at this scale; the cpu-only comparison uses the vaapi-enabled binary on `--backend cpu` which has slightly different Rayon scheduling.
+- **Overall:** iGPU VA-API is largely neutral on this workload mix. The only meaningful win is corpus-09 (2.41×), driven by scheduling differences rather than hardware JPEG decode (all frames are progressive SOF2, unsupported by `VAEntrypointVLD`). Dedicated GPU (nvJPEG) is the right tool for consistent gains.
 
 ---
 
