@@ -4,9 +4,10 @@ Tracking work needed to run pdf-raster on Intel x86-64, AMD iGPU, ARM, and Apple
 Silicon. The core raster pipeline is portable; the work is auditing, fixing build
 issues, adding SIMD fast paths, and adding VA-API GPU acceleration.
 
-**Current priorities:** Phase C2 (VA-API JPEG decode) ✓ complete. Next: C3 evaluation
-(VA-API VPP deskew — verdict already recorded: not viable), then ARM NEON (Phase E,
-already complete). Apple Silicon (Phase F) requires macOS hardware.
+**Status: all planned phases complete.** C2 (VA-API JPEG decode) shipped Apr 2026.
+C3 (VA-API VPP deskew) evaluated and closed — not viable (90° multiples only).
+ARM NEON (Phase E) complete. Apple Silicon (Phase F) requires macOS hardware.
+C4 (Vulkan BVH) deferred pending profiling evidence of complex-path bottleneck.
 
 ---
 
@@ -81,7 +82,7 @@ written and tested on AVX-512 hardware; they need an explicit pass on AVX2-only 
 When `nvjpeg` feature is disabled, DCTDecode goes through `zune-jpeg` (pure Rust).
 No work needed — this path has always been the default.
 
-### A2 — AVX2 AA popcount tier
+### A2 — AVX2 AA popcount tier ✓ DONE (Apr 2026)
 
 `aa_coverage_span` dispatch in `crates/raster/src/simd/popcnt.rs`:
 1. `avx512bitalg` + `avx512bw` — 128 px/iter (Ryzen only)
@@ -213,13 +214,14 @@ on the dev machine today. The i7-8700K test bench also has Intel UHD 630 via the
 `NvJpegDecoder`, `NvJpeg2kDecoder`, and `GpuCtx` implement these traits.
 Inline image GPU dispatch is wired (`decode_inline_image` passes GPU params through).
 
-### C2 — VA-API JPEG decoder (`VapiJpegDecoder`) ✓ DONE
+### C2 — VA-API JPEG decoder (`VapiJpegDecoder`) ✓ DONE (Apr 2026)
 
 Implements `GpuJpegDecoder` using raw `libva`/`libva-drm` FFI (no bindgen — the
 VA-API surface is small and stable; same rationale as raw CUDA driver API in nvJPEG).
 
-**Device selection:** open `/dev/dri/renderD129` (AMD iGPU on dev machine) via
-`vaGetDisplayDRM`. The device node should be configurable or auto-detected, not hardcoded.
+**Device selection:** `VAAPI_DRM_NODE` constant in `pdf_raster/src/render.rs` defaults
+to `/dev/dri/renderD128`; override by rebuilding with a different path.  Tested on
+`renderD129` (AMD Raphael iGPU) and confirmed working.
 
 **Key API objects:**
 ```c
@@ -583,7 +585,7 @@ skip at runtime when `sve2` is not detected — they will execute on Graviton4.
 | D — CI CPU-only job | medium | ✓ DONE (Apr 2026) — `.github/workflows/ci.yml` |
 | A7 — Intel RDT cache partitioning note | low | ✓ DONE — see "Deployment notes" section above |
 | C1 — `GpuJpegDecoder` / `GpuCompute` abstraction traits | low | ✓ DONE (Apr 2026) — `crates/gpu/src/traits.rs`; `NvJpegDecoder` + `NvJpeg2kDecoder` + `GpuCtx` impls; inline image GPU gap also closed |
-| C2 — `VapiJpegDecoder` (VA-API JPEG decode) | **high** | **UNBLOCKED** — AMD iGPU confirmed on dev machine (`renderD129`, VCN 4.0, VA-API 1.20, Apr 2026); design complete; implement next |
+| C2 — `VapiJpegDecoder` (VA-API JPEG decode) | high | ✓ DONE (Apr 2026) — `crates/gpu/src/vaapi`; raw `libva`/`libva-drm` FFI; NV12→RGB8 BT.601 CPU step; YUV400 grayscale fallback; wired into pdf_interp dispatch (nvJPEG → VA-API → zune-jpeg); `DecoderInit<T>` thread-local in pdf_raster; hardening pass complete |
 | C3 — VA-API VPP deskew rotation | low | Not feasible — `rotation_state` supports 90° multiples only; arbitrary-angle deskew stays on CPU/NPP |
 | C4 — BVH winding test (AMD/Intel RT via Vulkan) | low | design noted; implement only if profiling shows complex-path bottleneck |
 | E5 — SVE2 popcount tier | low | ✓ DONE (Apr 2026) — `nightly-sve2` Cargo feature; `popcnt_aa_row_sve2` + `aa_coverage_span_sve2`; `svlsr_u8_z` + `svcnt_u8_z` + `svadd_u8_z`; dispatch above NEON; `cargo check` clean on stable (feature off) and nightly (feature on); runs when `is_aarch64_feature_detected!("sve2")` returns true |
