@@ -26,6 +26,8 @@ nvjpeg2k = ["pdf_raster/nvjpeg2k"]
 gpu-icc  = ["pdf_raster/gpu-icc"]
 # Enable GPU-accelerated deskew rotation via CUDA NPP.
 gpu-deskew = ["pdf_raster/gpu-deskew"]
+# Enable VA-API hardware JPEG decoding (AMD/Intel iGPU; no CUDA required).
+vaapi      = ["pdf_raster/vaapi"]
 
 [dependencies]
 pdf_raster  = { path = "../pdf_raster" }
