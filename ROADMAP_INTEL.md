@@ -33,9 +33,9 @@ Notable differences from the Ryzen dev machine:
   Core Ultra 9 285K) do have movdir64b, so the test bench is conservative here —
   the AVX2 fallback will be tested even if production hardware would use movdir64b.
 - **No 3D V-Cache** — L3 is 12 MB vs 128 MB; large edge tables will spill to DRAM.
-- **Turing GPU** — `NVJPEG_BACKEND_HARDWARE` (on-die JPEG engine) **is available**
-  on CC 7.5, unlike Blackwell CC 12.0 where it returns `NVJPEG_STATUS_ARCH_MISMATCH`.
-  Worth testing whether HARDWARE outperforms GPU_HYBRID in the single-threaded case.
+- **Turing GPU** — `NVJPEG_BACKEND_HARDWARE` is **not available** on Turing (CC 7.5).
+  The docs list support as Ampere (A100/A30), Hopper, Ada, Blackwell, and Jetson Thor only.
+  We use `GPU_HYBRID` regardless, so this is moot — no code change required.
 - **CUDA 12.4** — PTX compiled for `sm_120` will not run; build with
   `CUDA_ARCH=sm_75` on this machine.
 

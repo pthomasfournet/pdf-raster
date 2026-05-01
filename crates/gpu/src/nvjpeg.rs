@@ -5,10 +5,11 @@
 //! into a host `Vec<u8>` via an async CUDA stream.
 //!
 //! On the RTX 5070 (Blackwell, CC 12.0) this runs at ~10 GB/s, roughly 10–20×
-//! faster than the CPU software JPEG path for large images.  Optimal throughput
-//! requires the hardware decode engine (`NVJPEG_BACKEND_HARDWARE`), which only
-//! supports baseline single-scan JPEGs; progressive/multi-scan images
-//! automatically fall back through the hybrid backend.
+//! faster than the CPU software JPEG path for large images.  We use
+//! `NVJPEG_BACKEND_GPU_HYBRID` (GPU Huffman + CUDA SM IDCT/colour-convert), which
+//! scales well with many concurrent Rayon threads each owning their own decoder.
+//! `NVJPEG_BACKEND_HARDWARE` (fixed-function engine) is not used: it serialises
+//! all callers through the engine and degrades multi-threaded throughput.
 //!
 //! # Memory model
 //!
@@ -114,20 +115,19 @@ const NVJPEG_OUTPUT_RGBI: nvjpegOutputFormat_t = 5;
 )]
 type nvjpegBackend_t = i32;
 
-/// Auto-select the best available backend (typically `HYBRID`).
-/// Final fallback when both `GPU_HYBRID` and `HARDWARE` are unavailable.
+/// Auto-select the best available backend; opaque internal heuristic.
+/// Used as a fallback when `GPU_HYBRID` is unavailable.
 const NVJPEG_BACKEND_DEFAULT: nvjpegBackend_t = 0;
-/// GPU-accelerated Huffman + SM IDCT/colour-convert.  Better aggregate throughput
-/// than `HARDWARE` when many threads decode concurrently, because it uses CUDA SMs
-/// rather than the single fixed-function JPEG engine that serialises all callers.
+/// GPU Huffman decoding + CUDA SM IDCT/colour-convert.
+/// Scales well under concurrent multi-thread load; our primary backend.
 const NVJPEG_BACKEND_GPU_HYBRID: nvjpegBackend_t = 2;
-/// Fixed-function on-die JPEG engine (Turing+/Blackwell).  Fastest for
-/// single-threaded baseline JPEG; serialises across all concurrent callers so it
-/// is slower than `GPU_HYBRID` in multi-threaded workloads.
-/// Retained as a named constant for documentation; not used in production code paths.
+/// Fixed-function hardware JPEG engine.  Supported on Ampere (A100/A30), Hopper,
+/// Ada, Blackwell, and Jetson Thor — **not Turing** (despite marketing).  Serialises
+/// all concurrent callers through the engine; slower than `GPU_HYBRID` for
+/// multi-threaded workloads.  Not used; retained for documentation only.
 #[expect(
     dead_code,
-    reason = "documents the HARDWARE backend value; not used in production"
+    reason = "documents the HARDWARE backend value; not used — see module doc"
 )]
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;
 
@@ -440,11 +440,6 @@ pub struct DecodedJpeg {
 pub(crate) struct NvJpeg {
     handle: nvjpegHandle_t,
     state: nvjpegJpegState_t,
-    /// True when the handle was opened with `NVJPEG_BACKEND_HARDWARE`.
-    /// The hardware engine does not support progressive or multi-scan JPEGs;
-    /// `decode` checks the return status and retries via a DEFAULT-backend
-    /// handle when it encounters `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`.
-    hardware_backend: bool,
 }
 
 // ── PendingDecode ─────────────────────────────────────────────────────────────
@@ -488,36 +483,44 @@ impl PendingDecode {
 unsafe impl Send for NvJpeg {}
 
 impl NvJpeg {
-    /// Initialise nvJPEG, preferring `GPU_HYBRID` for multi-threaded workloads.
+    /// Initialise nvJPEG with `GPU_HYBRID`, falling back to `DEFAULT`.
     ///
-    /// Attempts `NVJPEG_BACKEND_GPU_HYBRID` first — uses CUDA SMs for Huffman
-    /// decode + IDCT/colour-convert and scales well when many threads decode
-    /// concurrently.  Falls back to `NVJPEG_BACKEND_DEFAULT` if unavailable.
+    /// `GPU_HYBRID` uses CUDA SMs for Huffman decode + IDCT/colour-convert and
+    /// scales well when many Rayon worker threads decode concurrently.
+    /// `DEFAULT` is an opaque library-internal selection used as a fallback when
+    /// `GPU_HYBRID` is unavailable on older drivers.
     ///
-    /// `NVJPEG_BACKEND_HARDWARE` is intentionally not used here: it routes all
-    /// decodes through the single fixed-function JPEG engine, which serialises
-    /// across all concurrent callers and degrades throughput in multi-threaded
-    /// PDF rendering.
-    ///
-    /// Returns `Err` if both backends fail to initialise, or if per-decode state
-    /// allocation fails.  Callers should treat the error as "nvJPEG unavailable;
-    /// fall back to CPU".
+    /// `HARDWARE` (fixed-function engine) is intentionally not used: it serialises
+    /// all concurrent callers through a single engine and degrades multi-threaded
+    /// throughput.  It is also not available on Turing GPUs despite marketing claims;
+    /// the real availability baseline is Ampere (A100/A30), Hopper, Ada, Blackwell.
     ///
     /// # Errors
     ///
-    /// Returns an error if nvJPEG device initialisation or state allocation fails.
+    /// Returns an error if both backends fail to initialise, or if per-decode state
+    /// allocation fails.  Treat as "nvJPEG unavailable; fall back to CPU".
     pub(crate) fn new() -> Result<Self> {
-        let (handle, hardware_backend) = Self::create_handle()?;
-        Self::with_handle(handle, hardware_backend)
+        let handle = Self::create_handle()?;
+        let mut state: nvjpegJpegState_t = ptr::null_mut();
+        // SAFETY: handle is valid; nvjpegJpegStateCreate allocates per-decode buffers.
+        let status = unsafe { nvjpegJpegStateCreate(handle, ptr::addr_of_mut!(state)) };
+        if status != NVJPEG_STATUS_SUCCESS {
+            // Destroy the handle before propagating the error.
+            // SAFETY: handle is valid; state was never initialised.
+            let _ = unsafe { nvjpegDestroy(handle) };
+            return Err(NvJpegError::NvjpegStatus(status));
+        }
+        assert!(
+            !state.is_null(),
+            "nvjpegJpegStateCreate succeeded but returned null state"
+        );
+        Ok(Self { handle, state })
     }
 
-    /// Try `NVJPEG_BACKEND_GPU_HYBRID` first; fall back to `NVJPEG_BACKEND_DEFAULT`.
-    ///
-    /// Returns the handle and `hardware_backend = false` (neither selected backend
-    /// uses the fixed-function engine).
-    fn create_handle() -> Result<(nvjpegHandle_t, bool)> {
+    /// Try `GPU_HYBRID` first; fall back to `DEFAULT`.
+    fn create_handle() -> Result<nvjpegHandle_t> {
         let mut handle: nvjpegHandle_t = ptr::null_mut();
-        // SAFETY: nvjpegCreateEx initialises a fresh library handle with the chosen backend.
+        // SAFETY: nvjpegCreateEx initialises a fresh library handle.
         // NULL allocator pointers request the default CUDA device/pinned allocators.
         // flags must be 0 (reserved; any other value returns NVJPEG_STATUS_INVALID_PARAMETER).
         let hybrid_status = unsafe {
@@ -534,11 +537,11 @@ impl NvJpeg {
                 !handle.is_null(),
                 "nvjpegCreateEx(GPU_HYBRID) succeeded but returned null handle"
             );
-            return Ok((handle, false));
+            return Ok(handle);
         }
 
         log::debug!(
-            "nvJPEG GPU_HYBRID backend unavailable ({hybrid_status}), falling back to DEFAULT backend"
+            "nvJPEG GPU_HYBRID backend unavailable ({hybrid_status}), falling back to DEFAULT"
         );
         handle = ptr::null_mut();
         // SAFETY: same as above; NVJPEG_BACKEND_DEFAULT with default allocators.
@@ -558,110 +561,15 @@ impl NvJpeg {
             !handle.is_null(),
             "nvjpegCreateEx(DEFAULT) succeeded but returned null handle"
         );
-        Ok((handle, false))
-    }
-
-    /// Attach a per-decode state to an already-created handle.
-    fn with_handle(handle: nvjpegHandle_t, hardware_backend: bool) -> Result<Self> {
-        let mut state: nvjpegJpegState_t = ptr::null_mut();
-        // SAFETY: handle is valid; nvjpegJpegStateCreate allocates decode buffers.
-        let status = unsafe { nvjpegJpegStateCreate(handle, ptr::addr_of_mut!(state)) };
-        if status != NVJPEG_STATUS_SUCCESS {
-            // Destroy the handle before propagating the error.
-            // SAFETY: handle is valid; state was never initialised.
-            let _ = unsafe { nvjpegDestroy(handle) };
-            return Err(NvJpegError::NvjpegStatus(status));
-        }
-        assert!(
-            !state.is_null(),
-            "nvjpegJpegStateCreate succeeded but returned null state"
-        );
-        Ok(Self {
-            handle,
-            state,
-            hardware_backend,
-        })
+        Ok(handle)
     }
 
     /// Enqueue a JPEG decode on `stream`, returning a `PendingDecode`.
     ///
     /// The GPU is still writing when this returns; the caller must synchronise
     /// `stream` before calling `PendingDecode::into_decoded_jpeg`.
-    ///
-    /// Handles the hardware→default backend fallback for progressive JPEGs.
     fn decode(&mut self, data: &[u8], stream: CUstream) -> Result<PendingDecode> {
-        match self.decode_inner(data, stream) {
-            // HARDWARE backend rejects progressive / multi-scan JPEGs with
-            // NVJPEG_STATUS_JPEG_NOT_SUPPORTED.  Fall back to DEFAULT (hybrid)
-            // which handles them.  This retry happens at most once per NvJpeg
-            // instance: after reinit, hardware_backend is false and the guard
-            // no longer fires.
-            //
-            // If the DEFAULT backend also returns NVJPEG_STATUS_JPEG_NOT_SUPPORTED
-            // the JPEG encoding is genuinely unsupported (not a backend limitation)
-            // and the error propagates to the caller.
-            Err(NvJpegError::NvjpegStatus(NVJPEG_STATUS_JPEG_NOT_SUPPORTED))
-                if self.hardware_backend =>
-            {
-                log::debug!(
-                    "nvJPEG HARDWARE backend: JPEG not supported (progressive?), retrying with DEFAULT backend"
-                );
-                self.reinit_default_backend()?;
-                self.decode_inner(data, stream)
-            }
-            other => other,
-        }
-    }
-
-    /// Replace the current handle+state with a DEFAULT-backend pair.
-    ///
-    /// Called at most once per `NvJpeg` instance — subsequent progressive JPEGs
-    /// skip straight to `decode_inner` with the DEFAULT handle.
-    fn reinit_default_backend(&mut self) -> Result<()> {
-        // Tear down the hardware handle before creating the new one.
-        // SAFETY: handle and state are valid; no other references exist.
-        unsafe {
-            let _ = nvjpegJpegStateDestroy(self.state);
-            let _ = nvjpegDestroy(self.handle);
-        }
-        self.handle = ptr::null_mut();
-        self.state = ptr::null_mut();
-
-        let mut handle: nvjpegHandle_t = ptr::null_mut();
-        // SAFETY: nvjpegCreateEx with DEFAULT backend and null allocators is always valid.
-        let status = unsafe {
-            nvjpegCreateEx(
-                NVJPEG_BACKEND_DEFAULT,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                0,
-                ptr::addr_of_mut!(handle),
-            )
-        };
-        if status != NVJPEG_STATUS_SUCCESS {
-            return Err(NvJpegError::NvjpegStatus(status));
-        }
-        assert!(
-            !handle.is_null(),
-            "nvjpegCreateEx(DEFAULT) succeeded but returned null handle"
-        );
-
-        let mut state: nvjpegJpegState_t = ptr::null_mut();
-        // SAFETY: handle is valid.
-        let status = unsafe { nvjpegJpegStateCreate(handle, ptr::addr_of_mut!(state)) };
-        if status != NVJPEG_STATUS_SUCCESS {
-            let _ = unsafe { nvjpegDestroy(handle) };
-            return Err(NvJpegError::NvjpegStatus(status));
-        }
-        assert!(
-            !state.is_null(),
-            "nvjpegJpegStateCreate succeeded but returned null state"
-        );
-
-        self.handle = handle;
-        self.state = state;
-        self.hardware_backend = false;
-        Ok(())
+        self.decode_inner(data, stream)
     }
 
     /// Inner decode — calls nvJPEG API directly, no retry logic.
