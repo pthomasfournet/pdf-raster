@@ -47,13 +47,16 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::resources::dict_ext::DictExt;
 
-// ── nvJPEG GPU acceleration ───────────────────────────────────────────────────
+// ── GPU JPEG/JPEG2k acceleration ──────────────────────────────────────────────
 
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
 
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
+
+#[cfg(feature = "vaapi")]
+use gpu::vaapi::VapiJpegDecoder;
 
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
@@ -66,10 +69,11 @@ pub(crate) mod icc;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
-/// Below this threshold `PCIe` transfer overhead dominates and the CPU decoder
-/// is faster.  512 × 512 = 262 144 pixels — empirically the crossover between
-/// nvJPEG (~10 GB/s) and the CPU JPEG path (~1 GB/s) after `PCIe` DMA latency.
-#[cfg(feature = "nvjpeg")]
+/// Below this threshold transfer and decode setup overhead dominates and the
+/// CPU decoder is faster.  512 × 512 = 262 144 pixels — empirically the
+/// crossover between nvJPEG (~10 GB/s) and the CPU JPEG path (~1 GB/s) after
+/// DMA latency, and a similarly effective threshold for VA-API.
+#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
@@ -158,15 +162,12 @@ pub struct ImageDescriptor {
 /// - the filter is unsupported (a warning is logged), or
 /// - any decoding error occurs.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match arm per supported filter plus GPU cfg variants — splitting would obscure the dispatch table"
-)]
 pub fn resolve_image(
     doc: &Document,
     page_dict: &Dictionary,
     name: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
@@ -232,24 +233,17 @@ pub fn resolve_image(
             let parms = stream.dict.get(b"DecodeParms").ok();
             decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
         }
-        Some("DCTDecode") => {
-            #[cfg(all(feature = "nvjpeg", feature = "gpu-icc"))]
-            {
-                decode_dct(stream.content.as_slice(), w, h, gpu, gpu_ctx)
-            }
-            #[cfg(all(feature = "nvjpeg", not(feature = "gpu-icc")))]
-            {
-                decode_dct(stream.content.as_slice(), w, h, gpu)
-            }
-            #[cfg(all(not(feature = "nvjpeg"), feature = "gpu-icc"))]
-            {
-                decode_dct(stream.content.as_slice(), w, h, gpu_ctx)
-            }
-            #[cfg(all(not(feature = "nvjpeg"), not(feature = "gpu-icc")))]
-            {
-                decode_dct(stream.content.as_slice(), w, h)
-            }
-        }
+        Some("DCTDecode") => decode_dct(
+            stream.content.as_slice(),
+            w,
+            h,
+            #[cfg(feature = "nvjpeg")]
+            gpu,
+            #[cfg(feature = "vaapi")]
+            vaapi,
+            #[cfg(feature = "gpu-icc")]
+            gpu_ctx,
+        ),
         Some("JPXDecode") => {
             #[cfg(feature = "nvjpeg2k")]
             {

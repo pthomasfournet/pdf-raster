@@ -12,6 +12,9 @@ use gpu::nvjpeg::NvJpegDecoder;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
 
+#[cfg(feature = "vaapi")]
+use gpu::vaapi::VapiJpegDecoder;
+
 #[cfg(feature = "gpu-icc")]
 use gpu::GpuCtx;
 
@@ -39,15 +42,12 @@ use super::ImageColorSpace;
 /// Returns `None` if the parameter block is unparseable, dimensions are
 /// degenerate, or the filter is unsupported.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match arm per supported filter; each arm is small but the set is large"
-)]
 pub fn decode_inline_image(
     doc: &Document,
     params: &[u8],
     data: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
@@ -111,22 +111,17 @@ pub fn decode_inline_image(
         Some("DCTDecode") => {
             // GPU dispatch is threshold-gated inside decode_dct (same threshold as
             // resolve_image). Most inline images are small and will use the CPU path.
-            #[cfg(all(feature = "nvjpeg", feature = "gpu-icc"))]
-            {
-                decode_dct(data, w, h, gpu, gpu_ctx)
-            }
-            #[cfg(all(feature = "nvjpeg", not(feature = "gpu-icc")))]
-            {
-                decode_dct(data, w, h, gpu)
-            }
-            #[cfg(all(not(feature = "nvjpeg"), feature = "gpu-icc"))]
-            {
-                decode_dct(data, w, h, gpu_ctx)
-            }
-            #[cfg(all(not(feature = "nvjpeg"), not(feature = "gpu-icc")))]
-            {
-                decode_dct(data, w, h)
-            }
+            decode_dct(
+                data,
+                w,
+                h,
+                #[cfg(feature = "nvjpeg")]
+                gpu,
+                #[cfg(feature = "vaapi")]
+                vaapi,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+            )
         }
         Some("JPXDecode") => {
             // GPU dispatch is threshold-gated inside decode_jpx.
@@ -497,6 +492,8 @@ mod tests {
             &data,
             #[cfg(feature = "nvjpeg")]
             None,
+            #[cfg(feature = "vaapi")]
+            None,
             #[cfg(feature = "nvjpeg2k")]
             None,
             #[cfg(feature = "gpu-icc")]
@@ -522,6 +519,8 @@ mod tests {
             &data,
             #[cfg(feature = "nvjpeg")]
             None,
+            #[cfg(feature = "vaapi")]
+            None,
             #[cfg(feature = "nvjpeg2k")]
             None,
             #[cfg(feature = "gpu-icc")]
@@ -545,6 +544,8 @@ mod tests {
                 &[],
                 #[cfg(feature = "nvjpeg")]
                 None,
+                #[cfg(feature = "vaapi")]
+                None,
                 #[cfg(feature = "nvjpeg2k")]
                 None,
                 #[cfg(feature = "gpu-icc")]
@@ -565,6 +566,8 @@ mod tests {
                 params,
                 &[0u8; 4],
                 #[cfg(feature = "nvjpeg")]
+                None,
+                #[cfg(feature = "vaapi")]
                 None,
                 #[cfg(feature = "nvjpeg2k")]
                 None,

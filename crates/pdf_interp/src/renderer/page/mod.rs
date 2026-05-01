@@ -78,6 +78,8 @@ use gpu::GpuCtx;
 use gpu::nvjpeg::NvJpegDecoder;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
+#[cfg(feature = "vaapi")]
+use gpu::vaapi::VapiJpegDecoder;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 
@@ -206,6 +208,10 @@ pub struct PageRenderer<'doc> {
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
     nvjpeg: Option<NvJpegDecoder>,
+    /// VA-API JPEG decoder (AMD/Intel iGPU fallback), present when the `vaapi`
+    /// feature is enabled and the DRM render node is accessible.
+    #[cfg(feature = "vaapi")]
+    vaapi_jpeg: Option<VapiJpegDecoder>,
     /// GPU-accelerated JPEG 2000 decoder, present when the `nvjpeg2k` feature is
     /// enabled and a CUDA device is available.  `None` means CPU-only JPX decode.
     #[cfg(feature = "nvjpeg2k")]
@@ -293,6 +299,8 @@ impl<'doc> PageRenderer<'doc> {
             ocg_stack: Vec::new(),
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
+            #[cfg(feature = "vaapi")]
+            vaapi_jpeg: None,
             #[cfg(feature = "nvjpeg2k")]
             nvjpeg2k: None,
             #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
@@ -310,6 +318,27 @@ impl<'doc> PageRenderer<'doc> {
     #[cfg(feature = "nvjpeg")]
     pub fn set_nvjpeg(&mut self, dec: Option<NvJpegDecoder>) {
         self.nvjpeg = dec;
+    }
+
+    /// Attach a VA-API JPEG decoder (AMD/Intel iGPU) to this renderer.
+    ///
+    /// Used as a fallback when `nvjpeg` is not available.  When set,
+    /// `DCTDecode` image streams with pixel area ≥
+    /// [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are decoded via
+    /// VA-API instead of the CPU JPEG decoder.
+    ///
+    /// Call with `None` to revert to CPU-only JPEG decode.
+    #[cfg(feature = "vaapi")]
+    pub fn set_vaapi_jpeg(&mut self, dec: Option<VapiJpegDecoder>) {
+        self.vaapi_jpeg = dec;
+    }
+
+    /// Detach and return the VA-API JPEG decoder so the caller can reuse it.
+    ///
+    /// Returns `None` if no decoder was attached.
+    #[cfg(feature = "vaapi")]
+    pub const fn take_vaapi_jpeg(&mut self) -> Option<VapiJpegDecoder> {
+        self.vaapi_jpeg.take()
     }
 
     /// Attach a GPU JPEG 2000 decoder to this renderer.
@@ -674,6 +703,8 @@ impl<'doc> PageRenderer<'doc> {
                     data,
                     #[cfg(feature = "nvjpeg")]
                     self.nvjpeg.as_mut(),
+                    #[cfg(feature = "vaapi")]
+                    self.vaapi_jpeg.as_mut(),
                     #[cfg(feature = "nvjpeg2k")]
                     self.nvjpeg2k.as_mut(),
                     #[cfg(feature = "gpu-icc")]
@@ -1490,6 +1521,8 @@ impl<'doc> PageRenderer<'doc> {
             name,
             #[cfg(feature = "nvjpeg")]
             self.nvjpeg.as_mut(),
+            #[cfg(feature = "vaapi")]
+            self.vaapi_jpeg.as_mut(),
             #[cfg(feature = "nvjpeg2k")]
             self.nvjpeg2k.as_mut(),
             #[cfg(feature = "gpu-icc")]

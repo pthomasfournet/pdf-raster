@@ -20,6 +20,9 @@ nvjpeg = ["gpu/nvjpeg"]
 # Requires libnvjpeg2k.so.  Falls back to jpeg2k/OpenJPEG when GPU is unavailable
 # or the image is below the dispatch threshold.
 nvjpeg2k = ["gpu/nvjpeg2k"]
+# Enable VA-API hardware JPEG decoding for AMD/Intel iGPU and discrete GPU.
+# Requires libva.so.2 and libva-drm.so.2.  Falls back to zune-jpeg when unavailable.
+vaapi = ["gpu/vaapi", "dep:gpu"]
 # Enable GPU supersampled AA fill (64-sample warp-ballot kernel).
 # Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU 4× scanline AA when
 # the fill area is below the dispatch threshold or no GPU is available.

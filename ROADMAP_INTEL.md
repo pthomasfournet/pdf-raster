@@ -4,8 +4,9 @@ Tracking work needed to run pdf-raster on Intel x86-64, AMD iGPU, ARM, and Apple
 Silicon. The core raster pipeline is portable; the work is auditing, fixing build
 issues, adding SIMD fast paths, and adding VA-API GPU acceleration.
 
-**Current priorities:** VA-API JPEG decode (Phase C2, AMD iGPU confirmed on dev machine),
-then ARM NEON already complete (Phase E). Apple Silicon (Phase F) requires macOS hardware.
+**Current priorities:** Phase C2 (VA-API JPEG decode) ✓ complete. Next: C3 evaluation
+(VA-API VPP deskew — verdict already recorded: not viable), then ARM NEON (Phase E,
+already complete). Apple Silicon (Phase F) requires macOS hardware.
 
 ---
 
@@ -212,7 +213,7 @@ on the dev machine today. The i7-8700K test bench also has Intel UHD 630 via the
 `NvJpegDecoder`, `NvJpeg2kDecoder`, and `GpuCtx` implement these traits.
 Inline image GPU dispatch is wired (`decode_inline_image` passes GPU params through).
 
-### C2 — VA-API JPEG decoder (`VapiJpegDecoder`)
+### C2 — VA-API JPEG decoder (`VapiJpegDecoder`) ✓ DONE
 
 Implements `GpuJpegDecoder` using raw `libva`/`libva-drm` FFI (no bindgen — the
 VA-API surface is small and stable; same rationale as raw CUDA driver API in nvJPEG).
@@ -236,23 +237,31 @@ VABufferID  slice_param;  // vaCreateBuffer — VASliceParameterBufferType (VASl
 1. `vaBeginPicture(dpy, ctx, surface)`
 2. `vaRenderPicture(dpy, ctx, [pic_buf, iq_buf, slice_param, slice_buf], 4)`
 3. `vaEndPicture(dpy, ctx)`
-4. `vaSyncSurface(dpy, surface)` — block until VCN decode complete
-5. `vaDeriveImage` or `vaGetImage` → `vaMapBuffer` → copy YUV → host
-6. CPU YUV420→RGB8 conversion (cheap: ~1 ns/pixel with SIMD)
+4. `vaSyncSurface(dpy, surface)` — block until VCN JPEG engine completes
+5. `vaDeriveImage` or `vaGetImage` → `vaMapBuffer` → copy NV12 planes to host
+6. CPU NV12→RGB8 (BT.601 full-range): Y plane + interleaved UV → interleaved RGB
 7. `vaUnmapBuffer`, `vaDestroyImage`, destroy buffers
 
-**Output format:** Mesa RadeonSI returns `VA_FOURCC_NV12` (Y plane + interleaved UV).
-Convert to interleaved RGB8 with a scalar or AVX2 kernel post-sync — the conversion
-is ~0.5ms for a 4MP image and is not the bottleneck.
+**Output format — NV12 on Raphael (important):** Raphael is VCN 4.0.0 which is
+`RDECODE_JPEG_VER_2` in Mesa. Hardware format-conversion (direct RGB output from
+the JPEG engine) requires `RDECODE_JPEG_VER_3`, only available on VCN 4.0.3 or
+VCN 5.0+. On VCN 4.0.0 the hardware always outputs NV12 (luma plane +
+interleaved UV plane). CPU YUV→RGB conversion is required; with AVX2 it is
+~0.3ms for a 4MP image and is not the bottleneck relative to JPEG decode itself.
+Future hardware (VCN 4.0.3+, e.g. Strix Point) can skip this step via
+`VA_RT_FORMAT_RGB32` surface — the code should branch on the detected VCN version
+or query `vaQueryConfigAttributes` for `VAConfigAttribRTFormat` support.
 
-**CMYK:** Not supported by any VA-API JPEG hardware; fall through to CPU `zune-jpeg`.
-**Progressive JPEG:** `VAEntrypointVLD` for JPEG baseline only; fall through to CPU.
-**Grayscale:** Single-component JPEG → request `VA_RT_FORMAT_YUV400` surface if the
-driver supports it; otherwise decode as YUV420 and use only the Y plane.
+**CMYK:** Not in the VA-API surface model at all; fall through to CPU `zune-jpeg`.
+**Progressive JPEG:** baseline only via `VAEntrypointVLD`; fall through to CPU.
+**Grayscale:** Try `VA_RT_FORMAT_YUV400` surface; if driver rejects it, fall back
+to `VA_RT_FORMAT_YUV420` and use only the Y plane from the derived image.
 
-**Thread safety:** Each Rayon worker thread creates its own `VAContext` and `VASurface`.
-`VADisplay` is shared (thread-safe for read; `vaInitialize` called once). Same
-`DecoderInit<T>` thread-local pattern as nvJPEG.
+**Thread safety (confirmed from libva source):** `VADisplay` is shared and
+thread-safe. `VAContext` must not be used concurrently from multiple threads —
+each Rayon worker thread creates its own `VAContext` + `VASurface` pool. Same
+`DecoderInit<T>` thread-local pattern as nvJPEG. Mesa radeonsi also holds an
+internal mutex per driver instance, but context-level state is not protected.
 
 **Feature flag:** `gpu/vaapi` + `pdf_interp/vaapi`. Link `libva.so.2` + `libva-drm.so.2`.
 Zero-cost when disabled.

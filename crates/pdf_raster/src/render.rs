@@ -1,6 +1,6 @@
 //! Core render pipeline: PDF page → pixel buffer.
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
 use std::cell::RefCell;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
@@ -24,7 +24,7 @@ pub const MAX_PX_DIMENSION: u32 = 32_768;
 // lazily on first use.  DecoderInit<T> prevents retry-and-spam after a one-time
 // init failure.  RefCell gives interior mutability; thread_local prevents races.
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
 #[derive(Default)]
 enum DecoderInit<T> {
     #[default]
@@ -36,7 +36,8 @@ enum DecoderInit<T> {
 // nvjpegCreateEx is not safe to call concurrently from multiple threads —
 // simultaneous calls race inside the library and can null-deref.  This mutex
 // serialises all decoder construction calls across threads.
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+// VA-API init (vaInitialize) is also serialised here out of caution.
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
 static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "nvjpeg")]
@@ -51,6 +52,12 @@ thread_local! {
         const { RefCell::new(DecoderInit::Uninitialised) };
 }
 
+#[cfg(feature = "vaapi")]
+thread_local! {
+    static VAAPI_JPEG_DEC: RefCell<DecoderInit<gpu::vaapi::VapiJpegDecoder>> =
+        const { RefCell::new(DecoderInit::Uninitialised) };
+}
+
 #[cfg(feature = "nvjpeg")]
 fn init_nvjpeg() {
     NVJPEG_DEC.with(|cell| {
@@ -59,12 +66,12 @@ fn init_nvjpeg() {
         }
         // Serialise construction: nvjpegCreateEx races if called concurrently
         // from multiple threads and can null-deref inside the library.
-        let _guard = DECODER_INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = DECODER_INIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
         let result = gpu::nvjpeg::NvJpegDecoder::new(0);
-        drop(_guard);
+        drop(guard);
         match result {
             Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
             Err(e) => {
@@ -97,12 +104,12 @@ fn init_nvjpeg2k() {
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
-        let _guard = DECODER_INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = DECODER_INIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
         let result = gpu::nvjpeg2k::NvJpeg2kDecoder::new(0);
-        drop(_guard);
+        drop(guard);
         match result {
             Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
             Err(e) => {
@@ -121,6 +128,37 @@ fn init_nvjpeg2k() {
 pub(crate) fn release_nvjpeg2k_this_thread() {
     NVJPEG2K_DEC.with(|cell| {
         *cell.borrow_mut() = DecoderInit::Uninitialised;
+    });
+}
+
+/// Default DRM render node used when the `vaapi` feature is active.
+///
+/// Override by rebuilding with a different path if your setup differs.
+#[cfg(feature = "vaapi")]
+const VAAPI_DRM_NODE: &str = "/dev/dri/renderD128";
+
+#[cfg(feature = "vaapi")]
+fn init_vaapi_jpeg() {
+    VAAPI_JPEG_DEC.with(|cell| {
+        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
+            return;
+        }
+        let guard = DECODER_INIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
+            return;
+        }
+        let result = gpu::vaapi::VapiJpegDecoder::new(VAAPI_DRM_NODE);
+        drop(guard);
+        match result {
+            Ok(dec) => *cell.borrow_mut() = DecoderInit::Ready(Some(dec)),
+            Err(e) => {
+                log::info!(
+                    "pdf_raster: VA-API JPEG unavailable ({e}); \
+                     JPEG images will be decoded on CPU for this thread"
+                );
+                *cell.borrow_mut() = DecoderInit::Failed;
+            }
+        }
     });
 }
 
@@ -405,6 +443,16 @@ fn render_page_rgb_with_geom(
         });
     }
 
+    #[cfg(feature = "vaapi")]
+    {
+        init_vaapi_jpeg();
+        VAAPI_JPEG_DEC.with(|cell| {
+            if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+                renderer.set_vaapi_jpeg(slot.take());
+            }
+        });
+    }
+
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
 
@@ -418,6 +466,13 @@ fn render_page_rgb_with_geom(
     NVJPEG2K_DEC.with(|cell| {
         if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_nvjpeg2k();
+        }
+    });
+
+    #[cfg(feature = "vaapi")]
+    VAAPI_JPEG_DEC.with(|cell| {
+        if let DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+            *slot = renderer.take_vaapi_jpeg();
         }
     });
 

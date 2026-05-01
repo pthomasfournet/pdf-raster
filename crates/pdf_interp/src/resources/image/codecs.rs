@@ -11,10 +11,13 @@ use lopdf::{Document, Object};
 use super::{ImageColorSpace, ImageDescriptor, ImageFilter};
 use crate::resources::dict_ext::DictExt;
 
-// ── nvJPEG GPU acceleration ───────────────────────────────────────────────────
+// ── GPU JPEG acceleration (nvJPEG and/or VA-API) ──────────────────────────────
 
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
+
+#[cfg(feature = "vaapi")]
+use gpu::vaapi::{JpegColorSpace as VaapiCs, VapiJpegDecoder};
 
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
@@ -372,11 +375,17 @@ fn append_ccitt_row(
 /// where `C`, `K` are the complemented (i.e. raw) CMYK byte values.  This is
 /// equivalent to the standard CMY+K → RGB conversion applied to the inverted
 /// ink densities.
+#[expect(
+    clippy::too_many_lines,
+    reason = "GPU dispatch paths (nvjpeg, vaapi) plus the CPU decode path are each short; \
+              combining them in one function keeps the fallback logic visible"
+)]
 pub(super) fn decode_dct(
     data: &[u8],
     pdf_w: u32,
     pdf_h: u32,
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
 ) -> Option<ImageDescriptor> {
     use zune_core::bytestream::ZCursor;
@@ -384,21 +393,32 @@ pub(super) fn decode_dct(
     use zune_core::options::DecoderOptions;
     use zune_jpeg::JpegDecoder;
 
-    // ── GPU fast path (nvjpeg feature, large images, 1- or 3-component only) ──
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    let area = pdf_w.saturating_mul(pdf_h);
+
+    // ── nvJPEG fast path (primary GPU decoder) ────────────────────────────────
     #[cfg(feature = "nvjpeg")]
     if let Some(dec) = gpu {
         // Only dispatch to GPU when the image area meets the threshold.
         // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
         // decode_dct_gpu returns None for 4-component images, which causes
         // the fall-through to the CPU path below that handles CMYK→RGB.
-        let area = pdf_w.saturating_mul(pdf_h);
         if area >= super::GPU_JPEG_THRESHOLD_PX {
             if let Some(img) = decode_dct_gpu(data, pdf_w, pdf_h, dec) {
                 return Some(img);
             }
-            // GPU decode failed (e.g. unsupported encoding) — fall through to CPU.
-            log::debug!("image: DCTDecode: GPU path failed, retrying on CPU");
+            // GPU decode failed (e.g. unsupported encoding) — fall through.
+            log::debug!("image: DCTDecode: nvJPEG path failed, retrying");
         }
+    }
+
+    // ── VA-API fast path (fallback GPU decoder — AMD/Intel iGPU) ─────────────
+    #[cfg(feature = "vaapi")]
+    if let (Some(dec), true) = (vaapi, area >= super::GPU_JPEG_THRESHOLD_PX) {
+        if let Some(img) = decode_dct_vaapi(data, pdf_w, pdf_h, dec) {
+            return Some(img);
+        }
+        log::debug!("image: DCTDecode: VA-API path failed, retrying on CPU");
     }
 
     // ── CPU path ──────────────────────────────────────────────────────────────
@@ -545,6 +565,52 @@ fn decode_dct_gpu(
     let color_space = match img.color_space {
         GpuCs::Gray => ImageColorSpace::Gray,
         GpuCs::Rgb => ImageColorSpace::Rgb,
+    };
+
+    Some(ImageDescriptor {
+        width: img.width,
+        height: img.height,
+        color_space,
+        data: img.data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    })
+}
+
+/// VA-API hardware DCT decode — AMD/Intel iGPU fallback when nvJPEG is absent.
+///
+/// Returns `None` for CMYK (4-component) JPEG or on any VA-API error.  The
+/// caller must fall through to the CPU path when `None` is returned.
+#[cfg(feature = "vaapi")]
+fn decode_dct_vaapi(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    dec: &mut VapiJpegDecoder,
+) -> Option<ImageDescriptor> {
+    use gpu::vaapi::Error as VapiError;
+    let img = match dec.decode_sync(data, pdf_w, pdf_h) {
+        Ok(img) => img,
+        Err(VapiError::UnsupportedComponents(_)) => {
+            return None;
+        }
+        Err(e) => {
+            log::warn!("image: DCTDecode VA-API: {e}");
+            return None;
+        }
+    };
+
+    if img.width != pdf_w || img.height != pdf_h {
+        log::debug!(
+            "image: DCTDecode VA-API: PDF dict says {pdf_w}×{pdf_h}, VA-API reports {}×{} — using VA-API dims",
+            img.width,
+            img.height,
+        );
+    }
+
+    let color_space = match img.color_space {
+        VaapiCs::Gray => ImageColorSpace::Gray,
+        VaapiCs::Rgb => ImageColorSpace::Rgb,
     };
 
     Some(ImageDescriptor {

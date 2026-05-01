@@ -19,6 +19,9 @@
 //! - `gpu-deskew` — enables [`npp_rotate`] module for GPU rotation via CUDA NPP
 //!   (`nppiRotate_8u_C1R_Ctx`).  Requires `libnppig.so`, `libnppc.so`, and
 //!   `libcudart.so` at link time.
+//! - `vaapi` — enables [`vaapi`] module for VA-API hardware JPEG decoding on AMD
+//!   and Intel iGPU/discrete hardware.  Requires `libva.so.2` and `libva-drm.so.2`
+//!   at link time.
 
 mod cmyk;
 mod composite;
@@ -39,6 +42,9 @@ pub mod nvjpeg2k;
 
 #[cfg(feature = "gpu-deskew")]
 pub mod npp_rotate;
+
+#[cfg(feature = "vaapi")]
+pub mod vaapi;
 
 use std::sync::Arc;
 

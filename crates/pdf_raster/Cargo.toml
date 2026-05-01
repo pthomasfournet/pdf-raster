@@ -16,6 +16,8 @@ categories  = ["multimedia::images", "rendering", "parser-implementations"]
 gpu-aa  = ["dep:gpu", "pdf_interp/gpu-aa"]
 # GPU-accelerated JPEG decoding via nvJPEG.
 nvjpeg  = ["dep:gpu", "pdf_interp/nvjpeg"]
+# VA-API JPEG decoding (AMD/Intel iGPU fallback; no CUDA required).
+vaapi   = ["dep:gpu", "pdf_interp/vaapi"]
 # GPU-accelerated JPEG 2000 decoding via nvJPEG2000.
 nvjpeg2k = ["dep:gpu", "pdf_interp/nvjpeg2k"]
 # GPU ICC CMYK→RGB transform.

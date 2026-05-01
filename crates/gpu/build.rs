@@ -115,6 +115,30 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 
+    // VA-API: libva.so.2 (core API) + libva-drm.so.2 (headless DRM connection).
+    // Ships with Mesa (mesa-va-drivers) or intel-media-driver.
+    //
+    // The runtime libraries are in /usr/lib/x86_64-linux-gnu on Debian/Ubuntu but
+    // the dev package (libva-dev) is not required — we link directly to the .so.2
+    // versioned file using the `filename:` link syntax, which works without an
+    // unversioned symlink.  This avoids a hard build-time dependency on libva-dev.
+    if env::var("CARGO_FEATURE_VAAPI").is_ok() {
+        const VA_DIRS: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/lib",
+        ];
+        for dir in VA_DIRS {
+            if std::path::Path::new(dir).exists() {
+                println!("cargo:rustc-link-search=native={dir}");
+                break;
+            }
+        }
+        // Link with explicit versioned filename so no unversioned symlink is required.
+        println!("cargo:rustc-link-lib=dylib:+verbatim=libva.so.2");
+        println!("cargo:rustc-link-lib=dylib:+verbatim=libva-drm.so.2");
+    }
+
     // GPU deskew: CUDA NPP geometry library (nppiRotate_8u_C1R_Ctx lives in
     // libnppig; the stream context helpers nppSetStream/nppGetStreamContext live
     // in libnppc).  cudart and the driver are also required for cudaMalloc /

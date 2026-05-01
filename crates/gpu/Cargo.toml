@@ -21,6 +21,9 @@ gpu-deskew = []
 # Enable GPU vs CPU parity tests (requires a CUDA device at test time).
 # cargo test -p gpu --lib --features gpu-validation -- aa_fill_gpu_vs_cpu
 gpu-validation = []
+# Enable VA-API hardware JPEG decoding for AMD/Intel iGPU and discrete GPU on Linux.
+# Requires libva.so.2 and libva-drm.so.2 (Mesa / intel-media-driver).
+vaapi = []
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }
