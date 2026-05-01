@@ -60,13 +60,14 @@ thread_local! {
 
 #[cfg(feature = "nvjpeg")]
 fn init_nvjpeg() {
+    // nvjpegCreateEx races if called concurrently from multiple threads; lock serialises it.
     NVJPEG_DEC.with(|cell| {
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
-        // Serialise construction: nvjpegCreateEx races if called concurrently
-        // from multiple threads and can null-deref inside the library.
-        let guard = DECODER_INIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = DECODER_INIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
@@ -104,7 +105,9 @@ fn init_nvjpeg2k() {
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
-        let guard = DECODER_INIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = DECODER_INIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
@@ -143,7 +146,9 @@ fn init_vaapi_jpeg() {
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }
-        let guard = DECODER_INIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = DECODER_INIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(*cell.borrow(), DecoderInit::Uninitialised) {
             return;
         }

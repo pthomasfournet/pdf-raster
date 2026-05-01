@@ -295,11 +295,7 @@ unsafe extern "C" {
     pub(super) fn vaGetDisplayDRM(fd: c_int) -> VADisplay;
 
     // libva.so.2
-    pub(super) fn vaInitialize(
-        dpy: VADisplay,
-        major: *mut c_int,
-        minor: *mut c_int,
-    ) -> VAStatus;
+    pub(super) fn vaInitialize(dpy: VADisplay, major: *mut c_int, minor: *mut c_int) -> VAStatus;
     pub(super) fn vaTerminate(dpy: VADisplay) -> VAStatus;
     pub(super) fn vaErrorStr(error_status: VAStatus) -> *const c_char;
     pub(super) fn vaCreateConfig(

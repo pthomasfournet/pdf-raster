@@ -53,15 +53,15 @@ use std::ptr;
 use error::{Result, VapiError, check};
 use ffi::{
     VA_BUFFER_TYPE_HUFFMAN_TABLE, VA_BUFFER_TYPE_IQ_MATRIX, VA_BUFFER_TYPE_PICTURE_PARAMETER,
-    VA_BUFFER_TYPE_SLICE_DATA, VA_BUFFER_TYPE_SLICE_PARAMETER, VA_ENTRYPOINT_VLD,
-    VA_INVALID_ID, VA_MAP_IMAGE_READ, VA_PROFILE_JPEG_BASELINE, VA_PROGRESSIVE,
-    VA_RT_FORMAT_YUV400, VA_RT_FORMAT_YUV420, VA_STATUS_SUCCESS, VABufferID, VAConfigID,
-    VAContextID, VADisplay, VASurfaceID, VaHuffmanEntry, VaHuffmanTableJpeg, VaImage,
-    VaIqMatrixJpeg, VaJpegComponent, VaPictureParamJpeg, VaSliceComponent, VaSliceParamJpeg,
-    VaSurfaceAttrib, vaBeginPicture, vaCreateBuffer, vaCreateConfig, vaCreateContext,
-    vaCreateSurfaces, vaDestroyBuffer, vaDestroyConfig, vaDestroyContext, vaDestroyImage,
-    vaDestroySurfaces, vaDeriveImage, vaEndPicture, vaGetDisplayDRM, vaInitialize, vaMapBuffer,
-    vaRenderPicture, vaSyncSurface, vaTerminate, vaUnmapBuffer,
+    VA_BUFFER_TYPE_SLICE_DATA, VA_BUFFER_TYPE_SLICE_PARAMETER, VA_ENTRYPOINT_VLD, VA_INVALID_ID,
+    VA_MAP_IMAGE_READ, VA_PROFILE_JPEG_BASELINE, VA_PROGRESSIVE, VA_RT_FORMAT_YUV400,
+    VA_RT_FORMAT_YUV420, VA_STATUS_SUCCESS, VABufferID, VAConfigID, VAContextID, VADisplay,
+    VASurfaceID, VaHuffmanEntry, VaHuffmanTableJpeg, VaImage, VaIqMatrixJpeg, VaJpegComponent,
+    VaPictureParamJpeg, VaSliceComponent, VaSliceParamJpeg, VaSurfaceAttrib, vaBeginPicture,
+    vaCreateBuffer, vaCreateConfig, vaCreateContext, vaCreateSurfaces, vaDeriveImage,
+    vaDestroyBuffer, vaDestroyConfig, vaDestroyContext, vaDestroyImage, vaDestroySurfaces,
+    vaEndPicture, vaGetDisplayDRM, vaInitialize, vaMapBuffer, vaRenderPicture, vaSyncSurface,
+    vaTerminate, vaUnmapBuffer,
 };
 use jpeg_parser::JpegHeaders;
 use yuv::nv12_to_rgb8;
@@ -194,8 +194,7 @@ impl VapiJpegDecoder {
             "vaCreateConfig(JPEGBaseline/VLD)",
         )?;
         assert_ne!(
-            cfg,
-            VA_INVALID_ID,
+            cfg, VA_INVALID_ID,
             "vaCreateConfig succeeded but returned VA_INVALID_ID"
         );
 
@@ -263,12 +262,12 @@ impl VapiJpegDecoder {
         };
 
         // If YUV400 was rejected (some drivers don't implement it), retry with YUV420.
-        let (surf_status, actual_fmt) = if surf_status != VA_STATUS_SUCCESS && is_gray {
-            log::debug!(
-                "VA-API: YUV400 surface rejected ({surf_status}), retrying with YUV420"
-            );
+        // Extraction uses only the Y plane for grayscale regardless of surface format,
+        // so we don't need to track which format was actually allocated.
+        let surf_status = if surf_status != VA_STATUS_SUCCESS && is_gray {
+            log::debug!("VA-API: YUV400 surface rejected ({surf_status}), retrying with YUV420");
             surface = VA_INVALID_ID;
-            let s = unsafe {
+            unsafe {
                 vaCreateSurfaces(
                     self.dpy.dpy,
                     VA_RT_FORMAT_YUV420,
@@ -279,15 +278,15 @@ impl VapiJpegDecoder {
                     &raw mut attrib,
                     1,
                 )
-            };
-            (s, VA_RT_FORMAT_YUV420)
+            }
         } else {
-            (surf_status, surface_fmt)
+            surf_status
         };
         check(surf_status, "vaCreateSurfaces")?;
+        // vaCreateSurfaces returning success with VA_INVALID_ID would be a driver
+        // contract violation; assert so the failure is loud and attributable.
         assert_ne!(
-            surface,
-            VA_INVALID_ID,
+            surface, VA_INVALID_ID,
             "vaCreateSurfaces succeeded but returned VA_INVALID_ID"
         );
 
@@ -311,18 +310,18 @@ impl VapiJpegDecoder {
             )
         };
         if ctx_result != VA_STATUS_SUCCESS {
-            unsafe { let _ = vaDestroySurfaces(self.dpy.dpy, &raw mut surface, 1); }
+            unsafe {
+                let _ = vaDestroySurfaces(self.dpy.dpy, &raw mut surface, 1);
+            }
             check(ctx_result, "vaCreateContext")?;
         }
         assert_ne!(
-            ctx,
-            VA_INVALID_ID,
+            ctx, VA_INVALID_ID,
             "vaCreateContext succeeded but returned VA_INVALID_ID"
         );
 
         // Decode and clean up context + surface regardless of decode result.
-        let result =
-            self.decode_into(data, &h, ctx, surface, actual_fmt, w_u32, h_u32, is_gray);
+        let result = self.decode_into(data, &h, ctx, surface, w_u32, h_u32, is_gray);
 
         unsafe {
             let _ = vaDestroyContext(self.dpy.dpy, ctx);
@@ -336,7 +335,7 @@ impl VapiJpegDecoder {
     /// map NV12 surface, convert to RGB8.
     #[expect(
         clippy::too_many_arguments,
-        reason = "all 8 args are required: bitstream + parsed headers + context/surface IDs + format info"
+        reason = "all 7 args are required: bitstream + parsed headers + context/surface IDs + dimensions + grayscale flag"
     )]
     fn decode_into(
         &self,
@@ -344,7 +343,6 @@ impl VapiJpegDecoder {
         h: &JpegHeaders,
         ctx: VAContextID,
         surface: VASurfaceID,
-        actual_fmt: c_uint,
         width: u32,
         height: u32,
         is_gray: bool,
@@ -363,10 +361,14 @@ impl VapiJpegDecoder {
         Self::destroy_buffers(dpy, &mut buf_ids);
         submit_result?;
 
-        Self::map_and_convert(dpy, surface, actual_fmt, width, height, is_gray)
+        Self::map_and_convert(dpy, surface, width, height, is_gray)
     }
 
     /// Create the five VA-API decode buffers and write their IDs into `buf_ids`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "five sequential buffer-create calls plus their parameter structs; no meaningful way to split without obscuring the VA-API sequence"
+    )]
     fn create_buffers(
         dpy: VADisplay,
         ctx: VAContextID,
@@ -410,7 +412,18 @@ impl VapiJpegDecoder {
             }
         }
 
-        let scan_data = &data[h.scan_data_offset..h.scan_data_offset + h.scan_data_size];
+        let scan_end = h
+            .scan_data_offset
+            .checked_add(h.scan_data_size)
+            .ok_or(VapiError::Overflow)?;
+        if scan_end > data.len() {
+            return Err(VapiError::BadJpeg(format!(
+                "scan data [{}, {scan_end}) overruns JPEG buffer (len={})",
+                h.scan_data_offset,
+                data.len()
+            )));
+        }
+        let scan_data = &data[h.scan_data_offset..scan_end];
         let num_mcus = h.num_mcus();
 
         let mut slice_param = VaSliceParamJpeg::zeroed();
@@ -431,8 +444,7 @@ impl VapiJpegDecoder {
 
         macro_rules! create_buf {
             ($idx:expr, $type:expr, $size:expr, $ptr:expr) => {{
-                let size_u32 =
-                    c_uint::try_from($size).map_err(|_| VapiError::Overflow)?;
+                let size_u32 = c_uint::try_from($size).map_err(|_| VapiError::Overflow)?;
                 // SAFETY: dpy and ctx are valid; $ptr points to live data for
                 // the duration of this call.  The cast from *const to *mut is
                 // safe here because the VA-API buffer creation reads the data
@@ -454,9 +466,19 @@ impl VapiJpegDecoder {
             }};
         }
 
-        create_buf!(0, VA_BUFFER_TYPE_PICTURE_PARAMETER, std::mem::size_of_val(&pic), &pic);
+        create_buf!(
+            0,
+            VA_BUFFER_TYPE_PICTURE_PARAMETER,
+            std::mem::size_of_val(&pic),
+            &pic
+        );
         create_buf!(1, VA_BUFFER_TYPE_IQ_MATRIX, std::mem::size_of_val(&iq), &iq);
-        create_buf!(2, VA_BUFFER_TYPE_HUFFMAN_TABLE, std::mem::size_of_val(&huff), &huff);
+        create_buf!(
+            2,
+            VA_BUFFER_TYPE_HUFFMAN_TABLE,
+            std::mem::size_of_val(&huff),
+            &huff
+        );
         create_buf!(
             3,
             VA_BUFFER_TYPE_SLICE_PARAMETER,
@@ -465,8 +487,7 @@ impl VapiJpegDecoder {
         );
         // Slice data: the VA-API spec says the driver reads this but does not
         // write back, so the const→mut cast is safe in practice.
-        let slice_len_u32 =
-            c_uint::try_from(scan_data.len()).map_err(|_| VapiError::Overflow)?;
+        let slice_len_u32 = c_uint::try_from(scan_data.len()).map_err(|_| VapiError::Overflow)?;
         check(
             unsafe {
                 vaCreateBuffer(
@@ -514,7 +535,9 @@ impl VapiJpegDecoder {
         for id in buf_ids.iter_mut() {
             if *id != VA_INVALID_ID {
                 // SAFETY: id is a valid, non-destroyed buffer.
-                unsafe { let _ = vaDestroyBuffer(dpy, *id); }
+                unsafe {
+                    let _ = vaDestroyBuffer(dpy, *id);
+                }
                 *id = VA_INVALID_ID;
             }
         }
@@ -524,7 +547,6 @@ impl VapiJpegDecoder {
     fn map_and_convert(
         dpy: VADisplay,
         surface: VASurfaceID,
-        actual_fmt: c_uint,
         width: u32,
         height: u32,
         is_gray: bool,
@@ -543,12 +565,15 @@ impl VapiJpegDecoder {
         );
 
         let pixel_result = map_result.and_then(|()| {
+            // VA-API spec §4.5: a VA_STATUS_SUCCESS return from vaMapBuffer guarantees
+            // that *pbuf is a valid non-null host pointer.  Assert so a driver bug is
+            // caught immediately rather than causing a silent null-deref downstream.
             assert!(!pixels.is_null(), "vaMapBuffer succeeded but returned null");
             // SAFETY: pixels is valid for `data_size` bytes until UnmapBuffer.
             let mapped = unsafe {
                 std::slice::from_raw_parts(pixels.cast::<u8>(), image.data_size as usize)
             };
-            extract_pixels(mapped, &image, actual_fmt, width, height, is_gray)
+            extract_pixels(mapped, &image, width, height, is_gray)
         });
 
         // Always unmap and destroy, even on error.
@@ -565,7 +590,9 @@ impl Drop for VapiJpegDecoder {
     fn drop(&mut self) {
         // Destroy config before the display is terminated (field order).
         // SAFETY: cfg is valid; dpy is still alive because it's the next field.
-        unsafe { let _ = vaDestroyConfig(self.dpy.dpy, self.cfg); }
+        unsafe {
+            let _ = vaDestroyConfig(self.dpy.dpy, self.cfg);
+        }
     }
 }
 
@@ -575,15 +602,13 @@ impl Drop for VapiJpegDecoder {
 fn extract_pixels(
     mapped: &[u8],
     image: &VaImage,
-    actual_fmt: c_uint,
     width: u32,
     height: u32,
     is_gray: bool,
 ) -> Result<DecodedJpeg> {
-    if is_gray && actual_fmt == VA_RT_FORMAT_YUV400 {
-        extract_y_plane(mapped, image, width, height, JpegColorSpace::Gray)
-    } else if is_gray {
-        // YUV420 fallback for grayscale: use only the Y plane.
+    // For grayscale we only need the Y plane regardless of whether the surface
+    // is YUV400 (native) or YUV420 (driver fallback) — both start with a Y plane.
+    if is_gray {
         extract_y_plane(mapped, image, width, height, JpegColorSpace::Gray)
     } else {
         extract_nv12(mapped, image, width, height)
@@ -602,6 +627,12 @@ fn extract_y_plane(
     let stride = image.pitches[0] as usize;
     let w = width as usize;
     let h = height as usize;
+    // stride < width would cause an out-of-bounds slice in the extraction loop below.
+    if stride < w {
+        return Err(VapiError::BadJpeg(format!(
+            "Y plane stride {stride} < width {w}"
+        )));
+    }
     let y_size = stride.checked_mul(h).ok_or(VapiError::Overflow)?;
     if off + y_size > mapped.len() {
         return Err(VapiError::BadJpeg(format!(
@@ -623,16 +654,25 @@ fn extract_y_plane(
 }
 
 /// Extract NV12 planes and convert to RGB8 via BT.601 full-range.
-fn extract_nv12(
-    mapped: &[u8],
-    image: &VaImage,
-    width: u32,
-    height: u32,
-) -> Result<DecodedJpeg> {
+fn extract_nv12(mapped: &[u8], image: &VaImage, width: u32, height: u32) -> Result<DecodedJpeg> {
     let y_off = image.offsets[0] as usize;
     let uv_off = image.offsets[1] as usize;
     let stride_y = image.pitches[0];
     let stride_uv = image.pitches[1];
+    let w = width as usize;
+
+    // stride_y < width or stride_uv < 2 would cause out-of-bounds access in nv12_to_rgb8.
+    if (stride_y as usize) < w {
+        return Err(VapiError::BadJpeg(format!(
+            "NV12 Y stride {stride_y} < width {w}"
+        )));
+    }
+    // NV12 UV plane holds interleaved Cb/Cr pairs; minimum stride is 2 per chroma sample.
+    if w > 0 && (stride_uv as usize) < 2 {
+        return Err(VapiError::BadJpeg(format!(
+            "NV12 UV stride {stride_uv} < 2 for width {w}"
+        )));
+    }
 
     let y_size = (stride_y as usize)
         .checked_mul(height as usize)

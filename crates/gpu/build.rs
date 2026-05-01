@@ -123,11 +123,7 @@ fn main() {
     // versioned file using the `filename:` link syntax, which works without an
     // unversioned symlink.  This avoids a hard build-time dependency on libva-dev.
     if env::var("CARGO_FEATURE_VAAPI").is_ok() {
-        const VA_DIRS: &[&str] = &[
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib64",
-            "/usr/local/lib",
-        ];
+        const VA_DIRS: &[&str] = &["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/local/lib"];
         for dir in VA_DIRS {
             if std::path::Path::new(dir).exists() {
                 println!("cargo:rustc-link-search=native={dir}");

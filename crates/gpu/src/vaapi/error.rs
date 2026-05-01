@@ -4,7 +4,7 @@
 
 use std::ffi::CStr;
 
-use super::ffi::{vaErrorStr, VAStatus, VA_STATUS_SUCCESS};
+use super::ffi::{VA_STATUS_SUCCESS, VAStatus, vaErrorStr};
 
 /// Errors returned by the VA-API JPEG decoder.
 #[derive(Debug)]

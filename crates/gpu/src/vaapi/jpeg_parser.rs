@@ -147,9 +147,6 @@ impl JpegHeaders {
                     let body = read_bytes!(seg_len - 2);
                     let mut off = 0usize;
                     while off < body.len() {
-                        if off + 1 > body.len() {
-                            break;
-                        }
                         let id_prec = body[off];
                         off += 1;
                         let prec = id_prec >> 4;
@@ -276,10 +273,11 @@ impl JpegHeaders {
                     }
                     scan_data_offset = pos;
                     // Scan data runs from here to the EOI marker (last 0xFF 0xD9).
-                    let eoi = data
-                        .windows(2)
-                        .rposition(|w| w == [0xFF, 0xD9])
-                        .unwrap_or(data.len());
+                    let eoi_pos = data.windows(2).rposition(|w| w == [0xFF, 0xD9]);
+                    if eoi_pos.is_none() {
+                        log::warn!("VA-API JPEG parser: no EOI marker found — stream may be truncated");
+                    }
+                    let eoi = eoi_pos.unwrap_or(data.len());
                     scan_data_size = eoi.saturating_sub(pos);
                     break;
                 }
@@ -400,7 +398,10 @@ mod tests {
 
     #[test]
     fn parse_empty_returns_error() {
-        assert!(matches!(JpegHeaders::parse(&[]), Err(VapiError::BadJpeg(_))));
+        assert!(matches!(
+            JpegHeaders::parse(&[]),
+            Err(VapiError::BadJpeg(_))
+        ));
     }
 
     #[test]
