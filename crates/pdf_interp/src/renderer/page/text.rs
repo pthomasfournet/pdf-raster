@@ -128,8 +128,11 @@ impl PageRenderer<'_> {
 
             // Shared helper: push a rasterized glyph into `records` (when painting)
             // and collect its outline path into `clip_paths` (when clipping).
-            // `char_code_for_path` is the char-code argument for `glyph_path`
-            // (same convention as `make_glyph` — the face resolves GID internally).
+            //
+            // `gid` is the resolved glyph index passed to `make_glyph` directly.
+            // `char_code_for_path` is the raw character code passed to `glyph_path`,
+            // which calls `resolve_gid` internally — so it must be the encoding-level
+            // code, not a pre-resolved GID.
             let mut push_glyph = |char_code_for_path: u32, gid: u32, pen_x: i32, pen_y: i32| {
                 if do_paint && let Some(bmp) = face.make_glyph(gid, 0) {
                     records.push(GlyphRecord {

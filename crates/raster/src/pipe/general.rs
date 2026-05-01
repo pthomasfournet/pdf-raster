@@ -246,14 +246,7 @@ fn render_span_general_inner<'src>(
                             dst_px[j] = c as u8;
                         }
                     }
-                    // Apply transfer after all channels are written so the correct
-                    // LUT is selected per pixel mode (gray/RGB/CMYK/DeviceN).
-                    pipe::apply_transfer_in_place(pipe, dst_px);
-                }
-
-                // Overprint: restore channels not in mask (additive or replace).
-                if pipe.overprint_mask != 0xFFFF_FFFF {
-                    apply_overprint(pipe, dst_px, src_px, ncomps);
+                    finish_pixel(pipe, dst_px, src_px, ncomps);
                 }
 
                 #[expect(
@@ -318,13 +311,7 @@ fn render_span_general_inner<'src>(
                         dst_px[j] = c as u8;
                     }
                 }
-                // Apply transfer after all channels are written so the correct
-                // LUT is selected per pixel mode (gray/RGB/CMYK/DeviceN).
-                pipe::apply_transfer_in_place(pipe, dst_px);
-
-                if pipe.overprint_mask != 0xFFFF_FFFF {
-                    apply_overprint(pipe, dst_px, src_px, ncomps);
-                }
+                finish_pixel(pipe, dst_px, src_px, ncomps);
             }
         }
     }
@@ -471,6 +458,19 @@ fn apply_blend_fn(
         c_blend[..n].copy_from_slice(&r3[..n]);
     } else {
         blend::apply_separable(mode, src, dst, c_blend);
+    }
+}
+
+/// Apply transfer and conditional overprint at the end of each pixel's colour computation.
+///
+/// Called after the colour formula writes all channels of `dst_px` but before
+/// the alpha plane is updated.  Order matters: transfer must precede overprint
+/// so the transfer LUT sees the blended colour, not the restored source.
+#[inline]
+fn finish_pixel(pipe: &PipeState<'_>, dst_px: &mut [u8], src_px: &[u8], ncomps: usize) {
+    pipe::apply_transfer_in_place(pipe, dst_px);
+    if pipe.overprint_mask != 0xFFFF_FFFF {
+        apply_overprint(pipe, dst_px, src_px, ncomps);
     }
 }
 
