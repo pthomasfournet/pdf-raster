@@ -241,7 +241,9 @@ impl GpuCtx {
             "segs.len() must be a multiple of 4 (got {})",
             segs.len()
         );
-        let n_pixels = width as usize * height as usize;
+        let n_pixels = (width as usize)
+            .checked_mul(height as usize)
+            .expect("width × height overflows usize");
 
         if segs.is_empty() || n_pixels < GPU_AA_FILL_THRESHOLD {
             return Ok(aa_fill_cpu(segs, x_min, y_min, width, height, eo));
@@ -277,7 +279,9 @@ impl GpuCtx {
             "segs.len() must be a multiple of 4 (got {})",
             segs.len()
         );
-        let n_pixels = width as usize * height as usize;
+        let n_pixels = (width as usize)
+            .checked_mul(height as usize)
+            .expect("width × height overflows usize");
         let n_segs = u32::try_from(segs.len() / 4).expect("segment count exceeds u32::MAX");
         let n_pixels_u32 = u32::try_from(n_pixels).expect("pixel count exceeds u32::MAX");
 
@@ -362,7 +366,12 @@ impl GpuCtx {
             tile_counts.len(),
             "tile_starts and tile_counts must have the same length"
         );
-        let n_pixels = width as usize * height as usize;
+        let n_pixels = (width as usize)
+            .checked_mul(height as usize)
+            .expect("width × height overflows usize");
+        if n_pixels == 0 {
+            return Ok(Vec::new());
+        }
         let stream = &self.stream;
 
         // Upload inputs.
@@ -438,6 +447,13 @@ impl GpuCtx {
             "cmyk.len() must be a multiple of 4 (got {})",
             cmyk.len()
         );
+
+        // Early-out before any CLUT validation: empty input always produces empty output.
+        let n = cmyk.len() / 4;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
         if let Some((table, grid_n)) = clut {
             // grid_n ≤ 255 is enforced by the baking API; checked_pow guards future misuse.
             let expected = (grid_n as usize)
@@ -452,11 +468,6 @@ impl GpuCtx {
                 "CLUT table length {got} ≠ grid_n({grid_n})^4*3={expected}",
                 got = table.len(),
             );
-        }
-
-        let n = cmyk.len() / 4;
-        if n == 0 {
-            return Ok(Vec::new());
         }
         // Matrix path (clut=None): CPU AVX-512 always beats GPU on this machine —
         // threshold_bench showed the PCIe round-trip cost exceeds the compute cost
