@@ -121,17 +121,23 @@ impl PageRenderer<'_> {
             // ── Path construction ─────────────────────────────────────────────
             Operator::MoveTo(x, y) => {
                 let (dx, dy) = self.to_device(*x, *y);
-                let _ = self.path_builder().move_to(dx, dy);
+                if let Err(e) = self.path_builder().move_to(dx, dy) {
+                    log::debug!("pdf_interp: MoveTo failed: {e}");
+                }
             }
             Operator::LineTo(x, y) => {
                 let (dx, dy) = self.to_device(*x, *y);
-                let _ = self.path_builder().line_to(dx, dy);
+                if let Err(e) = self.path_builder().line_to(dx, dy) {
+                    log::debug!("pdf_interp: LineTo failed: {e}");
+                }
             }
             Operator::CurveTo(x1, y1, x2, y2, x3, y3) => {
                 let (dx1, dy1) = self.to_device(*x1, *y1);
                 let (dx2, dy2) = self.to_device(*x2, *y2);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
-                let _ = self.path_builder().curve_to(dx1, dy1, dx2, dy2, dx3, dy3);
+                if let Err(e) = self.path_builder().curve_to(dx1, dy1, dx2, dy2, dx3, dy3) {
+                    log::debug!("pdf_interp: CurveTo failed: {e}");
+                }
             }
             Operator::CurveToV(x2, y2, x3, y3) => {
                 // `v`: first control point = current point.
@@ -141,17 +147,23 @@ impl PageRenderer<'_> {
                 };
                 let (dx2, dy2) = self.to_device(*x2, *y2);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
-                let _ = self.path_builder().curve_to(cp.x, cp.y, dx2, dy2, dx3, dy3);
+                if let Err(e) = self.path_builder().curve_to(cp.x, cp.y, dx2, dy2, dx3, dy3) {
+                    log::debug!("pdf_interp: CurveToV failed: {e}");
+                }
             }
             Operator::CurveToY(x1, y1, x3, y3) => {
                 // `y`: second control point = endpoint.
                 let (dx1, dy1) = self.to_device(*x1, *y1);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
-                let _ = self.path_builder().curve_to(dx1, dy1, dx3, dy3, dx3, dy3);
+                if let Err(e) = self.path_builder().curve_to(dx1, dy1, dx3, dy3, dx3, dy3) {
+                    log::debug!("pdf_interp: CurveToY failed: {e}");
+                }
             }
             Operator::ClosePath => {
-                if let Some(b) = self.path.as_mut() {
-                    let _ = b.close(false);
+                if let Some(b) = self.path.as_mut()
+                    && let Err(e) = b.close(false)
+                {
+                    log::debug!("pdf_interp: ClosePath failed: {e}");
                 }
             }
             Operator::Rectangle(x, y, w, h) => {
@@ -164,6 +176,8 @@ impl PageRenderer<'_> {
                 let (x2, y2) = self.to_device(*x + *w, *y + *h);
                 let (x3, y3) = self.to_device(*x, *y + *h);
                 let b = self.path_builder();
+                // `re` is self-contained; individual segment failures are benign —
+                // a partial rectangle is better than a panic on a malformed PDF.
                 let _ = b.move_to(x0, y0);
                 let _ = b.line_to(x1, y1);
                 let _ = b.line_to(x2, y2);
@@ -246,11 +260,18 @@ impl PageRenderer<'_> {
                     match elem {
                         TextArrayElement::Text(bytes) => self.show_text(bytes),
                         TextArrayElement::Offset(kern) => {
-                            // Negative kern = move right; thousandths of text-space unit.
+                            // PDF §9.4.3: kern is in thousandths of a text-space unit.
+                            // Displacement = -(w/1000) * Th * Tfs, where Th is horizontal
+                            // scaling (Tz as a fraction, default 1.0) and Tfs is font size.
+                            // Tz=0 is degenerate (invisible text); treat as 1.0 like show_text.
                             let ts = &mut self.gstate.current_mut().text;
-                            let shift = -kern / 1000.0 * ts.font_size;
+                            let hz = if ts.horiz_scaling.abs() < f64::EPSILON {
+                                1.0
+                            } else {
+                                ts.horiz_scaling / 100.0
+                            };
+                            let shift = -kern / 1000.0 * ts.font_size * hz;
                             let [a, b, c, d, e, f] = ts.text_matrix;
-                            // Apply horizontal shift along the text direction.
                             ts.text_matrix = [a, b, c, d, e + shift * a, f + shift * b];
                         }
                     }
