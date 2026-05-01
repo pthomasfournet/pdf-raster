@@ -17,6 +17,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend)      BACKEND="$2";      shift 2 ;;
     --vaapi-device) VAAPI_DEVICE="$2"; shift 2 ;;
+    --corpus-dir)   FIXTURES="$2";     shift 2 ;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 1 ;;
   esac
 done
