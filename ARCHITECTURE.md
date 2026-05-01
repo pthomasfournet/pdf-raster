@@ -134,7 +134,7 @@ Active edge table scan, 4× supersampled AA (`AA_SIZE = 4`). Coverage per output
 pixel = popcount of 4 nibbles across 4 AA sub-rows. Hot path:
 `aa_coverage_span()` → SIMD popcount tier (see §5).
 
-Three compositing pipeline variants, selected at paint time by `PipeState::is_simple_path()`:
+Three compositing pipeline variants, selected at paint time by `PipeState::no_transparency()` / `use_aa_path()`:
 
 | Variant | When |
 |---|---|
@@ -173,7 +173,7 @@ FreeType wrapper with two-level caching.
 - `FontEngine` — owns `FT_Library`, assign face IDs. Protected by `Arc<Mutex<_>>`
   (FreeType is not thread-safe; lock is coarse but held only during face init, not render)
 - `FontFace` — scaled face; `make_glyph(code) → GlyphBitmap`
-- `GlyphCache` — `DashMap<GlyphKey, GlyphBitmap>` (lock-free, shared globally)
+- `GlyphCache` — `quick_cache::sync::Cache<GlyphKey, GlyphBitmap>` (sharded lock, shared globally)
 - `GlyphKey` — `{ face_id, code, size_px, base_idx, aa }`
 - `decompose_outline(ft_outline) → raster::Path` — bridge from FreeType contours
   to the raster path format; glyphs rendered as path fills when AA is on, direct
@@ -454,7 +454,7 @@ Threshold: `PARALLEL_FILL_MIN_HEIGHT`.
 
 **Font engine locking**
 `FontEngine` is behind `Arc<Mutex<_>>`. The mutex is held only during FreeType
-face initialisation (rare). Glyph rendering is lock-free via `DashMap<GlyphKey, GlyphBitmap>`.
+face initialisation (rare). Glyph rendering uses `quick_cache::sync::Cache` (sharded, no write lock on read hits).
 
 ---
 
@@ -498,7 +498,7 @@ dispatch in hot loops at the cost of slightly larger binaries.
 and shadings are resolved on first access. No per-page pre-computation pass.
 
 **Compositing pipeline is selected, not branched.**
-`PipeState::is_simple_path()` selects one of three monomorphised pipeline variants
+`PipeState::no_transparency()` / `use_aa_path()` select one of three monomorphised pipeline variants
 before the fill loop starts. The inner loop has no mode branches.
 
 **GPU is additive, not required.**

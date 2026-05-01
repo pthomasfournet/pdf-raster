@@ -25,6 +25,39 @@ Phase 5 is complete. The API exists and is integrated.
 
 ---
 
+## Release history
+
+### v0.3.0 (May 2026)
+
+Phases 5 and 6 are complete and integrated.  All core roadmap milestones done.
+
+**New since v0.2.0:**
+
+- **`pdf_raster` public library crate** — `raster_pdf`, `render_channel`, `open_session`, `RasterOptions`, `RenderedPage`, `PageDiagnostics`, `RasterError`.  Three review passes; full validation, GPU teardown, `render_channel` backpressure, atomic temp-file rename in CLI.
+- **`UserUnit` support** — `page_size_pts` reads, validates, and propagates `UserUnit`; `RenderedPage.effective_dpi` is the correct value to pass to Tesseract.
+- **`PageDiagnostics`** — `has_images`, `has_vector_text`, `dominant_filter`, `source_ppi_hint`, `suggested_dpi()` — zero-cost collection during render.
+- **Pipelined render+OCR** — `render_channel(path, opts, capacity)` for bounded producer/consumer.
+- **DPI auto-selection hint** — `suggested_dpi(min, max)` snaps to nearest standard DPI step.
+- **GPU teardown** — explicit `release_gpu_decoders()` via `pool.broadcast()` before pool drop; eliminates CUDA atexit race.
+- **Fuzz targets** — `crates/fuzz`: CCITTFaxDecode and JBIG2Decode coverage-guided fuzz targets.
+- **Image module refactor** — 1 500-line `image/mod.rs` split into focused submodules.
+- **Glyph cache** — `DashMap` + `lru` replaced with `quick_cache::sync::Cache` (sharded; reads no longer force write lock).
+- **CLI hardening** — named rayon workers, 8 MiB stack, `MONO_THRESHOLD` const, atomic temp-file rename, `--odd`/`--even` mutual exclusion, DPI/JPEG quality validation.
+- **Compositing correctness** — `apply_transfer_channel` removed; general pipe now calls `apply_transfer_in_place` with correct gray/CMYK LUT dispatch.  Overprint routing fixed: `no_transparency()` now excludes `overprint_mask != 0xFFFF_FFFF`.  Replace-overprint unimplemented path now panics loudly in release.
+- **Performance** — `panic = "abort"` in release profile; `#[inline(always)]` on `apply_transfer_pixel` / `apply_transfer_in_place`; CMYK CLUT tables cached per page render; `Compression::Fast` for PNG output; `black_box` bench fencing.
+- **Image decoding hardening** — 33 bugs fixed across image submodules and GPU/CLI paths over three hardening passes.
+- **`#[expect]` throughout** — all `#[allow]` replaced with `#[expect(lint, reason = "...")]`.
+
+### v0.2.0 (May 2026)
+
+ARM/aarch64 platform: NEON acceleration for AA popcount, CMYK→RGB, glyph unpack, solid fill, and bilinear deskew.  SVE2 popcount tier behind `nightly-sve2` feature.  AVX2 AA popcount and CMYK→RGB tiers for Intel consumer CPUs.  VA-API JPEG decode (`vaapi` feature) for AMD/Intel iGPU on Linux.  CPU-only CI workflow.  Full 10-corpus benchmark results.
+
+### v0.1.0 (Apr 2026)
+
+Initial release.  Native PDF interpreter (Phases 1–4), GPU acceleration (nvJPEG, nvJPEG2000, GPU AA fill, tile fill, ICC CLUT), deskew, CLI (`pdftoppm` replacement).
+
+---
+
 ## Phase 0 — Library API research ✓ COMPLETE (Apr 2026)
 
 ### Tesseract integration findings (researched Apr 2026)
