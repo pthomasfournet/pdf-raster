@@ -121,7 +121,30 @@ GPU gains are largest on scan-heavy corpora where nvJPEG and nvJPEG2000 offload 
 
 ## GPU-accelerated: Intel i7-8700K + RTX 2080 Super (Turing, sm_75)
 
-_Pending — build and benchmark in progress. The RTX 2080 Super supports nvJPEG; nvJPEG2000 is not available on Turing (sm\_75). Results will be added once the Turing GPU build is complete._
+Built with nvJPEG, GPU AA fill, and ICC CLUT features. nvJPEG2000 is not available on Turing (sm_75); JBIG2/JPEG2000 streams fall through to CPU. Compared against `pdftoppm` (CPU only) on the same machine.
+
+**Build:** `CUDA_ARCH=sm_75 LIBZ_SYS_STATIC=1 RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster --features "pdf_raster/nvjpeg,pdf_raster/gpu-aa,pdf_raster/gpu-icc"`
+
+| # | Document | Pages | pdf-raster (GPU) | pdftoppm | Speedup |
+|---|---|---|---|---|---|
+| 01 | Native text, small | 16 | 658 ms | 582 ms | 0.88× |
+| 02 | Native vector + text | 16 | 806 ms | 610 ms | 0.76× |
+| 03 | Native text, dense | 254 | 2 671 ms | 7 256 ms | **2.7×** |
+| 04 | Ebook, mixed | 358 | 8 556 ms | 7 554 ms | 0.88× |
+| 05 | Academic book | 601 | 3 527 ms | 12 043 ms | **3.4×** |
+| 06 | Modern layout, DCT | 160 | 12 219 ms | 11 241 ms | 0.92× |
+| 07 | Journal, DCT-heavy | 162 | 14 222 ms | 8 319 ms | 0.58× |
+| 08 | 1927 scan, DCT | 390 | 12 284 ms | 473 651 ms | **38.6×** |
+| 09 | 1836 scan, DCT | 490 | 14 003 ms | 633 098 ms | **45.2×** |
+| 10 | Scan, JBIG2+JPX | 576 | 57 850 ms | 311 040 ms | **5.4×** |
+
+### Notes
+
+- **Short PDFs (01–02):** GPU init overhead exceeds any decode savings at 16 pages. 0.76–0.88× expected.
+- **Corpus 07 (0.58×):** Dense small JPEG pages — nvJPEG dispatch overhead per image exceeds decode savings. The RTX 2080 Super's nvJPEG throughput is outrun by the 12-thread CPU path for high-frequency small images.
+- **Corpora 08–09 (38.6×, 45.2×):** Headline results. Large progressive JPEG scan pages offloaded to nvJPEG (Turing supports progressive JPEG unlike VA-API). pdftoppm takes 8–10 minutes single-threaded; GPU finishes in 12–14 seconds.
+- **Corpus 10 (5.4×):** JBIG2+JPX — no nvJPEG2000 on Turing, falls through to CPU. Speedup is purely from Rayon parallelism vs pdftoppm single-threaded, same as the CPU-only result.
+- **vs CPU-only on same machine:** GPU adds overhead on corpora 01–07 relative to the CPU-only run (GPU init cost). The win is exclusively on scan-heavy corpora 08–09 where nvJPEG offloads large JPEG decode from the CPU thread pool.
 
 ---
 
