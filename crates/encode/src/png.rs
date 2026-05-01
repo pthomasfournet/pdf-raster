@@ -69,7 +69,10 @@ fn png_encoder<W: Write>(
     encoder.set_depth(depth);
     // Paeth filter gives good compression for photographic/gradient content.
     encoder.set_filter(::png::FilterType::Paeth);
-    encoder.set_compression(::png::Compression::Default);
+    // Fast (zlib level 1) keeps encode time low across hundreds of pages.
+    // The size penalty vs Default is small for rendered grayscale content
+    // because the Paeth predictor already decorrelates most of the signal.
+    encoder.set_compression(::png::Compression::Fast);
     Ok(encoder.write_header()?)
 }
 
