@@ -24,9 +24,8 @@
 //!
 //! # Pixel-count contract
 //!
-//! `ncomps` passed to [`draw_image`] **must** equal `P::BYTES`.  A
-//! `debug_assert!` enforces this; mismatched values produce wrong colours in
-//! release builds so callers are responsible for correctness.
+//! [`draw_image`] derives the component count directly from `P::BYTES`,
+//! eliminating any possibility of a caller passing a mismatched value.
 //!
 //! # C++ equivalents
 //!
@@ -1147,19 +1146,12 @@ fn blit_image<P: Pixel>(
     scaled_h: i32,
     x_dest: i32,
     y_dest: i32,
-    ncomps: usize,
     clip_res: ClipResult,
 ) {
-    debug_assert_eq!(
-        ncomps,
-        P::BYTES,
-        "blit_image: ncomps={ncomps} != P::BYTES={} — \
-         scaled image has wrong component count for this pixel format",
-        P::BYTES,
-    );
+    let ncomps = P::BYTES;
     debug_assert!(
         ncomps <= MAX_NCOMPS,
-        "blit_image: ncomps={ncomps} exceeds MAX_NCOMPS={MAX_NCOMPS}",
+        "blit_image: P::BYTES={ncomps} exceeds MAX_NCOMPS={MAX_NCOMPS}",
     );
 
     #[expect(
@@ -1360,20 +1352,14 @@ pub fn draw_image<P: Pixel>(
     src_w: u32,
     src_h: u32,
     matrix: &[f64; 6],
-    ncomps: usize,
 ) -> ImageResult {
     // Record src_mode for future colour-space conversion; unused in Phase 2.
     let _ = src_mode;
 
-    debug_assert_eq!(
-        ncomps,
-        P::BYTES,
-        "draw_image: ncomps={ncomps} != P::BYTES={} — pixel format mismatch",
-        P::BYTES,
-    );
+    let ncomps = P::BYTES;
     debug_assert!(
         ncomps <= MAX_NCOMPS,
-        "draw_image: ncomps={ncomps} exceeds MAX_NCOMPS={MAX_NCOMPS}",
+        "draw_image: P::BYTES={ncomps} exceeds MAX_NCOMPS={MAX_NCOMPS}",
     );
 
     if src_w == 0 || src_h == 0 {
@@ -1444,7 +1430,6 @@ pub fn draw_image<P: Pixel>(
         },
         x0,
         y0,
-        ncomps,
         clip_res,
     );
 
@@ -1575,7 +1560,6 @@ mod tests {
             4,
             4,
             &mat,
-            3,
         );
 
         assert_eq!(result, ImageResult::Ok);
@@ -1611,7 +1595,6 @@ mod tests {
             4,
             4,
             &mat,
-            3,
         );
         assert_eq!(result, ImageResult::ArbitraryTransformSkipped);
     }
@@ -1634,7 +1617,6 @@ mod tests {
             0,
             4,
             &mat,
-            3,
         );
         assert_eq!(result, ImageResult::ZeroImage);
     }
@@ -1661,7 +1643,6 @@ mod tests {
             2,
             2,
             &mat,
-            3,
         );
         assert_eq!(result, ImageResult::Ok);
         for y in 0..4u32 {
@@ -1695,7 +1676,6 @@ mod tests {
             4,
             4,
             &mat,
-            3,
         );
         assert_eq!(result, ImageResult::Ok);
         for y in 0..2u32 {
@@ -1805,7 +1785,6 @@ mod tests {
             2,
             2,
             &mat,
-            3,
         );
         assert_eq!(result, ImageResult::Ok);
         // After vflip: source row 1 (blue) maps to dest top, row 0 (red) to dest bottom.
@@ -1841,7 +1820,6 @@ mod tests {
             8,
             8,
             &mat,
-            3,
         );
         assert_eq!(result, ImageResult::Ok);
 
