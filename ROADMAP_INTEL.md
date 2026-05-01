@@ -1,10 +1,11 @@
-# Intel / ARM CPU platform roadmap
+# Cross-platform roadmap — CPU SIMD, VA-API GPU, ARM, Apple Silicon
 
-Tracking work needed to run pdf-raster on Intel x86-64 and ARM hardware.
-The core raster pipeline is portable; the work is auditing, fixing build issues,
-and adding SIMD fast paths where the existing ones are x86-only.
+Tracking work needed to run pdf-raster on Intel x86-64, AMD iGPU, ARM, and Apple
+Silicon. The core raster pipeline is portable; the work is auditing, fixing build
+issues, adding SIMD fast paths, and adding VA-API GPU acceleration.
 
-**Next CPU target after Intel: ARM** (see Phase E).
+**Current priorities:** VA-API JPEG decode (Phase C2, AMD iGPU confirmed on dev machine),
+then ARM NEON already complete (Phase E). Apple Silicon (Phase F) requires macOS hardware.
 
 ---
 
@@ -178,219 +179,165 @@ Confirmed by `cargo check` (no GPU features) completing cleanly.
 
 ---
 
-## Phase C — Intel GPU (Arc / Xe) — future
+## Phase C — VA-API GPU acceleration (iGPU + Intel Arc / AMD discrete)
 
-Intel Arc GPUs expose three relevant capability surfaces:
+VA-API (`libva`) is the unified Linux hardware video decode API. It works on:
+- **AMD iGPU** (Raphael/RDNA 2, VCN 4.0) — **confirmed working on dev machine** (`renderD129`, Mesa RadeonSI 25.2.8, VA-API 1.20, Apr 2026)
+- **Intel iGPU** (Skylake+ UHD / Iris Xe) — Quick Sync JPEG engine; same `libva` API
+- **Intel Arc discrete** — same `libva` API, more compute units
+- **AMD discrete** (RX 6000/7000) — VCN block exposed via Mesa RadeonSI
 
-| Capability | API | Replaces |
-|---|---|---|
-| JPEG / video decode | VA-API (`libva`) / oneVPL | nvJPEG + nvJPEG2K |
-| General compute (ICC CLUT, AA fill, tile fill) | OpenCL / Vulkan compute / SYCL | CUDA kernels in `crates/gpu` |
-| Texture sampling / bilinear rotate | VA-API VPP or Vulkan `VK_KHR_maintenance1` blit | `nppiRotate_8u_C1R_Ctx` (NPP) |
+The same `VapiJpegDecoder` Rust implementation serves all of these — no per-vendor code.
 
-**Prerequisite: Intel Arc hardware.** The i7-8700K test bench has only UHD 630 iGPU
-and an RTX 2080 Super — no Intel Arc discrete. All Phase C items are design-ready
-but not implementable until Arc hardware is available.
-
-### C1 — GPU abstraction traits
-
-The current `NvJpegDecoder` and `NvJpeg2kDecoder` types are concrete CUDA structs
-with no shared interface. Adding a VA-API backend requires an abstraction boundary
-first. The right design is two traits:
-
-```rust
-// In crates/gpu/src/traits.rs (new file)
-
-/// Decode a JPEG bytestream to an interleaved RGB or Gray u8 buffer.
-/// Implementations: NvJpegDecoder (CUDA), VapiJpegDecoder (VA-API/Intel/AMD iGPU).
-pub trait GpuJpegDecoder: Send {
-    fn decode_jpeg(&mut self, data: &[u8], width: u32, height: u32)
-        -> Result<Vec<u8>, GpuDecodeError>;
-}
-
-/// Decode a JPEG 2000 bytestream to an interleaved RGB or Gray u8 buffer.
-/// Implementations: NvJpeg2kDecoder (CUDA), (no VA-API equivalent — CPU fallback only).
-pub trait GpuJpeg2kDecoder: Send {
-    fn decode_jpeg2k(&mut self, data: &[u8]) -> Result<Vec<u8>, GpuDecodeError>;
-}
-
-/// General compute operations: ICC CLUT lookup, AA fill coverage, tile fill.
-/// Implementations: CudaCompute (CUDA), VulkanCompute (future, cross-vendor).
-pub trait GpuCompute: Send {
-    fn icc_clut(&self, pixels: &mut [u8], clut: &[u8], grid_n: u8)
-        -> Result<(), GpuDecodeError>;
-    fn aa_fill(&self, segs: &[Seg], width: u32, height: u32)
-        -> Result<Vec<u8>, GpuDecodeError>;
-    fn tile_fill(&self, records: &[TileRecord], ...) -> Result<Vec<u8>, GpuDecodeError>;
-}
+**Hardware confirmed available on dev machine (`/dev/dri/renderD129`):**
+```
+AMD Ryzen 9 9900X3D — Raphael iGPU (RDNA 2, VCN 4.0)
+Mesa Gallium 25.2.8 / radeonsi / VA-API 1.20
+VAProfileJPEGBaseline:  VAEntrypointVLD   ← JPEG baseline decode ✓
+VAProfileNone:          VAEntrypointVideoProc  ← VPP (scale, colour convert, etc.)
 ```
 
-**Dispatch:** `pdf_raster::RasterSession` holds `Option<Box<dyn GpuJpegDecoder>>` etc.,
-constructed at session open time. On CUDA hardware: `NvJpegDecoder`. On Intel
-(VA-API available): `VapiJpegDecoder`. On neither: `None` (CPU path).
+**No prerequisite hardware needed** — VA-API JPEG decode is implementable and testable
+on the dev machine today. The i7-8700K test bench also has Intel UHD 630 via the same API.
 
-**Thread safety:** The `DecoderInit<T>` thread-local pattern used for CUDA decoders
-(one decoder per Rayon worker thread) carries forward unchanged — each worker owns
-its `Box<dyn GpuJpegDecoder>`. The trait bound is `Send` not `Sync`, matching
-the existing pattern.
+### C1 — GPU abstraction traits ✓ DONE (Apr 2026)
 
-**`GpuDecodeError`:** unified error enum replacing `NvJpegError` and `NvJpeg2kError`
-at the trait boundary. Concrete error types remain as inner variants.
+`crates/gpu/src/traits.rs` defines:
+- `GpuJpegDecoder: Send` — `decode_jpeg(&mut self, data, width, height) → Result<DecodedImage>`
+- `GpuJpeg2kDecoder: Send` — `decode_jpeg2k(&mut self, data) → Result<DecodedImage>`
+- `GpuCompute: Send + Sync` — `icc_clut(&self, pixels, clut, grid_n, width, height) → Result<()>`
+- `GpuDecodeError` — unified error wrapping `Box<dyn Error + Send + Sync>`
+- `DecodedImage` — interleaved u8 pixels + dims + component count
 
-**Implementation order when Arc hardware arrives:**
-1. Define traits + `GpuDecodeError` in `crates/gpu/src/traits.rs`
-2. Wrap existing `NvJpegDecoder` / `NvJpeg2kDecoder` as trait impls (zero behaviour change)
-3. Implement `VapiJpegDecoder`
-4. Update `RasterSession` to hold `Box<dyn GpuJpegDecoder>`
+`NvJpegDecoder`, `NvJpeg2kDecoder`, and `GpuCtx` implement these traits.
+Inline image GPU dispatch is wired (`decode_inline_image` passes GPU params through).
 
 ### C2 — VA-API JPEG decoder (`VapiJpegDecoder`)
 
-VA-API (`libva`) exposes the Quick Sync JPEG engine on Intel Skylake+ iGPU and Arc
-discrete. The same `libva` calls work for both; no separate driver or API surface.
+Implements `GpuJpegDecoder` using raw `libva`/`libva-drm` FFI (no bindgen — the
+VA-API surface is small and stable; same rationale as raw CUDA driver API in nvJPEG).
+
+**Device selection:** open `/dev/dri/renderD129` (AMD iGPU on dev machine) via
+`vaGetDisplayDRM`. The device node should be configurable or auto-detected, not hardcoded.
 
 **Key API objects:**
 ```c
-VADisplay dpy;           // obtained from vaGetDisplayDRM("/dev/dri/renderD128")
-VAConfigID cfg;          // vaCreateConfig(dpy, VAProfileJPEGBaseline, VAEntrypointVLD, ...)
-VAContextID ctx;         // vaCreateContext(dpy, cfg, width, height, ...)
-VASurfaceID surface;     // vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, width, height, ...)
-VABufferID pic_buf;      // vaCreateBuffer — VAPictureParameterBufferJPEGBaseline
-VABufferID slice_buf;    // vaCreateBuffer — VASliceDataBufferType (raw JPEG bytes)
-VABufferID iqmatrix_buf; // vaCreateBuffer — VAIQMatrixBufferJPEGBaseline
+VADisplay  dpy;           // vaGetDisplayDRM(fd)  — fd = open("/dev/dri/renderD129", O_RDWR)
+VAConfigID cfg;           // vaCreateConfig(dpy, VAProfileJPEGBaseline, VAEntrypointVLD, NULL, 0, &cfg)
+VAContextID ctx;          // vaCreateContext(dpy, cfg, width, height, VA_PROGRESSIVE, NULL, 0, &ctx)
+VASurfaceID surface;      // vaCreateSurfaces(dpy, VA_RT_FORMAT_YUV420, width, height, &surf, 1, NULL, 0)
+VABufferID  pic_buf;      // vaCreateBuffer — VAPictureParameterBufferType (VAPictureParameterBufferJPEGBaseline)
+VABufferID  iq_buf;       // vaCreateBuffer — VAIQMatrixBufferType (VAIQMatrixBufferJPEGBaseline)
+VABufferID  slice_buf;    // vaCreateBuffer — VASliceDataBufferType (raw JPEG bitstream bytes)
+VABufferID  slice_param;  // vaCreateBuffer — VASliceParameterBufferType (VASliceParameterBufferJPEGBaseline)
 ```
 
 **Decode sequence:**
-1. `vaBeginPicture` → `vaRenderPicture` (pic + iq + slice bufs) → `vaEndPicture`
-2. `vaSyncSurface` — blocks until decode complete
-3. `vaMapBuffer` on a `VAImageBuffer` to copy YUV → host; convert to RGB with libyuv
-   or a simple integer kernel (no GPU needed for the YUV→RGB step at these sizes)
+1. `vaBeginPicture(dpy, ctx, surface)`
+2. `vaRenderPicture(dpy, ctx, [pic_buf, iq_buf, slice_param, slice_buf], 4)`
+3. `vaEndPicture(dpy, ctx)`
+4. `vaSyncSurface(dpy, surface)` — block until VCN decode complete
+5. `vaDeriveImage` or `vaGetImage` → `vaMapBuffer` → copy YUV → host
+6. CPU YUV420→RGB8 conversion (cheap: ~1 ns/pixel with SIMD)
+7. `vaUnmapBuffer`, `vaDestroyImage`, destroy buffers
 
-**Output format:** VA-API returns NV12 or YUV420 planar (hardware decoder output).
-Convert to interleaved RGB8 on CPU after `vaSyncSurface` — the conversion is cheap
-relative to decode. CMYK JPEG is not supported by VA-API hardware; fall through to
-CPU `zune-jpeg`, same as the nvJPEG path.
+**Output format:** Mesa RadeonSI returns `VA_FOURCC_NV12` (Y plane + interleaved UV).
+Convert to interleaved RGB8 with a scalar or AVX2 kernel post-sync — the conversion
+is ~0.5ms for a 4MP image and is not the bottleneck.
 
-**Inline image gap:** `decode_inline_image` in `pdf_interp/src/resources/image.rs`
-currently has no decoder parameter and always uses CPU. When implementing
-`VapiJpegDecoder`, fix this at the same time:
-- Add `decoder: Option<&mut dyn GpuJpegDecoder>` parameter to `decode_inline_image`
-- Gate dispatch on the same area threshold as `resolve_image`
-- This closes the structural gap for both CUDA and VA-API paths simultaneously
+**CMYK:** Not supported by any VA-API JPEG hardware; fall through to CPU `zune-jpeg`.
+**Progressive JPEG:** `VAEntrypointVLD` for JPEG baseline only; fall through to CPU.
+**Grayscale:** Single-component JPEG → request `VA_RT_FORMAT_YUV400` surface if the
+driver supports it; otherwise decode as YUV420 and use only the Y plane.
 
-**Rust binding:** Use raw `libva` FFI (same rationale as raw CUDA driver API in
-`NvJpegDecoder` — avoids mixing safe wrapper context management with hardware
-decoder internal state). Link `libva.so.2` and `libva-drm.so.2` behind a
-`vaapi` feature flag. No bindgen — the VA-API surface is small and stable.
+**Thread safety:** Each Rayon worker thread creates its own `VAContext` and `VASurface`.
+`VADisplay` is shared (thread-safe for read; `vaInitialize` called once). Same
+`DecoderInit<T>` thread-local pattern as nvJPEG.
 
-**Feature flag:** `gpu/vaapi` + `pdf_interp/vaapi`. Same opt-in pattern as
-`nvjpeg`/`nvjpeg2k`. Zero-cost when disabled.
+**Feature flag:** `gpu/vaapi` + `pdf_interp/vaapi`. Link `libva.so.2` + `libva-drm.so.2`.
+Zero-cost when disabled.
 
-**Threshold:** Same 512×512 px (`GPU_JPEG_THRESHOLD_PX`) as nvJPEG. Recalibrate
-against actual VA-API setup latency on Arc hardware — Quick Sync overhead may
-differ from nvJPEG.
+**Threshold:** Start at `GPU_JPEG_THRESHOLD_PX` (512×512 = 262 144 px). VA-API context
+creation has per-image overhead (~0.5–2ms depending on driver); recalibrate once
+implemented by running `threshold_bench` equivalent on `renderD129`.
 
-### C3 — BVH winding test on Intel GPU (evaluate after profiling)
+**Dispatch priority:** when both nvJPEG and VA-API are compiled in, nvJPEG takes
+priority (discrete GPU is faster for large images). VA-API fires when nvJPEG is
+absent or returns `GpuDecodeError` (e.g. on a machine with only iGPU).
 
-The main ROADMAP.md defers OptiX BVH (RT cores on Blackwell) until profiling shows
-complex-path fill as the bottleneck. The Intel equivalent:
+### C3 — VA-API VPP for deskew rotation (evaluate)
 
-- **Intel Arc**: ray tracing via Vulkan `VK_KHR_ray_tracing_pipeline`. Arc A770
-  has 32 ray-tracing units (Xe SS, not dedicated RT cores like NVIDIA).
-- **SYCL / Embree**: Embree 4.3+ supports Arc via SYCL backend — CPU+GPU BVH
-  with the same API. More portable than raw Vulkan RT.
+`VAEntrypointVideoProc` is confirmed available on `renderD129`. VPP exposes:
+- `VAProcFilterNone` pipeline with `VAProcPipelineParameterBuffer`
+- `output_region` / `surface_region` for crop+scale
+- `rotation_state`: `VA_ROTATION_NONE / 90 / 180 / 270` — **only 90° multiples**
 
-In practice the tile-fill kernel handles typical PDF geometry (O(100–1000) segments)
-well. BVH adds value only at O(10 000+) segments. **Do not implement; revisit if
-flamegraph shows complex-path fill dominating on Intel Arc.**
+**Arbitrary-angle rotation is not in the VA-API VPP spec.** The `rotation_state` field
+only supports 0/90/180/270°. Deskew requires sub-degree precision (e.g. 0.3°).
+**Verdict: VA-API VPP cannot do deskew rotation. CPU bilinear or NPP remain the path.**
+
+VPP scaling (`VA_FILTER_SCALING_HQ`) could accelerate the 4× downsample in deskew
+angle detection, but the downsample is already fast on CPU (< 0.5ms) and is not a
+bottleneck. Not worth the API complexity.
+
+### C4 — BVH winding test on AMD/Intel GPU (evaluate after profiling)
+
+Deferred — see main ROADMAP.md. VCN/Arc don't have dedicated RT cores; Vulkan RT
+would be required. Only relevant at O(10 000+) path segments which is not typical.
 
 ---
 
-## Phase C2 — Integrated GPU / iGPU compute
+## Phase C2 — iGPU / UMA platform analysis
 
-Most modern CPUs ship with an integrated GPU. Whether it helps depends heavily on
-the operation and the memory architecture. Analysis per platform:
-
-### Operations worth targeting
-
-**JPEG decode is the main prize.**
-It is the dominant cost in scanned-document pipelines and the primary reason nvJPEG
-exists. Hardware JPEG engines on iGPUs are real, fast, and well-supported via
-platform APIs. The argument for iGPU JPEG decode is identical to the nvJPEG argument:
-bulk decode of many large images, where the per-image setup cost amortises.
-
-**General compute (ICC CLUT, AA fill, tile fill) — depends on memory architecture.**
-With a discrete GPU there is a PCIe transfer overhead that sets a minimum payload
-size before GPU wins (hence our 500K pixel ICC threshold). With a UMA iGPU that
-overhead disappears, which changes the break-even point for small kernels significantly.
-
-**Bilinear deskew — CPU wins on non-UMA; recheck on UMA.**
-The rotation kernel is small and memory-bandwidth-bound. On x86 iGPU the
-copy-in + copy-out cost dominates. On Apple Silicon UMA it is worth measuring.
-
-### Intel iGPU (UHD 630 / Iris Xe / Arc in laptop)
+### AMD iGPU (Raphael/RDNA 2 on Ryzen 9 9900X3D) — confirmed hardware
 
 | Operation | API | Verdict |
 |---|---|---|
-| JPEG decode | VA-API (`libva`) / oneVPL | **Worth it.** Quick Sync JPEG engine present on Skylake+. Same `VapiDecoder` impl that would serve Intel Arc discrete — no separate work item. |
-| General compute | OpenCL / Vulkan compute / SYCL | Not worth it vs NEON+AVX2 on non-UMA iGPU. Transfer cost dominates for our kernel sizes. |
-| Bilinear deskew | VA-API VPP (video post-processing) | Possible but complex API; CPU bilinear with AVX2 is fast enough. |
+| JPEG decode | VA-API VCN 4.0 (`renderD129`) | **Worth it — implement as C2.** Shares `VapiJpegDecoder` impl with Intel. |
+| General compute (ICC CLUT, AA fill) | Vulkan compute / OpenCL | **Not worth it.** Discrete RTX 5070 handles all GPU compute. iGPU adds no value when discrete is present. |
+| Bilinear deskew | VA-API VPP (rotation_state) | **No** — VPP only supports 90° multiples; arbitrary angle not available. CPU path wins. |
+| Solid fill | CPU `movdir64b` / AVX2 | CPU wins — bandwidth-limited. |
 
-**Known structural gap (inherited from CUDA path):** `decode_inline_image` in
-`pdf_interp/src/resources/image.rs` never routes through GPU decoders — all inline
-`DCTDecode` and `JPXDecode` images go through the CPU path regardless of image area.
-Most inline images are small (thumbnails, icons) so the threshold rarely triggers,
-but the gap is architectural. When implementing VA-API JPEG decode in Phase C, the
-same fix applies: add decoder parameters to `decode_inline_image` and gate on the
-same area threshold. Do not design the VA-API abstraction without accounting for this.
+**Key finding:** the AMD iGPU is strictly a JPEG decode acceleration path on this machine.
+All other compute stays on the RTX 5070 (CUDA) or CPU (AVX-512).
+The `VapiJpegDecoder` on `renderD129` serves as a fallback decode path when the
+discrete GPU is busy or unavailable, and as the primary path on machines without
+a discrete CUDA GPU.
 
-**Key point:** Intel iGPU JPEG decode falls out of the Phase C VA-API work for free.
-The `trait GpuJpegDecoder` abstraction needed for Intel Arc also serves iGPU — no
-separate driver or API. A machine with only an Intel iGPU (no discrete) gets JPEG
-acceleration as soon as Phase C lands.
-
-The test bench at 192.168.1.185 (i7-8700K + RTX 2080 Super) has Intel UHD 630 iGPU
-available. It could be used to validate VA-API JPEG decode independently of the Arc
-discrete work, since the API surface is identical.
-
-### Apple Silicon (M1–M4) — UMA changes the calculus
-
-Apple Silicon has no PCIe bus between CPU and GPU — they share the same physical
-memory (Unified Memory Architecture). This eliminates the transfer-overhead argument
-that makes small GPU kernels not worth it on x86.
+### Intel iGPU (UHD 630 / Iris Xe / Arc laptop)
 
 | Operation | API | Verdict |
 |---|---|---|
-| JPEG decode | VideoToolbox (`VTDecompressSession`) | **Worth it.** Hardware JPEG engine, zero-copy via CVPixelBuffer into shared memory. |
-| ICC CLUT lookup | Metal Compute (`MTLComputeCommandEncoder`) | **Worth measuring.** No copy penalty; GPU parallelism at 500K+ pixels could win. |
-| AA fill / tile fill | Metal Compute | **Worth measuring on M1+.** UMA means the 256px threshold may drop significantly. |
-| Bilinear deskew | Metal Performance Shaders (`MPSImageBilinearScale`) | **Worth it.** MPS is a tuned Apple library; bilinear rotate is a first-class operation. |
-| Solid fill | CPU `vst1q_u8` | CPU wins — fill is memory-bandwidth-limited and the CPU already saturates the bus. |
+| JPEG decode | VA-API Quick Sync | **Worth it** — same `VapiJpegDecoder`, no extra work. |
+| General compute | OpenCL / Vulkan compute | Not worth it vs AVX2 on non-UMA. |
+| Bilinear deskew | VA-API VPP | No — 90° only (see C3). CPU wins. |
 
-**Platform note:** VideoToolbox and Metal are macOS/iOS APIs. They require a separate
-feature flag (e.g. `metal`) and a macOS build target. This is a distinct work stream
-from the Linux/CUDA path — not a drop-in replacement.
+### Apple Silicon (M1–M4) — UMA changes the calculus (Phase F, macOS only)
 
-**Abstraction boundary:** A `trait GpuJpegDecoder` + `trait GpuCompute` (for CLUT/fill)
-with `NvJpeg`/`Metal`/`VaApi` impls is the right design. The trait design done for
-Intel Arc applies directly; Metal is just another impl.
+| Operation | API | Verdict |
+|---|---|---|
+| JPEG decode | VideoToolbox (`VTDecompressSession`) | **Worth it.** Zero-copy via CVPixelBuffer. |
+| ICC CLUT lookup | Metal Compute | **Worth measuring** — no PCIe penalty; 500K px threshold may drop. |
+| AA fill / tile fill | Metal Compute | **Worth measuring** — same UMA argument. |
+| Bilinear deskew | Metal Performance Shaders (`MPSImageBilinearScale`) | **Worth it** — MPS supports arbitrary angle. |
+| Solid fill | CPU `vst1q_u8` | CPU wins — bandwidth-limited. |
+
+Metal/VideoToolbox require a separate `metal` feature flag and macOS build target.
+Not implementable on Linux. Phase F.
 
 ### Raspberry Pi 4/5 (VideoCore VI/VII)
 
-The VideoCore GPU is accessible via Mesa V3D (OpenGL ES 3.1, experimental Vulkan 1.2
-on Pi 5). The userspace stack is immature for compute workloads and the GPU is weak
-relative to the Pi's Cortex-A72/A76 NEON capabilities. **Not worth targeting.**
-The CPU NEON paths (Phase E) are the correct answer on Raspberry Pi.
-
-VideoCore does have a hardware JPEG decode block (ISP pipeline) but it is exposed
-through the camera/ISP stack (`libcamera`), not a general-purpose decode API. Not
-usable for arbitrary PDF image streams.
+VideoCore compute is not accessible for general workloads; hardware JPEG decode is
+ISP-only (`libcamera`), not usable for arbitrary bitstreams. **Skip.**
+CPU NEON paths (Phase E) are the correct answer.
 
 ### Summary
 
 | Platform | JPEG decode | Compute (ICC/fill) | Deskew | Priority |
 |---|---|---|---|---|
-| Intel iGPU (UHD/Iris/Arc laptop) | VA-API — falls out of Phase C | not worth it (non-UMA) | CPU wins | Phase C (no extra work) |
-| Apple M1–M4 | VideoToolbox — zero copy | Metal Compute — UMA, worth measuring | MPS bilinear | Phase F (macOS feature flag) |
+| AMD iGPU (Raphael, dev machine) | VA-API VCN — `VapiJpegDecoder` | discrete GPU handles it | CPU (VPP = 90° only) | **C2 — implement now** |
+| Intel iGPU (UHD/Iris/Arc laptop) | VA-API Quick Sync — same impl | not worth it (non-UMA) | CPU (VPP = 90° only) | C2 — falls out for free |
+| Apple M1–M4 | VideoToolbox — zero copy | Metal Compute (UMA) | MPS bilinear (arbitrary angle) | Phase F (macOS) |
 | Raspberry Pi 4/5 | not accessible | not worth it | CPU NEON | skip |
 
 ---
@@ -627,7 +574,8 @@ skip at runtime when `sve2` is not detected — they will execute on Graviton4.
 | D — CI CPU-only job | medium | ✓ DONE (Apr 2026) — `.github/workflows/ci.yml` |
 | A7 — Intel RDT cache partitioning note | low | ✓ DONE — see "Deployment notes" section above |
 | C1 — `GpuJpegDecoder` / `GpuCompute` abstraction traits | low | ✓ DONE (Apr 2026) — `crates/gpu/src/traits.rs`; `NvJpegDecoder` + `NvJpeg2kDecoder` + `GpuCtx` impls; inline image GPU gap also closed |
-| C2 — `VapiJpegDecoder` (VA-API JPEG, inline image fix) | low | design complete (see Phase C); implement when Arc hardware available; inline image gap closed as part of C1 |
-| C3 — BVH winding test (Intel RT cores / Embree) | low | design noted; implement only if profiling shows complex-path bottleneck |
+| C2 — `VapiJpegDecoder` (VA-API JPEG decode) | **high** | **UNBLOCKED** — AMD iGPU confirmed on dev machine (`renderD129`, VCN 4.0, VA-API 1.20, Apr 2026); design complete; implement next |
+| C3 — VA-API VPP deskew rotation | low | Not feasible — `rotation_state` supports 90° multiples only; arbitrary-angle deskew stays on CPU/NPP |
+| C4 — BVH winding test (AMD/Intel RT via Vulkan) | low | design noted; implement only if profiling shows complex-path bottleneck |
 | E5 — SVE2 popcount tier | low | ✓ DONE (Apr 2026) — `nightly-sve2` Cargo feature; `popcnt_aa_row_sve2` + `aa_coverage_span_sve2`; `svlsr_u8_z` + `svcnt_u8_z` + `svadd_u8_z`; dispatch above NEON; `cargo check` clean on stable (feature off) and nightly (feature on); runs when `is_aarch64_feature_detected!("sve2")` returns true |
 | aarch64 CI job | medium | ✓ DONE (Apr 2026) — `aarch64-check` job in `.github/workflows/ci.yml`; stable NEON + nightly SVE2; installs `gcc-aarch64-linux-gnu` for C dep crates |
