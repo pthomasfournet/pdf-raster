@@ -24,10 +24,12 @@ mod cmyk;
 mod composite;
 pub(crate) mod cuda;
 mod fill;
+pub mod traits;
 
 pub use cmyk::icc_cmyk_to_rgb_cpu;
 pub use composite::{apply_soft_mask_cpu, composite_rgba8_cpu};
 pub use fill::{TileRecord, aa_fill_cpu, build_tile_records};
+pub use traits::{DecodedImage, GpuCompute, GpuDecodeError, GpuJpeg2kDecoder, GpuJpegDecoder};
 
 #[cfg(feature = "nvjpeg")]
 pub mod nvjpeg;

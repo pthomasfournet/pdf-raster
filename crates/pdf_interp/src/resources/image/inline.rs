@@ -6,6 +6,15 @@ use super::codecs::{decode_ccitt, decode_dct, decode_jbig2, decode_jpx};
 use super::{ImageDescriptor, ImageFilter, decode_raw, filter_name, validated_dims};
 use crate::resources::dict_ext::DictExt;
 
+#[cfg(feature = "nvjpeg")]
+use gpu::nvjpeg::NvJpegDecoder;
+
+#[cfg(feature = "nvjpeg2k")]
+use gpu::nvjpeg2k::NvJpeg2kDecoder;
+
+#[cfg(feature = "gpu-icc")]
+use gpu::GpuCtx;
+
 #[cfg(test)]
 use super::ImageColorSpace;
 
@@ -19,6 +28,14 @@ use super::ImageColorSpace;
 /// Inline images cannot carry an `SMask` stream (they have no object identity),
 /// so the returned descriptor always has `smask: None`.
 ///
+/// GPU decoders are passed in for `DCTDecode` and `JPXDecode` streams.  The same
+/// area threshold as `resolve_image` applies — images below
+/// [`GPU_JPEG_THRESHOLD_PX`](super::GPU_JPEG_THRESHOLD_PX) use the CPU path
+/// regardless.  Most inline images are small (thumbnails, icons) and will fall
+/// through to the CPU path; the parameters are plumbed through so that the
+/// dispatch logic in `decode_dct` / `decode_jpx` can make the threshold decision
+/// rather than unconditionally bypassing GPU decode for all inline images.
+///
 /// Returns `None` if the parameter block is unparseable, dimensions are
 /// degenerate, or the filter is unsupported.
 #[must_use]
@@ -26,7 +43,14 @@ use super::ImageColorSpace;
     clippy::too_many_lines,
     reason = "one match arm per supported filter; each arm is small but the set is large"
 )]
-pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option<ImageDescriptor> {
+pub fn decode_inline_image(
+    doc: &Document,
+    params: &[u8],
+    data: &[u8],
+    #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
+    #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
+    #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
+) -> Option<ImageDescriptor> {
     let dict = parse_inline_params(params);
 
     let w_raw = dict.get_i64(b"Width")?;
@@ -57,7 +81,7 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
             is_mask,
             &dict,
             #[cfg(feature = "gpu-icc")]
-            None,
+            gpu_ctx,
         ),
         Some("FlateDecode") => {
             use lopdf::Stream;
@@ -72,7 +96,7 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
                     is_mask,
                     &dict,
                     #[cfg(feature = "gpu-icc")]
-                    None,
+                    gpu_ctx,
                 ),
                 Err(e) => {
                     log::warn!("inline image: FlateDecode failed: {e}");
@@ -85,19 +109,19 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
             decode_ccitt(data, w, h, is_mask, decode_parms)
         }
         Some("DCTDecode") => {
-            // Inline images are typically small (embedded in the content stream).
-            // GPU dispatch for inline images is not worthwhile — use CPU always.
+            // GPU dispatch is threshold-gated inside decode_dct (same threshold as
+            // resolve_image). Most inline images are small and will use the CPU path.
             #[cfg(all(feature = "nvjpeg", feature = "gpu-icc"))]
             {
-                decode_dct(data, w, h, None, None)
+                decode_dct(data, w, h, gpu, gpu_ctx)
             }
             #[cfg(all(feature = "nvjpeg", not(feature = "gpu-icc")))]
             {
-                decode_dct(data, w, h, None)
+                decode_dct(data, w, h, gpu)
             }
             #[cfg(all(not(feature = "nvjpeg"), feature = "gpu-icc"))]
             {
-                decode_dct(data, w, h, None)
+                decode_dct(data, w, h, gpu_ctx)
             }
             #[cfg(all(not(feature = "nvjpeg"), not(feature = "gpu-icc")))]
             {
@@ -105,10 +129,10 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
             }
         }
         Some("JPXDecode") => {
-            // Inline images are typically small — GPU dispatch is not worthwhile.
+            // GPU dispatch is threshold-gated inside decode_jpx.
             #[cfg(feature = "nvjpeg2k")]
             {
-                decode_jpx(data, w, h, None)
+                decode_jpx(data, w, h, gpu_j2k)
             }
             #[cfg(not(feature = "nvjpeg2k"))]
             {
@@ -129,7 +153,7 @@ pub fn decode_inline_image(doc: &Document, params: &[u8], data: &[u8]) -> Option
                 is_mask,
                 &dict,
                 #[cfg(feature = "gpu-icc")]
-                None,
+                gpu_ctx,
             )
         }
         Some(other) => {
@@ -467,7 +491,18 @@ mod tests {
         let params = b"/W 2 /H 2 /CS /G /BPC 8";
         let data = [0x00u8, 0x80, 0xFF, 0x40];
         let doc = lopdf::Document::new();
-        let img = decode_inline_image(&doc, params, &data).expect("decode should succeed");
+        let img = decode_inline_image(
+            &doc,
+            params,
+            &data,
+            #[cfg(feature = "nvjpeg")]
+            None,
+            #[cfg(feature = "nvjpeg2k")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .expect("decode should succeed");
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.color_space, ImageColorSpace::Gray);
@@ -481,7 +516,18 @@ mod tests {
         // 1-bpp mask: byte 0b10000000 → pixel 0 = 1 (transparent), pixel 1 = 0 (paint).
         let data = [0b1000_0000u8];
         let doc = lopdf::Document::new();
-        let img = decode_inline_image(&doc, params, &data).expect("decode should succeed");
+        let img = decode_inline_image(
+            &doc,
+            params,
+            &data,
+            #[cfg(feature = "nvjpeg")]
+            None,
+            #[cfg(feature = "nvjpeg2k")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .expect("decode should succeed");
         assert_eq!(img.color_space, ImageColorSpace::Mask);
         // Expanded 1-bpp: bit 7 = 1 → 0xFF, bit 6 = 0 → 0x00
         assert_eq!(img.data[0], 0xFF); // first pixel: transparent
@@ -492,7 +538,20 @@ mod tests {
     fn inline_image_degenerate_dims() {
         let params = b"/W 0 /H 1 /CS /G /BPC 8";
         let doc = lopdf::Document::new();
-        assert!(decode_inline_image(&doc, params, &[]).is_none());
+        assert!(
+            decode_inline_image(
+                &doc,
+                params,
+                &[],
+                #[cfg(feature = "nvjpeg")]
+                None,
+                #[cfg(feature = "nvjpeg2k")]
+                None,
+                #[cfg(feature = "gpu-icc")]
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -500,6 +559,19 @@ mod tests {
         // No width/height → None.
         let params = b"/CS /G /BPC 8";
         let doc = lopdf::Document::new();
-        assert!(decode_inline_image(&doc, params, &[0u8; 4]).is_none());
+        assert!(
+            decode_inline_image(
+                &doc,
+                params,
+                &[0u8; 4],
+                #[cfg(feature = "nvjpeg")]
+                None,
+                #[cfg(feature = "nvjpeg2k")]
+                None,
+                #[cfg(feature = "gpu-icc")]
+                None,
+            )
+            .is_none()
+        );
     }
 }

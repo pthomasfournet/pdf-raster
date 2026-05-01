@@ -107,9 +107,15 @@ Ordered by priority. Wire CLI by default is the finish line.
 - [x] Annotation rendering
 - [x] Non-axis-aligned image transforms (currently bounding-box nearest-neighbour approximation)
 
-### Open: inline images never use GPU decoders
+### ~~Open: inline images never use GPU decoders~~ — RESOLVED
 
-`decode_inline_image` in `pdf_interp/src/resources/image.rs` does not accept GPU decoder parameters — all inline `DCTDecode` and `JPXDecode` images go through the CPU path regardless of image area or enabled features. Most inline images are small (thumbnails, icons) so the threshold would rarely trigger, but the gap means the GPU path is structurally incomplete for inline streams. Fix: add the same `#[cfg]`-gated decoder parameters to `decode_inline_image` as `resolve_image` has.
+`decode_inline_image` now accepts the same `#[cfg]`-gated GPU decoder
+parameters as `resolve_image`.  The `PageRenderer::InlineImage` arm passes
+`self.nvjpeg.as_mut()` / `self.nvjpeg2k.as_mut()` / `self.gpu_ctx.as_deref()`
+through.  The threshold-based dispatch inside `decode_dct` / `decode_jpx`
+handles the actual gating — most inline images are small and take the CPU path,
+but large inline JPEG/JPEG 2000 images (≥ 512×512) are now eligible for GPU
+acceleration.
 
 ---
 

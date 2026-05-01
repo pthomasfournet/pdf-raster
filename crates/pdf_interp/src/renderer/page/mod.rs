@@ -668,7 +668,17 @@ impl<'doc> PageRenderer<'doc> {
                 self.do_xobject(name);
             }
             Operator::InlineImage { params, data } => {
-                if let Some(img) = decode_inline_image(self.resources.doc(), params, data) {
+                if let Some(img) = decode_inline_image(
+                    self.resources.doc(),
+                    params,
+                    data,
+                    #[cfg(feature = "nvjpeg")]
+                    self.nvjpeg.as_mut(),
+                    #[cfg(feature = "nvjpeg2k")]
+                    self.nvjpeg2k.as_mut(),
+                    #[cfg(feature = "gpu-icc")]
+                    self.gpu_ctx.as_deref(),
+                ) {
                     self.blit_image(&img);
                 } else {
                     log::debug!("pdf_interp: inline image decode failed — skipping");
