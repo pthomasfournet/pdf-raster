@@ -33,6 +33,19 @@ check_disk() {
   fi
 }
 
+# Evict a single file from page cache without root via posix_fadvise(FADV_DONTNEED).
+evict_file() {
+  local path="$1"
+  python3 -c "
+import ctypes, os, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY)
+size = os.fstat(fd).st_size
+ctypes.CDLL(None).posix_fadvise(fd, 0, size, 4)  # POSIX_FADV_DONTNEED=4
+os.close(fd)
+" "$path" 2>/dev/null || true  # non-fatal: falls back to warm-cache run
+}
+
 [[ -x "$BIN" ]] || { echo "ERROR: binary not found or not executable: $BIN" >&2; exit 1; }
 command -v pdftoppm >/dev/null || { echo "ERROR: pdftoppm not found in PATH" >&2; exit 1; }
 
@@ -73,6 +86,7 @@ for name in "${corpora[@]}"; do
   fi
 
   # ── pdf-raster ──
+  evict_file "$pdf"
   check_disk /tmp
   TMPDIR_R=$(mktemp -d)
   t1=$( { time "$BIN" "${PDF_RASTER_ARGS[@]}" "$pdf" "$TMPDIR_R/r" >/dev/null 2>&1; } 2>&1 | awk '/^real/{print $2}')
@@ -80,6 +94,7 @@ for name in "${corpora[@]}"; do
   rm -rf "$TMPDIR_R"
 
   # ── reference (pdftoppm or cpu-only) ──
+  evict_file "$pdf"
   check_disk /tmp
   TMPDIR_P=$(mktemp -d)
   if [[ "$BACKEND" == "vaapi" ]]; then
