@@ -2,12 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.2.0] - 2026-05-01
+
+### Bug Fixes
+
+- Fix nvJPEG segfault on process exit — eager decoder teardown
+- Guard PTX compilation behind GPU feature flags
+- Hardening pass — bounds checks, SAFETY docs, dead-code removal
+- Correct release.toml schema for cargo-release 1.x
 
 ### Chores
 
 - Set GitHub URL and strip email from Cargo metadata
 - Set author to Tom in Cargo metadata
+- Add versioning tooling — cargo-release + git-cliff
+- Gitignore ROADMAP_INTEL.md
+- Cargo fmt
+
+### Documentation
+
+- Update performance table with full 10-corpus benchmark results
+- Add ARCHITECTURE.md
+- Update ROADMAP_INTEL.md for AMD iGPU VA-API discovery
+- Mark C2 complete, sync checklist with implemented state
+
+### Features
+
+- Add ARM NEON acceleration for AA popcount paths
+- Add NEON for CMYK→RGB and glyph unpack; fix AVX-512 dispatch bug
+- Add NEON solid fill for RGB and gray (E6)
+- Add NEON bilinear deskew rotation (E7)
+- Add AVX2 AA popcount tier (A2)
+- Add AVX2 ICC CMYK→RGB tier (A4)
+- Add CPU-only CI workflow and fix PTX placeholder generation (D)
+- Add SVE2 popcount tier and aarch64 CI job (E5)
+- GPU decoder traits + inline image GPU dispatch
+- VA-API JPEG decoder for AMD/Intel iGPU on Linux
+
+### Refactor
+
+- Hardening pass on popcnt.rs
+- Hardening pass on NEON CMYK, glyph unpack, and popcnt
+- Hardening pass on blend.rs
+- Hardening pass on cmyk.rs
+- Hardening pass on CI workflow and build.rs
+- Hardening pass on SVE2 tier and CI fixes
+- Hardening pass on traits.rs
+- Remove dead hardware_backend field and fix doc accuracy
+- Hardening pass on nvjpeg.rs
+
+### Testing
+
+- Add rotate_cpu 8.4 MP timing smoke-test (A6)
 
 ## [0.1.0] - 2026-04-30
 

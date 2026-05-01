@@ -14,10 +14,9 @@ sign-commit = false
 tag-name = "v{{version}}"
 tag-message = "Release v{{version}}"
 
-# Run git-cliff to regenerate CHANGELOG.md before the version bump commit
-pre-release-hook = [
-    "git-cliff", "--output", "CHANGELOG.md", "--tag", "v{{version}}",
-]
+# git-cliff is run manually before cargo release:
+#   git-cliff --output CHANGELOG.md --tag vX.Y.Z && git add CHANGELOG.md
+# The hook is left empty; cargo-release handles Cargo.toml bumps + tag + push.
 
 # Commit message for the version bump
 pre-release-commit-message = "chore: release v{{version}}"
