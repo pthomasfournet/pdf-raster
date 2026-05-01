@@ -15,7 +15,7 @@
 //! | `DCTDecode` (JPEG) | no | yes (CPU software or GPU nvJPEG) |
 //! | `JPXDecode` (JPEG 2000) | no | yes (CPU software or GPU nvJPEG2000) |
 //! | `JBIG2Decode` | yes/no | yes (via `hayro-jbig2`) |
-//! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | — | stub |
+//! | `CCITTFaxDecode` (`K>0`, Group 3 mixed 2D) | yes/no | yes (via `hayro-ccitt`) |
 //!
 //! # Pixel layout in `ImageDescriptor::data`
 //!

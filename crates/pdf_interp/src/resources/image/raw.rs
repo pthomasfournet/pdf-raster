@@ -244,9 +244,10 @@ fn decode_raw_8bpp(
     let raw = &data[..expected];
 
     if resolved == ResolvedCs::Cmyk {
-        // Raw PDF CMYK: 255 = full ink, 0 = no ink.
+        // Raw PDF CMYK: 255 = full ink, 0 = no ink (not inverted).
         let rgb = cmyk_raw_to_rgb(
             raw,
+            false,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]

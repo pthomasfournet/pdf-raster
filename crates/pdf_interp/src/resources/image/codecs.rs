@@ -38,7 +38,7 @@ use super::icc::{self, IccClutCache};
 /// `K` in `DecodeParms` (PDF §7.4.6):
 /// - `K < 0` → Group 4 (T.6, 2D) — fully supported.
 /// - `K = 0` → Group 3 1D (T.4 1D) — supported.
-/// - `K > 0` → Group 3 mixed 1D/2D (T.4 2D) — not yet implemented.
+/// - `K > 0` → Group 3 mixed 1D/2D (T.4 2D) — supported via `hayro-ccitt`.
 ///
 /// `Rows` (if present) caps the number of rows decoded; otherwise decodes
 /// until the bitstream signals end-of-data.
@@ -100,6 +100,23 @@ struct CcittParams {
     black_is_1: bool,
 }
 
+/// Build the final [`ImageDescriptor`] for a decoded CCITT bitonal image.
+const fn ccitt_descriptor(p: &CcittParams, data: Vec<u8>) -> ImageDescriptor {
+    let color_space = if p.is_mask {
+        ImageColorSpace::Mask
+    } else {
+        ImageColorSpace::Gray
+    };
+    ImageDescriptor {
+        width: p.width,
+        height: p.height,
+        color_space,
+        data,
+        smask: None,
+        filter: ImageFilter::Raw,
+    }
+}
+
 /// Decode a Group 4 (K<0, T.6) CCITT fax stream.
 fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
     let h_u16 = u16::try_from(p.height).ok()?;
@@ -125,19 +142,7 @@ fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
         data_out.resize(p.capacity, pad);
     }
 
-    let cs = if p.is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: p.width,
-        height: p.height,
-        color_space: cs,
-        data: data_out,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
+    Some(ccitt_descriptor(p, data_out))
 }
 
 /// Decode a Group 3 1D (K=0, T.4) CCITT fax stream.
@@ -159,32 +164,23 @@ fn decode_ccitt_g3_1d(data: &[u8], p: &CcittParams, rows_limit: u32) -> Option<I
         rows_decoded += 1;
     });
 
-    if result.is_none() && rows_decoded == 0 {
-        log::warn!("image: CCITTFaxDecode Group3 1D decode failed with no rows");
-        return None;
-    }
-    if rows_decoded < p.height {
-        log::debug!(
-            "image: CCITTFaxDecode Group3 1D: got {rows_decoded}/{} rows — padding remainder",
+    if result.is_none() {
+        if rows_decoded == 0 {
+            log::warn!("image: CCITTFaxDecode Group3 1D decode failed with no rows");
+            return None;
+        }
+        log::warn!(
+            "image: CCITTFaxDecode Group3 1D decode error after {rows_decoded}/{} rows — \
+             padding remainder",
             p.height
         );
+    }
+    if rows_decoded < p.height {
         let pad = if p.black_is_1 { 0x00 } else { 0xFF };
         data_out.resize(p.capacity, pad);
     }
 
-    let cs = if p.is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: p.width,
-        height: p.height,
-        color_space: cs,
-        data: data_out,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
+    Some(ccitt_descriptor(p, data_out))
 }
 
 /// Decode a Group 3 mixed 1D/2D (K>0, T.4 2D / "MR") CCITT fax stream.
@@ -222,8 +218,8 @@ fn decode_ccitt_g3_2d(
                 log::warn!("image: CCITTFaxDecode Group3 2D decode failed: {e}");
                 return None;
             }
-            log::debug!(
-                "image: CCITTFaxDecode Group3 2D partial decode ({}/{} rows): {e}",
+            log::warn!(
+                "image: CCITTFaxDecode Group3 2D decode error after {}/{} rows: {e}",
                 collector.rows_decoded(),
                 p.height
             );
@@ -250,19 +246,7 @@ fn decode_ccitt_g3_2d(
         data_out.resize(p.capacity, pad);
     }
 
-    let cs = if p.is_mask {
-        ImageColorSpace::Mask
-    } else {
-        ImageColorSpace::Gray
-    };
-    Some(ImageDescriptor {
-        width: p.width,
-        height: p.height,
-        color_space: cs,
-        data: data_out,
-        smask: None,
-        filter: ImageFilter::Raw,
-    })
+    Some(ccitt_descriptor(p, data_out))
 }
 
 /// Accumulates `hayro-ccitt` decoded pixels into a `Vec<u8>` (one byte per pixel,
@@ -502,13 +486,13 @@ pub(super) fn decode_dct(
             filter: ImageFilter::Raw,
         }),
         ZColorSpace::CMYK => {
-            // JPEG CMYK has inverted convention (0=full ink, 255=no ink).
-            // Complement to direct convention (255=full ink, 0=no ink) before dispatch.
-            let direct: Vec<u8> = pixels.iter().map(|&b| 255 - b).collect();
-            // JPEG streams embed their own colour profile; the PDF ICCBased stream
-            // is not available here, so ICC CLUT baking is not performed for DCT.
+            // JPEG CMYK stores inverted ink densities (0 = full ink, 255 = no ink).
+            // Pass inverted=true so cmyk_raw_to_rgb complements on-the-fly without
+            // a separate allocation.  JPEG streams embed their own colour profile;
+            // the PDF ICCBased stream is not available here, so no CLUT baking.
             let rgb = cmyk_raw_to_rgb(
-                &direct,
+                &pixels,
+                true,
                 #[cfg(feature = "gpu-icc")]
                 gpu_ctx,
                 #[cfg(feature = "gpu-icc")]
@@ -629,48 +613,74 @@ fn decode_dct_vaapi(
 
 /// Convert a raw CMYK pixel buffer to RGB, dispatching to GPU when available.
 ///
-/// Input convention (raw images / `decode_raw_8bpp`): 0 = no ink, 255 = full ink.
-/// This matches the `GpuCtx::icc_cmyk_to_rgb` matrix kernel directly.
+/// `inverted = false` (raw images / `decode_raw_8bpp`): 0 = no ink, 255 = full ink.
+/// `inverted = true` (JPEG CMYK): codec returns the complement convention (0 = full
+/// ink, 255 = no ink); the complement is applied on-the-fly, avoiding a separate
+/// allocation.
 ///
 /// `icc_bytes` — raw ICC profile bytes extracted from an `ICCBased` colour space.
 /// When provided (and the `gpu-icc` feature is active), a CLUT is baked from the
 /// profile and used for the colour transform instead of the fast matrix approximation.
 ///
-/// Returns `None` only on arithmetic overflow (degenerate image size).
+/// Returns `None` when the pixel buffer length is not a multiple of 4, or on
+/// arithmetic overflow (degenerate image size).
+#[expect(
+    clippy::many_single_char_names,
+    reason = "c/m/y/k/r/g/b are the canonical channel names for CMYK→RGB — renaming hurts clarity"
+)]
 pub(super) fn cmyk_raw_to_rgb(
     pixels: &[u8],
+    inverted: bool,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] icc_bytes: Option<&[u8]>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<Vec<u8>> {
+    if !pixels.len().is_multiple_of(4) {
+        log::warn!(
+            "image: cmyk_raw_to_rgb: pixel buffer length {} is not a multiple of 4",
+            pixels.len()
+        );
+        return None;
+    }
+
     // GPU path: delegate to GpuCtx which handles the dispatch-threshold check and
     // CPU fallback internally.  When ICC bytes are present, bake a CLUT for
     // profile-accurate conversion; fall back to the fast matrix approximation if
     // baking fails (e.g. corrupt profile or wrong colour space).
     #[cfg(feature = "gpu-icc")]
     if let Some(ctx) = gpu_ctx {
+        // Complement JPEG CMYK pixels before GPU dispatch if needed.
+        // A Cow avoids the allocation when `inverted = false` (the common case).
+        let gpu_pixels: std::borrow::Cow<[u8]> = if inverted {
+            pixels.iter().map(|&b| 255 - b).collect::<Vec<_>>().into()
+        } else {
+            pixels.into()
+        };
+
+        #[expect(
+            clippy::option_if_let_else,
+            reason = "branches are not symmetric (cached path omits .map(Into::into)); \
+                      map_or_else would make this harder to read"
+        )]
         let clut_arc: Option<std::sync::Arc<[u8]>> = icc_bytes.and_then(|bytes| {
-            clut_cache.map_or_else(
-                || {
-                    icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
-                        .map_err(|e| {
-                            log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
-                        })
-                        .ok()
-                        .map(std::convert::Into::into)
-                },
-                |cache| {
-                    icc::bake_cmyk_clut_cached(bytes, icc::DEFAULT_GRID_N, cache)
-                        .map_err(|e| {
-                            log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
-                        })
-                        .ok()
-                },
-            )
+            if let Some(cache) = clut_cache {
+                icc::bake_cmyk_clut_cached(bytes, icc::DEFAULT_GRID_N, cache)
+                    .map_err(|e| {
+                        log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
+                    })
+                    .ok()
+            } else {
+                icc::bake_cmyk_clut(bytes, icc::DEFAULT_GRID_N)
+                    .map_err(|e| {
+                        log::warn!("image: ICC CLUT bake failed, using matrix fallback: {e}");
+                    })
+                    .ok()
+                    .map(std::convert::Into::into)
+            }
         });
 
         match ctx.icc_cmyk_to_rgb(
-            pixels,
+            &gpu_pixels,
             clut_arc.as_deref().map(|t| (t, icc::DEFAULT_GRID_N)),
         ) {
             Ok(rgb) => return Some(rgb),
@@ -680,19 +690,20 @@ pub(super) fn cmyk_raw_to_rgb(
 
     // CPU path (also used below threshold by GpuCtx itself, but we land here
     // when the feature is disabled or no GpuCtx is provided).
-    if !pixels.len().is_multiple_of(4) {
-        log::warn!(
-            "image: cmyk_raw_to_rgb: pixel buffer length {} is not a multiple of 4 — \
-             {} trailing bytes ignored",
-            pixels.len(),
-            pixels.len() % 4
-        );
-    }
     let npixels = pixels.len() / 4;
     let mut rgb = Vec::with_capacity(npixels.checked_mul(3)?);
     for chunk in pixels.chunks_exact(4) {
-        let (r, g, b) =
-            color::convert::cmyk_to_rgb_reflectance(chunk[0], chunk[1], chunk[2], chunk[3]);
+        let (c, m, y, k) = if inverted {
+            (
+                255 - chunk[0],
+                255 - chunk[1],
+                255 - chunk[2],
+                255 - chunk[3],
+            )
+        } else {
+            (chunk[0], chunk[1], chunk[2], chunk[3])
+        };
+        let (r, g, b) = color::convert::cmyk_to_rgb_reflectance(c, m, y, k);
         rgb.push(r);
         rgb.push(g);
         rgb.push(b);
@@ -929,15 +940,22 @@ pub(super) fn decode_jbig2(
     let globals_bytes: Option<Vec<u8>> = parms
         .and_then(|o| o.as_dict().ok())
         .and_then(|d| d.get(b"JBIG2Globals").ok())
-        .and_then(|o| match o {
-            Object::Reference(id) => {
+        .and_then(|o| {
+            if let Object::Reference(id) = o {
                 let g_obj = doc.get_object(*id).ok()?;
                 let g_stream = g_obj.as_stream().ok()?;
                 // JBIG2Globals streams are typically not compressed, but
                 // decompressed_content handles both cases transparently.
                 g_stream.decompressed_content().ok()
+            } else {
+                // PDF spec requires JBIG2Globals to be an indirect reference to
+                // a stream object; any other form is malformed.
+                log::warn!(
+                    "image: JBIG2Decode: JBIG2Globals is not an indirect reference — \
+                     ignoring globals"
+                );
+                None
             }
-            _ => None,
         });
 
     // Parse the embedded JBIG2 image (page segments + optional globals).

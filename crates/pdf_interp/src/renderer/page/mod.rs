@@ -721,7 +721,7 @@ impl<'doc> PageRenderer<'doc> {
                 ) {
                     self.blit_image(&img);
                 } else {
-                    log::debug!("pdf_interp: inline image decode failed — skipping");
+                    log::warn!("pdf_interp: inline image decode failed — skipping");
                 }
             }
             Operator::PaintShading(name) => {
