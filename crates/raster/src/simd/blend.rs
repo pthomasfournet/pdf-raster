@@ -17,6 +17,15 @@
 //! tail handles any remaining bytes.  Because `movdir64b` is not yet exposed in
 //! `std::arch::x86_64`, runtime detection uses a `std::sync::OnceLock` that
 //! queries CPUID leaf 7 subleaf 0 ECX bit 28 exactly once per process.
+//!
+//! # Acceleration tiers (aarch64)
+//!
+//! 1. **NEON `vst3q_u8`** (≥ 16 px): 48-byte interleaved RGB stores via three-channel
+//!    scatter, 16 pixels per iteration.
+//! 2. **NEON `vst1q_u8`** (≥ 16 px, gray): 16-byte stores, 16 pixels per iteration.
+//! 3. **Scalar**: `copy_from_slice` / `fill` per pixel.
+//!
+//! NEON is mandatory on all ARMv8-A targets; no runtime detection is needed.
 
 /// Fill `count` RGB pixels in `dst` with `color` using a scalar loop.
 #[inline]
@@ -351,7 +360,146 @@ unsafe fn blend_solid_gray8_movdir64b(dst: &mut [u8], color: u8, count: usize) {
     dst[tail_start..count].fill(color);
 }
 
-// ── Public dispatch functions ─────────────────────────────────────────────────
+// ── aarch64 NEON solid fill ───────────────────────────────────────────────────
+
+/// Fill `count` RGB pixels in `dst` using NEON `vst3q_u8`, 16 pixels per iter.
+///
+/// `vst3q_u8` interleaves three `uint8x16_t` channels into 48 bytes of packed
+/// RGB output in a single store.  Each channel vector is a constant broadcast
+/// of the corresponding colour component.
+///
+/// # Safety
+///
+/// NEON is mandatory on all ARMv8-A targets.  `dst.len() >= count * 3` must hold.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn blend_solid_rgb8_neon(dst: &mut [u8], color: [u8; 3], count: usize) {
+    use std::arch::aarch64::{uint8x16x3_t, vdupq_n_u8, vst3q_u8};
+
+    debug_assert!(
+        dst.len() >= count * 3,
+        "dst too short for NEON RGB fill: {} < {}",
+        dst.len(),
+        count * 3
+    );
+
+    let [r, g, b] = color;
+    // Broadcast each colour component to a full 16-byte vector.
+    let vr = vdupq_n_u8(r);
+    let vg = vdupq_n_u8(g);
+    let vb = vdupq_n_u8(b);
+    let chunk = uint8x16x3_t(vr, vg, vb);
+
+    let mut px = 0usize;
+    while px + 16 <= count {
+        // SAFETY: px*3 + 48 ≤ count*3 ≤ dst.len(); vst3q_u8 requires 1-byte alignment.
+        unsafe { vst3q_u8(dst.as_mut_ptr().add(px * 3), chunk) };
+        px += 16;
+    }
+    // Scalar tail for remaining pixels (< 16).
+    blend_solid_rgb8_scalar(&mut dst[px * 3..], color, count - px);
+}
+
+/// Fill `count` grayscale pixels in `dst` using NEON `vst1q_u8`, 16 pixels per iter.
+///
+/// # Safety
+///
+/// NEON is mandatory on all ARMv8-A targets.  `dst.len() >= count` must hold.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn blend_solid_gray8_neon(dst: &mut [u8], color: u8, count: usize) {
+    use std::arch::aarch64::{vdupq_n_u8, vst1q_u8};
+
+    debug_assert!(
+        dst.len() >= count,
+        "dst too short for NEON gray fill: {} < {}",
+        dst.len(),
+        count
+    );
+
+    let vec = vdupq_n_u8(color);
+
+    let mut px = 0usize;
+    while px + 16 <= count {
+        // SAFETY: px + 16 ≤ count ≤ dst.len(); vst1q_u8 requires 1-byte alignment.
+        unsafe { vst1q_u8(dst.as_mut_ptr().add(px), vec) };
+        px += 16;
+    }
+    // Scalar tail for remaining pixels (< 16).
+    dst[px..count].fill(color);
+}
+
+// ── Per-arch dispatch helpers ─────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dispatch_blend_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
+    if count > MOVDIR64B_THRESHOLD_PX && has_movdir64b() {
+        // SAFETY: movdir64b confirmed; dst.len() >= count*3 asserted by caller.
+        unsafe { blend_solid_rgb8_movdir64b(dst, color, count) };
+        return;
+    }
+    #[cfg(feature = "simd-avx2")]
+    if count >= 32 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 confirmed; dst.len() >= count*3 asserted by caller.
+        unsafe { blend_solid_rgb8_avx2(dst, color, count) };
+        return;
+    }
+    blend_solid_rgb8_scalar(dst, color, count);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dispatch_blend_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
+    if count >= 16 {
+        // SAFETY: NEON mandatory on aarch64; dst.len() >= count*3 asserted by caller.
+        unsafe { blend_solid_rgb8_neon(dst, color, count) };
+    } else {
+        blend_solid_rgb8_scalar(dst, color, count);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn dispatch_blend_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
+    blend_solid_rgb8_scalar(dst, color, count);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dispatch_blend_gray8(dst: &mut [u8], color: u8, count: usize) {
+    if count > MOVDIR64B_THRESHOLD_PX && has_movdir64b() {
+        // SAFETY: movdir64b confirmed; dst.len() >= count asserted by caller.
+        unsafe { blend_solid_gray8_movdir64b(dst, color, count) };
+        return;
+    }
+    #[cfg(feature = "simd-avx2")]
+    if count >= 32 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 confirmed; dst.len() >= count asserted by caller.
+        unsafe { blend_solid_gray8_avx2(dst, color, count) };
+        return;
+    }
+    blend_solid_gray8_scalar(dst, color, count);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dispatch_blend_gray8(dst: &mut [u8], color: u8, count: usize) {
+    if count >= 16 {
+        // SAFETY: NEON mandatory on aarch64; dst.len() >= count asserted by caller.
+        unsafe { blend_solid_gray8_neon(dst, color, count) };
+    } else {
+        blend_solid_gray8_scalar(dst, color, count);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn dispatch_blend_gray8(dst: &mut [u8], color: u8, count: usize) {
+    blend_solid_gray8_scalar(dst, color, count);
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Fill `count` RGB pixels in `dst` (starting at byte 0) with `color`.
 ///
@@ -359,12 +507,11 @@ unsafe fn blend_solid_gray8_movdir64b(dst: &mut [u8], color: u8, count: usize) {
 ///
 /// Panics if `dst.len() < count * 3`.
 ///
-/// # Dispatch order (x86-64)
+/// # Dispatch order
 ///
-/// 1. `movdir64b` non-temporal stores when `count > 256` and the CPU supports it —
-///    preserves L3 V-Cache residency for the scanner edge table.
-/// 2. AVX2 256-bit stores when `count >= 32`.
-/// 3. Scalar `copy_from_slice` loop.
+/// - **x86-64**: `movdir64b` (> 256 px, non-temporal) → AVX2 (≥ 32 px) → scalar
+/// - **aarch64**: NEON `vst3q_u8` (≥ 16 px) → scalar
+/// - **other**: scalar
 pub fn blend_solid_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
     assert!(
         dst.len() >= count * 3,
@@ -372,22 +519,7 @@ pub fn blend_solid_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
         dst.len(),
         count * 3,
     );
-
-    #[cfg(target_arch = "x86_64")]
-    if count > MOVDIR64B_THRESHOLD_PX && has_movdir64b() {
-        // SAFETY: movdir64b confirmed by has_movdir64b(); dst.len() >= count*3 asserted above.
-        unsafe { blend_solid_rgb8_movdir64b(dst, color, count) };
-        return;
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
-    if is_x86_feature_detected!("avx2") && count >= 32 {
-        // SAFETY: AVX2 confirmed by is_x86_feature_detected!; dst.len() >= count*3 asserted above.
-        unsafe { blend_solid_rgb8_avx2(dst, color, count) };
-        return;
-    }
-
-    blend_solid_rgb8_scalar(dst, color, count);
+    dispatch_blend_rgb8(dst, color, count);
 }
 
 /// Fill `count` grayscale pixels in `dst` (starting at byte 0) with `color`.
@@ -396,11 +528,11 @@ pub fn blend_solid_rgb8(dst: &mut [u8], color: [u8; 3], count: usize) {
 ///
 /// Panics if `dst.len() < count`.
 ///
-/// # Dispatch order (x86-64)
+/// # Dispatch order
 ///
-/// 1. `movdir64b` non-temporal stores when `count > 256` and the CPU supports it.
-/// 2. AVX2 256-bit stores when `count >= 32`.
-/// 3. Scalar `fill`.
+/// - **x86-64**: `movdir64b` (> 256 px, non-temporal) → AVX2 (≥ 32 px) → scalar
+/// - **aarch64**: NEON `vst1q_u8` (≥ 16 px) → scalar
+/// - **other**: scalar
 pub fn blend_solid_gray8(dst: &mut [u8], color: u8, count: usize) {
     assert!(
         dst.len() >= count,
@@ -408,22 +540,7 @@ pub fn blend_solid_gray8(dst: &mut [u8], color: u8, count: usize) {
         dst.len(),
         count,
     );
-
-    #[cfg(target_arch = "x86_64")]
-    if count > MOVDIR64B_THRESHOLD_PX && has_movdir64b() {
-        // SAFETY: movdir64b confirmed by has_movdir64b(); dst.len() >= count asserted above.
-        unsafe { blend_solid_gray8_movdir64b(dst, color, count) };
-        return;
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
-    if is_x86_feature_detected!("avx2") && count >= 32 {
-        // SAFETY: AVX2 confirmed by is_x86_feature_detected!; dst.len() >= count asserted above.
-        unsafe { blend_solid_gray8_avx2(dst, color, count) };
-        return;
-    }
-
-    blend_solid_gray8_scalar(dst, color, count);
+    dispatch_blend_gray8(dst, color, count);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -641,6 +758,76 @@ mod tests {
         // SAFETY: has_movdir64b() confirmed CPUID.07H.00H:ECX[28] = 1.
         unsafe { blend_solid_gray8_movdir64b(&mut got, 17, count) };
         assert_eq!(got, expected, "movdir64b gray odd-count mismatch");
+    }
+
+    // ── NEON tests (aarch64 only) ─────────────────────────────────────────────
+
+    /// NEON RGB: 16 pixels exactly (one full chunk, no tail).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_rgb8_exact_16_pixels() {
+        let color = [11u8, 22, 33];
+        let count = 16usize;
+        let mut expected = vec![0u8; count * 3];
+        blend_solid_rgb8_scalar(&mut expected, color, count);
+        let mut got = vec![0u8; count * 3];
+        // SAFETY: NEON mandatory on aarch64; got.len() == count * 3.
+        unsafe { blend_solid_rgb8_neon(&mut got, color, count) };
+        assert_eq!(got, expected, "NEON RGB 16-pixel mismatch");
+    }
+
+    /// NEON RGB: 35 pixels (2 full chunks + 3-pixel scalar tail).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_rgb8_with_tail() {
+        let color = [100u8, 150, 200];
+        let count = 35usize;
+        let mut expected = vec![0u8; count * 3];
+        blend_solid_rgb8_scalar(&mut expected, color, count);
+        let mut got = vec![0u8; count * 3];
+        // SAFETY: NEON mandatory on aarch64; got.len() == count * 3.
+        unsafe { blend_solid_rgb8_neon(&mut got, color, count) };
+        assert_eq!(got, expected, "NEON RGB tail mismatch");
+    }
+
+    /// NEON RGB: count < 16 falls straight to scalar (no NEON store).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_rgb8_small_count() {
+        let color = [7u8, 8, 9];
+        let count = 5usize;
+        let mut expected = vec![0u8; count * 3];
+        blend_solid_rgb8_scalar(&mut expected, color, count);
+        let mut got = vec![0u8; count * 3];
+        // SAFETY: NEON mandatory on aarch64.
+        unsafe { blend_solid_rgb8_neon(&mut got, color, count) };
+        assert_eq!(got, expected, "NEON RGB small count mismatch");
+    }
+
+    /// NEON gray: 32 pixels (2 full chunks, no tail).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gray8_exact_32_pixels() {
+        let count = 32usize;
+        let mut expected = vec![0u8; count];
+        blend_solid_gray8_scalar(&mut expected, 42, count);
+        let mut got = vec![0u8; count];
+        // SAFETY: NEON mandatory on aarch64; got.len() == count.
+        unsafe { blend_solid_gray8_neon(&mut got, 42, count) };
+        assert_eq!(got, expected, "NEON gray 32-pixel mismatch");
+    }
+
+    /// NEON gray: 19 pixels (1 full chunk + 3-pixel scalar tail).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gray8_with_tail() {
+        let count = 19usize;
+        let mut expected = vec![0u8; count];
+        blend_solid_gray8_scalar(&mut expected, 77, count);
+        let mut got = vec![0u8; count];
+        // SAFETY: NEON mandatory on aarch64.
+        unsafe { blend_solid_gray8_neon(&mut got, 77, count) };
+        assert_eq!(got, expected, "NEON gray tail mismatch");
     }
 
     // ── public API boundary checks ────────────────────────────────────────────
