@@ -33,6 +33,13 @@ thread_local! {
 ///
 /// Handles soft mask, blend modes, non-isolated groups, knockout, and overprint.
 /// Slower than `simple` or `aa` but covers every case.
+///
+/// # Preconditions (checked with `debug_assert!`)
+///
+/// - `x1 >= x0`
+/// - `dst_pixels.len() == (x1 - x0 + 1) * P::BYTES`
+/// - If `shape` is `Some`, `shape.len() == x1 - x0 + 1`
+/// - If `pipe.soft_mask` is `Some`, `soft_mask.len() == x1 - x0 + 1`
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors C++ SplashPipe API; all parameters are necessary"
@@ -47,9 +54,10 @@ pub(crate) fn render_span_general<P: Pixel>(
     x1: i32,
     y: i32,
 ) {
+    debug_assert!(x1 >= x0, "render_span_general: x1={x1} < x0={x0}");
     #[expect(
         clippy::cast_sign_loss,
-        reason = "x1 >= x0 is a precondition, so x1 - x0 + 1 >= 1 > 0"
+        reason = "x1 >= x0 is asserted above, so x1 - x0 + 1 >= 1 > 0"
     )]
     let count = (x1 - x0 + 1) as usize;
     let ncomps = P::BYTES;
@@ -57,6 +65,9 @@ pub(crate) fn render_span_general<P: Pixel>(
     debug_assert_eq!(dst_pixels.len(), count * ncomps);
     if let Some(sh) = shape {
         debug_assert_eq!(sh.len(), count);
+    }
+    if let Some(sm) = pipe.soft_mask {
+        debug_assert_eq!(sm.len(), count, "soft_mask length must equal span count");
     }
 
     let a_input = u32::from(pipe.a_input);
@@ -123,6 +134,10 @@ pub(crate) fn render_span_general<P: Pixel>(
     clippy::too_many_lines,
     reason = "compositing formula has many branches that cannot be meaningfully split"
 )]
+#[expect(
+    clippy::single_match_else,
+    reason = "both Some and None arms have substantial independent logic; if-let would be less clear"
+)]
 fn render_span_general_inner<'src>(
     pipe: &PipeState<'_>,
     src_px_at: impl Fn(usize) -> &'src [u8],
@@ -154,16 +169,21 @@ fn render_span_general_inner<'src>(
                 // Source alpha (PDF spec §11.3.6 eq 11.1).
                 let a_src = compute_a_src(a_input, soft_v, shape_v, has_soft_mask, has_shape);
 
+                // Knockout: clear destination alpha before the colour formula so that
+                // a_dst_eff (read on line below) reflects the zeroed value.
+                // This applies to both isolated and non-isolated knockout groups.
+                if pipe.knockout && shape_v >= u32::from(pipe.knockout_opacity) {
+                    dst_alpha[i] = 0;
+                }
+
                 // Non-isolated group colour correction (PDF spec §11.4.8).
                 // c_src_corrected = c_src + (c_src - c_dst) * (a_dst * 255 / shape - a_dst) / 255.
+                // shape_v in [1, 255] (from u8), a_dst in [0, 255]:
+                //   t_max = (255 * 255) / 1 - 0 = 65025 ≤ i32::MAX, so the cast is lossless.
                 let mut c_src_corr: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 let c_src: &[u8] = if pipe.non_isolated_group && shape_v != 0 {
                     let t = (a_dst * 255) / shape_v - a_dst;
-                    #[expect(
-                        clippy::cast_possible_wrap,
-                        reason = "t is a u32 alpha-domain value; wrapping is not expected in practice"
-                    )]
-                    let t_i = t as i32;
+                    let t_i = t.cast_signed(); // t ≤ (255*255)/1 - 0 = 65025 ≪ i32::MAX
                     for j in 0..ncomps {
                         let v = i32::from(src_px[j])
                             + (i32::from(src_px[j]) - i32::from(dst_px[j])) * t_i / 255;
@@ -174,11 +194,6 @@ fn render_span_general_inner<'src>(
                         {
                             c_src_corr[j] = v.clamp(0, 255) as u8;
                         }
-                    }
-                    // Knockout: if shape >= knockout_opacity, clear the destination alpha.
-                    if pipe.knockout && shape_v >= u32::from(pipe.knockout_opacity) {
-                        dst_alpha[i] = 0;
-                        // a_dst effectively becomes 0; recompute below if needed.
                     }
                     &c_src_corr[..ncomps]
                 } else {
@@ -207,6 +222,8 @@ fn render_span_general_inner<'src>(
                 if a_result == 0 {
                     dst_px.fill(0);
                 } else {
+                    // alpha_i >= a_result > 0: safe to divide.
+                    debug_assert!(alpha_i > 0, "alpha_i must be > 0 when a_result > 0");
                     for j in 0..ncomps {
                         let c_src_j = u32::from(c_src[j]);
                         let c_dst_j = u32::from(dst_px[j]);
@@ -251,6 +268,12 @@ fn render_span_general_inner<'src>(
         None => {
             // No separate alpha plane: aDest = 0xFF implicitly.
             // Simplifies: aResult = aSrc + 255 - div255(aSrc * 255) = 255, alpha_i = 255.
+            // Non-isolated and knockout modes require a dst_alpha plane to carry the
+            // group alpha; those states are meaningless without one.
+            debug_assert!(
+                !pipe.non_isolated_group && !pipe.knockout,
+                "non_isolated_group/knockout require dst_alpha; None arm uses implicit a_dst=255"
+            );
             for i in 0..count {
                 let src_px = src_px_at(i);
                 let dst_px = &mut dst_pixels[i * ncomps..(i + 1) * ncomps];
@@ -258,6 +281,9 @@ fn render_span_general_inner<'src>(
                 let soft_v = u32::from(soft_mask_at(i));
 
                 let a_src = compute_a_src(a_input, soft_v, shape_v, has_soft_mask, has_shape);
+                // a_src is derived from u8 inputs via div255, so always ≤ 255.
+                // The assert catches any future change that widens the input path.
+                debug_assert!(a_src <= 255, "a_src={a_src} out of [0, 255]");
 
                 let mut c_blend: [u8; MAX_COMPS] = [0; MAX_COMPS];
                 if pipe.blend_mode != BlendMode::Normal {
@@ -278,6 +304,7 @@ fn render_span_general_inner<'src>(
 
                     // With implicit a_dst=255: alpha_i=255, alpha_im1=255.
                     // General formula simplifies to div255((255-a_src)*c_dst + a_src*c_b).
+                    // 255 - a_src: safe because a_src ≤ 255 (asserted above).
                     let c = if pipe.blend_mode == BlendMode::Normal {
                         u32::from(div255((255 - a_src) * c_dst_j + a_src * c_src_j))
                     } else {
@@ -384,10 +411,11 @@ fn apply_blend_fn(
     let ncomps = src.len();
 
     if is_cmyk_like {
-        // Subtractive complement: invert channels, blend in additive space, re-invert.
+        // Subtractive complement: invert all channels, blend in additive space, re-invert.
+        // Fill all ncomps so spot channels (j >= 4) are correctly inverted.
         let mut src2 = [0u8; MAX_COMPS];
         let mut dst2 = [0u8; MAX_COMPS];
-        for j in 0..ncomps.min(4) {
+        for j in 0..ncomps {
             src2[j] = 255 - src[j];
             dst2[j] = 255 - dst[j];
         }
@@ -399,7 +427,7 @@ fn apply_blend_fn(
             c_blend[0] = 255 - r3[0];
             c_blend[1] = 255 - r3[1];
             c_blend[2] = 255 - r3[2];
-            // K/spot channel: for Luminosity, use src K; for others use dst K (see C++).
+            // K/spot channel: for Luminosity, use src K; for others use dst K (PDF §11.3.5).
             if ncomps >= 4 {
                 c_blend[3] = 255
                     - (if mode == BlendMode::Luminosity {
@@ -409,7 +437,8 @@ fn apply_blend_fn(
                     });
             }
             for j in 4..ncomps {
-                c_blend[j] = 255 - dst2[j]; // spot channels pass through dst
+                // Spot channels pass through dst (same rule as K for non-Luminosity).
+                c_blend[j] = 255 - dst2[j];
             }
         } else {
             blend::apply_separable(
@@ -421,7 +450,8 @@ fn apply_blend_fn(
             for v in &mut c_blend[..ncomps.min(4)] {
                 *v = 255 - *v;
             }
-            c_blend[4..ncomps].copy_from_slice(&dst[4..ncomps]); // spot channels: pass dst unchanged
+            // Spot channels (j >= 4): not blended, pass dst through unchanged.
+            c_blend[4..ncomps].copy_from_slice(&dst[4..ncomps]);
         }
     } else if is_nonseparable {
         // RGB/Gray additive space.
@@ -445,8 +475,16 @@ fn apply_blend_fn(
 }
 
 /// Apply overprint: for channels where the bit in `overprint_mask` is 0,
-/// restore the destination channel (do not paint it).
-/// For additive overprint, blend additively; for replace, restore dst.
+/// the channel is not painted.
+///
+/// Only `overprint_additive = true` is implemented.  Replace-mode overprint
+/// requires the caller to preserve the pre-blend destination bytes, which the
+/// current call structure does not support.
+///
+/// # Panics
+///
+/// Panics if `pipe.overprint_additive` is `false`; replace-mode overprint is
+/// not yet implemented.
 fn apply_overprint(pipe: &PipeState<'_>, dst_px: &mut [u8], src_px: &[u8], ncomps: usize) {
     if pipe.overprint_additive {
         for j in 0..ncomps {
