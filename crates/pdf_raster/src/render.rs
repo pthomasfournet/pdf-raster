@@ -312,7 +312,7 @@ fn render_page_rgb_with_geom(
         geom.rotate_cw,
         doc,
         page_id,
-    );
+    )?;
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     renderer.set_gpu_ctx(session.gpu_ctx.as_ref().map(Arc::clone));

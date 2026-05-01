@@ -68,6 +68,7 @@ use super::color::RasterColor;
 use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform, mat2x2_mul};
 use super::text::TextState;
+use crate::InterpError;
 use crate::content::{Operator, TextArrayElement};
 use crate::resources::{
     IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageResources, image::decode_inline_image,
@@ -232,8 +233,16 @@ impl<'doc> PageRenderer<'doc> {
     /// where 1 user-space unit = 1 device pixel (72 dpi).
     ///
     /// `doc` and `page_id` are used to resolve font and resource dictionaries.
-    #[must_use]
-    pub fn new(width: u32, height: u32, doc: &'doc Document, page_id: ObjectId) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InterpError::FontInit`] if `FreeType` cannot be initialised.
+    pub fn new(
+        width: u32,
+        height: u32,
+        doc: &'doc Document,
+        page_id: ObjectId,
+    ) -> Result<Self, InterpError> {
         Self::new_scaled(width, height, 1.0, 0, doc, page_id)
     }
 
@@ -245,9 +254,11 @@ impl<'doc> PageRenderer<'doc> {
     ///
     /// # Panics
     ///
-    /// Panics if `scale` is not a positive finite number, or if `FreeType`
-    /// initialisation fails.
-    #[must_use]
+    /// Panics if `scale` is not a positive finite number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InterpError::FontInit`] if `FreeType` cannot be initialised.
     pub fn new_scaled(
         width: u32,
         height: u32,
@@ -255,7 +266,7 @@ impl<'doc> PageRenderer<'doc> {
         rotate_cw: u16,
         doc: &'doc Document,
         page_id: ObjectId,
-    ) -> Self {
+    ) -> Result<Self, InterpError> {
         assert!(
             scale.is_finite() && scale > 0.0,
             "PageRenderer::new_scaled: scale must be a positive finite number, got {scale}"
@@ -283,13 +294,13 @@ impl<'doc> PageRenderer<'doc> {
         };
         gstate.current_mut().ctm = ctm;
 
-        let engine: SharedEngine =
-            FontEngine::init(true, true, false).expect("FreeType initialisation failed");
+        let engine: SharedEngine = FontEngine::init(true, true, false)
+            .map_err(|e| InterpError::FontInit(e.to_string()))?;
         let glyph_cache = GlyphCache::new();
         let font_cache = FontCache::new(engine, glyph_cache);
         let resources = PageResources::new(doc, page_id);
 
-        Self {
+        Ok(Self {
             bitmap,
             width,
             height,
@@ -312,7 +323,7 @@ impl<'doc> PageRenderer<'doc> {
             gpu_ctx: None,
             #[cfg(feature = "gpu-icc")]
             icc_clut_cache: crate::resources::image::IccClutCache::new(),
-        }
+        })
     }
 
     /// Attach a GPU JPEG decoder to this renderer.
@@ -1498,7 +1509,13 @@ impl<'doc> PageRenderer<'doc> {
     ) -> Bitmap<Rgb8> {
         // Build a temporary child renderer sharing the same document / font engine.
         let doc = self.resources.doc();
-        let mut tile_renderer = PageRenderer::new(tile_w, tile_h, doc, desc.stream_id);
+        let mut tile_renderer = match PageRenderer::new(tile_w, tile_h, doc, desc.stream_id) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("render_pattern_tile: {e}");
+                return Bitmap::new(tile_w, tile_h, 1, false);
+            }
+        };
 
         // Override the CTM to map pattern space → tile device space.
         tile_renderer.gstate.current_mut().ctm = *tile_ctm;

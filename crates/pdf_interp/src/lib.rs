@@ -53,6 +53,8 @@ pub enum InterpError {
     /// A Page dictionary entry has a value that is structurally valid PDF but
     /// outside the range permitted by the spec or our safety limits.
     InvalidPageGeometry(String),
+    /// `FreeType` library initialisation failed (library not available or internal error).
+    FontInit(String),
 }
 
 impl std::fmt::Display for InterpError {
@@ -70,6 +72,7 @@ impl std::fmt::Display for InterpError {
                 write!(f, "document contains JavaScript ({location}) — refused")
             }
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
+            Self::FontInit(msg) => write!(f, "FreeType initialisation failed: {msg}"),
         }
     }
 }
@@ -78,7 +81,11 @@ impl std::error::Error for InterpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pdf(e) => Some(e),
-            _ => None,
+            Self::FontInit(_)
+            | Self::PageOutOfRange { .. }
+            | Self::MissingResource(_)
+            | Self::JavaScript { .. }
+            | Self::InvalidPageGeometry(_) => None,
         }
     }
 }
