@@ -114,12 +114,7 @@ unsafe fn blend_solid_rgb8_avx2(dst: &mut [u8], color: [u8; 3], count: usize) {
 
     // Scalar tail for the remaining pixels.
     let done = chunks * 32;
-    for px in done..count {
-        let base = px * 3;
-        dst[base] = r;
-        dst[base + 1] = g;
-        dst[base + 2] = b;
-    }
+    blend_solid_rgb8_scalar(&mut dst[done * 3..], color, count - done);
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "simd-avx2"))]
@@ -426,7 +421,7 @@ unsafe fn blend_solid_gray8_neon(dst: &mut [u8], color: u8, count: usize) {
         px += 16;
     }
     // Scalar tail for remaining pixels (< 16).
-    dst[px..count].fill(color);
+    blend_solid_gray8_scalar(&mut dst[px..], color, count - px);
 }
 
 // ── Per-arch dispatch helpers ─────────────────────────────────────────────────
@@ -831,6 +826,20 @@ mod tests {
     }
 
     // ── public API boundary checks ────────────────────────────────────────────
+
+    #[test]
+    fn public_rgb8_zero_count() {
+        let mut dst = vec![0xFFu8; 6];
+        blend_solid_rgb8(&mut dst, [1, 2, 3], 0);
+        assert!(dst.iter().all(|&b| b == 0xFF), "zero-count must not write");
+    }
+
+    #[test]
+    fn public_gray8_zero_count() {
+        let mut dst = vec![0xFFu8; 4];
+        blend_solid_gray8(&mut dst, 42, 0);
+        assert!(dst.iter().all(|&b| b == 0xFF), "zero-count must not write");
+    }
 
     #[test]
     #[should_panic(expected = "blend_solid_rgb8: dst too short")]
