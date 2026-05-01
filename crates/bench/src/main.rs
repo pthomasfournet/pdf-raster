@@ -40,17 +40,27 @@ fn parse_config() -> Config {
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--iters" => {
-                if let Some(v) = args.next() {
-                    cfg.iters = v.parse().unwrap_or(cfg.iters);
-                }
-            }
-            "--stars" => {
-                if let Some(v) = args.next() {
-                    cfg.stars = v.parse().unwrap_or(cfg.stars);
-                }
-            }
-            _ => {}
+            "--iters" => match args.next() {
+                Some(v) => match v.parse::<u32>() {
+                    Ok(n) => cfg.iters = n,
+                    Err(e) => eprintln!(
+                        "warning: --iters {v:?} is not a valid u32 ({e}); using {}",
+                        cfg.iters
+                    ),
+                },
+                None => eprintln!("warning: --iters requires a value"),
+            },
+            "--stars" => match args.next() {
+                Some(v) => match v.parse::<usize>() {
+                    Ok(n) => cfg.stars = n,
+                    Err(e) => eprintln!(
+                        "warning: --stars {v:?} is not a valid usize ({e}); using {}",
+                        cfg.stars
+                    ),
+                },
+                None => eprintln!("warning: --stars requires a value"),
+            },
+            other => eprintln!("warning: unknown flag {other:?}"),
         }
     }
     cfg
@@ -188,7 +198,7 @@ fn bench_vello(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
             ctx.fill_path(p);
         }
         ctx.flush();
-        ctx.render_to_pixmap(&mut pixmap);
+        ctx.render_to_pixmap(black_box(&mut pixmap));
     }
     t0.elapsed().as_secs_f64() * 1000.0 / f64::from(cfg.iters)
 }

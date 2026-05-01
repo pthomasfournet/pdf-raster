@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 
-use crate::pipe::{PipeSrc, PipeState, blend};
+use crate::pipe::{self, PipeSrc, PipeState, blend};
 use crate::types::BlendMode;
 use color::Pixel;
 use color::convert::div255;
@@ -235,9 +235,12 @@ fn render_span_general_inner<'src>(
                             reason = "c is a weighted average of values ≤ 255, so c ≤ 255"
                         )]
                         {
-                            dst_px[j] = apply_transfer_channel(pipe, j, c as u8);
+                            dst_px[j] = c as u8;
                         }
                     }
+                    // Apply transfer after all channels are written so the correct
+                    // LUT is selected per pixel mode (gray/RGB/CMYK/DeviceN).
+                    pipe::apply_transfer_in_place(pipe, dst_px);
                 }
 
                 // Overprint: restore channels not in mask (additive or replace).
@@ -304,9 +307,12 @@ fn render_span_general_inner<'src>(
                         reason = "c is a weighted average of values ≤ 255, so c ≤ 255"
                     )]
                     {
-                        dst_px[j] = apply_transfer_channel(pipe, j, c as u8);
+                        dst_px[j] = c as u8;
                     }
                 }
+                // Apply transfer after all channels are written so the correct
+                // LUT is selected per pixel mode (gray/RGB/CMYK/DeviceN).
+                pipe::apply_transfer_in_place(pipe, dst_px);
 
                 if pipe.overprint_mask != 0xFFFF_FFFF {
                     apply_overprint(pipe, dst_px, src_px, ncomps);
@@ -431,35 +437,6 @@ fn apply_blend_fn(
     }
 }
 
-/// Apply the per-channel transfer LUT for one blended byte.
-///
-/// Channel mapping:
-/// - 0 → RGB[0] (or gray / CMYK[0] for mono/subtractive modes — callers that need
-///   full per-channel dispatch must call [`apply_transfer_pixel_general`] instead).
-/// - 1 → RGB[1] (green / CMYK[1])
-/// - 2 → RGB[2] (blue / CMYK[2])
-/// - 3 → CMYK[3] (K / alpha)
-/// - 4..7 → `device_n` spot channels
-/// - other → identity (should not occur with supported pixel modes)
-#[inline]
-fn apply_transfer_channel(pipe: &PipeState<'_>, channel: usize, v: u8) -> u8 {
-    let t = &pipe.transfer;
-    match channel {
-        0 => t.rgb[0][v as usize],
-        1 => t.rgb[1][v as usize],
-        2 => t.rgb[2][v as usize],
-        3 => t.cmyk[3][v as usize],
-        n @ 4..=7 => t.device_n[n][v as usize],
-        _ => {
-            debug_assert!(
-                false,
-                "apply_transfer_channel: unexpected channel={channel}"
-            );
-            v
-        }
-    }
-}
-
 /// Apply overprint: for channels where the bit in `overprint_mask` is 0,
 /// restore the destination channel (do not paint it).
 /// For additive overprint, blend additively; for replace, restore dst.
@@ -475,15 +452,16 @@ fn apply_overprint(pipe: &PipeState<'_>, dst_px: &mut [u8], src_px: &[u8], ncomp
             dst_px[j] = (u16::from(dst_px[j]) + u16::from(src_px[j])).min(255) as u8;
         }
     } else {
-        // Replace overprint: channels not in mask keep their original dst value.
-        // Since we've already written dst_px with the blended result, we need to
-        // restore the channels that should not be painted.  The original dst is lost
-        // at this point (we don't have it separately).  This is a known limitation:
-        // overprint in the general pipe requires the caller to pass the pre-blend dst.
-        // For Phase 2 correctness, assert that the caller handles this edge case.
-        debug_assert_eq!(
-            pipe.overprint_mask, 0xFFFF_FFFF,
-            "general pipe: replace overprint requires pre-blend dst preservation; not yet implemented"
+        // Replace overprint: channels not in mask should keep the original dst value,
+        // but the pre-blend destination has already been overwritten.  Restoring it
+        // here would require the caller to pass the pre-blend dst separately.
+        // Panic loudly (in both debug and release) rather than silently producing
+        // wrong output.  Callers must either set overprint_additive=true or pass the
+        // original dst bytes before calling apply_overprint.
+        panic!(
+            "general pipe: replace overprint (mask={:#010x}) is not yet implemented; \
+             use overprint_additive=true or preserve pre-blend dst in the caller",
+            pipe.overprint_mask,
         );
     }
 }
@@ -493,7 +471,7 @@ mod tests {
     use super::*;
     use crate::pipe::{PipeSrc, PipeState};
     use crate::state::TransferSet;
-    use color::Rgb8;
+    use color::{Gray8, Rgb8};
 
     fn normal_pipe(a: u8) -> PipeState<'static> {
         PipeState {
@@ -601,5 +579,79 @@ mod tests {
         // c = (0 * 0 + 128 * 255) / 128 = 255.
         assert_eq!(dst[0], 255);
         assert!((alpha[0] as i32 - 128).abs() <= 2, "alpha={}", alpha[0]);
+    }
+
+    #[test]
+    fn gray_transfer_lut_applied_correctly() {
+        // Regression: the old apply_transfer_channel used rgb[0] for channel 0
+        // regardless of pixel mode, so gray transfer was silently wrong.
+        // Build an inverting gray LUT and a pass-through rgb LUT; the general
+        // pipe over a Gray8 pixel must invert the output via the gray table.
+        static INV: [u8; 256] = {
+            let mut a = [0u8; 256];
+            let mut i = 0u8;
+            loop {
+                a[i as usize] = 255 - i;
+                if i == 255 {
+                    break;
+                }
+                i += 1;
+            }
+            a
+        };
+        static ID: [u8; 256] = {
+            let mut a = [0u8; 256];
+            let mut i = 0u8;
+            loop {
+                a[i as usize] = i;
+                if i == 255 {
+                    break;
+                }
+                i += 1;
+            }
+            a
+        };
+        static DN: [[u8; 256]; 8] = {
+            let mut t = [[0u8; 256]; 8];
+            let mut ch = 0;
+            while ch < 8 {
+                let mut i = 0u8;
+                loop {
+                    t[ch][i as usize] = i;
+                    if i == 255 {
+                        break;
+                    }
+                    i += 1;
+                }
+                ch += 1;
+            }
+            t
+        };
+        let transfer = TransferSet {
+            gray: &INV, // inverting gray transfer
+            rgb: [&ID, &ID, &ID],
+            cmyk: [&ID, &ID, &ID, &ID],
+            device_n: &DN,
+        };
+        let pipe = PipeState {
+            blend_mode: BlendMode::Normal,
+            a_input: 255,
+            overprint_mask: 0xFFFF_FFFF,
+            overprint_additive: false,
+            transfer,
+            soft_mask: None,
+            alpha0: None,
+            knockout: false,
+            knockout_opacity: 255,
+            non_isolated_group: false,
+        };
+
+        // Opaque gray source value 100; after inverting transfer: 155.
+        let src_color = [100u8];
+        let src = PipeSrc::Solid(&src_color);
+        let mut dst = vec![0u8; 1];
+        let mut alpha = vec![0u8; 1];
+        render_span_general::<Gray8>(&pipe, &src, &mut dst, Some(&mut alpha), None, 0, 0, 0);
+        assert_eq!(dst[0], 155, "gray transfer must use gray LUT, not rgb[0]");
     }
 }

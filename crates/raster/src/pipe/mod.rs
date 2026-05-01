@@ -101,6 +101,9 @@ impl PipeState<'_> {
     ///
     /// Matches C++ `pipe->noTransparency`:
     /// `a_input == 255 && no soft_mask && no shape && !in_non_isolated_group && !in_knockout_group`
+    ///
+    /// Overprint must be excluded: the simple path overwrites `dst_pixels` before
+    /// reading the original destination, making channel-selective restore impossible.
     #[must_use]
     pub const fn no_transparency(&self, uses_shape: bool) -> bool {
         self.a_input == 255
@@ -109,6 +112,7 @@ impl PipeState<'_> {
             && !self.non_isolated_group
             && !self.knockout
             && self.alpha0.is_none()
+            && self.overprint_mask == 0xFFFF_FFFF
     }
 
     /// Returns `true` when the AA (shape-only) fast path is applicable.
@@ -333,5 +337,16 @@ mod tests {
             let v = dst[i * 3];
             assert!(v > 100 && v < 160, "pixel {i} R={v} expected ~128");
         }
+    }
+
+    #[test]
+    fn no_transparency_false_with_overprint() {
+        // Overprint must not use the simple path (dst channels already overwritten).
+        let mut pipe = make_pipe(255, BlendMode::Normal);
+        pipe.overprint_mask = 0x0000_0001; // only channel 0 painted
+        assert!(
+            !pipe.no_transparency(false),
+            "overprint must route to general pipe"
+        );
     }
 }

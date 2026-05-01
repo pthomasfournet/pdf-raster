@@ -93,10 +93,13 @@ pub(crate) fn render_span_simple<P: Pixel>(
         }
     }
 
-    // Overprint: mask determines which channels are written.
-    if pipe.overprint_mask != 0xFFFF_FFFF {
-        apply_overprint_simple(pipe, ncomps);
-    }
+    // Overprint: excluded by no_transparency(); this branch is unreachable in
+    // a correct caller.  Panic loudly rather than silently dropping overprint.
+    debug_assert_eq!(
+        pipe.overprint_mask, 0xFFFF_FFFF,
+        "simple pipe reached with overprint_mask {:#010x}; route through render_span_general",
+        pipe.overprint_mask,
+    );
 
     // Set destination alpha to fully opaque.
     if let Some(alpha) = dst_alpha {
@@ -105,21 +108,6 @@ pub(crate) fn render_span_simple<P: Pixel>(
             *a = 255;
         }
     }
-}
-
-/// Guard: overprint in the simple path requires the general pipe.
-///
-/// The simple pipe overwrites `dst_pixels` before we can read the original
-/// destination, so channel-selective restore is impossible here.  The caller
-/// in `render_span` must route overprint operations through `render_span_general`.
-/// This function exists only to produce a loud diagnostic if the invariant breaks.
-fn apply_overprint_simple(pipe: &PipeState<'_>, ncomps: usize) {
-    debug_assert_eq!(
-        pipe.overprint_mask, 0xFFFF_FFFF,
-        "simple pipe reached with overprint_mask {:#010x} and ncomps={ncomps}; \
-         route overprint through render_span_general instead",
-        pipe.overprint_mask,
-    );
 }
 
 #[cfg(test)]
