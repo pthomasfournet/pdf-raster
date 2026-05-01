@@ -6,7 +6,7 @@ Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tes
 
 ```toml
 # Cargo.toml
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.1.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.2.0" }
 ```
 
 ```rust
@@ -39,8 +39,8 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 |---|---|
 | `pdf_raster` | **Public API** — `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage` |
 | `pdf_interp` | Native PDF interpreter — content streams, fonts, images, shading, transparency |
-| `raster` | Pixel-level fill/composite with AVX-512 and AVX2 SIMD |
-| `gpu` | CUDA kernels — nvJPEG, nvJPEG2000, AA fill, tile fill, ICC CLUT, deskew |
+| `raster` | Pixel-level fill/composite with AVX-512, AVX2, and NEON SIMD |
+| `gpu` | CUDA kernels — nvJPEG, nvJPEG2000, AA fill, tile fill, ICC CLUT, deskew; VA-API JPEG decode |
 | `font` | FreeType glyph cache and rendering |
 | `color` | Pixel types, colour math |
 | `encode` | PPM / PGM / PBM / PNG output |
@@ -49,11 +49,11 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 
 ## Hardware compatibility
 
-**CPU:** x86-64 only (AMD and Intel). AVX2 used when available; AVX-512 enabled with `-C target-cpu=native`. ARM / Apple Silicon / NEON are not yet supported — there is no `aarch64` build and no Apple Metal backend.
+**CPU:** x86-64 (AMD and Intel) and `aarch64` (ARM). AVX2/AVX-512 on x86-64; NEON (and SVE2 on nightly) on aarch64. Build with `-C target-cpu=native` to enable AVX-512 or native NEON width.
 
-**GPU:** NVIDIA only via CUDA 12. AMD/Radeon (ROCm/HIP) and Intel (oneAPI) GPU backends are not yet implemented. If no NVIDIA GPU is present, all GPU features fall back to CPU automatically.
+**GPU (optional):** NVIDIA via CUDA 12, and Linux iGPU/dGPU via VA-API (AMD VCN, Intel Quick Sync, Intel Arc). AMD/Radeon ROCm and Apple Metal backends are not yet implemented. All GPU features fall back to CPU automatically when unavailable.
 
-**Planned:** ARM NEON + Apple Metal → Intel CPU/GPU → Vulkan + AMD/Radeon. See [getting-started.md](docs/getting-started.md#planned-platform-support) for the roadmap.
+**Planned:** Apple Metal (macOS/Apple Silicon) → Vulkan compute. See [getting-started.md](docs/getting-started.md#platform-support) for details.
 
 ## Build
 

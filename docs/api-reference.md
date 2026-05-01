@@ -302,16 +302,21 @@ Implements `std::error::Error`. `InterpError::Pdf(e)` chains to `lopdf::Error`.
 
 ### CPU
 
-**Supported:** x86-64 (AMD and Intel) only.
+**Supported:** x86-64 (AMD and Intel) and `aarch64` (ARM / Apple Silicon).
 
+**x86-64:**
 - AVX2 SIMD blend and fill paths are runtime-detected with a scalar fallback.
 - AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and related sub-extensions) is activated by building with `-C target-cpu=native` on a compatible CPU. Developed and benchmarked on an AMD Ryzen 9900X3D.
-- **ARM is not yet supported.** NEON paths have not been implemented; the codebase does not compile for `aarch64`. Apple Silicon (M-series) is also unsupported — there is no Apple Metal backend. Both are planned.
-- Intel x86-64 CPUs run correctly on the CPU path but GPU features are NVIDIA-only (see below).
+- All Intel consumer CPUs (Alder/Raptor/Arrow Lake) have AVX2; AVX-512 is disabled on them — Xeon only.
+
+**aarch64:**
+- NEON is used unconditionally (mandatory on all ARMv8-A). No runtime detection needed.
+- SVE2 (`svcnt_u8_z` popcount tier) is available behind the `nightly-sve2` Cargo feature on nightly Rust. Gives up to 4× NEON throughput on wide-SVE2 server chips (Graviton4 full width).
+- `cargo check --target aarch64-unknown-linux-gnu` is clean; no Apple Metal GPU backend yet.
 
 ### GPU
 
-All GPU features are currently **NVIDIA-only via CUDA 12**. AMD/Radeon (ROCm/HIP), Intel (oneAPI), and cross-vendor Vulkan backends are planned but not yet implemented.
+**NVIDIA (CUDA 12):**
 
 | Feature flag | Minimum requirement | Notes |
 |---|---|---|
@@ -321,15 +326,30 @@ All GPU features are currently **NVIDIA-only via CUDA 12**. AMD/Radeon (ROCm/HIP
 | `gpu-icc` | CUDA 12-capable NVIDIA GPU | CUDA runtime only |
 | `gpu-deskew` | CUDA 12-capable NVIDIA GPU | Requires CUDA NPP: `libnppig.so` + `libnppc.so` |
 
+**VA-API (Linux iGPU/dGPU — AMD VCN, Intel Quick Sync, Intel Arc):**
+
+| Feature flag | Supported hardware | Libraries required |
+|---|---|---|
+| `vaapi` | AMD VCN (Raphael+), Intel UHD 630+, Intel Arc | `libva.so.2`, `libva-drm.so.2` |
+
+VA-API provides hardware JPEG baseline decode. CMYK and progressive JPEGs fall through to CPU. When both `nvjpeg` and `vaapi` are active, nvJPEG takes priority; VA-API fires as fallback.
+
 GPU initialisation failures at runtime print a warning to stderr and fall back to CPU — no error is returned, rendering continues normally.
 
-### Planned platform support
+### Platform support
 
-Support is planned in this order:
+| Platform | CPU SIMD | GPU acceleration | Status |
+|---|---|---|---|
+| x86-64 AMD (Ryzen) | AVX-512 + AVX2 | NVIDIA CUDA + AMD VA-API | **Supported** |
+| x86-64 Intel (consumer) | AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
+| x86-64 Intel (Xeon) | AVX-512 + AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
+| aarch64 Linux (Graviton, RPi) | NEON + SVE2 † | — | **Supported (CPU only)** |
+| Apple Silicon (M1–M4) | NEON | — (no Metal backend yet) | CPU only, compile clean |
+| AMD/Radeon ROCm | — | — | Not yet implemented |
+| Apple Metal | — | — | Not yet implemented |
+| Vulkan compute | — | — | Not yet implemented |
 
-1. **ARM NEON + Apple Metal** — `aarch64` CPU SIMD and Apple Silicon GPU via Metal.
-2. **Intel CPU tuning + Intel GPU (Arc / Iris Xe)** — Intel AVX-512 VNNI and a oneAPI / Level Zero GPU backend.
-3. **Vulkan compute + AMD/Radeon (ROCm)** — cross-vendor GPU via Vulkan, plus a dedicated ROCm/HIP path for AMD.
+† SVE2 requires `nightly-sve2` Cargo feature and nightly Rust.
 
 ## Feature flags
 
@@ -342,6 +362,7 @@ Support is planned in this order:
 | `gpu-aa` | CUDA 12 | GPU supersampled AA fill (64-sample warp-ballot kernel). Falls back to CPU 4× scanline AA below 256 px. |
 | `gpu-icc` | CUDA 12 | GPU ICC CMYK→RGB via 4D CLUT. Falls back to CPU AVX-512 matrix formula below 500 000 px. |
 | `gpu-deskew` | CUDA 12, CUDA NPP | GPU bilinear rotation (nppiRotate). Falls back to CPU bilinear when disabled. |
+| `vaapi` | `libva.so.2`, `libva-drm.so.2` | VA-API JPEG baseline decode on Linux iGPU/dGPU. Falls back to CPU on CMYK/progressive JPEG. When `nvjpeg` is also active, nvJPEG takes priority. |
 | `gpu-validation` | CUDA device at test time | Enables GPU vs CPU parity tests (`cargo test -p gpu --features gpu-validation`). |
 
 GPU initialisation failures print a warning to stderr and fall back to CPU — they do not return errors.

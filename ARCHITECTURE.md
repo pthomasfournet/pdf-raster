@@ -244,7 +244,8 @@ the rayon pool drops — this avoids the CUDA driver teardown race at process ex
 
 ### 3.6 `gpu`
 
-All CUDA code. Not linked unless at least one `gpu-*` feature is active.
+CUDA kernels and VA-API decoders. Not linked unless at least one `gpu-*` or `vaapi`
+feature is active.
 
 **`GpuCtx`** — one per process, holds the CUDA context and all compiled PTX kernels
 as `cudarc` modules. Shared via `Arc<GpuCtx>`.
@@ -264,6 +265,7 @@ as `cudarc` modules. Shared via `Arc<GpuCtx>`.
 - `nvjpeg` — `NvJpegDecoder`, TLS one-per-thread, primary `GPU_HYBRID`, fallback `DEFAULT`
 - `nvjpeg2k` — `NvJpeg2kDecoder`, same TLS pattern; C++ exception shim in `shim/nvjpeg2k_shim.cpp`
 - `gpu-deskew` — `npp_rotate()` via `nppiRotate_8u_C1R_Ctx`
+- `vaapi` — `VapiJpegDecoder`; VA-API JPEG baseline decode on Linux iGPU/dGPU (AMD VCN, Intel Quick Sync, Intel Arc); links `libva.so.2` + `libva-drm.so.2`. Dispatch priority: nvJPEG → VA-API → zune-jpeg (CPU). CMYK and progressive JPEG fall through to CPU.
 
 **CPU fallbacks** — every GPU function has a pure-Rust CPU counterpart. The
 dispatch logic is in the same function; the threshold is the only branch.
@@ -399,10 +401,12 @@ fn dispatch_popcnt(row: &[u8]) -> u32 { popcnt_aa_row_scalar(row) }
 
 ### iGPU / integrated compute
 
-**Intel iGPU (UHD/Iris/Arc laptop)**
-VA-API JPEG decode is the only operation worth targeting. It falls out of the
-Phase C Intel Arc work for free — same API, no extra work. Transfer overhead makes
-other compute (ICC, fill) not worth it on non-UMA x86.
+**Intel iGPU (UHD/Iris/Arc laptop) and AMD VCN**
+VA-API JPEG baseline decode is implemented (`vaapi` feature). Hardware handles
+YUV surface allocation and IDCT; the result is extracted to an `Rgb8` bitmap.
+Transfer overhead makes other compute (ICC, fill) not worth it on non-UMA x86.
+CMYK and progressive JPEGs fall through to CPU; the `nvjpeg` feature takes
+priority when both are active.
 
 **Apple Silicon (M1–M4)**
 Unified Memory Architecture eliminates PCIe transfer overhead. Metal Compute for

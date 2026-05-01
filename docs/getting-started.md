@@ -10,15 +10,23 @@ Given a PDF file, pdf-raster renders each page to an 8-bit grayscale buffer in m
 
 ### CPU
 
-**Supported:** x86-64 processors with AMD or Intel silicon.
+**Supported:** x86-64 (AMD and Intel) and `aarch64` (ARM / Apple Silicon).
 
-- AVX2 is used when available (runtime-detected, scalar fallback otherwise).
-- AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and related extensions) is used when the binary is built with `-C target-cpu=native` on a compatible CPU. The project is developed and benchmarked on an AMD Ryzen 9900X3D.
-- **ARM / Apple Silicon are not yet supported.** NEON SIMD paths have not been implemented. The code will not compile for `aarch64` targets. There is no Apple Metal backend. ARM/NEON and Apple Metal support is planned (see [Planned platform support](#planned-platform-support) below).
+**x86-64:**
+- AVX2 SIMD paths are runtime-detected with a scalar fallback.
+- AVX-512 (`avx512f/bw/vl/dq/vnni/vpopcntdq` and extensions) is active when built with `-C target-cpu=native` on a compatible CPU. Developed and benchmarked on an AMD Ryzen 9900X3D.
+- All Intel consumer CPUs (Alder/Raptor/Arrow Lake) have AVX2; AVX-512 is disabled on them — Xeon only.
+
+**aarch64:**
+- NEON is used unconditionally (mandatory on all ARMv8-A).
+- SVE2 (`svcnt_u8_z` popcount tier) is available behind the `nightly-sve2` Cargo feature on nightly Rust. Gives up to 4× NEON throughput on wide-SVE2 server chips (Graviton4 full width).
+- `cargo check --target aarch64-unknown-linux-gnu` is clean; no Apple Metal GPU backend yet.
 
 ### GPU (optional)
 
-All GPU features currently require an **NVIDIA GPU with CUDA 12**.
+Two GPU backends are available on Linux:
+
+**NVIDIA (CUDA 12):**
 
 | Feature | Minimum GPU | Library required |
 |---|---|---|
@@ -28,21 +36,30 @@ All GPU features currently require an **NVIDIA GPU with CUDA 12**.
 | `gpu-icc` | Any CUDA 12-capable NVIDIA GPU | CUDA runtime |
 | `gpu-deskew` | Any CUDA 12-capable NVIDIA GPU | CUDA NPP (`libnppig.so`, `libnppc.so`) |
 
-**AMD/Radeon GPUs are not yet supported.** ROCm / HIP and Vulkan backends are planned.
+**VA-API (Linux iGPU/dGPU — AMD VCN, Intel Quick Sync, Intel Arc):**
 
-**Intel GPUs (Arc, Iris Xe) are not yet supported.** oneAPI / Level Zero backend is planned.
+| Feature | Supported hardware | Libraries required |
+|---|---|---|
+| `vaapi` | AMD VCN (Raphael+), Intel UHD 630+, Intel Arc | `libva.so.2`, `libva-drm.so.2` |
 
-If no NVIDIA GPU is present, or if CUDA initialisation fails at runtime, all GPU features fall back to CPU automatically — a warning is printed to stderr but no error is returned. The CPU path is fully functional on its own.
+VA-API provides hardware JPEG baseline decode. CMYK and progressive JPEGs fall through to CPU. When both `nvjpeg` and `vaapi` are active, nvJPEG takes priority; VA-API fires as fallback.
 
-## Planned platform support
+All GPU features fall back to CPU automatically if initialisation fails — a message is logged but no error is returned.
 
-The following platforms are unimplemented and untested today. Support is planned in this order:
+## Platform support
 
-1. **ARM NEON + Apple Metal** — `aarch64` CPU SIMD (NEON) and Apple Silicon GPU acceleration via Metal. This enables native macOS support and mobile/embedded deployment.
-2. **Intel CPU (AVX-512 VNNI) + Intel GPU (Arc / Iris Xe)** — Intel-specific AVX-512 tuning and a oneAPI / Level Zero GPU backend.
-3. **Vulkan compute + AMD/Radeon (ROCm)** — cross-vendor GPU compute via Vulkan (covering AMD, Intel, and NVIDIA), plus a dedicated ROCm/HIP path for AMD.
+| Platform | CPU SIMD | GPU acceleration | Status |
+|---|---|---|---|
+| x86-64 AMD (Ryzen) | AVX-512 + AVX2 | NVIDIA CUDA + AMD VA-API | **Supported** |
+| x86-64 Intel (consumer) | AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
+| x86-64 Intel (Xeon) | AVX-512 + AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
+| aarch64 Linux (Graviton, RPi) | NEON + SVE2† | — | **Supported (CPU only)** |
+| Apple Silicon (M1–M4) | NEON | — (no Metal backend yet) | CPU only, compile clean |
+| AMD/Radeon ROCm | — | — | Not yet implemented |
+| Apple Metal | — | — | Not yet implemented (Phase F) |
+| Vulkan compute | — | — | Not yet implemented |
 
-Until a platform tier is implemented, attempting to use it will result in a compile error (`aarch64`) or missing feature flag. There is no silent wrong-answer fallback.
+† SVE2 requires `nightly-sve2` Cargo feature and nightly Rust.
 
 ## Installation
 
@@ -50,14 +67,18 @@ Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.1.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.2.0" }
 ```
 
-For GPU acceleration (CUDA 12 required):
+For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.1.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+# CUDA GPU features (NVIDIA only):
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.2.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+
+# VA-API (AMD/Intel iGPU on Linux — libva required):
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.2.0", features = ["vaapi"] }
 ```
 
 To track the latest commit on `master` instead of a pinned tag:
