@@ -2,7 +2,7 @@
 
 ## Methodology
 
-All benchmarks render all pages of each corpus PDF at **150 DPI** (the default) to PPM output, measuring wall-clock time with millisecond precision. Each tool is run sequentially (one PDF at a time, one tool at a time) to avoid contention. Output files are written to a temporary directory and discarded.
+All benchmarks render all pages of each corpus PDF at **150 DPI** (the default) to PPM output, measuring wall-clock time with millisecond precision. Each tool is run sequentially (one PDF at a time, one tool at a time) to avoid contention. Output files are written to a tmpfs temporary directory and discarded. The input PDF is evicted from the OS page cache before each timed run via `posix_fadvise(FADV_DONTNEED)`, ensuring cold-cache reads that reflect real-world single-run usage.
 
 **Tool versions:**
 
@@ -34,10 +34,10 @@ Both binaries built **without GPU features** (`--backend cpu`). This isolates th
 
 **Hardware:**
 
-| Machine | CPU | ISA | Cores | RAM |
-|---|---|---|---|---|
-| Ryzen bench | AMD Ryzen 9 9900X3D @ 4.4 GHz | x86-64 + AVX-512 | 12C/24T | 32 GB DDR5 |
-| Intel bench | Intel Core i7-8700K @ 3.7 GHz | x86-64 + AVX2 | 6C/12T | 32 GB DDR4 |
+| Machine | CPU | ISA | Cores | RAM | Storage |
+|---|---|---|---|---|---|
+| Ryzen bench | AMD Ryzen 9 9900X3D @ 4.4 GHz | x86-64 + AVX-512 | 12C/24T | 32 GB DDR5 | SATA SSD |
+| Intel bench | Intel Core i7-8700K @ 3.7 GHz | x86-64 + AVX2 | 6C/12T | 32 GB DDR4 | SATA SSD |
 
 **Reference:** `pdftoppm` (Poppler), CPU only, same machine as each pdf-raster run.
 
