@@ -12,12 +12,10 @@ raster   = { path = "../raster" }
 # freetype-rs 0.38 wraps FreeType 2.x with a safe API; the system library
 # is linked via pkg-config (libfreetype-dev must be installed).
 freetype-rs = "0.38"
-# lru 0.12 provides LruCache used for per-face glyph eviction.
-lru = "0.12"
-# dashmap 6 gives lock-free sharded concurrent maps for the global glyph cache.
-dashmap = "6"
-# ahash is used as the hasher for dashmap and manual HashMap instances.
-ahash = "0.8"
+# quick_cache gives a sharded concurrent LRU cache where reads do not
+# require write locks (unlike dashmap + lru::LruCache, where get() takes
+# &mut self and therefore serializes reads within each shard).
+quick_cache = "0.6.21"
 
 [lints]
 workspace = true
