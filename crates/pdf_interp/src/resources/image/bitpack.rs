@@ -13,7 +13,7 @@
 ///
 /// `bits` ∈ {1, 2, 4}; each row is padded to a whole-byte boundary.
 /// `samples_per_row` is the number of samples to extract per row.
-/// Each raw value [0, 2^bits − 1] is transformed by `map` before being pushed.
+/// Each raw value in [0, 2^bits − 1] is transformed by `map` before being pushed.
 ///
 /// Returns `None` if `bits` is not in {1, 2, 4}, or if
 /// `samples_per_row × height` overflows `usize`.
@@ -22,7 +22,7 @@ pub(super) fn unpack_packed_bits(
     bits: u32,
     samples_per_row: usize,
     height: u32,
-    map: impl Fn(u8, u8) -> u8, // (raw_value, mask) → output byte
+    map: impl Fn(u8) -> u8, // raw_value → output byte
 ) -> Option<Vec<u8>> {
     // Hard precondition — not a debug_assert so adversarial PDF data cannot
     // trigger a divide-by-zero in release builds.
@@ -50,7 +50,7 @@ pub(super) fn unpack_packed_bits(
             let shift = bits as usize * (samples_per_byte - 1 - (s % samples_per_byte));
             let byte = row_data.get(byte_idx).copied().unwrap_or(0);
             let val = (byte >> shift) & mask;
-            out.push(map(val, mask));
+            out.push(map(val));
         }
     }
     Some(out)
@@ -65,25 +65,10 @@ pub(super) fn unpack_packed_bits(
 ///
 /// Returns `None` if `width × height` overflows `usize`.
 pub(super) fn expand_1bpp(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    let row_bytes = (width as usize).div_ceil(8);
-    let total = (width as usize).checked_mul(height as usize)?;
-    let mut out = Vec::with_capacity(total);
-
-    for row in 0..height as usize {
-        let row_start = row * row_bytes;
-        let row_data = if row_start < data.len() {
-            &data[row_start..data.len().min(row_start + row_bytes)]
-        } else {
-            &[]
-        };
-        for col in 0..width as usize {
-            let byte_idx = col / 8;
-            let bit_idx = 7 - (col % 8);
-            let bit = row_data.get(byte_idx).map_or(0u8, |b| (b >> bit_idx) & 1);
-            out.push(if bit == 0 { 0x00 } else { 0xFF });
-        }
-    }
-    Some(out)
+    let width_usize = usize::try_from(width).ok()?;
+    unpack_packed_bits(data, 1, width_usize, height, |val| {
+        if val == 0 { 0x00 } else { 0xFF }
+    })
 }
 
 // ── N-bpp expansion ───────────────────────────────────────────────────────────
@@ -114,7 +99,7 @@ pub(super) fn expand_nbpp<const BITS: u32>(
     let scale = 255u16 / u16::from(max_val);
     let width_usize = usize::try_from(width).ok()?;
     let samples_per_row = width_usize.checked_mul(components)?;
-    unpack_packed_bits(data, BITS, samples_per_row, height, |val, _mask| {
+    unpack_packed_bits(data, BITS, samples_per_row, height, |val| {
         // val ≤ max_val ≤ 15; val*scale ≤ 255 — fits u8.
         #[expect(
             clippy::cast_possible_truncation,
@@ -139,7 +124,7 @@ pub(super) fn expand_nbpp_indexed(
     bits: u32,
 ) -> Option<Vec<u8>> {
     let width_usize = usize::try_from(width).ok()?;
-    unpack_packed_bits(data, bits, width_usize, height, |val, _mask| val)
+    unpack_packed_bits(data, bits, width_usize, height, |val| val)
 }
 
 // ── 16-bpp downsampling ───────────────────────────────────────────────────────
@@ -164,7 +149,7 @@ pub(super) fn downsample_16bpp(
     let n_samples = npixels.checked_mul(components)?;
     let needed = n_samples.checked_mul(2)?;
     if data.len() < needed {
-        log::debug!(
+        log::warn!(
             "image: 16bpp data too short ({} bytes, need {needed} for {width}×{height}×{components}×2)",
             data.len()
         );

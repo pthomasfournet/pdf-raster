@@ -45,6 +45,13 @@ impl ResolvedCs {
 
 // ── Colour space resolution ───────────────────────────────────────────────────
 
+/// Maximum recursion depth for `Indexed` base-space chains.
+///
+/// PDF spec §8.6.6.3 forbids nested `Indexed` spaces, but adversarial PDFs are
+/// not required to be spec-compliant.  We stop after this many levels to prevent
+/// stack overflow.
+const MAX_CS_DEPTH: u8 = 8;
+
 /// Resolve the `ColorSpace` entry of an image stream dictionary to one of the
 /// three device spaces the blit path understands.
 ///
@@ -57,8 +64,18 @@ impl ResolvedCs {
 /// - `Separation` / `DeviceN`        → approximate as Gray (tint 0 = full ink = dark)
 /// - unknown / absent                → Gray (safe fallback)
 pub(super) fn resolve_cs(doc: &Document, cs_obj: &Object) -> ResolvedCs {
+    resolve_cs_depth(doc, cs_obj, 0)
+}
+
+fn resolve_cs_depth(doc: &Document, cs_obj: &Object, depth: u8) -> ResolvedCs {
     match cs_obj {
         Object::Name(n) => device_cs_name(n),
+        Object::Reference(id) => {
+            // Indirect colour space reference — dereference and resolve.
+            doc.get_object(*id)
+                .ok()
+                .map_or(ResolvedCs::Gray, |obj| resolve_cs_depth(doc, obj, depth))
+        }
         Object::Array(arr) => {
             let name = arr.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
             match name {
@@ -73,7 +90,15 @@ pub(super) fn resolve_cs(doc: &Document, cs_obj: &Object) -> ResolvedCs {
                 }
                 b"Indexed" => {
                     // [/Indexed base hival lookup] — base is element 1.
-                    arr.get(1).map_or(ResolvedCs::Gray, |o| resolve_cs(doc, o))
+                    // Guard against adversarial nested Indexed chains.
+                    if depth >= MAX_CS_DEPTH {
+                        log::debug!(
+                            "image: Indexed colour space nested too deeply (depth {depth}) — treating as Gray"
+                        );
+                        return ResolvedCs::Gray;
+                    }
+                    arr.get(1)
+                        .map_or(ResolvedCs::Gray, |o| resolve_cs_depth(doc, o, depth + 1))
                 }
                 // DeviceGray, CalGray, Separation, DeviceN, and unknown → Gray.
                 _ => {
@@ -238,5 +263,13 @@ mod tests {
     #[test]
     fn device_cs_name_unknown_is_gray() {
         assert_eq!(device_cs_name(b"Unknown"), ResolvedCs::Gray);
+    }
+
+    #[test]
+    fn resolve_cs_indirect_reference_falls_back_to_gray() {
+        // An unresolvable Reference should not panic — it falls back to Gray.
+        let doc = lopdf::Document::new();
+        let obj = lopdf::Object::Reference((999, 0));
+        assert_eq!(resolve_cs(&doc, &obj), ResolvedCs::Gray);
     }
 }

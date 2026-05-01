@@ -341,12 +341,13 @@ pub(crate) fn cs_to_image_color_space(doc: &Document, cs_obj: &Object) -> ImageC
 /// Validate raw `i64` image dimensions and cast them to `u32`.
 ///
 /// Returns `None` (caller logs and propagates) if either dimension is ≤ 0 or
-/// exceeds 65536.  The 65536 cap keeps `w × h` within `u32` and limits the
-/// maximum allocation a single image can request to ≈ 16 GiB (before component
-/// multiplication), which is checked separately by each decoder.
+/// exceeds 65536.  The 65536 cap keeps `w × h` within `usize` on 64-bit targets
+/// (65536² = 4 294 967 296, which fits in `u64` / 64-bit `usize` but not in
+/// `u32`).  Each decoder is responsible for checking that the final allocation
+/// does not exceed available memory.
 ///
-/// The cast is safe: after the range check, the value is in [1, 65536] which
-/// fits in both `u32` and `usize`.
+/// The cast is safe: after the range check, each dimension is in [1, 65536]
+/// which fits in `u32` without sign loss or truncation.
 #[expect(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
@@ -365,10 +366,17 @@ pub(super) const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)>
 /// chained filters as a multi-element array; chained filters are not supported
 /// here — a warning is emitted and `None` is returned so the caller can skip
 /// the image gracefully rather than trying to decode garbled data.
+///
+/// An empty array (`Filter = []`) is treated as no filter (returns `None`)
+/// and a debug message is emitted, matching the behaviour of an absent key.
 pub(super) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
     match obj {
         Object::Name(n) => Some(String::from_utf8_lossy(n)),
         Object::Array(arr) => {
+            if arr.is_empty() {
+                log::debug!("image: Filter is an empty array — treating as no filter");
+                return None;
+            }
             if arr.len() > 1 {
                 log::warn!(
                     "image: chained filters ({} filters in array) not supported — skipping image",

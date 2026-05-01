@@ -6,7 +6,7 @@
 
 use lopdf::{Dictionary, Document, Object};
 
-use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp, expand_nbpp_indexed};
+use super::bitpack::{downsample_16bpp, expand_nbpp, expand_nbpp_indexed, unpack_packed_bits};
 use super::colorspace::{ResolvedCs, indexed_palette, resolve_cs};
 use super::{ImageColorSpace, ImageDescriptor, ImageFilter};
 use crate::resources::dict_ext::DictExt as _;
@@ -21,7 +21,7 @@ use gpu::GpuCtx;
 /// Expand raw (already-decompressed) pixel bytes into a normalised 8-bpp form.
 ///
 /// Supported `BitsPerComponent` values:
-/// - 1  — packed MSB-first, expanded to 0x00/0xFF per pixel
+/// - 1  — packed MSB-first; 1 sample per component per pixel (PDF §8.9.3)
 /// - 2  — 4 levels, scaled to 0x00/0x55/0xAA/0xFF
 /// - 4  — 16 levels, scaled to 0x00…0xFF (value × 17)
 /// - 8  — direct (common case)
@@ -29,10 +29,6 @@ use gpu::GpuCtx;
 ///
 /// `Indexed` images with bpc 1/2/4 unpack the sub-byte palette indices first.
 /// CMYK images (bpc 8/16) are converted to RGB inline.
-#[expect(
-    clippy::too_many_lines,
-    reason = "bpc dispatch table + cfg-gated GPU paths — splitting would obscure the decision tree"
-)]
 pub(super) fn decode_raw(
     doc: &Document,
     data: &[u8],
@@ -46,45 +42,18 @@ pub(super) fn decode_raw(
 
     if is_mask {
         // Stencil mask — always 1 byte per pixel, no colour space conversion.
-        return match bpc {
-            1 => {
-                let pixels = expand_1bpp(data, width, height)?;
-                Some(ImageDescriptor {
-                    width,
-                    height,
-                    color_space: ImageColorSpace::Mask,
-                    data: pixels,
-                    smask: None,
-                    filter: ImageFilter::Raw,
-                })
-            }
-            8 => {
-                let expected = (width as usize).checked_mul(height as usize)?;
-                if data.len() < expected {
-                    log::warn!(
-                        "image: mask raw data too short ({} bytes, need {expected})",
-                        data.len()
-                    );
-                    return None;
-                }
-                Some(ImageDescriptor {
-                    width,
-                    height,
-                    color_space: ImageColorSpace::Mask,
-                    data: data[..expected].to_vec(),
-                    smask: None,
-                    filter: ImageFilter::Raw,
-                })
-            }
-            other => {
-                log::debug!("image: mask {other} bpc not yet implemented");
-                None
-            }
-        };
+        return decode_mask_raw(data, width, height, bpc);
     }
 
-    // Read raw ColorSpace object to detect Indexed before resolving.
-    let cs_obj = dict.get(b"ColorSpace").ok();
+    // Resolve the ColorSpace entry, following indirect references.  We need the
+    // raw Object to detect Indexed (which uses a different decode path) as well
+    // as for subsequent color-space resolution.
+    let cs_obj_raw = dict.get(b"ColorSpace").ok();
+    // Follow a top-level Reference so Indexed detection below works correctly.
+    let cs_obj: Option<&Object> = match cs_obj_raw {
+        Some(Object::Reference(id)) => doc.get_object(*id).ok(),
+        other => other,
+    };
 
     // Check for Indexed colour space: [/Indexed base hival lookup].
     // These images carry palette indices rather than component samples, so they
@@ -112,16 +81,26 @@ pub(super) fn decode_raw(
     };
 
     match bpc {
+        // bpc=1: PDF §8.9.3 packs one bit per sample, one sample per component.
+        // Multi-component spaces (RGB: 3 bits/px, CMYK: 4 bits/px) must use
+        // unpack_packed_bits with `components` samples per row — not expand_1bpp
+        // which treats one bit as one pixel.
         1 => {
-            let pixels = expand_1bpp(data, width, height)?;
-            Some(ImageDescriptor {
+            let width_usize = usize::try_from(width).ok()?;
+            let samples_per_row = width_usize.checked_mul(resolved.components())?;
+            let pixels = unpack_packed_bits(data, 1, samples_per_row, height, |v| {
+                if v == 0 { 0x00 } else { 0xFF }
+            })?;
+            decode_raw_8bpp(
+                &pixels,
                 width,
                 height,
-                color_space: resolved.to_image_cs(),
-                data: pixels,
-                smask: None,
-                filter: ImageFilter::Raw,
-            })
+                resolved,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                icc_bytes.as_deref(),
+            )
         }
         2 => decode_raw_8bpp(
             &expand_nbpp::<2>(data, width, height, resolved.components())?,
@@ -171,6 +150,49 @@ pub(super) fn decode_raw(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Decode a stencil mask (ImageMask=true) from raw data.
+fn decode_mask_raw(data: &[u8], width: u32, height: u32, bpc: i64) -> Option<ImageDescriptor> {
+    match bpc {
+        1 => {
+            let width_usize = usize::try_from(width).ok()?;
+            // Mask images are always 1-component: 1 bit per pixel.
+            let pixels = unpack_packed_bits(data, 1, width_usize, height, |v| {
+                if v == 0 { 0x00 } else { 0xFF }
+            })?;
+            Some(ImageDescriptor {
+                width,
+                height,
+                color_space: ImageColorSpace::Mask,
+                data: pixels,
+                smask: None,
+                filter: ImageFilter::Raw,
+            })
+        }
+        8 => {
+            let expected = (width as usize).checked_mul(height as usize)?;
+            if data.len() < expected {
+                log::warn!(
+                    "image: mask raw data too short ({} bytes, need {expected})",
+                    data.len()
+                );
+                return None;
+            }
+            Some(ImageDescriptor {
+                width,
+                height,
+                color_space: ImageColorSpace::Mask,
+                data: data[..expected].to_vec(),
+                smask: None,
+                filter: ImageFilter::Raw,
+            })
+        }
+        other => {
+            log::debug!("image: mask {other} bpc not yet implemented");
+            None
+        }
+    }
+}
 
 /// Decode an 8-bpp non-indexed image for `resolved` colour space.
 ///
@@ -415,5 +437,52 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn decode_raw_gray_1bpp() {
+        // 2-pixel Gray image at bpc=1: byte 0b10_000000 → pixels [0xFF, 0x00].
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", lopdf::Object::Integer(1));
+        let data = vec![0b1000_0000u8];
+        let desc = decode_raw(
+            &doc,
+            &data,
+            2,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        assert_eq!(desc.color_space, ImageColorSpace::Gray);
+        assert_eq!(desc.data, &[0xFF, 0x00]);
+    }
+
+    #[test]
+    fn decode_raw_rgb_1bpp() {
+        // 1-pixel RGB image at bpc=1: 3 bits packed MSB-first in one byte.
+        // Byte 0b110_00000: R=1→0xFF, G=1→0xFF, B=0→0x00.
+        let doc = lopdf::Document::new();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
+        dict.set("BitsPerComponent", lopdf::Object::Integer(1));
+        let data = vec![0b1100_0000u8];
+        let desc = decode_raw(
+            &doc,
+            &data,
+            1,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        assert_eq!(desc.color_space, ImageColorSpace::Rgb);
+        assert_eq!(desc.data, &[0xFF, 0xFF, 0x00]);
     }
 }

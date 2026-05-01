@@ -6,7 +6,7 @@
 
 use lopdf::{Document, ObjectId};
 
-use super::bitpack::{downsample_16bpp, expand_nbpp};
+use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp};
 use super::codecs::{decode_ccitt, decode_jbig2};
 use super::filter_name;
 use super::validated_dims;
@@ -37,7 +37,7 @@ pub(super) fn decode_smask(
     let w_raw = stream.dict.get_i64(b"Width")?;
     let h_raw = stream.dict.get_i64(b"Height")?;
     let Some((sm_w, sm_h)) = validated_dims(w_raw, h_raw) else {
-        log::debug!("image: SMask degenerate dimensions {w_raw}×{h_raw}, skipping");
+        log::warn!("image: SMask degenerate dimensions {w_raw}×{h_raw}, skipping");
         return None;
     };
 
@@ -46,47 +46,47 @@ pub(super) fn decode_smask(
 
     // CCITTFaxDecode and JBIG2Decode return Mask-space (0x00 = paint, 0xFF = skip),
     // which must be inverted to alpha-space before use.
+    //
+    // For these compressed formats we use the actual decoded dimensions
+    // (sm_desc.width × sm_desc.height) — not the dict-declared sm_w × sm_h —
+    // as the true source size passed to scale_smask, so that a decoder that
+    // reports a different output size does not produce an out-of-bounds index.
     let alpha: Vec<u8> = match filter.as_deref() {
         Some("CCITTFaxDecode") => {
             let parms = stream.dict.get(b"DecodeParms").ok();
             let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, true, parms)?;
-            sm_desc
+            let actual_w = sm_desc.width;
+            let actual_h = sm_desc.height;
+            let inverted: Vec<u8> = sm_desc
                 .data
                 .iter()
                 .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
-                .collect()
+                .collect();
+            return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
         }
         Some("JBIG2Decode") => {
             let parms = stream.dict.get(b"DecodeParms").ok();
             let sm_desc = decode_jbig2(doc, stream.content.as_slice(), sm_w, sm_h, true, parms)?;
-            sm_desc
+            let actual_w = sm_desc.width;
+            let actual_h = sm_desc.height;
+            let inverted: Vec<u8> = sm_desc
                 .data
                 .iter()
                 .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
-                .collect()
+                .collect();
+            return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
+        }
+        Some("FlateDecode") => {
+            let raw = stream.decompressed_content().ok()?;
+            decode_smask_raw_bytes(&raw, sm_w, sm_h, bpc)?
+        }
+        None => {
+            // No filter — raw (uncompressed) byte stream.
+            decode_smask_raw_bytes(stream.content.as_slice(), sm_w, sm_h, bpc)?
         }
         Some(other) => {
-            log::debug!("image: SMask filter {other:?} not yet supported");
+            log::warn!("image: SMask filter {other:?} not supported — skipping image");
             return None;
-        }
-        // Raw or FlateDecode: decode to bytes then interpret via bpc.
-        filter_opt => {
-            let raw: Vec<u8> = match filter_opt {
-                None => stream.content.clone(),
-                Some("FlateDecode") => stream.decompressed_content().ok()?,
-                _ => unreachable!("matched above"),
-            };
-            match bpc {
-                1 => expand_smask_1bpp(&raw, sm_w, sm_h)?,
-                2 => expand_nbpp::<2>(&raw, sm_w, sm_h, 1)?,
-                4 => expand_nbpp::<4>(&raw, sm_w, sm_h, 1)?,
-                8 => raw,
-                16 => downsample_16bpp(&raw, sm_w, sm_h, 1)?,
-                other => {
-                    log::debug!("image: SMask {other} bpc not yet supported");
-                    return None;
-                }
-            }
         }
     };
 
@@ -95,35 +95,34 @@ pub(super) fn decode_smask(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Expand a 1-bit-per-pixel packed `SMask` buffer to one byte per pixel.
+/// Interpret an already-decompressed byte buffer as an `SMask` alpha channel.
 ///
-/// Bit 1 (MSB-first) = opaque (0xFF); bit 0 = transparent (0x00).
-/// Truncated rows are defensively treated as all-transparent (0-bit padding).
-///
-/// Returns `None` if `sm_w × sm_h` overflows `usize`.
-pub(super) fn expand_smask_1bpp(raw: &[u8], sm_w: u32, sm_h: u32) -> Option<Vec<u8>> {
-    let cols = usize::try_from(sm_w).ok()?;
-    let rows = usize::try_from(sm_h).ok()?;
-    let total = cols.checked_mul(rows)?;
-    let row_bytes = cols.div_ceil(8);
-    let mut out = Vec::with_capacity(total);
-    // Iterate exactly `rows` times regardless of how many bytes `raw` contains —
-    // a FlateDecode stream that decompresses to more bytes than the declared
-    // dimensions imply must not produce more output rows than `sm_h`.
-    for row_idx in 0..rows {
-        let row_start = row_idx * row_bytes;
-        let row = if row_start < raw.len() {
-            &raw[row_start..raw.len().min(row_start + row_bytes)]
-        } else {
-            &[]
-        };
-        for x in 0..cols {
-            let byte = row.get(x / 8).copied().unwrap_or(0);
-            let bit = (byte >> (7 - (x % 8))) & 1;
-            out.push(if bit != 0 { 0xFF } else { 0x00 });
+/// Dispatches on `bpc` to normalise sub-byte and 16-bit formats to one byte per
+/// pixel.  Returns `None` if the buffer is too short or the bpc is unsupported.
+fn decode_smask_raw_bytes(raw: &[u8], sm_w: u32, sm_h: u32, bpc: i64) -> Option<Vec<u8>> {
+    match bpc {
+        1 => expand_1bpp(raw, sm_w, sm_h),
+        2 => expand_nbpp::<2>(raw, sm_w, sm_h, 1),
+        4 => expand_nbpp::<4>(raw, sm_w, sm_h, 1),
+        8 => {
+            // Validate length before the raw pass-through: scale_smask would
+            // panic with an out-of-bounds index if data is shorter than sm_w×sm_h.
+            let expected = (sm_w as usize).checked_mul(sm_h as usize)?;
+            if raw.len() < expected {
+                log::warn!(
+                    "image: SMask raw data too short ({} bytes, need {expected} for {sm_w}×{sm_h})",
+                    raw.len()
+                );
+                return None;
+            }
+            Some(raw[..expected].to_vec())
+        }
+        16 => downsample_16bpp(raw, sm_w, sm_h, 1),
+        other => {
+            log::debug!("image: SMask {other} bpc not yet supported");
+            None
         }
     }
-    Some(out)
 }
 
 /// Nearest-neighbour resample of a flat grayscale `src` buffer from `(sw×sh)`
@@ -151,24 +150,24 @@ pub(super) fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> V
         .unwrap_or(0);
     let mut out = Vec::with_capacity(capacity);
     for dy in 0..dh {
-        // sy = floor(dy * src_h / dst_h); since dy < dst_h, result < src_h ≤ u32::MAX.
+        // sy = floor(dy * src_h / dst_h); since dy < dst_h, result < src_h ≤ 65535.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "dy < dst_h ⟹ sy < src_h ≤ 65536"
+            reason = "dy < dst_h ⟹ sy < src_h ≤ 65535 — fits u32"
         )]
         let sy = (u64::from(dy) * src_h / dst_h) as u32;
         for dx in 0..dw {
-            // sx = floor(dx * src_w / dst_w); since dx < dst_w, result < src_w ≤ u32::MAX.
+            // sx = floor(dx * src_w / dst_w); since dx < dst_w, result < src_w ≤ 65535.
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "dx < dst_w ⟹ sx < src_w ≤ 65536"
+                reason = "dx < dst_w ⟹ sx < src_w ≤ 65535 — fits u32"
             )]
             let sx = (u64::from(dx) * src_w / dst_w) as u32;
-            // sy * src_w + sx < src_h * src_w ≤ 65536² = 4G; usize ≥ 32 bits on any
-            // target pdf_interp runs on.
+            // index = sy * src_w + sx < src_h * src_w ≤ 65535² = 4_294_836_225 < usize::MAX
+            // on all targets (usize::MAX ≥ 2^32−1 on 32-bit, 2^64−1 on 64-bit).
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "index < src_h*src_w ≤ 65536² = 4G; usize ≥ 32 bits"
+                reason = "index ≤ 65535²−1 < usize::MAX on 32-bit and 64-bit targets"
             )]
             out.push(src[(u64::from(sy) * src_w + u64::from(sx)) as usize]);
         }
@@ -205,9 +204,21 @@ mod tests {
 
     #[test]
     fn scale_smask_zero_src_returns_empty() {
-        // sw=0 means no source pixels; scaling into a non-empty dst would panic
-        // on src index access — must return empty instead.
+        // sw=0 means no source pixels; scaling into a non-empty dst would index
+        // an empty buffer — must return empty instead.
         let result = scale_smask(vec![], 0, 1, 4, 4);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_smask_raw_bpc8_too_short_returns_none() {
+        // 2×2 SMask needs 4 bytes; supplying 2 must return None, not panic.
+        assert!(decode_smask_raw_bytes(&[0u8, 255], 2, 2, 8).is_none());
+    }
+
+    #[test]
+    fn decode_smask_raw_bpc8_exact_length() {
+        let result = decode_smask_raw_bytes(&[10u8, 20, 30, 40], 2, 2, 8).unwrap();
+        assert_eq!(result, &[10, 20, 30, 40]);
     }
 }
