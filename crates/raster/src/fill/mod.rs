@@ -43,7 +43,7 @@ use color::Pixel;
 /// AA gamma table for `splashAASize=4`, `splashAAGamma=1.5`.
 /// Entry `i`: `round((i/16)^1.5 * 255)` for i in 0..=16.
 pub(super) const AA_GAMMA: [u8; (AA_SIZE * AA_SIZE + 1) as usize] = [
-    0, 4, 11, 20, 32, 45, 59, 75, 91, 108, 128, 148, 169, 191, 214, 238, 255,
+    0, 4, 11, 21, 32, 45, 59, 74, 90, 108, 126, 145, 166, 187, 209, 231, 255,
 ];
 
 /// Non-zero winding fill.
@@ -513,15 +513,15 @@ mod tests {
 
     #[test]
     fn aa_gamma_table_correct() {
-        // Spot-check a few entries.
-        assert_eq!(AA_GAMMA[0], 0);
-        assert_eq!(AA_GAMMA[16], 255);
-        // t=8 (50%): round((8/16)^1.5 * 255) = round(0.5^1.5 * 255) = round(0.3536*255) ≈ 90
-        assert!(
-            AA_GAMMA[8] >= 88 && AA_GAMMA[8] <= 93,
-            "AA_GAMMA[8]={}",
-            AA_GAMMA[8]
-        );
+        // Validate every entry against the defining formula: round((i/16)^1.5 * 255).
+        for i in 0u8..=16 {
+            let expected = ((f64::from(i) / 16.0).powf(1.5) * 255.0).round() as u8;
+            assert_eq!(
+                AA_GAMMA[usize::from(i)],
+                expected,
+                "AA_GAMMA[{i}]: expected {expected}"
+            );
+        }
     }
 
     #[test]
