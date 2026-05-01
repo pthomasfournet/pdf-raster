@@ -297,7 +297,9 @@ impl<'doc> PageResources<'doc> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
         let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
         let xobj_dict = resolve_dict(self.doc, res.get(b"XObject").ok()?)?;
-        let Object::Reference(id) = xobj_dict.get(name).ok()? else { return None };
+        let Object::Reference(id) = xobj_dict.get(name).ok()? else {
+            return None;
+        };
         let stream_id = *id;
 
         let obj = self.doc.get_object(stream_id).ok()?;
