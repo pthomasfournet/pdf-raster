@@ -17,6 +17,10 @@ fn main() {
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)
+        .thread_name(|i| format!("raster-worker-{i}"))
+        // 8 MiB per worker: path flattening and Bézier subdivision recurse deeply
+        // on degenerate inputs and overflow the 2 MiB rayon default.
+        .stack_size(8 * 1024 * 1024)
         .build()
         .expect("failed to build thread pool");
 

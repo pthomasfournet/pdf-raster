@@ -107,6 +107,15 @@ struct GpuKernels {
 /// An initialised CUDA context and compiled kernel set.
 ///
 /// Create once per process with [`GpuCtx::init`] and share across threads via `Arc`.
+///
+/// # Concurrency
+///
+/// All methods take `&self` and are safe to call from multiple threads, but they
+/// serialize on the single internal `CudaStream`: a call from thread B blocks until
+/// thread A's `stream.synchronize()` returns.  This is correct for the current
+/// architecture where GPU work is occasional (threshold-gated) and pages are the
+/// unit of parallelism.  If image decode is ever parallelized within a page, replace
+/// the shared stream with a `thread_local!` `Arc<CudaStream>` per rayon worker.
 pub struct GpuCtx {
     stream: Arc<CudaStream>,
     kernels: GpuKernels,
