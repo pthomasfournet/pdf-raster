@@ -363,7 +363,7 @@ pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
 #[inline]
 #[must_use]
 pub const fn byte_to_col(x: u8) -> i32 {
-    let xi = x as i32;
+    let xi = x as i32; // u8 → i32 is lossless; `i32::from` is not const-stable yet
     (xi << 8) | xi
 }
 

@@ -53,7 +53,10 @@ impl PageRenderer<'_> {
         // This overrides an explicit `Tz 0` instruction — rare in practice.
         let raw_hz = self.gstate.current().text.horiz_scaling;
         let horiz_scaling = if raw_hz.abs() < f64::EPSILON {
-            log::debug!("pdf_interp: Tz is 0 %, substituting 100 %");
+            // Tz=0 % is degenerate (zero-width advance = invisible text).
+            // Substitute 100 % so text remains visible; warn because this
+            // overrides explicit PDF authoring intent.
+            log::warn!("pdf_interp: Tz is 0 %, substituting 100 % to avoid invisible text");
             1.0
         } else {
             raw_hz / 100.0
@@ -316,7 +319,7 @@ impl PageRenderer<'_> {
             if do_paint && self.form_depth >= MAX_FORM_DEPTH {
                 log::warn!(
                     "pdf_interp: Type 3 CharProc depth {MAX_FORM_DEPTH} exceeded — \
-                     skipping glyph 0x{byte:02X}"
+                     glyph 0x{byte:02X} not painted (text position still advances)"
                 );
             } else if do_paint {
                 // Build the CharProc CTM:
