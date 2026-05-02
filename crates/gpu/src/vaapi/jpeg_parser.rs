@@ -97,9 +97,11 @@ impl JpegHeaders {
         let mut restart_interval: u16 = 0;
         let mut scan_data_offset: usize = 0;
         let mut scan_data_size: usize = 0;
+        let mut truncated = false;
 
         loop {
             if pos + 2 > data.len() {
+                truncated = true;
                 break;
             }
             if data[pos] != 0xFF {
@@ -122,6 +124,9 @@ impl JpegHeaders {
                     if body.len() < 6 {
                         return Err(err("SOF0 body too short"));
                     }
+                    if body[0] != 8 {
+                        return Err(err("SOF0: unsupported sample precision (expected 8-bit)"));
+                    }
                     height = u16::from_be_bytes([body[1], body[2]]);
                     width = u16::from_be_bytes([body[3], body[4]]);
                     components = body[5];
@@ -134,6 +139,9 @@ impl JpegHeaders {
                         h_samp[i] = body[b + 1] >> 4;
                         v_samp[i] = body[b + 1] & 0x0F;
                         quant_sel[i] = body[b + 2];
+                        if body[b + 2] > 3 {
+                            return Err(err("SOF0: quantiser table selector out of range"));
+                        }
                     }
                 }
 
@@ -160,12 +168,14 @@ impl JpegHeaders {
                             quant_tables[table_id].copy_from_slice(&body[off..off + 64]);
                             off += 64;
                         } else {
-                            // 16-bit table: take high byte only (VA-API uses u8).
+                            // 16-bit table: clamp to u8 for VA-API (big-endian u16, high byte first).
                             if off + 128 > body.len() {
                                 return Err(err("DQT: 16-bit table overruns segment"));
                             }
                             for k in 0..64 {
-                                quant_tables[table_id][k] = body[off + k * 2];
+                                let val =
+                                    u16::from_be_bytes([body[off + k * 2], body[off + k * 2 + 1]]);
+                                quant_tables[table_id][k] = val.min(255) as u8;
                             }
                             off += 128;
                         }
@@ -183,7 +193,7 @@ impl JpegHeaders {
                     let mut off = 0usize;
                     while off < body.len() {
                         if off + 17 > body.len() {
-                            break;
+                            return Err(err("DHT: segment truncated"));
                         }
                         let tc_th = body[off];
                         off += 1;
@@ -201,9 +211,10 @@ impl JpegHeaders {
                         // Slot: DC uses 0/2, AC uses 1/3.
                         // huffman_entries layout: [luma_DC, luma_AC, chroma_DC, chroma_AC].
                         let slot = th * 2 + tc as usize;
-                        if slot >= 4 {
-                            return Err(err("DHT: computed slot index out of range"));
-                        }
+                        debug_assert!(
+                            slot < 4,
+                            "DHT slot invariant: tc∈{{0,1}}, th<2 ⟹ slot∈[0,3]"
+                        );
 
                         let mut entry = VaHuffmanEntry {
                             num_dc_codes: [0; 16],
@@ -245,10 +256,11 @@ impl JpegHeaders {
                     if seg_len < 2 {
                         return Err(err("DRI segment too short"));
                     }
-                    let body = read_bytes!(seg_len - 2);
-                    if body.len() >= 2 {
-                        restart_interval = u16::from_be_bytes([body[0], body[1]]);
+                    if seg_len != 4 {
+                        return Err(err("DRI: segment must be exactly 4 bytes"));
                     }
+                    let body = read_bytes!(seg_len - 2);
+                    restart_interval = u16::from_be_bytes([body[0], body[1]]);
                 }
 
                 // SOS — start of scan: last header we need.
@@ -262,6 +274,9 @@ impl JpegHeaders {
                         return Err(err("SOS header empty"));
                     }
                     scan_components = body[0];
+                    if scan_components > 4 {
+                        return Err(err("SOS: scan_components > 4"));
+                    }
                     if (scan_components as usize) * 2 + 4 > body.len() {
                         return Err(err("SOS component table overruns header"));
                     }
@@ -269,17 +284,23 @@ impl JpegHeaders {
                         scan_comp_ids[i] = body[1 + i * 2];
                         scan_dc_table[i] = body[2 + i * 2] >> 4;
                         scan_ac_table[i] = body[2 + i * 2] & 0x0F;
+                        if scan_dc_table[i] > 1 || scan_ac_table[i] > 1 {
+                            return Err(err("SOS: Huffman table index out of range"));
+                        }
                     }
                     scan_data_offset = pos;
                     // Scan data runs from here to the EOI marker (last 0xFF 0xD9).
-                    let eoi_pos = data.windows(2).rposition(|w| w == [0xFF, 0xD9]);
+                    let eoi_pos = data[pos..]
+                        .windows(2)
+                        .rposition(|w| w == [0xFF, 0xD9])
+                        .map(|i| pos + i);
                     if eoi_pos.is_none() {
                         log::warn!(
                             "VA-API JPEG parser: no EOI marker found — stream may be truncated"
                         );
                     }
                     let eoi = eoi_pos.unwrap_or(data.len());
-                    scan_data_size = eoi.saturating_sub(pos);
+                    scan_data_size = eoi - pos;
                     break;
                 }
 
@@ -303,6 +324,9 @@ impl JpegHeaders {
             }
         }
 
+        if truncated {
+            return Err(err("JPEG stream truncated before SOF0/SOS"));
+        }
         if width == 0 || height == 0 {
             return Err(err("JPEG SOF0 not found or zero dimensions"));
         }
