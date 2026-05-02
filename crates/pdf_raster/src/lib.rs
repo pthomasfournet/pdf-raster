@@ -194,19 +194,22 @@ impl Default for SessionConfig {
 /// Constructed via [`PageSet::new`].  Clone is O(1) — the underlying storage is
 /// reference-counted.  Use as the [`RasterOptions::pages`] field to render a
 /// sparse subset of pages without visiting intermediate ones.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageSet(std::sync::Arc<[u32]>);
 
 impl PageSet {
-    /// Construct a `PageSet` from an arbitrary collection of 1-based page numbers.
+    /// Construct a `PageSet` from any collection of 1-based page numbers.
     ///
-    /// Sorts and deduplicates the input.
+    /// Accepts `Vec<u32>`, arrays, slices (via `.to_vec()`), and any
+    /// `IntoIterator<Item = u32>`.  The input is sorted and deduplicated
+    /// before storage.
     ///
     /// # Errors
     ///
-    /// Returns [`RasterError::InvalidOptions`] if `pages` is empty or any value is 0.
-    pub fn new(pages: impl Into<Vec<u32>>) -> Result<Self, RasterError> {
-        let mut v: Vec<u32> = pages.into();
+    /// Returns [`RasterError::InvalidOptions`] if the resulting set is empty
+    /// (all-zeros input counts) or any value is 0.
+    pub fn new(pages: impl IntoIterator<Item = u32>) -> Result<Self, RasterError> {
+        let mut v: Vec<u32> = pages.into_iter().collect();
         v.sort_unstable();
         v.dedup();
         if v.is_empty() {
@@ -229,15 +232,25 @@ impl PageSet {
     }
 
     /// The smallest page number in the set.
+    ///
+    /// # Panics
+    ///
+    /// Never panics on a correctly constructed `PageSet` — non-emptiness is a
+    /// structural invariant enforced by [`PageSet::new`].
     #[must_use]
     pub fn first(&self) -> u32 {
-        self.0[0]
+        *self.0.first().expect("PageSet is non-empty by invariant")
     }
 
     /// The largest page number in the set.
+    ///
+    /// # Panics
+    ///
+    /// Never panics on a correctly constructed `PageSet` — non-emptiness is a
+    /// structural invariant enforced by [`PageSet::new`].
     #[must_use]
     pub fn last(&self) -> u32 {
-        self.0[self.0.len() - 1]
+        *self.0.last().expect("PageSet is non-empty by invariant")
     }
 
     /// Number of pages in the set.
@@ -246,9 +259,10 @@ impl PageSet {
         self.0.len()
     }
 
-    /// Always `false` for a successfully constructed `PageSet`.
+    /// Always returns `false`.
     ///
-    /// Provided for API completeness and to satisfy `clippy::len_without_is_empty`.
+    /// A `PageSet` is guaranteed non-empty by construction; this method exists
+    /// to satisfy the `clippy::len_without_is_empty` lint.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -450,6 +464,40 @@ mod page_set_tests {
         let ps2 = ps.clone();
         // Both point to the same allocation — Arc pointer equality
         assert!(std::ptr::eq(ps.0.as_ptr(), ps2.0.as_ptr()));
+    }
+
+    #[test]
+    fn sole_zero_is_rejected() {
+        assert!(matches!(
+            PageSet::new(vec![0u32]),
+            Err(RasterError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn single_max_page_is_accepted() {
+        let ps = PageSet::new(vec![u32::MAX]).unwrap();
+        assert_eq!(ps.first(), u32::MAX);
+        assert_eq!(ps.last(), u32::MAX);
+        assert_eq!(ps.len(), 1);
+        assert!(!ps.is_empty());
+        assert!(ps.contains(u32::MAX));
+        assert!(!ps.contains(u32::MAX - 1));
+    }
+
+    #[test]
+    fn accepts_iterator_input() {
+        // IntoIterator covers slices, arrays, ranges, etc.
+        let ps = PageSet::new([3u32, 1, 2]).unwrap();
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps.first(), 1);
+    }
+
+    #[test]
+    fn equality_is_value_based() {
+        let a = PageSet::new(vec![1, 2, 3]).unwrap();
+        let b = PageSet::new([3u32, 1, 2]).unwrap(); // same content, different origin
+        assert_eq!(a, b);
     }
 
     #[test]
