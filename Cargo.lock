@@ -120,9 +120,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "bench"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "color 0.4.0",
+ "color 0.5.0",
  "raster",
  "vello_cpu",
 ]
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "color"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
 ]
@@ -427,9 +427,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "encode"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "color 0.4.0",
+ "color 0.5.0",
  "png 0.17.16",
  "raster",
 ]
@@ -562,9 +562,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "font"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "color 0.4.0",
+ "color 0.5.0",
  "freetype-rs",
  "quick_cache",
  "raster",
@@ -639,10 +639,10 @@ dependencies = [
 
 [[package]]
 name = "gpu"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
- "color 0.4.0",
+ "color 0.5.0",
  "cudarc",
  "log",
 ]
@@ -1066,10 +1066,10 @@ dependencies = [
 
 [[package]]
 name = "pdf-raster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
- "color 0.4.0",
+ "color 0.5.0",
  "encode",
  "env_logger",
  "log",
@@ -1081,18 +1081,18 @@ dependencies = [
 
 [[package]]
 name = "pdf_bridge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cc",
- "color 0.4.0",
+ "color 0.5.0",
  "log",
 ]
 
 [[package]]
 name = "pdf_interp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "color 0.4.0",
+ "color 0.5.0",
  "encode",
  "env_logger",
  "fax",
@@ -1111,9 +1111,9 @@ dependencies = [
 
 [[package]]
 name = "pdf_raster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "color 0.4.0",
+ "color 0.5.0",
  "gpu",
  "log",
  "lopdf",
@@ -1271,11 +1271,11 @@ checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
 
 [[package]]
 name = "raster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
- "color 0.4.0",
+ "color 0.5.0",
  "rayon",
 ]
 
