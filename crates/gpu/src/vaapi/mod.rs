@@ -147,14 +147,17 @@ unsafe impl Send for VapiDisplay {}
 
 // ── Cached context ────────────────────────────────────────────────────────────
 
-/// Cached `VAContext` and `VASurface` for a specific image resolution.
+/// Cached `VAContext` and `VASurface` for a specific image resolution and colour mode.
 ///
-/// Destroyed and recreated whenever the image dimensions change.  Eliminates
-/// the `vaCreateContext`/`vaCreateSurfaces` overhead on same-size decode runs
-/// (e.g. all pages of a scanned document share one resolution).
+/// Destroyed and recreated whenever the image dimensions or colour mode (gray vs. colour)
+/// change.  Eliminates the `vaCreateContext`/`vaCreateSurfaces` overhead on same-size,
+/// same-mode decode runs (e.g. all pages of a scanned document share one resolution).
 struct CachedCtx {
     width: u32,
     height: u32,
+    /// Whether the context was created for a grayscale image.
+    /// Part of the cache key — a gray and a colour context at the same dimensions are not interchangeable.
+    is_gray: bool,
     ctx: VAContextID,
     surface: VASurfaceID,
     /// Surface format actually allocated (YUV400 or YUV420).
@@ -168,9 +171,9 @@ struct CachedCtx {
 /// VA-API hardware JPEG decoder.
 ///
 /// Implements [`crate::traits::GpuJpegDecoder`].  Each instance owns one
-/// `VAConfig` and caches one `VAContext`+`VASurface` pair for the most
-/// recently seen image resolution.  When consecutive images share dimensions
-/// (common in scanned documents), the context is reused, avoiding the
+/// `VAConfig` and caches one `VAContext`+`VASurface` pair keyed on image
+/// resolution and colour mode (gray vs. colour).  When consecutive images share
+/// both (common in scanned documents), the context is reused, avoiding the
 /// `vaCreateContext`/`vaCreateSurfaces` round-trip overhead.
 ///
 /// `Send` but not `Sync` — use one instance per Rayon worker thread.
@@ -320,6 +323,7 @@ impl VapiJpegDecoder {
         Ok(CachedCtx {
             width,
             height,
+            is_gray,
             ctx,
             surface,
             surface_fmt,
@@ -375,11 +379,12 @@ impl VapiJpegDecoder {
         let h_u32 = u32::from(h.height);
         let is_gray = h.components == 1;
 
-        // Reuse the cached context+surface if dimensions match; recreate otherwise.
+        // Reuse the cached context+surface if dimensions and colour mode match.
+        // is_gray is part of the key because YUV400 and YUV420 surfaces are not interchangeable.
         let cache_valid = self
             .cached_ctx
             .as_ref()
-            .is_some_and(|c| c.width == w_u32 && c.height == h_u32);
+            .is_some_and(|c| c.width == w_u32 && c.height == h_u32 && c.is_gray == is_gray);
 
         if !cache_valid {
             // Destroy the old context+surface before creating new ones.
