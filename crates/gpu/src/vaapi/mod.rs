@@ -226,6 +226,92 @@ impl VapiJpegDecoder {
         })
     }
 
+    /// Allocate a VA-API surface and context for decoding images of `width × height`.
+    ///
+    /// Tries `YUV400` for grayscale; falls back to `YUV420` if the driver rejects it.
+    /// Returns a `CachedCtx` that must be destroyed (via `Drop` or explicitly) when done.
+    fn create_surface_and_context(
+        &self,
+        width: u32,
+        height: u32,
+        is_gray: bool,
+    ) -> Result<CachedCtx> {
+        let preferred_fmt = if is_gray { VA_RT_FORMAT_YUV400 } else { VA_RT_FORMAT_YUV420 };
+
+        let mut surface: VASurfaceID = VA_INVALID_ID;
+        let mut attrib = VaSurfaceAttrib::unused();
+
+        // SAFETY: dpy valid; surface, attrib are stack vars.
+        let surf_status = unsafe {
+            vaCreateSurfaces(
+                self.dpy.dpy,
+                preferred_fmt,
+                width,
+                height,
+                &raw mut surface,
+                1,
+                &raw mut attrib,
+                1,
+            )
+        };
+
+        // If YUV400 was rejected (some drivers don't implement it), retry with YUV420.
+        let (surf_status, surface_fmt) = if surf_status != VA_STATUS_SUCCESS && is_gray {
+            log::debug!("VA-API: YUV400 surface rejected ({surf_status}), retrying with YUV420");
+            surface = VA_INVALID_ID;
+            let s = unsafe {
+                vaCreateSurfaces(
+                    self.dpy.dpy,
+                    VA_RT_FORMAT_YUV420,
+                    width,
+                    height,
+                    &raw mut surface,
+                    1,
+                    &raw mut attrib,
+                    1,
+                )
+            };
+            (s, VA_RT_FORMAT_YUV420)
+        } else {
+            (surf_status, preferred_fmt)
+        };
+        check(surf_status, "vaCreateSurfaces")?;
+        assert_ne!(
+            surface, VA_INVALID_ID,
+            "vaCreateSurfaces succeeded but returned VA_INVALID_ID"
+        );
+
+        let mut ctx: VAContextID = VA_INVALID_ID;
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "width/height are derived from u16 JPEG SOF fields and cannot exceed 65535"
+        )]
+        let ctx_result = unsafe {
+            vaCreateContext(
+                self.dpy.dpy,
+                self.cfg,
+                width as c_int,
+                height as c_int,
+                VA_PROGRESSIVE,
+                &raw mut surface,
+                1,
+                &raw mut ctx,
+            )
+        };
+        if ctx_result != VA_STATUS_SUCCESS {
+            unsafe {
+                let _ = vaDestroySurfaces(self.dpy.dpy, &raw mut surface, 1);
+            }
+            check(ctx_result, "vaCreateContext")?;
+        }
+        assert_ne!(
+            ctx, VA_INVALID_ID,
+            "vaCreateContext succeeded but returned VA_INVALID_ID"
+        );
+
+        Ok(CachedCtx { width, height, ctx, surface, surface_fmt })
+    }
+
     /// Decode `data` synchronously, returning host-resident interleaved pixels.
     ///
     /// Parses the JPEG headers, creates a per-resolution context and surface,
@@ -879,5 +965,24 @@ mod tests {
         // This test only compiles — hardware is not available in CI.
         // The real cache-hit test requires hardware and is marked #[ignore].
         let _: fn(&str) -> Result<VapiJpegDecoder> = VapiJpegDecoder::new;
+    }
+
+    #[test]
+    #[ignore = "requires VA-API hardware"]
+    fn create_surface_and_context_returns_valid_ids() {
+        let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129")
+            .expect("VA-API unavailable");
+        // Create a 16×16 YUV420 context; just check it doesn't error.
+        let cached = dec
+            .create_surface_and_context(16, 16, false)
+            .expect("create failed");
+        assert_ne!(cached.ctx, VA_INVALID_ID);
+        assert_ne!(cached.surface, VA_INVALID_ID);
+        // Clean up manually since Drop handles it now.
+        unsafe {
+            let _ = vaDestroyContext(dec.dpy.dpy, cached.ctx);
+            let mut surface = cached.surface;
+            let _ = vaDestroySurfaces(dec.dpy.dpy, &raw mut surface, 1);
+        }
     }
 }
