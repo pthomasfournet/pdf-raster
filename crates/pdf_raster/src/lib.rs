@@ -502,7 +502,6 @@ mod page_set_tests {
 
     #[test]
     fn raster_options_with_pages_none_is_valid() {
-        // Verifies the field exists and validate_opts accepts it
         let opts = RasterOptions {
             dpi: 150.0,
             first_page: 1,

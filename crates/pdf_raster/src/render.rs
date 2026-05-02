@@ -797,4 +797,22 @@ mod channel_tests {
         };
         assert_eq!(i, c, "validation error messages must be identical");
     }
+
+    #[test]
+    fn pages_some_bypasses_first_last_page_validation() {
+        // When pages=Some, first_page/last_page are documented as ignored —
+        // validate_opts must not reject zero-value or inverted defaults.
+        let ps = crate::PageSet::new(vec![3u32]).unwrap();
+        let opts = RasterOptions {
+            dpi: 72.0,
+            first_page: 0, // would normally be rejected
+            last_page: 0,  // would normally be rejected (< first_page after clamping)
+            deskew: false,
+            pages: Some(ps),
+        };
+        assert!(
+            validate_opts(&opts).is_none(),
+            "zero first/last_page must be accepted when pages=Some"
+        );
+    }
 }
