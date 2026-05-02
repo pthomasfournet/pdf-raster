@@ -149,7 +149,7 @@ unsafe impl Send for VapiDisplay {}
 
 /// Cached VAContext and VASurface for a specific image resolution.
 ///
-/// Destroyed and recreated whenever the image dimensions change.  Eliminated
+/// Destroyed and recreated whenever the image dimensions change.  Eliminates
 /// the `vaCreateContext`/`vaCreateSurfaces` overhead on same-size decode runs
 /// (e.g. all pages of a scanned document share one resolution).
 struct CachedCtx {
@@ -176,7 +176,10 @@ pub struct VapiJpegDecoder {
     cached_ctx: Option<CachedCtx>,
 }
 
-// SAFETY: VapiDisplay is Send; VAConfigID is a u32 with no thread affinity.
+// SAFETY: VapiDisplay is Send; VAConfigID, VAContextID, VASurfaceID are all
+// c_uint handles with no thread affinity — the VA-API threading contract
+// requires that a given VAContext is used only from its owning thread, which
+// is enforced by VapiJpegDecoder being Send but not Sync.
 unsafe impl Send for VapiJpegDecoder {}
 
 impl VapiJpegDecoder {
@@ -216,7 +219,11 @@ impl VapiJpegDecoder {
             "vaCreateConfig succeeded but returned VA_INVALID_ID"
         );
 
-        Ok(Self { dpy, cfg, cached_ctx: None })
+        Ok(Self {
+            dpy,
+            cfg,
+            cached_ctx: None,
+        })
     }
 
     /// Decode `data` synchronously, returning host-resident interleaved pixels.
