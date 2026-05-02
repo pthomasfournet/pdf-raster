@@ -27,6 +27,15 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.4.0 (May 2026)
+
+**New since v0.3.0:**
+
+- **`--backend auto|cpu|cuda|vaapi` flag** — `BackendPolicy` enum (`Auto`, `CpuOnly`, `ForceCuda`, `ForceVaapi`) exposed on `SessionConfig`; `RasterError::BackendUnavailable` for forced-backend failures. CLI `--backend` and `--vaapi-device` flags wired through; `vaapi` feature exposed on the CLI crate.
+- **Compositing correctness hardening** — 5 bugs in the general pipe, 4 safety assertions; AA gamma table values corrected with exhaustive test; `ncomps` parameter removed from `draw_image`/`blit_image` (derived from pixel type instead).
+- **Bug fixes** — TJ kern ignores Tz correctly; FreeType init error propagated instead of panicking; `col_to_byte` uses saturating cast; PTX compilation now triggered correctly on `gpu-aa`/`gpu-icc` builds; PDF page cache evicted before each timed bench run.
+- **Refactors** — `finish_pixel` helper extracted; `compute_a_src` helper extracted eliminating duplicated alpha logic; `page/mod.rs` split into focused sub-modules.
+
 ### v0.3.0 (May 2026)
 
 Phases 5 and 6 are complete and integrated.  All core roadmap milestones done.

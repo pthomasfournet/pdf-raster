@@ -67,7 +67,7 @@ Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.3.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0" }
 ```
 
 For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
@@ -75,10 +75,10 @@ For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
 ```toml
 [dependencies]
 # CUDA GPU features (NVIDIA only):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.3.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
 
 # VA-API (AMD/Intel iGPU on Linux — libva required):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.3.0", features = ["vaapi"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0", features = ["vaapi"] }
 ```
 
 To track the latest commit on `master` instead of a pinned tag:

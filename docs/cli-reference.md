@@ -119,7 +119,7 @@ DPI values must be positive finite numbers; non-positive values are rejected at 
 | `--backend auto\|cpu\|cuda\|vaapi` | `auto` | Compute backend for image decoding and GPU fills. |
 | `--vaapi-device PATH` | `/dev/dri/renderD128` | VA-API DRM render node (only used with `auto` or `vaapi`). |
 
-**`auto`** — GPU when available, silent CPU fallback (same as pre-v0.3.1).
+**`auto`** — GPU when available, silent CPU fallback (same as pre-v0.4.0).
 
 **`cpu`** — CPU only. All GPU init is skipped entirely. Use this for benchmarking, debugging, or on machines without a GPU.
 

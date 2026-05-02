@@ -202,7 +202,7 @@ pub enum BackendPolicy {
 }
 ```
 
-Controls which compute backend is used. `Auto` matches pre-v0.3.1 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active.
+Controls which compute backend is used. `Auto` matches pre-v0.4.0 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active.
 
 ---
 
