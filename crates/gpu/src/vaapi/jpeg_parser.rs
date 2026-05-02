@@ -42,8 +42,7 @@ impl JpegHeaders {
     /// # Errors
     ///
     /// Returns [`VapiError::BadJpeg`] on any parse error: missing SOI, truncated
-    /// segments, progressive JPEG (not supported by `VAEntrypointVLD`), unknown
-    /// segment structure, or missing SOF0/SOS markers.
+    /// segments, unknown segment structure, or missing SOF0/SOS markers.
     #[expect(
         clippy::too_many_lines,
         reason = "single-function JPEG header parser — the state machine naturally spans many lines; splitting mid-loop would reduce clarity"
@@ -284,13 +283,6 @@ impl JpegHeaders {
                     break;
                 }
 
-                // SOF2 — progressive DCT; not supported by VAEntrypointVLD.
-                0xC2 => {
-                    return Err(VapiError::BadJpeg(
-                        "progressive JPEG not supported by VA-API VLD entrypoint".into(),
-                    ));
-                }
-
                 // APP0–APP15 (0xE0–0xEF), APP-style / COM (0xF0–0xFE) — length-prefixed; skip.
                 0xE0..=0xFE => {
                     let seg_len = read_u16!() as usize;
@@ -412,5 +404,37 @@ mod tests {
             JpegHeaders::parse(&[0xFF, 0xD8]),
             Err(VapiError::BadJpeg(_))
         ));
+    }
+
+    #[test]
+    fn parse_does_not_reject_sof2_directly() {
+        // jpeg_parser::parse() should no longer know about progressive JPEG;
+        // the caller (decode_sync) is responsible for routing.
+        // A SOF2-only stream still fails (no SOF0 found), but the *reason*
+        // must not mention "progressive".
+        let minimal_sof2: &[u8] = &[
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC2, // SOF2
+            0x00, 0x11, // length = 17
+            0x08, // precision
+            0x00, 0x10, 0x00, 0x10, // height=16, width=16
+            0x03, // components
+            0x01, 0x11, 0x00, // comp 1
+            0x02, 0x11, 0x01, // comp 2
+            0x03, 0x11, 0x01, // comp 3
+            0xFF, 0xD9, // EOI
+        ];
+        let err = JpegHeaders::parse(minimal_sof2)
+            .err()
+            .expect("SOF2-only stream must fail");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("progressive"),
+            "parser should not reject progressive JPEG; got: {msg}"
+        );
+        assert!(
+            msg.contains("SOF0"),
+            "expected SOF0-not-found error; got: {msg}"
+        );
     }
 }
