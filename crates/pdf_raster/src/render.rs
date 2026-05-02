@@ -626,6 +626,7 @@ mod channel_tests {
             first_page: 1,
             last_page: 1,
             deskew: false,
+            pages: None,
         }
     }
 

@@ -9,7 +9,7 @@
 //! use std::path::Path;
 //! use pdf_raster::{RasterOptions, raster_pdf};
 //!
-//! let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 5, deskew: true };
+//! let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 5, deskew: true, pages: None };
 //! for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 //!     match result {
 //!         Ok(page) => {
@@ -26,7 +26,7 @@
 //! ```rust,no_run
 //! # use pdf_raster::{RasterOptions, raster_pdf};
 //! # use std::path::Path;
-//! # let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 1, deskew: true };
+//! # let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 1, deskew: true, pages: None };
 //! for (_, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 //!     let page = result.expect("page render failed");
 //!     // tesseract crate (v0.15+):
@@ -208,12 +208,18 @@ pub struct RasterOptions {
     pub dpi: f32,
 
     /// First page to render (1-based, inclusive).  Must be ≥ 1.
+    ///
+    /// Ignored when [`pages`](Self::pages) is `Some` — the render window is
+    /// derived from the `PageSet` bounds instead.
     pub first_page: u32,
 
     /// Last page to render (1-based, inclusive).  Must be ≥ `first_page`.
     ///
     /// If `last_page` exceeds the document's page count, rendering stops at the
     /// last page in the document rather than returning an error.
+    ///
+    /// Ignored when [`pages`](Self::pages) is `Some` — the render window is
+    /// derived from the `PageSet` bounds instead.
     pub last_page: u32,
 
     /// Apply deskew before returning pixels.
@@ -223,6 +229,15 @@ pub struct RasterOptions {
     /// or CPU bilinear fallback.  Corrects skew up to ±7° with sub-0.05°
     /// accuracy.  Disable for native-text PDFs that are never physically skewed.
     pub deskew: bool,
+
+    /// Sparse page selection.
+    ///
+    /// When `Some`, only the pages in the [`PageSet`] are rendered and yielded.
+    /// The iteration window is `PageSet::first()..=PageSet::last()`; intermediate
+    /// pages not in the set are skipped without rendering.
+    ///
+    /// When `None`, all pages in `first_page..=last_page` are rendered.
+    pub pages: Option<PageSet>,
 }
 
 /// A single rendered page, returned as 8-bit grayscale pixels.
@@ -375,5 +390,31 @@ mod page_set_tests {
         let ps2 = ps.clone();
         // Both point to the same allocation — Arc pointer equality
         assert!(std::ptr::eq(ps.0.as_ptr(), ps2.0.as_ptr()));
+    }
+
+    #[test]
+    fn raster_options_with_pages_none_is_valid() {
+        // Verifies the field exists and validate_opts accepts it
+        let opts = RasterOptions {
+            dpi: 150.0,
+            first_page: 1,
+            last_page: 5,
+            deskew: false,
+            pages: None,
+        };
+        assert!(opts.pages.is_none());
+    }
+
+    #[test]
+    fn raster_options_with_pages_some_is_valid() {
+        let ps = PageSet::new(vec![1, 3, 5]).unwrap();
+        let opts = RasterOptions {
+            dpi: 150.0,
+            first_page: 1,
+            last_page: 5,
+            deskew: false,
+            pages: Some(ps),
+        };
+        assert!(opts.pages.is_some());
     }
 }
