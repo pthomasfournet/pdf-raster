@@ -424,6 +424,13 @@ struct RenderState {
     current_page: u32,
 }
 
+fn page_window(opts: &RasterOptions) -> std::ops::RangeInclusive<u32> {
+    match &opts.pages {
+        Some(ps) => ps.first()..=ps.last(),
+        None => opts.first_page..=opts.last_page,
+    }
+}
+
 fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
     if opts.dpi <= 0.0 || !opts.dpi.is_finite() {
         return Some(RasterError::InvalidOptions(format!(
@@ -431,16 +438,18 @@ fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
             opts.dpi
         )));
     }
-    if opts.first_page == 0 {
-        return Some(RasterError::InvalidOptions(
-            "first_page must be ≥ 1 (pages are 1-based)".to_owned(),
-        ));
-    }
-    if opts.first_page > opts.last_page {
-        return Some(RasterError::InvalidOptions(format!(
-            "first_page ({}) > last_page ({})",
-            opts.first_page, opts.last_page
-        )));
+    if opts.pages.is_none() {
+        if opts.first_page == 0 {
+            return Some(RasterError::InvalidOptions(
+                "first_page must be ≥ 1 (pages are 1-based)".to_owned(),
+            ));
+        }
+        if opts.first_page > opts.last_page {
+            return Some(RasterError::InvalidOptions(format!(
+                "first_page ({}) > last_page ({})",
+                opts.first_page, opts.last_page
+            )));
+        }
     }
     None
 }
@@ -455,8 +464,9 @@ pub fn render_pages(
         };
     }
 
+    let window = page_window(opts);
     let state = open_session(path, &SessionConfig::default()).map(|session| RenderState {
-        current_page: opts.first_page,
+        current_page: *window.start(),
         session,
         opts: opts.clone(),
     });
@@ -480,18 +490,26 @@ impl Iterator for PageIter {
                 Some((1, Err(e)))
             }
             Ok(state) => {
-                if state.current_page > state.opts.last_page
-                    || state.current_page > state.session.total_pages
-                {
-                    self.state = None;
-                    return None;
+                let window = page_window(&state.opts);
+                loop {
+                    if state.current_page > *window.end()
+                        || state.current_page > state.session.total_pages
+                    {
+                        self.state = None;
+                        return None;
+                    }
+
+                    let page_num = state.current_page;
+                    state.current_page += 1;
+
+                    if let Some(ps) = &state.opts.pages {
+                        if !ps.contains(page_num) {
+                            continue;
+                        }
+                    }
+
+                    return Some((page_num, render_one(state, page_num)));
                 }
-
-                let page_num = state.current_page;
-                state.current_page += 1;
-
-                let result = render_one(state, page_num);
-                Some((page_num, result))
             }
         }
     }
@@ -527,15 +545,21 @@ pub fn render_channel(
             }
         };
 
+        let window = page_window(&opts_owned);
         let state = RenderState {
-            current_page: opts_owned.first_page,
+            current_page: *window.start(),
             session,
             opts: opts_owned,
         };
 
-        let last = state.opts.last_page.min(state.session.total_pages);
+        let last = window.end().min(&state.session.total_pages);
 
-        for page_num in state.opts.first_page..=last {
+        for page_num in *window.start()..=*last {
+            if let Some(ps) = &state.opts.pages {
+                if !ps.contains(page_num) {
+                    continue;
+                }
+            }
             let result = render_one(&state, page_num);
             if tx.send((page_num, result)).is_err() {
                 return;
@@ -679,6 +703,74 @@ mod channel_tests {
             "error item must be delivered even with capacity=0"
         );
         assert!(rx.recv().is_err(), "channel must be closed after error");
+    }
+
+    #[test]
+    fn sparse_pages_only_yields_requested_pages() {
+        // corpus-01 is a small native-text PDF — use pages 1 and 3 from it.
+        // If the doc has fewer than 3 pages, the test still passes (page 3 won't arrive).
+        let ps = crate::PageSet::new(vec![1, 3]).unwrap();
+        let opts = RasterOptions {
+            dpi: 72.0,
+            first_page: 1,  // ignored when pages is Some
+            last_page: 100, // ignored when pages is Some
+            deskew: false,
+            pages: Some(ps),
+        };
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let path = std::path::Path::new(&manifest_dir)
+            .parent()
+            .expect("parent dir should exist")
+            .parent()
+            .expect("grandparent dir should exist")
+            .join("tests/fixtures/corpus-01-native-text-small.pdf");
+        // Collect all yielded page numbers from the iterator
+        let yielded: Vec<u32> = render_pages(path.as_path(), &opts)
+            .filter_map(|(pn, r)| r.ok().map(|_| pn))
+            .collect();
+        assert!(!yielded.is_empty(), "expected at least one page to render successfully");
+        // Must only contain pages 1 and/or 3 — no 2, no 4+
+        for pn in &yielded {
+            assert!(
+                *pn == 1 || *pn == 3,
+                "unexpected page {pn} in sparse render output"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_pages_channel_only_yields_requested_pages() {
+        let ps = crate::PageSet::new(vec![1, 3]).unwrap();
+        let opts = RasterOptions {
+            dpi: 72.0,
+            first_page: 1,
+            last_page: 100,
+            deskew: false,
+            pages: Some(ps),
+        };
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let path = std::path::Path::new(&manifest_dir)
+            .parent()
+            .expect("parent dir should exist")
+            .parent()
+            .expect("grandparent dir should exist")
+            .join("tests/fixtures/corpus-01-native-text-small.pdf");
+        let rx = render_channel(path.as_path(), &opts, 4);
+        let mut yielded = Vec::new();
+        while let Ok((pn, r)) = rx.recv() {
+            if r.is_ok() {
+                yielded.push(pn);
+            }
+        }
+        assert!(!yielded.is_empty(), "expected at least one page to render successfully");
+        for pn in &yielded {
+            assert!(
+                *pn == 1 || *pn == 3,
+                "unexpected page {pn} in sparse channel output"
+            );
+        }
     }
 
     #[test]
