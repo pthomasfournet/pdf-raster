@@ -127,6 +127,74 @@ impl Default for SessionConfig {
     }
 }
 
+// ── PageSet ───────────────────────────────────────────────────────────────────
+
+/// A validated, sorted, deduplicated set of 1-based page numbers.
+///
+/// Constructed via [`PageSet::new`].  Clone is O(1) — the underlying storage is
+/// reference-counted.  Use as the [`RasterOptions::pages`] field to render a
+/// sparse subset of pages without visiting intermediate ones.
+#[derive(Debug, Clone)]
+pub struct PageSet(std::sync::Arc<[u32]>);
+
+impl PageSet {
+    /// Construct a `PageSet` from an arbitrary collection of 1-based page numbers.
+    ///
+    /// Sorts and deduplicates the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RasterError::InvalidOptions`] if `pages` is empty or any value is 0.
+    pub fn new(pages: impl Into<Vec<u32>>) -> Result<Self, RasterError> {
+        let mut v: Vec<u32> = pages.into();
+        v.sort_unstable();
+        v.dedup();
+        if v.is_empty() {
+            return Err(RasterError::InvalidOptions(
+                "PageSet must contain at least one page".to_owned(),
+            ));
+        }
+        if v[0] == 0 {
+            return Err(RasterError::InvalidOptions(
+                "PageSet contains page 0 — pages are 1-based".to_owned(),
+            ));
+        }
+        Ok(Self(v.into_boxed_slice().into()))
+    }
+
+    /// Returns `true` if `page` is in this set.  O(log n).
+    #[must_use]
+    pub fn contains(&self, page: u32) -> bool {
+        self.0.binary_search(&page).is_ok()
+    }
+
+    /// The smallest page number in the set.
+    #[must_use]
+    pub fn first(&self) -> u32 {
+        self.0[0]
+    }
+
+    /// The largest page number in the set.
+    #[must_use]
+    pub fn last(&self) -> u32 {
+        self.0[self.0.len() - 1]
+    }
+
+    /// Number of pages in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false` for a successfully constructed `PageSet`.
+    ///
+    /// Provided for API completeness and to satisfy `clippy::len_without_is_empty`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Options controlling how pages are rendered.
@@ -254,4 +322,58 @@ pub fn render_channel(
     capacity: usize,
 ) -> std::sync::mpsc::Receiver<(u32, Result<RenderedPage, RasterError>)> {
     render::render_channel(path, opts, capacity)
+}
+
+#[cfg(test)]
+mod page_set_tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_is_rejected() {
+        assert!(matches!(
+            PageSet::new(vec![]),
+            Err(RasterError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn zero_page_is_rejected() {
+        assert!(matches!(
+            PageSet::new(vec![0, 1, 2]),
+            Err(RasterError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn valid_input_is_accepted() {
+        let ps = PageSet::new(vec![3, 1, 2]).unwrap();
+        assert_eq!(ps.first(), 1);
+        assert_eq!(ps.last(), 3);
+        assert_eq!(ps.len(), 3);
+        assert!(!ps.is_empty());
+    }
+
+    #[test]
+    fn duplicates_are_deduplicated() {
+        let ps = PageSet::new(vec![2, 1, 2, 3, 1]).unwrap();
+        assert_eq!(ps.len(), 3);
+    }
+
+    #[test]
+    fn contains_works() {
+        let ps = PageSet::new(vec![1, 5, 10]).unwrap();
+        assert!(ps.contains(1));
+        assert!(ps.contains(5));
+        assert!(ps.contains(10));
+        assert!(!ps.contains(2));
+        assert!(!ps.contains(11));
+    }
+
+    #[test]
+    fn clone_is_cheap() {
+        let ps = PageSet::new(vec![1, 2, 3]).unwrap();
+        let ps2 = ps.clone();
+        // Both point to the same allocation — Arc pointer equality
+        assert!(std::ptr::eq(ps.0.as_ptr(), ps2.0.as_ptr()));
+    }
 }
