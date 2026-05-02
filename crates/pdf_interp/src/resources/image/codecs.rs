@@ -15,10 +15,10 @@ use crate::resources::dict_ext::DictExt;
 // ── GPU JPEG acceleration (nvJPEG and/or VA-API) ──────────────────────────────
 
 #[cfg(feature = "nvjpeg")]
-use gpu::nvjpeg::{JpegColorSpace as GpuCs, NvJpegDecoder};
+use gpu::nvjpeg::NvJpegDecoder;
 
 #[cfg(feature = "vaapi")]
-use gpu::vaapi::{JpegColorSpace as VaapiCs, VapiJpegDecoder};
+use gpu::vaapi::VapiJpegDecoder;
 
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
@@ -387,24 +387,21 @@ pub(super) fn decode_dct(
     if let Some(dec) = gpu {
         // Only dispatch to GPU when the image area meets the threshold.
         // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
-        // decode_dct_gpu returns None for 4-component images, which causes
-        // the fall-through to the CPU path below that handles CMYK→RGB.
+        // decode_dct_gpu_path returns None for 4-component images (CMYK),
+        // which fall through to the CPU path below that handles CMYK→RGB.
         if area >= super::GPU_JPEG_THRESHOLD_PX {
-            if let Some(img) = decode_dct_gpu(data, pdf_w, pdf_h, dec) {
+            if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
                 return Some(img);
             }
-            // GPU decode failed (e.g. unsupported encoding) — fall through.
-            log::debug!("image: DCTDecode: nvJPEG path failed, retrying");
         }
     }
 
     // ── VA-API fast path (fallback GPU decoder — AMD/Intel iGPU) ─────────────
     #[cfg(feature = "vaapi")]
     if let (Some(dec), true) = (vaapi, area >= super::GPU_JPEG_THRESHOLD_PX) {
-        if let Some(img) = decode_dct_vaapi(data, pdf_w, pdf_h, dec) {
+        if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
             return Some(img);
         }
-        log::debug!("image: DCTDecode: VA-API path failed, retrying on CPU");
     }
 
     // ── CPU path ──────────────────────────────────────────────────────────────
@@ -514,100 +511,41 @@ pub(super) fn decode_dct(
     }
 }
 
-/// GPU-accelerated DCT decode via nvJPEG.
+/// Attempt JPEG decode via any [`gpu::GpuJpegDecoder`] implementation.
 ///
-/// Returns `None` if the component count is unsupported (e.g. CMYK, which
-/// nvJPEG cannot output as RGBI) or if any CUDA API call fails.  The caller
-/// must fall back to the CPU path when `None` is returned.
-///
-/// The stream is synchronised inside `NvJpegDecoder::decode_sync` before
-/// pixel bytes are returned, so the result is safe to use immediately.
-#[cfg(feature = "nvjpeg")]
-fn decode_dct_gpu(
+/// Returns `None` if the decoder rejects the image (unsupported encoding,
+/// component count, or any transient decode error). The caller must then
+/// fall through to the CPU path.
+#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+fn decode_dct_gpu_path<D: gpu::GpuJpegDecoder>(
     data: &[u8],
     pdf_w: u32,
     pdf_h: u32,
-    dec: &mut NvJpegDecoder,
+    dec: &mut D,
 ) -> Option<ImageDescriptor> {
-    let img = match dec.decode_sync(data) {
-        Ok(img) => img,
-        Err(gpu::nvjpeg::NvJpegError::UnsupportedComponents(_)) => {
-            // CMYK or other unsupported component count — expected, fall back silently.
+    use gpu::DecodedImage;
+
+    let decoded: DecodedImage = dec
+        .decode_jpeg(data, pdf_w, pdf_h)
+        .map_err(|e| log::warn!("image: DCTDecode: GPU path failed: {e}"))
+        .ok()?;
+
+    let color_space = match decoded.components {
+        1 => ImageColorSpace::Gray,
+        3 => ImageColorSpace::Rgb,
+        n => {
+            log::debug!("image: DCTDecode: GPU returned unsupported component count {n}");
             return None;
         }
-        Err(e) => {
-            // Unexpected CUDA/nvJPEG failure — log at warn so it's visible.
-            log::warn!("image: DCTDecode GPU: unexpected nvJPEG error: {e}");
-            return None;
-        }
-    };
-
-    if img.width != pdf_w || img.height != pdf_h {
-        log::debug!(
-            "image: DCTDecode GPU: PDF dict says {pdf_w}×{pdf_h}, nvJPEG reports {}×{} — using nvJPEG dims",
-            img.width,
-            img.height,
-        );
-    }
-
-    let color_space = match img.color_space {
-        GpuCs::Gray => ImageColorSpace::Gray,
-        GpuCs::Rgb => ImageColorSpace::Rgb,
     };
 
     Some(ImageDescriptor {
-        width: img.width,
-        height: img.height,
+        width: decoded.width,
+        height: decoded.height,
         color_space,
-        data: img.data,
-        smask: None,
+        data: decoded.data,
         filter: ImageFilter::Raw,
-    })
-}
-
-/// VA-API hardware DCT decode — AMD/Intel iGPU fallback when nvJPEG is absent.
-///
-/// Returns `None` for CMYK (4-component) JPEG or on any VA-API error.  The
-/// caller must fall through to the CPU path when `None` is returned.
-#[cfg(feature = "vaapi")]
-fn decode_dct_vaapi(
-    data: &[u8],
-    pdf_w: u32,
-    pdf_h: u32,
-    dec: &mut VapiJpegDecoder,
-) -> Option<ImageDescriptor> {
-    use gpu::vaapi::Error as VapiError;
-    let img = match dec.decode_sync(data, pdf_w, pdf_h) {
-        Ok(img) => img,
-        Err(VapiError::UnsupportedComponents(_)) => {
-            return None;
-        }
-        Err(e) => {
-            log::warn!("image: DCTDecode VA-API: {e}");
-            return None;
-        }
-    };
-
-    if img.width != pdf_w || img.height != pdf_h {
-        log::debug!(
-            "image: DCTDecode VA-API: PDF dict says {pdf_w}×{pdf_h}, VA-API reports {}×{} — using VA-API dims",
-            img.width,
-            img.height,
-        );
-    }
-
-    let color_space = match img.color_space {
-        VaapiCs::Gray => ImageColorSpace::Gray,
-        VaapiCs::Rgb => ImageColorSpace::Rgb,
-    };
-
-    Some(ImageDescriptor {
-        width: img.width,
-        height: img.height,
-        color_space,
-        data: img.data,
         smask: None,
-        filter: ImageFilter::Raw,
     })
 }
 
@@ -1071,5 +1009,115 @@ mod tests {
         let doc = lopdf::Document::new();
         let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
         assert!(result.is_none());
+    }
+
+    // ── decode_dct_gpu_path ───────────────────────────────────────────────────
+
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    mod gpu_path_tests {
+        use super::*;
+
+        struct AlwaysGray;
+
+        impl gpu::GpuJpegDecoder for AlwaysGray {
+            fn decode_jpeg(
+                &mut self,
+                _data: &[u8],
+                _width: u32,
+                _height: u32,
+            ) -> Result<gpu::DecodedImage, gpu::GpuDecodeError> {
+                Ok(gpu::DecodedImage {
+                    data: vec![128u8; 4],
+                    width: 2,
+                    height: 2,
+                    components: 1,
+                })
+            }
+        }
+
+        struct AlwaysFail;
+
+        impl gpu::GpuJpegDecoder for AlwaysFail {
+            fn decode_jpeg(
+                &mut self,
+                _data: &[u8],
+                _width: u32,
+                _height: u32,
+            ) -> Result<gpu::DecodedImage, gpu::GpuDecodeError> {
+                Err(gpu::GpuDecodeError::new(std::io::Error::other(
+                    "simulated failure",
+                )))
+            }
+        }
+
+        struct AlwaysRgb;
+
+        impl gpu::GpuJpegDecoder for AlwaysRgb {
+            fn decode_jpeg(
+                &mut self,
+                _data: &[u8],
+                _width: u32,
+                _height: u32,
+            ) -> Result<gpu::DecodedImage, gpu::GpuDecodeError> {
+                Ok(gpu::DecodedImage {
+                    data: vec![255u8; 12],
+                    width: 2,
+                    height: 2,
+                    components: 3,
+                })
+            }
+        }
+
+        struct AlwaysCmyk;
+
+        impl gpu::GpuJpegDecoder for AlwaysCmyk {
+            fn decode_jpeg(
+                &mut self,
+                _data: &[u8],
+                _width: u32,
+                _height: u32,
+            ) -> Result<gpu::DecodedImage, gpu::GpuDecodeError> {
+                Ok(gpu::DecodedImage {
+                    data: vec![0u8; 16],
+                    width: 2,
+                    height: 2,
+                    components: 4,
+                })
+            }
+        }
+
+        #[test]
+        fn generic_gpu_path_gray() {
+            let mut dec = AlwaysGray;
+            let result = decode_dct_gpu_path(&[], 2, 2, &mut dec);
+            let img = result.expect("should succeed");
+            assert_eq!(img.color_space, ImageColorSpace::Gray);
+            assert_eq!(img.width, 2);
+            assert_eq!(img.height, 2);
+            assert_eq!(img.data, vec![128u8; 4]);
+        }
+
+        #[test]
+        fn generic_gpu_path_failure_returns_none() {
+            let mut dec = AlwaysFail;
+            let result = decode_dct_gpu_path(&[], 2, 2, &mut dec);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn generic_gpu_path_rgb() {
+            let mut dec = AlwaysRgb;
+            let result = decode_dct_gpu_path(&[], 2, 2, &mut dec);
+            let img = result.expect("should succeed");
+            assert_eq!(img.color_space, ImageColorSpace::Rgb);
+            assert_eq!(img.data.len(), 12);
+        }
+
+        #[test]
+        fn generic_gpu_path_rejects_cmyk() {
+            let mut dec = AlwaysCmyk;
+            let result = decode_dct_gpu_path(&[], 2, 2, &mut dec);
+            assert!(result.is_none());
+        }
     }
 }
