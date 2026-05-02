@@ -21,11 +21,11 @@
 //! | Trait | Impl | Feature flag |
 //! |---|---|---|
 //! | [`GpuJpegDecoder`] | [`NvJpegDecoder`](crate::nvjpeg::NvJpegDecoder) | `nvjpeg` |
+//! | [`GpuJpegDecoder`] | [`VapiJpegDecoder`](crate::vaapi::VapiJpegDecoder) | `vaapi` |
 //! | [`GpuJpeg2kDecoder`] | [`NvJpeg2kDecoder`](crate::nvjpeg2k::NvJpeg2kDecoder) | `nvjpeg2k` |
 //! | [`GpuCompute`] | [`GpuCtx`](crate::GpuCtx) | `gpu-aa` or `gpu-icc` |
 //!
-//! VA-API and Metal impls will be added when the respective hardware is
-//! available (see `ROADMAP_INTEL.md` Phase C and Phase F).
+//! Metal (Apple Silicon) is planned — see `ROADMAP_INTEL.md` Phase F.
 
 use std::fmt;
 

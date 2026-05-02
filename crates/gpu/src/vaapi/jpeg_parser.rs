@@ -208,8 +208,9 @@ impl JpegHeaders {
                         off += 16;
                         let total_codes: usize = num_codes.iter().map(|&n| n as usize).sum();
 
-                        // Slot: DC uses 0/2, AC uses 1/3.
-                        // huffman_entries layout: [luma_DC, luma_AC, chroma_DC, chroma_AC].
+                        // huffman_entries: [luma_DC=0, luma_AC=1, chroma_DC=2, chroma_AC=3].
+                        // th=0 → luma (slots 0,1); th=1 → chroma (slots 2,3).
+                        // tc=0 → DC (even slots); tc=1 → AC (odd slots).
                         let slot = th * 2 + tc as usize;
                         debug_assert!(
                             slot < 4,
@@ -432,10 +433,10 @@ mod tests {
 
     #[test]
     fn parse_does_not_reject_sof2_directly() {
-        // jpeg_parser::parse() should no longer know about progressive JPEG;
-        // the caller (decode_sync) is responsible for routing.
-        // A SOF2-only stream still fails (no SOF0 found), but the *reason*
-        // must not mention "progressive".
+        // The parser only handles SOF0 (baseline); a SOF2 stream still fails
+        // because no SOF0 is found.  The error must not mention "progressive" —
+        // progressive detection and routing is the caller's responsibility
+        // (see `decode_sync` / `jpeg_sof_type`).
         let minimal_sof2: &[u8] = &[
             0xFF, 0xD8, // SOI
             0xFF, 0xC2, // SOF2

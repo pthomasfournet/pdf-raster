@@ -349,17 +349,16 @@ fn append_ccitt_row(
 /// # CMYK handling
 ///
 /// JPEG CMYK images in PDF store ink densities in *inverted* form: a byte value
-/// of 0 means *full ink*, 255 means *no ink* (the complement of the usual
-/// convention).  The JPEG decoder returns raw bytes in this form.  We convert to RGB
-/// using:
+/// of 0 means *full ink*, 255 means *no ink*.  The JPEG decoder returns raw
+/// bytes in this inverted form.  Converting to RGB:
 ///
 /// ```text
-/// R = (255 - C) * (255 - K) / 255
+/// R = (255 - C_raw) * (255 - K_raw) / 255
 /// ```
 ///
-/// where `C`, `K` are the complemented (i.e. raw) CMYK byte values.  This is
-/// equivalent to the standard CMY+K → RGB conversion applied to the inverted
-/// ink densities.
+/// where `C_raw` and `K_raw` are the raw (inverted) byte values.  The `255 -`
+/// term converts each inverted value to a normal ink density before applying
+/// the standard CMY+K → RGB formula.
 #[expect(
     clippy::too_many_lines,
     reason = "GPU dispatch paths (nvjpeg, vaapi) plus the CPU decode path are each short; \

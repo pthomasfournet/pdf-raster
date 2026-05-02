@@ -3,9 +3,9 @@
 //! Wraps `libva`/`libva-drm` via raw FFI (no bindgen — the VA-API surface we
 //! use is small and stable, mirroring the CUDA driver API approach in `nvjpeg`).
 //!
-//! On the dev machine this targets the AMD Raphael iGPU (`renderD129`, VCN 4.0.0,
-//! Mesa `RadeonSI` 25.2.8).  The same code runs unchanged on Intel Quick Sync
-//! (UHD 630 / Iris Xe / Arc) — `libva` is the common abstraction.
+//! Developed against an AMD Raphael iGPU (VCN 4.0.0) via Mesa RadeonSI.  The
+//! same code runs unchanged on Intel Quick Sync (UHD 630 / Iris Xe / Arc) —
+//! `libva` is the common abstraction.
 //!
 //! # Output format — NV12 on Raphael
 //!
@@ -736,6 +736,12 @@ const fn merge_huffman(
 // ── GpuJpegDecoder impl ───────────────────────────────────────────────────────
 
 impl crate::traits::GpuJpegDecoder for VapiJpegDecoder {
+    /// Decode a JPEG stream via VA-API.
+    ///
+    /// Unlike the nvJPEG implementation, `width` and `height` are **not**
+    /// validated against the decoded dimensions — they are accepted but ignored.
+    /// Dimension authorisation is the caller's responsibility when using this
+    /// implementation.
     fn decode_jpeg(
         &mut self,
         data: &[u8],
