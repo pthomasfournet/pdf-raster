@@ -424,12 +424,22 @@ struct RenderState {
     current_page: u32,
 }
 
+/// Returns the inclusive page range to iterate: `PageSet` bounds when
+/// `opts.pages` is set, otherwise `first_page..=last_page`.
 fn page_window(opts: &RasterOptions) -> std::ops::RangeInclusive<u32> {
     opts.pages
         .as_ref()
         .map_or(opts.first_page..=opts.last_page, |ps| {
             ps.first()..=ps.last()
         })
+}
+
+/// Returns `true` if `page_num` should be rendered given `opts`.
+///
+/// When `opts.pages` is `None` every page in the iteration window is rendered.
+/// When `Some`, only pages present in the [`PageSet`] are rendered.
+fn should_render(opts: &RasterOptions, page_num: u32) -> bool {
+    opts.pages.as_ref().is_none_or(|ps| ps.contains(page_num))
 }
 
 fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
@@ -501,11 +511,12 @@ impl Iterator for PageIter {
                     }
 
                     let page_num = state.current_page;
-                    state.current_page += 1;
+                    // Saturate rather than wrap: u32::MAX is a legal page number
+                    // in a PageSet, so a plain `+= 1` would overflow to 0 and
+                    // loop forever on the next iteration.
+                    state.current_page = state.current_page.saturating_add(1);
 
-                    if let Some(ps) = &state.opts.pages
-                        && !ps.contains(page_num)
-                    {
+                    if !should_render(&state.opts, page_num) {
                         continue;
                     }
 
@@ -547,18 +558,15 @@ pub fn render_channel(
         };
 
         let window = page_window(&opts_owned);
+        let last = *window.end().min(&session.total_pages);
         let state = RenderState {
             current_page: *window.start(),
             session,
             opts: opts_owned,
         };
 
-        let last = window.end().min(&state.session.total_pages);
-
-        for page_num in *window.start()..=*last {
-            if let Some(ps) = &state.opts.pages
-                && !ps.contains(page_num)
-            {
+        for page_num in *window.start()..=last {
+            if !should_render(&state.opts, page_num) {
                 continue;
             }
             let result = render_one(&state, page_num);
