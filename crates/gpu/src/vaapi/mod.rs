@@ -229,6 +229,16 @@ impl VapiJpegDecoder {
         _width_hint: u32,
         _height_hint: u32,
     ) -> Result<DecodedJpeg> {
+        // Reject progressive JPEG early — VA-API VAEntrypointVLD is baseline-only.
+        if matches!(
+            crate::jpeg_sof::jpeg_sof_type(data),
+            Some(crate::jpeg_sof::JpegVariant::Progressive)
+        ) {
+            return Err(VapiError::BadJpeg(
+                "progressive JPEG not supported by VA-API VLD entrypoint".into(),
+            ));
+        }
+
         let h = JpegHeaders::parse(data)?;
 
         if h.components != 1 && h.components != 3 {
@@ -769,6 +779,32 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xda, 0x00,
         0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x80, 0x3f, 0xff, 0xd9,
     ];
+
+    #[test]
+    fn jpeg_sof_type_identifies_sof2_as_progressive() {
+        // Verify jpeg_sof_type correctly identifies a SOF2 stream as Progressive.
+        // decode_sync uses this function as its first guard against progressive JPEG;
+        // a real decode_sync integration test would require a /dev/dri device.
+        #[rustfmt::skip]
+        let progressive_jpeg: &[u8] = &[
+            0xFF, 0xD8,             // SOI
+            0xFF, 0xC2,             // SOF2 (progressive DCT)
+            0x00, 0x11,             // length = 17
+            0x08,                   // precision
+            0x00, 0x10, 0x00, 0x10, // height=16, width=16
+            0x03,                   // 3 components
+            0x01, 0x11, 0x00,
+            0x02, 0x11, 0x01,
+            0x03, 0x11, 0x01,
+            0xFF, 0xD9,             // EOI
+        ];
+        use crate::jpeg_sof::{JpegVariant, jpeg_sof_type};
+        assert_eq!(
+            jpeg_sof_type(progressive_jpeg),
+            Some(JpegVariant::Progressive),
+            "jpeg_sof_type must identify this stream as Progressive"
+        );
+    }
 
     /// `VapiJpegDecoder::new` must not panic — it either succeeds or returns an error.
     /// Skipped gracefully if the device is absent.

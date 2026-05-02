@@ -382,25 +382,33 @@ pub(super) fn decode_dct(
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
     let area = pdf_w.saturating_mul(pdf_h);
 
-    // ── nvJPEG fast path (primary GPU decoder) ────────────────────────────────
+    // Peek at the JPEG SOF marker to route to the correct decoder.
+    // Prevents sending progressive JPEG to VA-API (baseline-only).
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    let jpeg_variant = gpu::jpeg_sof_type(data);
+
+    // ── nvJPEG fast path (baseline + progressive) ─────────────────────────────
     #[cfg(feature = "nvjpeg")]
     if let Some(dec) = gpu {
-        // Only dispatch to GPU when the image area meets the threshold.
-        // CMYK JPEG (4 components) is not supported by the nvJPEG RGBI/Y path;
-        // decode_dct_gpu_path returns None for 4-component images (CMYK),
-        // which fall through to the CPU path below that handles CMYK→RGB.
-        if area >= super::GPU_JPEG_THRESHOLD_PX {
+        let is_eligible = matches!(
+            jpeg_variant,
+            Some(gpu::JpegVariant::Baseline) | Some(gpu::JpegVariant::Progressive)
+        );
+        if is_eligible && area >= super::GPU_JPEG_THRESHOLD_PX {
             if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
                 return Some(img);
             }
         }
     }
 
-    // ── VA-API fast path (fallback GPU decoder — AMD/Intel iGPU) ─────────────
+    // ── VA-API fast path (baseline only) ─────────────────────────────────────
+    // Progressive JPEG is skipped — VA-API VAEntrypointVLD supports baseline DCT only.
     #[cfg(feature = "vaapi")]
     if let (Some(dec), true) = (vaapi, area >= super::GPU_JPEG_THRESHOLD_PX) {
-        if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
-            return Some(img);
+        if matches!(jpeg_variant, Some(gpu::JpegVariant::Baseline)) {
+            if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
+                return Some(img);
+            }
         }
     }
 
@@ -1009,6 +1017,47 @@ mod tests {
         let doc = lopdf::Document::new();
         let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
         assert!(result.is_none());
+    }
+
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    fn minimal_baseline_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x05, // length = 5
+            0x08, // precision
+            0x00, 0x01, // height = 1
+            0xFF, 0xD9, // EOI
+        ]
+    }
+
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    fn minimal_progressive_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC2, // SOF2
+            0x00, 0x05, // length = 5
+            0x08, // precision
+            0x00, 0x01, // height = 1
+            0xFF, 0xD9, // EOI
+        ]
+    }
+
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    #[test]
+    fn jpeg_variant_baseline_detected() {
+        let data = minimal_baseline_jpeg();
+        assert_eq!(gpu::jpeg_sof_type(&data), Some(gpu::JpegVariant::Baseline));
+    }
+
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    #[test]
+    fn jpeg_variant_progressive_detected() {
+        let data = minimal_progressive_jpeg();
+        assert_eq!(
+            gpu::jpeg_sof_type(&data),
+            Some(gpu::JpegVariant::Progressive)
+        );
     }
 
     // ── decode_dct_gpu_path ───────────────────────────────────────────────────
