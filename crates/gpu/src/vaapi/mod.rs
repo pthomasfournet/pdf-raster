@@ -236,7 +236,11 @@ impl VapiJpegDecoder {
         height: u32,
         is_gray: bool,
     ) -> Result<CachedCtx> {
-        let preferred_fmt = if is_gray { VA_RT_FORMAT_YUV400 } else { VA_RT_FORMAT_YUV420 };
+        let preferred_fmt = if is_gray {
+            VA_RT_FORMAT_YUV400
+        } else {
+            VA_RT_FORMAT_YUV420
+        };
 
         let mut surface: VASurfaceID = VA_INVALID_ID;
         let mut attrib = VaSurfaceAttrib::unused();
@@ -309,7 +313,13 @@ impl VapiJpegDecoder {
             "vaCreateContext succeeded but returned VA_INVALID_ID"
         );
 
-        Ok(CachedCtx { width, height, ctx, surface, surface_fmt })
+        Ok(CachedCtx {
+            width,
+            height,
+            ctx,
+            surface,
+            surface_fmt,
+        })
     }
 
     /// Decode `data` synchronously, returning host-resident interleaved pixels.
@@ -383,8 +393,8 @@ impl VapiJpegDecoder {
         };
 
         // If YUV400 was rejected (some drivers don't implement it), retry with YUV420.
-        // Extraction uses only the Y plane for grayscale regardless of surface format,
-        // so we don't need to track which format was actually allocated.
+        // Extraction uses only the Y plane for grayscale regardless of surface format
+        // (both YUV400 and YUV420 start with a Y plane).
         let surf_status = if surf_status != VA_STATUS_SUCCESS && is_gray {
             log::debug!("VA-API: YUV400 surface rejected ({surf_status}), retrying with YUV420");
             surface = VA_INVALID_ID;
@@ -970,15 +980,14 @@ mod tests {
     #[test]
     #[ignore = "requires VA-API hardware"]
     fn create_surface_and_context_returns_valid_ids() {
-        let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129")
-            .expect("VA-API unavailable");
+        let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129").expect("VA-API unavailable");
         // Create a 16×16 YUV420 context; just check it doesn't error.
         let cached = dec
             .create_surface_and_context(16, 16, false)
             .expect("create failed");
         assert_ne!(cached.ctx, VA_INVALID_ID);
         assert_ne!(cached.surface, VA_INVALID_ID);
-        // Clean up manually since Drop handles it now.
+        // Clean up manually — CachedCtx has no Drop impl.
         unsafe {
             let _ = vaDestroyContext(dec.dpy.dpy, cached.ctx);
             let mut surface = cached.surface;
