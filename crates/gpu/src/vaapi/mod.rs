@@ -961,12 +961,11 @@ mod tests {
 
     #[test]
     fn drop_impl_compiles_with_cached_ctx() {
-        // Static check: VapiJpegDecoder implements Drop, and Drop must
-        // clean up cached_ctx. We verify by constructing a value and letting it
-        // drop — if the Drop impl doesn't handle Option<CachedCtx>, this won't compile.
-        // No hardware needed; new() will return Err on CI.
+        // Smoke test: VapiJpegDecoder::new compiles and drops without panic when
+        // no hardware is present.  Does NOT verify that a populated cached_ctx
+        // is destroyed — that path requires hardware and is covered by the
+        // #[ignore] integration tests above.
         let _ = VapiJpegDecoder::new("/dev/dri/renderD129");
-        // If we reach here without a compile error, Drop handles the field.
     }
 
     #[test]
