@@ -425,10 +425,11 @@ struct RenderState {
 }
 
 fn page_window(opts: &RasterOptions) -> std::ops::RangeInclusive<u32> {
-    match &opts.pages {
-        Some(ps) => ps.first()..=ps.last(),
-        None => opts.first_page..=opts.last_page,
-    }
+    opts.pages
+        .as_ref()
+        .map_or(opts.first_page..=opts.last_page, |ps| {
+            ps.first()..=ps.last()
+        })
 }
 
 fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
@@ -502,10 +503,10 @@ impl Iterator for PageIter {
                     let page_num = state.current_page;
                     state.current_page += 1;
 
-                    if let Some(ps) = &state.opts.pages {
-                        if !ps.contains(page_num) {
-                            continue;
-                        }
+                    if let Some(ps) = &state.opts.pages
+                        && !ps.contains(page_num)
+                    {
+                        continue;
                     }
 
                     return Some((page_num, render_one(state, page_num)));
@@ -555,10 +556,10 @@ pub fn render_channel(
         let last = window.end().min(&state.session.total_pages);
 
         for page_num in *window.start()..=*last {
-            if let Some(ps) = &state.opts.pages {
-                if !ps.contains(page_num) {
-                    continue;
-                }
+            if let Some(ps) = &state.opts.pages
+                && !ps.contains(page_num)
+            {
+                continue;
             }
             let result = render_one(&state, page_num);
             if tx.send((page_num, result)).is_err() {
@@ -717,8 +718,7 @@ mod channel_tests {
             deskew: false,
             pages: Some(ps),
         };
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set");
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let path = std::path::Path::new(&manifest_dir)
             .parent()
             .expect("parent dir should exist")
@@ -729,7 +729,10 @@ mod channel_tests {
         let yielded: Vec<u32> = render_pages(path.as_path(), &opts)
             .filter_map(|(pn, r)| r.ok().map(|_| pn))
             .collect();
-        assert!(!yielded.is_empty(), "expected at least one page to render successfully");
+        assert!(
+            !yielded.is_empty(),
+            "expected at least one page to render successfully"
+        );
         // Must only contain pages 1 and/or 3 — no 2, no 4+
         for pn in &yielded {
             assert!(
@@ -749,8 +752,7 @@ mod channel_tests {
             deskew: false,
             pages: Some(ps),
         };
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set");
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let path = std::path::Path::new(&manifest_dir)
             .parent()
             .expect("parent dir should exist")
@@ -764,7 +766,10 @@ mod channel_tests {
                 yielded.push(pn);
             }
         }
-        assert!(!yielded.is_empty(), "expected at least one page to render successfully");
+        assert!(
+            !yielded.is_empty(),
+            "expected at least one page to render successfully"
+        );
         for pn in &yielded {
             assert!(
                 *pn == 1 || *pn == 3,
