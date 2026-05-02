@@ -715,6 +715,7 @@ mod channel_tests {
     }
 
     #[test]
+    #[ignore = "requires tests/fixtures/corpus-01-native-text-small.pdf (not in repo)"]
     fn sparse_pages_only_yields_requested_pages() {
         // corpus-01 is a small native-text PDF — use pages 1 and 3 from it.
         // If the doc has fewer than 3 pages, the test still passes (page 3 won't arrive).
@@ -751,6 +752,7 @@ mod channel_tests {
     }
 
     #[test]
+    #[ignore = "requires tests/fixtures/corpus-01-native-text-small.pdf (not in repo)"]
     fn sparse_pages_channel_only_yields_requested_pages() {
         let ps = crate::PageSet::new(vec![1, 3]).unwrap();
         let opts = RasterOptions {
