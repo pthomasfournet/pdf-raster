@@ -53,9 +53,12 @@
 //! use std::path::Path;
 //! use pdf_raster::{RasterOptions, render_channel};
 //!
-//! // Requires `rayon` in Cargo.toml: rayon = "1"
-//! // Use a dedicated rayon pool in production if OCR tasks are long-running,
-//! // to avoid stalling the render producer on the shared thread pool.
+//! // `rayon` is a transitive dependency of `pdf_raster`; add it explicitly
+//! // to your Cargo.toml only if you call rayon APIs directly: rayon = "1"
+//! //
+//! // Keep the consumer loop on the calling thread (not inside a rayon::scope)
+//! // to avoid pool starvation: render_channel's producer also runs on rayon's
+//! // global pool and can deadlock if all workers are occupied by scope tasks.
 //! let opts = RasterOptions {
 //!     dpi: 300.0,
 //!     first_page: 1,
@@ -64,17 +67,17 @@
 //!     pages: None,
 //! };
 //! let rx = render_channel(Path::new("scan.pdf"), &opts, 4); // 4-page buffer
-//! rayon::scope(|s| {
-//!     while let Ok((page_num, result)) = rx.recv() {
-//!         match result {
-//!             Ok(page) => s.spawn(move |_| {
-//!                 // process page — runs in parallel with the next render
-//!                 let _ = (page_num, page.pixels);
-//!             }),
-//!             Err(e) => eprintln!("page {page_num}: {e}"),
-//!         }
+//! while let Ok((page_num, result)) = rx.recv() {
+//!     match result {
+//!         Ok(page) => rayon::spawn(move || {
+//!             // process page — overlaps with the next render
+//!             let _ = (page_num, page.pixels);
+//!         }),
+//!         Err(e) => eprintln!("page {page_num}: {e}"),
 //!     }
-//! });
+//! }
+//! // Note: rayon::spawn tasks may still be running here. Use a rayon scope
+//! // or channel to join them if you need to wait for all work to complete.
 //! ```
 //!
 //! # Sparse page selection
@@ -89,8 +92,8 @@
 //! let pages = PageSet::new(vec![1, 5, 23, 100]).unwrap();
 //! let opts = RasterOptions {
 //!     dpi: 300.0,
-//!     first_page: 1,   // ignored when pages is Some
-//!     last_page: 1,    // ignored when pages is Some
+//!     first_page: 1,        // ignored when pages is Some
+//!     last_page: u32::MAX,  // ignored when pages is Some
 //!     deskew: true,
 //!     pages: Some(pages),
 //! };
