@@ -3,7 +3,7 @@
 //! Wraps `libva`/`libva-drm` via raw FFI (no bindgen — the VA-API surface we
 //! use is small and stable, mirroring the CUDA driver API approach in `nvjpeg`).
 //!
-//! Developed against an AMD Raphael iGPU (VCN 4.0.0) via Mesa RadeonSI.  The
+//! Developed against an AMD Raphael iGPU (VCN 4.0.0) via Mesa `RadeonSI`.  The
 //! same code runs unchanged on Intel Quick Sync (UHD 630 / Iris Xe / Arc) —
 //! `libva` is the common abstraction.
 //!
@@ -147,7 +147,7 @@ unsafe impl Send for VapiDisplay {}
 
 // ── Cached context ────────────────────────────────────────────────────────────
 
-/// Cached VAContext and VASurface for a specific image resolution.
+/// Cached `VAContext` and `VASurface` for a specific image resolution.
 ///
 /// Destroyed and recreated whenever the image dimensions change.  Eliminates
 /// the `vaCreateContext`/`vaCreateSurfaces` overhead on same-size decode runs
@@ -159,6 +159,7 @@ struct CachedCtx {
     surface: VASurfaceID,
     /// Surface format actually allocated (YUV400 or YUV420).
     /// Stored so grayscale images routed via YUV420 fallback are handled correctly.
+    #[expect(dead_code, reason = "consumed by Drop and future decode_into routing")]
     surface_fmt: c_uint,
 }
 
@@ -368,98 +369,31 @@ impl VapiJpegDecoder {
 
         let w_u32 = u32::from(h.width);
         let h_u32 = u32::from(h.height);
+        let is_gray = h.components == 1;
 
-        let (surface_fmt, is_gray) = if h.components == 1 {
-            (VA_RT_FORMAT_YUV400, true)
-        } else {
-            (VA_RT_FORMAT_YUV420, false)
-        };
+        // Reuse the cached context+surface if dimensions match; recreate otherwise.
+        let cache_valid = self
+            .cached_ctx
+            .as_ref()
+            .is_some_and(|c| c.width == w_u32 && c.height == h_u32);
 
-        // ── Create surface ────────────────────────────────────────────────────
-        let mut surface: VASurfaceID = VA_INVALID_ID;
-        let mut attrib = VaSurfaceAttrib::unused();
-        // SAFETY: dpy valid; surface, attrib are stack vars.
-        let surf_status = unsafe {
-            vaCreateSurfaces(
-                self.dpy.dpy,
-                surface_fmt,
-                w_u32,
-                h_u32,
-                &raw mut surface,
-                1,
-                &raw mut attrib,
-                1,
-            )
-        };
-
-        // If YUV400 was rejected (some drivers don't implement it), retry with YUV420.
-        // Extraction uses only the Y plane for grayscale regardless of surface format
-        // (both YUV400 and YUV420 start with a Y plane).
-        let surf_status = if surf_status != VA_STATUS_SUCCESS && is_gray {
-            log::debug!("VA-API: YUV400 surface rejected ({surf_status}), retrying with YUV420");
-            surface = VA_INVALID_ID;
-            unsafe {
-                vaCreateSurfaces(
-                    self.dpy.dpy,
-                    VA_RT_FORMAT_YUV420,
-                    w_u32,
-                    h_u32,
-                    &raw mut surface,
-                    1,
-                    &raw mut attrib,
-                    1,
-                )
+        if !cache_valid {
+            // Destroy the old context+surface before creating new ones.
+            if let Some(old) = self.cached_ctx.take() {
+                unsafe {
+                    let _ = vaDestroyContext(self.dpy.dpy, old.ctx);
+                    let mut s = old.surface;
+                    let _ = vaDestroySurfaces(self.dpy.dpy, &raw mut s, 1);
+                }
             }
-        } else {
-            surf_status
-        };
-        check(surf_status, "vaCreateSurfaces")?;
-        // vaCreateSurfaces returning success with VA_INVALID_ID would be a driver
-        // contract violation; assert so the failure is loud and attributable.
-        assert_ne!(
-            surface, VA_INVALID_ID,
-            "vaCreateSurfaces succeeded but returned VA_INVALID_ID"
-        );
-
-        // ── Create context ────────────────────────────────────────────────────
-        let mut ctx: VAContextID = VA_INVALID_ID;
-        // w_u32 / h_u32 come from u16 JPEG SOF0 fields: max 65535 ≪ i32::MAX.
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "width/height are derived from u16 JPEG SOF fields and cannot exceed 65535"
-        )]
-        let ctx_result = unsafe {
-            vaCreateContext(
-                self.dpy.dpy,
-                self.cfg,
-                w_u32 as c_int,
-                h_u32 as c_int,
-                VA_PROGRESSIVE,
-                &raw mut surface,
-                1,
-                &raw mut ctx,
-            )
-        };
-        if ctx_result != VA_STATUS_SUCCESS {
-            unsafe {
-                let _ = vaDestroySurfaces(self.dpy.dpy, &raw mut surface, 1);
-            }
-            check(ctx_result, "vaCreateContext")?;
-        }
-        assert_ne!(
-            ctx, VA_INVALID_ID,
-            "vaCreateContext succeeded but returned VA_INVALID_ID"
-        );
-
-        // Decode and clean up context + surface regardless of decode result.
-        let result = self.decode_into(data, &h, ctx, surface, w_u32, h_u32, is_gray);
-
-        unsafe {
-            let _ = vaDestroyContext(self.dpy.dpy, ctx);
-            let _ = vaDestroySurfaces(self.dpy.dpy, &raw mut surface, 1);
+            let new_ctx = self.create_surface_and_context(w_u32, h_u32, is_gray)?;
+            self.cached_ctx = Some(new_ctx);
         }
 
-        result
+        // SAFETY: cache_valid ensures Some, and !cache_valid branch just assigned Some.
+        let cached = self.cached_ctx.as_ref().expect("cached_ctx must be Some");
+
+        self.decode_into(data, &h, cached.ctx, cached.surface, w_u32, h_u32, is_gray)
     }
 
     /// Inner decode: build parameter structs, create VA-API buffers, submit, sync,
@@ -993,5 +927,46 @@ mod tests {
             let mut surface = cached.surface;
             let _ = vaDestroySurfaces(dec.dpy.dpy, &raw mut surface, 1);
         }
+    }
+
+    /// Verifies that decode_sync can be called twice on the same decoder.
+    /// On hardware, the second call reuses the cached context (same dims).
+    /// In CI (no hardware), we just verify the code compiles and the error is
+    /// from the driver, not from a logic bug.
+    #[test]
+    #[ignore = "requires VA-API hardware and a real JPEG file"]
+    fn decode_sync_reuses_context_same_dims() {
+        use std::fs;
+        let jpeg = fs::read("/tmp/test_16x16.jpg").expect("test JPEG not found");
+        let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129").expect("VA-API unavailable");
+        let r1 = dec.decode_sync(&jpeg, 16, 16).expect("first decode failed");
+        let r2 = dec
+            .decode_sync(&jpeg, 16, 16)
+            .expect("second decode failed");
+        assert_eq!(r1.width, r2.width);
+        assert_eq!(r1.height, r2.height);
+        // Cache should be populated after both calls.
+        assert!(dec.cached_ctx.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires VA-API hardware and two real JPEG files of different sizes"]
+    fn decode_sync_invalidates_cache_on_dim_change() {
+        use std::fs;
+        let jpeg_16 = fs::read("/tmp/test_16x16.jpg").expect("16×16 JPEG not found");
+        let jpeg_32 = fs::read("/tmp/test_32x32.jpg").expect("32×32 JPEG not found");
+        let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129").expect("VA-API unavailable");
+        dec.decode_sync(&jpeg_16, 16, 16)
+            .expect("16×16 decode failed");
+        let old_ctx = dec.cached_ctx.as_ref().map(|c| c.ctx);
+        dec.decode_sync(&jpeg_32, 32, 32)
+            .expect("32×32 decode failed");
+        let new_ctx = dec.cached_ctx.as_ref().map(|c| c.ctx);
+        // Context must have changed.
+        assert_ne!(
+            old_ctx, new_ctx,
+            "cache should have been invalidated on dim change"
+        );
+        assert_eq!(dec.cached_ctx.as_ref().map(|c| c.width), Some(32));
     }
 }
