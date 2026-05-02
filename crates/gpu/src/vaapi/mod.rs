@@ -168,7 +168,10 @@ struct CachedCtx {
 /// VA-API hardware JPEG decoder.
 ///
 /// Implements [`crate::traits::GpuJpegDecoder`].  Each instance owns one
-/// `VAConfig`; a fresh `VAContext` and `VASurface` are created per decode call.
+/// `VAConfig` and caches one `VAContext`+`VASurface` pair for the most
+/// recently seen image resolution.  When consecutive images share dimensions
+/// (common in scanned documents), the context is reused, avoiding the
+/// `vaCreateContext`/`vaCreateSurfaces` round-trip overhead.
 ///
 /// `Send` but not `Sync` — use one instance per Rayon worker thread.
 pub struct VapiJpegDecoder {
@@ -325,9 +328,10 @@ impl VapiJpegDecoder {
 
     /// Decode `data` synchronously, returning host-resident interleaved pixels.
     ///
-    /// Parses the JPEG headers, creates a per-resolution context and surface,
-    /// submits the four required decode buffers, synchronises the surface, maps
-    /// the NV12 result, and converts to RGB8 (BT.601 full-range) on CPU.
+    /// Parses the JPEG headers, reuses or recreates the per-resolution
+    /// `VAContext`+`VASurface` from the cache, submits the four required
+    /// decode buffers, synchronises the surface, maps the NV12 result, and
+    /// converts to RGB8 (BT.601 full-range) on CPU.
     ///
     /// The `width_hint` and `height_hint` parameters are accepted for API
     /// compatibility with the `GpuJpegDecoder` trait but are not used — actual
