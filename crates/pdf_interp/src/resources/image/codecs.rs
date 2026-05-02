@@ -541,7 +541,9 @@ fn decode_dct_gpu_path<D: gpu::GpuJpegDecoder>(
         1 => ImageColorSpace::Gray,
         3 => ImageColorSpace::Rgb,
         n => {
-            log::warn!("image: DCTDecode: GPU decoder returned unexpected component count {n}; falling back to CPU");
+            log::warn!(
+                "image: DCTDecode: GPU decoder returned unexpected component count {n}; falling back to CPU"
+            );
             return None;
         }
     };
