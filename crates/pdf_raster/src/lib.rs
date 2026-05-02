@@ -42,6 +42,66 @@
 //!     // Do NOT pre-binarise — the LSTM engine reads your grayscale values directly.
 //! }
 //! ```
+//!
+//! # Streaming: render and process pages in parallel
+//!
+//! For large documents, [`render_channel`] renders on a background rayon thread
+//! and sends pages as they complete, so downstream work (e.g. OCR) can start
+//! immediately rather than waiting for the full render:
+//!
+//! ```rust,no_run
+//! use std::path::Path;
+//! use pdf_raster::{RasterOptions, render_channel};
+//!
+//! // Requires `rayon` in Cargo.toml: rayon = "1"
+//! // Use a dedicated rayon pool in production if OCR tasks are long-running,
+//! // to avoid stalling the render producer on the shared thread pool.
+//! let opts = RasterOptions {
+//!     dpi: 300.0,
+//!     first_page: 1,
+//!     last_page: u32::MAX,
+//!     deskew: true,
+//!     pages: None,
+//! };
+//! let rx = render_channel(Path::new("scan.pdf"), &opts, 4); // 4-page buffer
+//! rayon::scope(|s| {
+//!     while let Ok((page_num, result)) = rx.recv() {
+//!         match result {
+//!             Ok(page) => s.spawn(move |_| {
+//!                 // process page — runs in parallel with the next render
+//!                 let _ = (page_num, page.pixels);
+//!             }),
+//!             Err(e) => eprintln!("page {page_num}: {e}"),
+//!         }
+//!     }
+//! });
+//! ```
+//!
+//! # Sparse page selection
+//!
+//! To render only specific pages (e.g. a subset identified by a prior scan),
+//! use [`PageSet`]:
+//!
+//! ```rust,no_run
+//! use std::path::Path;
+//! use pdf_raster::{PageSet, RasterOptions, raster_pdf};
+//!
+//! let pages = PageSet::new(vec![1, 5, 23, 100]).unwrap();
+//! let opts = RasterOptions {
+//!     dpi: 300.0,
+//!     first_page: 1,   // ignored when pages is Some
+//!     last_page: 1,    // ignored when pages is Some
+//!     deskew: true,
+//!     pages: Some(pages),
+//! };
+//! for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
+//!     // Only pages 1, 5, 23, and 100 are rendered — intermediates are skipped.
+//!     match result {
+//!         Ok(page) => { /* process page.pixels */ let _ = (page_num, page); }
+//!         Err(e) => eprintln!("page {page_num}: {e}"),
+//!     }
+//! }
+//! ```
 
 pub mod deskew;
 pub(crate) mod gpu_init;
