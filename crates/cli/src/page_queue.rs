@@ -8,8 +8,8 @@
 //! Bounded work-stealing page queue for the CLI render loop.
 //!
 //! Replaces the static `par_iter()` dispatch with a producer/consumer pattern
-//! that provides back-pressure and a [`RoutingHint`] extension point for future
-//! content-aware GPU routing (Phase 7 `PageDiagnostics` pre-scan pass).
+//! that provides back-pressure and content-aware GPU routing via [`RoutingHint`]
+//! hints set by the [`pdf_raster::prescan_page`] pre-scan pass.
 //!
 //! # Back-pressure
 //!
@@ -56,29 +56,19 @@ pub(crate) struct ProgressCtx<'a> {
 
 /// Per-page routing signal for GPU vs CPU dispatch.
 ///
-/// Only [`Unclassified`](RoutingHint::Unclassified) is produced today.  When
-/// the `PageDiagnostics` pre-scan pass lands (Phase 7), the producer will set
-/// [`GpuJpegCandidate`](RoutingHint::GpuJpegCandidate) and
-/// [`CpuOnly`](RoutingHint::CpuOnly) before submitting tasks, enabling the
-/// consumer to route pages to GPU or CPU workers accordingly.
+/// Set by the [`pdf_raster::prescan_page`] pass before tasks are enqueued.
+/// The consumer inspects this hint to choose between GPU and CPU workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutingHint {
     /// No content classification available; any worker may handle this page.
     Unclassified,
     /// Page has large baseline-JPEG images — prefer VA-API / nvJPEG worker.
     ///
-    /// Set by the pre-scan pass when `dominant_filter == Dct` and estimated
-    /// image area exceeds the GPU threshold.  Unused until the pre-scan lands.
-    // #[allow] not #[expect]: the lint fires only in non-test builds; the variant
-    // IS constructed in the test exhaustive-match, making #[expect] unfulfilled
-    // in test mode.  Remove when the PageDiagnostics pre-scan wires this in.
-    #[allow(dead_code)]
+    /// Set by the pre-scan pass when `dominant_filter == Dct`.
     GpuJpegCandidate,
     /// Page is text/vector only — skip GPU decoder setup overhead.
     ///
-    /// Set by the pre-scan pass when `has_images == false`.  Unused until the
-    /// pre-scan lands.
-    #[allow(dead_code)]
+    /// Set by the pre-scan pass when `has_images == false`.
     CpuOnly,
 }
 
@@ -175,9 +165,10 @@ impl PageQueue {
                             // guard drops here, lock released before render
                         };
 
-                        // RoutingHint is available here for future dispatch logic.
-                        // Today all hints are Unclassified; GPU decisions are made
-                        // inside render_page via lend_decoders transparently.
+                        // Hint is set by the prescan pass; affinity dispatch
+                        // (steering GpuJpegCandidate to GPU workers) is a
+                        // future work item.  The hint is captured here so the
+                        // compiler sees it as used and the extension point is clear.
                         let _ = task.hint;
 
                         #[expect(

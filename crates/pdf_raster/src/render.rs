@@ -149,6 +149,13 @@ impl RasterSession {
     pub const fn total_pages(&self) -> u32 {
         self.total_pages
     }
+
+    /// Borrow the underlying `lopdf::Document` for read-only operations such as
+    /// the [`pdf_raster::prescan_page`] pre-scan pass.
+    #[must_use]
+    pub fn doc(&self) -> &lopdf::Document {
+        &self.doc
+    }
 }
 
 // Compile-time assertions: RasterSession must be Sync (shared across rayon threads) and

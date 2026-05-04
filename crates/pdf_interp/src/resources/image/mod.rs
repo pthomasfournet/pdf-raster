@@ -384,7 +384,7 @@ pub(super) const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)>
 ///
 /// An empty array (`Filter = []`) is treated as no filter (returns `None`)
 /// and a debug message is emitted, matching the behaviour of an absent key.
-pub(super) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
+pub(crate) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
     match obj {
         Object::Name(n) => Some(String::from_utf8_lossy(n)),
         Object::Array(arr) => {

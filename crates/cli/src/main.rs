@@ -68,10 +68,25 @@ fn main() {
     )]
     let total_u32 = total as u32;
 
-    let tasks = pages.iter().map(|&page_num| page_queue::PageTask {
-        page_num,
-        hint: page_queue::RoutingHint::Unclassified,
-    });
+    // Pre-scan: cheaply classify each page before enqueueing for full render.
+    // Errors are non-fatal — a page that can't be scanned gets Unclassified and
+    // is rendered normally.  The scan runs serially here (before pool.install)
+    // to avoid racing with lopdf's non-Sync internals.
+    let hints: Vec<page_queue::RoutingHint> = pages
+        .iter()
+        .map(|&page_num| {
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "page_num ≥ 1, enforced by build_page_list"
+            )]
+            let diag = pdf_raster::prescan_page(session.doc(), page_num as u32);
+            routing_hint_from_diag(diag.as_ref().ok())
+        })
+        .collect();
+    let tasks = pages
+        .iter()
+        .zip(hints)
+        .map(|(&page_num, hint)| page_queue::PageTask { page_num, hint });
     // Capacity = 2× thread count keeps workers fed while bounding peak
     // in-flight bitmap memory (vs par_iter which can start all N pages at once).
     let queue_capacity = args.num_threads.max(1) * 2;
@@ -96,6 +111,27 @@ fn main() {
     let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
 
     report_errors(errors);
+}
+
+/// Map a [`pdf_raster::PageDiagnostics`] to a [`page_queue::RoutingHint`].
+///
+/// Rules:
+/// - No images → `CpuOnly` (skip GPU decoder setup overhead).
+/// - Dominant filter is `Dct` → `GpuJpegCandidate` (VA-API / nvJPEG eligible).
+/// - Otherwise → `Unclassified` (any worker may handle).
+///
+/// `None` (prescan error) → `Unclassified` so the page is rendered normally.
+fn routing_hint_from_diag(diag: Option<&pdf_raster::PageDiagnostics>) -> page_queue::RoutingHint {
+    let Some(d) = diag else {
+        return page_queue::RoutingHint::Unclassified;
+    };
+    if !d.has_images {
+        return page_queue::RoutingHint::CpuOnly;
+    }
+    if matches!(d.dominant_filter, Some(pdf_raster::ImageFilter::Dct)) {
+        return page_queue::RoutingHint::GpuJpegCandidate;
+    }
+    page_queue::RoutingHint::Unclassified
 }
 
 /// Build the filtered, clamped list of 1-based page numbers to render.

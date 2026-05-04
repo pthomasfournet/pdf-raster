@@ -633,8 +633,8 @@ Currently every progressive JPEG incurs a full VA-API header parse + `BadJpeg` e
 
 - [x] Extract SOF marker detection into `gpu::jpeg_sof_type()` — `crates/gpu/src/jpeg_sof.rs`; `JpegVariant { Baseline, Progressive, Other }`; zero-allocation marker scan; `#[must_use]`; 8 unit tests; shared by VA-API and dispatch
 - [x] Update `decode_dct` dispatch: `jpeg_variant = gpu::jpeg_sof_type(data)` before threshold check; nvJPEG accepts `Baseline | Progressive`; VA-API accepts `Baseline` only — progressive skipped entirely; `VapiJpegDecoder::decode_sync` also guards with early return; `decode_dct_gpu` + `decode_dct_vaapi` collapsed into generic `decode_dct_gpu_path<D: GpuJpegDecoder>`
-- [ ] Work-stealing page queue: `crossbeam::deque` or Rayon `scope` with dynamic task injection; GPU slot semaphore per decoder type
-- [ ] `PageDiagnostics` pre-scan pass: lightweight content stream scan (no render) to classify page before full render; used to pre-route page to CPU vs GPU worker
+- [x] Work-stealing page queue: bounded `mpsc::sync_channel` + `rayon::scope`; `RoutingHint` extension point; back-pressure at 2× thread count; `crates/cli/src/page_queue.rs`
+- [x] `PageDiagnostics` pre-scan pass: `pdf_interp::prescan_page` walks XObject dict + content stream operators without decoding pixels; sets `GpuJpegCandidate`/`CpuOnly` hints before enqueueing; `crates/pdf_interp/src/prescan.rs`
 - [ ] Benchmark: re-run full corpus with heterogeneous dispatch; target corpus 08/09 GPU speedup ≥ 5× over current CPU path
 
 ---

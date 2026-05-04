@@ -11,8 +11,11 @@
 //! machine and resource resolver are in place.
 
 pub mod content;
+pub mod prescan;
 pub mod renderer;
 pub mod resources;
+
+pub use prescan::prescan_page;
 
 /// Entry points for fuzz targets — forwards to codec wrappers in `image::fuzz_entry`.
 ///
@@ -189,7 +192,10 @@ pub fn page_count(doc: &Document) -> u32 {
 ///
 /// # Errors
 /// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document.
-fn resolve_page_id(doc: &Document, page_num: u32) -> Result<lopdf::ObjectId, InterpError> {
+pub(crate) fn resolve_page_id(
+    doc: &Document,
+    page_num: u32,
+) -> Result<lopdf::ObjectId, InterpError> {
     let pages = doc.get_pages();
     let total = u32::try_from(pages.len()).unwrap_or(u32::MAX);
     if page_num == 0 || page_num > total {

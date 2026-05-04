@@ -114,6 +114,7 @@ mod render;
 
 use std::path::Path;
 
+pub use pdf_interp::prescan_page;
 pub use pdf_interp::renderer::PageDiagnostics;
 pub use pdf_interp::resources::ImageFilter;
 pub use render::{

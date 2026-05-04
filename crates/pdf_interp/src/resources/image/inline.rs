@@ -250,7 +250,7 @@ pub(super) fn decode_run_length_capped(data: &[u8], max_output: usize) -> Vec<u8
 /// Unknown keys are passed through unchanged; unrecognised values are passed
 /// through unchanged — the caller's `DictExt` helpers return `None` for
 /// malformed entries, so no validation is needed here.
-pub(super) fn parse_inline_params(params: &[u8]) -> Dictionary {
+pub(crate) fn parse_inline_params(params: &[u8]) -> Dictionary {
     // Tokenise the parameter block with the content-stream tokenizer and
     // collect alternating key/value pairs.
     use crate::content::tokenizer::{Token, Tokenizer};
