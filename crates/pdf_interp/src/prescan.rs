@@ -6,9 +6,9 @@
 //!
 //! # What is inspected
 //!
-//! - **XObject images**: `Filter`, `Width`, `Height` read from the stream
+//! - **`XObject` images**: `Filter`, `Width`, `Height` read from the stream
 //!   dictionary via reference lookup — no decompression.
-//! - **Form XObjects**: recursed up to [`MAX_PRESCAN_DEPTH`] levels deep so
+//! - **Form `XObject`s**: recursed up to [`MAX_PRESCAN_DEPTH`] levels deep so
 //!   images inside forms are counted.
 //! - **Inline images**: `Filter`, `W`/`Width`, `H`/`Height` read from the raw
 //!   parameter block via the same `parse_inline_params` path used by the full
@@ -36,8 +36,8 @@
 //!
 //! Errors from `parse_page` or `page_size_pts` are propagated.  Errors from
 //! individual resource lookups (missing dict key, corrupt stream header) are
-//! logged at `debug` level and silently skipped — the scan continues.  A
-//! partial result is still useful for routing.
+//! silently skipped — the scan continues.  A partial result is still useful
+//! for routing.
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
@@ -52,10 +52,12 @@ use crate::{
     },
 };
 
-/// Maximum Form XObject recursion depth during the pre-scan.
+/// Maximum Form `XObject` recursion depth during the pre-scan.
 ///
-/// Matches the renderer's `MAX_FORM_DEPTH` to prevent stack overflow on
-/// pathological or malicious inputs.
+/// Intentionally shallower than the renderer's `MAX_FORM_DEPTH` (32): the
+/// prescan only needs to find the dominant image filter, so deeply nested
+/// forms are unlikely to change the classification.  A lower cap also
+/// limits prescan cost on adversarially nested documents.
 const MAX_PRESCAN_DEPTH: u32 = 4;
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -75,6 +77,10 @@ const MAX_PRESCAN_DEPTH: u32 = 4;
 /// silently skipped so that a partial classification is still returned.
 pub fn prescan_page(doc: &Document, page_num: u32) -> Result<PageDiagnostics, InterpError> {
     let geom = page_size_pts(doc, page_num)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "page width in PDF points (≤ ~10 000 pts); f32 is sufficient for PPI routing"
+    )]
     let page_pts_width = geom.width_pts as f32;
 
     let mut filter_counts = [0u32; IMAGE_FILTER_COUNT];
@@ -137,9 +143,9 @@ pub fn prescan_page(doc: &Document, page_num: u32) -> Result<PageDiagnostics, In
 
 // ── XObject walker ────────────────────────────────────────────────────────────
 
-/// Walk the XObject resource dict of `context_id`, accumulating image stats.
+/// Walk the `XObject` resource dict of `context_id`, accumulating image stats.
 ///
-/// Recurses into Form XObjects up to `depth` = [`MAX_PRESCAN_DEPTH`].
+/// Recurses into Form `XObject`s up to `depth` = [`MAX_PRESCAN_DEPTH`].
 fn scan_xobjects(
     doc: &Document,
     context_id: ObjectId,
@@ -189,7 +195,7 @@ fn scan_xobjects(
             .get(b"Subtype")
             .ok()
             .and_then(|o| o.as_name().ok())
-            .map(|n| n.to_vec());
+            .map(<[u8]>::to_vec);
 
         match subtype.as_deref() {
             Some(b"Image") => {
@@ -214,7 +220,7 @@ fn scan_xobjects(
 
 // ── Per-image dict scanners ───────────────────────────────────────────────────
 
-/// Extract filter and PPI hint from an image XObject stream dictionary.
+/// Extract filter and PPI hint from an image `XObject` stream dictionary.
 fn scan_image_dict(
     dict: &Dictionary,
     filter_counts: &mut [u32; IMAGE_FILTER_COUNT],
@@ -235,20 +241,20 @@ fn scan_image_dict(
         filter_name(resolved)
     });
 
-    let img_filter = filter_str_to_enum(filter.as_deref());
+    let img_filter = ImageFilter::from_filter_str(filter.as_deref());
     filter_counts[img_filter as usize] = filter_counts[img_filter as usize].saturating_add(1);
 
     // PPI estimate: image width pixels / page width pts × 72.
-    if page_pts_width > 0.0 {
-        if let Some(w_px) = dict_integer(dict, b"Width") {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "image width in pixels; values up to ~10k; f32 is sufficient for routing"
-            )]
-            let ppi = (w_px as f32 / page_pts_width) * 72.0;
-            if ppi > *max_ppi {
-                *max_ppi = ppi;
-            }
+    if page_pts_width > 0.0
+        && let Some(w_px) = dict_integer(dict, b"Width")
+    {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "image width in pixels; values up to ~10k; f32 is sufficient for routing"
+        )]
+        let ppi = (w_px as f32 / page_pts_width) * 72.0;
+        if ppi > *max_ppi {
+            *max_ppi = ppi;
         }
     }
 }
@@ -260,15 +266,14 @@ fn scan_inline_image(
     max_ppi: &mut f32,
     page_pts_width: f32,
 ) {
-    // Inline images use either full names or abbreviated keys (PDF §8.9.7 Table 89).
-    let filter_obj = dict.get(b"Filter").or_else(|_| dict.get(b"F")).ok();
-    let filter = filter_obj.and_then(filter_name);
-    let img_filter = filter_str_to_enum(filter.as_deref());
+    // `parse_inline_params` has already expanded abbreviated keys (b"F" → b"Filter",
+    // b"W" → b"Width") so we only need the full names here.
+    let filter = dict.get(b"Filter").ok().and_then(filter_name);
+    let img_filter = ImageFilter::from_filter_str(filter.as_deref());
     filter_counts[img_filter as usize] = filter_counts[img_filter as usize].saturating_add(1);
 
     if page_pts_width > 0.0 {
-        // Try full name first, then abbreviated.
-        let w_px = dict_integer(dict, b"Width").or_else(|| dict_integer(dict, b"W"));
+        let w_px = dict_integer(dict, b"Width");
         if let Some(w) = w_px {
             #[expect(
                 clippy::cast_precision_loss,
@@ -284,24 +289,12 @@ fn scan_inline_image(
 
 // ── Utility helpers ───────────────────────────────────────────────────────────
 
-/// Map a filter name string to [`ImageFilter`].
-fn filter_str_to_enum(name: Option<&str>) -> ImageFilter {
-    match name {
-        Some("DCTDecode") => ImageFilter::Dct,
-        Some("JPXDecode") => ImageFilter::Jpx,
-        Some("CCITTFaxDecode") => ImageFilter::CcittFax,
-        Some("JBIG2Decode") => ImageFilter::Jbig2,
-        Some("FlateDecode") => ImageFilter::Flate,
-        _ => ImageFilter::Raw,
-    }
-}
-
 /// Map a `filter_counts` array index back to [`ImageFilter`].
 ///
 /// Relies on `ImageFilter` discriminant values matching the array positions.
 /// The compile-time assert in `resources::image` (checked via `IMAGE_FILTER_COUNT`)
 /// enforces that both are kept in sync.
-fn idx_to_filter(idx: usize) -> ImageFilter {
+const fn idx_to_filter(idx: usize) -> ImageFilter {
     match idx {
         0 => ImageFilter::Dct,
         1 => ImageFilter::Jpx,
@@ -312,10 +305,17 @@ fn idx_to_filter(idx: usize) -> ImageFilter {
     }
 }
 
-/// Read an integer value (Integer or Real) from a dictionary key.
+/// Read a positive integer value (Integer or Real) from a dictionary key.
 ///
-/// Returns `None` if the key is absent or the value is non-numeric.
+/// Returns `None` if the key is absent, zero, negative, or non-numeric.
+/// PDF image dimensions (Width, Height) are always positive and fit comfortably
+/// in `u32`; the guards `*i > 0` and `*r > 0.0` enforce this before the cast.
 fn dict_integer(dict: &Dictionary, key: &[u8]) -> Option<u32> {
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "guarded by *i > 0; PDF image dimensions fit in u32 (max ~65 535 px)"
+    )]
     match dict.get(key).ok()? {
         Object::Integer(i) if *i > 0 => Some(*i as u32),
         Object::Real(r) if *r > 0.0 => Some(*r as u32),
@@ -405,30 +405,33 @@ mod tests {
     }
 
     #[test]
-    fn filter_str_to_enum_covers_all_variants() {
+    fn image_filter_from_filter_str_covers_all_variants() {
         assert!(matches!(
-            filter_str_to_enum(Some("DCTDecode")),
+            ImageFilter::from_filter_str(Some("DCTDecode")),
             ImageFilter::Dct
         ));
         assert!(matches!(
-            filter_str_to_enum(Some("JPXDecode")),
+            ImageFilter::from_filter_str(Some("JPXDecode")),
             ImageFilter::Jpx
         ));
         assert!(matches!(
-            filter_str_to_enum(Some("CCITTFaxDecode")),
+            ImageFilter::from_filter_str(Some("CCITTFaxDecode")),
             ImageFilter::CcittFax
         ));
         assert!(matches!(
-            filter_str_to_enum(Some("JBIG2Decode")),
+            ImageFilter::from_filter_str(Some("JBIG2Decode")),
             ImageFilter::Jbig2
         ));
         assert!(matches!(
-            filter_str_to_enum(Some("FlateDecode")),
+            ImageFilter::from_filter_str(Some("FlateDecode")),
             ImageFilter::Flate
         ));
-        assert!(matches!(filter_str_to_enum(None), ImageFilter::Raw));
         assert!(matches!(
-            filter_str_to_enum(Some("Unknown")),
+            ImageFilter::from_filter_str(None),
+            ImageFilter::Raw
+        ));
+        assert!(matches!(
+            ImageFilter::from_filter_str(Some("Unknown")),
             ImageFilter::Raw
         ));
     }

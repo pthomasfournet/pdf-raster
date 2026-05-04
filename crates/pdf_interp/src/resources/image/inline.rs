@@ -1,4 +1,9 @@
 //! Inline image decoding (`BI … ID … EI`) and parameter parsing.
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "parse_inline_params is pub(crate) for prescan.rs; \
+              redundant here because inline is a private module, but explicit visibility aids readability"
+)]
 
 use lopdf::{Dictionary, Document, Object};
 
@@ -45,11 +50,6 @@ use super::ImageColorSpace;
 ///
 /// Returns `None` if the parameter block is unparseable, dimensions are
 /// degenerate, or the filter is unsupported.
-#[expect(
-    clippy::too_many_lines,
-    reason = "GPU dispatch paths (nvjpeg, vaapi) plus all filter branches are each short; \
-              combining them in one function keeps the fallback logic visible"
-)]
 #[must_use]
 pub fn decode_inline_image(
     doc: &Document,
@@ -73,14 +73,7 @@ pub fn decode_inline_image(
     let is_mask = dict.get_bool(b"ImageMask").unwrap_or(false);
     let filter = dict.get(b"Filter").ok().and_then(filter_name);
 
-    let img_filter = match filter.as_deref() {
-        Some("DCTDecode") => ImageFilter::Dct,
-        Some("JPXDecode") => ImageFilter::Jpx,
-        Some("CCITTFaxDecode") => ImageFilter::CcittFax,
-        Some("JBIG2Decode") => ImageFilter::Jbig2,
-        Some("FlateDecode") => ImageFilter::Flate,
-        _ => ImageFilter::Raw,
-    };
+    let img_filter = ImageFilter::from_filter_str(filter.as_deref());
 
     let mut img = match filter.as_deref() {
         None => decode_raw(

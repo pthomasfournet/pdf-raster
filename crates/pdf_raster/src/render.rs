@@ -153,7 +153,7 @@ impl RasterSession {
     /// Borrow the underlying `lopdf::Document` for read-only operations such as
     /// the [`pdf_raster::prescan_page`] pre-scan pass.
     #[must_use]
-    pub fn doc(&self) -> &lopdf::Document {
+    pub const fn doc(&self) -> &lopdf::Document {
         &self.doc
     }
 }

@@ -166,6 +166,25 @@ pub enum ImageFilter {
     Raw = 5,
 }
 
+impl ImageFilter {
+    /// Map a PDF filter name string to the matching [`ImageFilter`] variant.
+    ///
+    /// Unrecognised or absent names map to [`ImageFilter::Raw`].  This is the
+    /// single canonical mapping used by the renderer, the inline-image decoder,
+    /// and the pre-scan pass.
+    #[must_use]
+    pub(crate) fn from_filter_str(name: Option<&str>) -> Self {
+        match name {
+            Some("DCTDecode") => Self::Dct,
+            Some("JPXDecode") => Self::Jpx,
+            Some("CCITTFaxDecode") => Self::CcittFax,
+            Some("JBIG2Decode") => Self::Jbig2,
+            Some("FlateDecode") => Self::Flate,
+            _ => Self::Raw,
+        }
+    }
+}
+
 /// Number of [`ImageFilter`] variants — must match `filter_counts` array size in
 /// `PageRenderer`.  The const assert in that module enforces this at compile time.
 pub const IMAGE_FILTER_COUNT: usize = 6;
@@ -202,11 +221,6 @@ pub struct ImageDescriptor {
 /// - the object is not an image (`Subtype != Image`),
 /// - the filter is unsupported (a warning is logged), or
 /// - any decoding error occurs.
-#[expect(
-    clippy::too_many_lines,
-    reason = "each filter variant is a short dispatch arm; combining them keeps the fallback \
-              chain visible in one place"
-)]
 #[must_use]
 pub fn resolve_image(
     doc: &Document,
@@ -242,14 +256,7 @@ pub fn resolve_image(
 
     let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
 
-    let img_filter = match filter.as_deref() {
-        Some("DCTDecode") => ImageFilter::Dct,
-        Some("JPXDecode") => ImageFilter::Jpx,
-        Some("CCITTFaxDecode") => ImageFilter::CcittFax,
-        Some("JBIG2Decode") => ImageFilter::Jbig2,
-        Some("FlateDecode") => ImageFilter::Flate,
-        _ => ImageFilter::Raw,
-    };
+    let img_filter = ImageFilter::from_filter_str(filter.as_deref());
 
     let mut img = match filter.as_deref() {
         None => decode_raw(

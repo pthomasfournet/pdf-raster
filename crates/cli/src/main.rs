@@ -121,7 +121,9 @@ fn main() {
 /// - Otherwise → `Unclassified` (any worker may handle).
 ///
 /// `None` (prescan error) → `Unclassified` so the page is rendered normally.
-fn routing_hint_from_diag(diag: Option<&pdf_raster::PageDiagnostics>) -> page_queue::RoutingHint {
+const fn routing_hint_from_diag(
+    diag: Option<&pdf_raster::PageDiagnostics>,
+) -> page_queue::RoutingHint {
     let Some(d) = diag else {
         return page_queue::RoutingHint::Unclassified;
     };
