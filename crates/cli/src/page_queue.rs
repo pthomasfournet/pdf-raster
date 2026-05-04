@@ -162,12 +162,12 @@ impl PageQueue {
         let errors: Arc<Mutex<Vec<(i32, RenderError)>>> = Arc::new(Mutex::new(Vec::new()));
 
         // pool.scope is self.install(|| scope(op)) — the closure runs on pool
-        // worker W0.  Consumer tasks are injected into the pool's own registry
-        // (not the global one), so the remaining num_threads-1 workers can steal
-        // them.  After the producer loop, W0 itself work-steals consumer tasks.
+        // worker W0.  W0 runs the producer loop below, so spawn n_threads-1
+        // consumer tasks for the other workers.  After the producer loop W0
+        // work-steals any remaining consumer tasks before scope returns.
         pool.scope(|s| {
-            let n_workers = pool.current_num_threads().max(1);
-            for _ in 0..n_workers {
+            let n_consumers = pool.current_num_threads().saturating_sub(1).max(1);
+            for _ in 0..n_consumers {
                 let rx = Arc::clone(&rx);
                 let errors = Arc::clone(&errors);
                 s.spawn(move |_| {
