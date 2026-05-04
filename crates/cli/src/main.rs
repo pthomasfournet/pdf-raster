@@ -1,4 +1,5 @@
 mod args;
+mod diagnostics;
 mod naming;
 mod page_queue;
 mod render;
@@ -40,7 +41,7 @@ fn main() {
 
     let session = pdf_raster::open_session(std::path::Path::new(&args.input), &session_config)
         .unwrap_or_else(|e| {
-            report_open_error(&e, &args);
+            diagnostics::report_open_error(&e, &args);
             std::process::exit(1);
         });
 
@@ -106,7 +107,7 @@ fn main() {
     // driver that has already started its own atexit shutdown sequence.
     let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
 
-    report_errors(errors);
+    diagnostics::report_errors(errors);
 }
 
 /// Map a [`pdf_raster::PageDiagnostics`] to a [`page_queue::RoutingHint`].
@@ -220,66 +221,4 @@ pub(crate) fn report_progress(
         "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
          {elapsed:.1}s elapsed  {eta_str}"
     );
-}
-
-/// Print the `source()` chain of `e` to stderr, one line per level.
-fn print_error_chain(e: &dyn std::error::Error) {
-    let mut src = e.source();
-    while let Some(cause) = src {
-        eprintln!("  caused by: {cause}");
-        src = cause.source();
-    }
-}
-
-/// Print a human-readable error (and actionable hints) when `open_session` fails.
-fn report_open_error(e: &pdf_raster::RasterError, args: &Args) {
-    if matches!(e, pdf_raster::RasterError::BackendUnavailable(_)) {
-        eprintln!("pdf-raster: {e}");
-        print_backend_hint(args);
-    } else {
-        eprintln!("pdf-raster: failed to open PDF: {e}");
-        print_error_chain(e);
-    }
-}
-
-/// Print a backend-specific hint after a `BackendUnavailable` error.
-fn print_backend_hint(args: &Args) {
-    match args.backend {
-        args::BackendArg::Cuda => {
-            eprintln!("  hint: --backend cuda requires a working CUDA driver and GPU.");
-            eprintln!("        Run `nvidia-smi` to verify the driver is loaded.");
-            eprintln!(
-                "        Use --backend auto to fall back to CPU silently, or \
-                 --backend cpu to skip GPU entirely."
-            );
-        }
-        args::BackendArg::Vaapi => {
-            eprintln!(
-                "  hint: --backend vaapi could not open the DRM device ({}).",
-                args.vaapi_device
-            );
-            eprintln!("        Verify the device exists and is readable by your user.");
-            eprintln!("        Use --vaapi-device PATH to specify an alternate render node.");
-            eprintln!(
-                "        Use --backend auto to fall back to CPU silently, or \
-                 --backend cpu to skip GPU entirely."
-            );
-        }
-        _ => {
-            eprintln!("  hint: use --backend auto to fall back to CPU when GPU is unavailable,");
-            eprintln!("        or --backend cpu to force CPU-only mode.");
-        }
-    }
-}
-
-fn report_errors(mut errors: Vec<(i32, render::RenderError)>) {
-    if errors.is_empty() {
-        return;
-    }
-    errors.sort_by_key(|(p, _)| *p);
-    for (page, err) in &errors {
-        eprintln!("pdf-raster: page {page}: {err}");
-        print_error_chain(err);
-    }
-    std::process::exit(1);
 }
