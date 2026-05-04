@@ -71,6 +71,9 @@ tests/bench/bins/
 tests/bench/bench-results.json
 tests/bench/bench-features-results.json
 
+# ── Git worktrees ─────────────────────────────────────────────────────────────
+.worktrees/
+
 # ── Temp / scratch files ──────────────────────────────────────────────────────
 *.tmp
 *.bak
