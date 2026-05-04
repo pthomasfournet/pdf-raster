@@ -18,7 +18,7 @@ use crate::resources::dict_ext::DictExt;
 use gpu::nvjpeg::NvJpegDecoder;
 
 #[cfg(feature = "vaapi")]
-use gpu::vaapi::VapiJpegDecoder;
+use gpu::JpegQueueHandle;
 
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
@@ -369,7 +369,7 @@ pub(super) fn decode_dct(
     pdf_w: u32,
     pdf_h: u32,
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
-    #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
+    #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
@@ -400,15 +400,17 @@ pub(super) fn decode_dct(
         }
     }
 
-    // ── VA-API fast path (baseline only) ─────────────────────────────────────
+    // ── VA-API fast path (baseline only, via decode queue) ───────────────────
     // Progressive JPEG is skipped — VA-API VAEntrypointVLD supports baseline DCT only.
+    // Jobs are routed through a dedicated worker thread (JpegQueueHandle) that owns
+    // the VapiJpegDecoder, eliminating Mesa driver contention across Rayon workers.
     #[cfg(feature = "vaapi")]
-    if let (Some(dec), true) = (vaapi, area >= super::GPU_JPEG_THRESHOLD_PX) {
-        if matches!(jpeg_variant, Some(gpu::JpegVariant::Baseline)) {
-            if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
-                return Some(img);
-            }
-        }
+    if let Some(handle) = vaapi
+        && matches!(jpeg_variant, Some(gpu::JpegVariant::Baseline))
+        && area >= super::GPU_JPEG_THRESHOLD_PX
+        && let Some(img) = decode_dct_queue_path(data, pdf_w, pdf_h, handle)
+    {
+        return Some(img);
     }
 
     // ── CPU path ──────────────────────────────────────────────────────────────
@@ -523,7 +525,7 @@ pub(super) fn decode_dct(
 /// Returns `None` if the decoder rejects the image (unsupported encoding,
 /// component count, or any transient decode error). The caller must then
 /// fall through to the CPU path.
-#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+#[cfg(feature = "nvjpeg")]
 fn decode_dct_gpu_path<D: gpu::GpuJpegDecoder>(
     data: &[u8],
     pdf_w: u32,
@@ -543,6 +545,48 @@ fn decode_dct_gpu_path<D: gpu::GpuJpegDecoder>(
         n => {
             log::warn!(
                 "image: DCTDecode: GPU decoder returned unexpected component count {n}; falling back to CPU"
+            );
+            return None;
+        }
+    };
+
+    Some(ImageDescriptor {
+        width: decoded.width,
+        height: decoded.height,
+        color_space,
+        data: decoded.data,
+        filter: ImageFilter::Raw,
+        smask: None,
+    })
+}
+
+/// Attempt JPEG decode via a [`gpu::JpegQueueHandle`] (VA-API worker thread).
+///
+/// Mirrors [`decode_dct_gpu_path`] but routes through the dedicated OS worker
+/// thread rather than calling the decoder directly on the Rayon thread.  Returns
+/// `None` if the worker is unavailable or the decoder rejects the image; the
+/// caller must then fall through to the CPU path.
+#[cfg(feature = "vaapi")]
+fn decode_dct_queue_path(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    handle: &gpu::JpegQueueHandle,
+) -> Option<ImageDescriptor> {
+    use gpu::DecodedImage;
+
+    // Arc<[u8]> is required to send the JPEG bytes to the worker thread without
+    // unsafe lifetime extension.  One memcpy of the JPEG payload; negligible vs
+    // VCN hardware decode time (1–5 ms/frame for ≥512×512 images).
+    let arc_data: std::sync::Arc<[u8]> = std::sync::Arc::from(data);
+    let decoded: DecodedImage = handle.decode(arc_data, pdf_w, pdf_h)?;
+
+    let color_space = match decoded.components {
+        1 => ImageColorSpace::Gray,
+        3 => ImageColorSpace::Rgb,
+        n => {
+            log::warn!(
+                "image: DCTDecode: VA-API queue returned unexpected component count {n}; falling back to CPU"
             );
             return None;
         }
@@ -1063,7 +1107,7 @@ mod tests {
 
     // ── decode_dct_gpu_path ───────────────────────────────────────────────────
 
-    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    #[cfg(feature = "nvjpeg")]
     mod gpu_path_tests {
         use super::*;
 

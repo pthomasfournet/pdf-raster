@@ -106,6 +106,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "vaapi")]
+pub(crate) mod decode_queue;
 pub mod deskew;
 pub(crate) mod gpu_init;
 mod render;

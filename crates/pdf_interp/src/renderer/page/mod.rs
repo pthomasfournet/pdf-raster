@@ -77,12 +77,12 @@ use crate::content::Operator;
 use crate::resources::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageResources};
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use gpu::GpuCtx;
+#[cfg(feature = "vaapi")]
+use gpu::JpegQueueHandle;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
-#[cfg(feature = "vaapi")]
-use gpu::vaapi::VapiJpegDecoder;
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
 use std::sync::Arc;
 
@@ -211,10 +211,14 @@ pub struct PageRenderer<'doc> {
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
     nvjpeg: Option<NvJpegDecoder>,
-    /// VA-API JPEG decoder (AMD/Intel iGPU fallback), present when the `vaapi`
-    /// feature is enabled and the DRM render node is accessible.
+    /// VA-API JPEG decode queue handle (AMD/Intel iGPU), present when the
+    /// `vaapi` feature is enabled and the DRM render node is accessible.
+    ///
+    /// A [`JpegQueueHandle`] is a cheaply-cloneable sender to a single OS
+    /// thread that owns the `VapiJpegDecoder`.  All Rayon workers share the
+    /// same worker thread via cloned handles, eliminating Mesa driver contention.
     #[cfg(feature = "vaapi")]
-    vaapi_jpeg: Option<VapiJpegDecoder>,
+    vaapi_jpeg_queue: Option<JpegQueueHandle>,
     /// GPU-accelerated JPEG 2000 decoder, present when the `nvjpeg2k` feature is
     /// enabled and a CUDA device is available.  `None` means CPU-only JPX decode.
     #[cfg(feature = "nvjpeg2k")]
@@ -318,7 +322,7 @@ impl<'doc> PageRenderer<'doc> {
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
             #[cfg(feature = "vaapi")]
-            vaapi_jpeg: None,
+            vaapi_jpeg_queue: None,
             #[cfg(feature = "nvjpeg2k")]
             nvjpeg2k: None,
             #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
@@ -340,25 +344,20 @@ impl<'doc> PageRenderer<'doc> {
         self.nvjpeg = dec;
     }
 
-    /// Attach a VA-API JPEG decoder (AMD/Intel iGPU) to this renderer.
+    /// Attach a VA-API JPEG decode queue handle to this renderer.
     ///
-    /// Used as a fallback when `nvjpeg` is not available.  When set,
-    /// `DCTDecode` image streams with pixel area ≥
-    /// [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are decoded via
-    /// VA-API instead of the CPU JPEG decoder.
+    /// The handle is a cheaply-cloneable sender to a dedicated OS worker thread
+    /// that owns the `VapiJpegDecoder`.  `DCTDecode` baseline JPEG streams with
+    /// pixel area ≥ [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are
+    /// submitted to the queue instead of being decoded on the calling thread,
+    /// eliminating Mesa driver contention across Rayon workers.
     ///
-    /// Call with `None` to revert to CPU-only JPEG decode.
+    /// The handle is dropped when the renderer drops — no explicit reclaim step
+    /// is needed because the queue worker lives in `RasterSession`, which always
+    /// outlives the renderer.
     #[cfg(feature = "vaapi")]
-    pub fn set_vaapi_jpeg(&mut self, dec: Option<VapiJpegDecoder>) {
-        self.vaapi_jpeg = dec;
-    }
-
-    /// Detach and return the VA-API JPEG decoder so the caller can reuse it.
-    ///
-    /// Returns `None` if no decoder was attached.
-    #[cfg(feature = "vaapi")]
-    pub const fn take_vaapi_jpeg(&mut self) -> Option<VapiJpegDecoder> {
-        self.vaapi_jpeg.take()
+    pub fn set_vaapi_queue(&mut self, handle: JpegQueueHandle) {
+        self.vaapi_jpeg_queue = Some(handle);
     }
 
     /// Attach a GPU JPEG 2000 decoder to this renderer.
@@ -735,7 +734,7 @@ impl<'doc> PageRenderer<'doc> {
             #[cfg(feature = "nvjpeg")]
             self.nvjpeg.as_mut(),
             #[cfg(feature = "vaapi")]
-            self.vaapi_jpeg.as_mut(),
+            self.vaapi_jpeg_queue.as_ref(),
             #[cfg(feature = "nvjpeg2k")]
             self.nvjpeg2k.as_mut(),
             #[cfg(feature = "gpu-icc")]

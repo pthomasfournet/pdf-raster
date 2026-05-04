@@ -56,7 +56,7 @@ use gpu::nvjpeg::NvJpegDecoder;
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
 
 #[cfg(feature = "vaapi")]
-use gpu::vaapi::VapiJpegDecoder;
+use gpu::JpegQueueHandle;
 
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
@@ -213,7 +213,7 @@ pub fn resolve_image(
     page_dict: &Dictionary,
     name: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
-    #[cfg(feature = "vaapi")] vaapi: Option<&mut VapiJpegDecoder>,
+    #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
