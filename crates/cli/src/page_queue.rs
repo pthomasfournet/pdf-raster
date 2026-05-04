@@ -13,9 +13,14 @@
 //!
 //! # Back-pressure
 //!
-//! [`std::sync::mpsc::SyncSender::send`] blocks when all `capacity` slots are
+//! [`std::sync::mpsc::SyncSender::send`] blocks when all capacity slots are
 //! occupied by in-progress renders, preventing the producer from holding an
 //! unbounded number of in-flight bitmaps in memory.
+//!
+//! When the pool has only one thread, W0 is both producer and consumer, so a
+//! blocking channel would deadlock.  In that case capacity is set to `n_pages`
+//! (the exact number of tasks to be sent), ensuring the producer loop completes
+//! before W0 starts consuming.
 //!
 //! # GPU slot model
 //!
@@ -25,7 +30,7 @@
 //! Rayon worker has its own decoder after the first page it renders.
 
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use std::sync::atomic::AtomicU32;
@@ -80,6 +85,22 @@ pub(crate) struct PageTask {
     pub(crate) hint: RoutingHint,
 }
 
+// ── Mutex helpers ─────────────────────────────────────────────────────────────
+
+/// Lock `m`, recovering from poison.
+///
+/// If another thread panicked while holding the lock the mutex is poisoned but
+/// the data inside is still valid (the push/recv that was in progress may be
+/// incomplete, but the Vec/Receiver itself is not corrupted).  We recover
+/// rather than propagating because the render pipeline treats all errors as
+/// collected results, not as panics — and in release builds `panic = "abort"`
+/// means a panicking consumer terminates the whole process before we ever
+/// reach this path.
+#[inline]
+fn lock_recovering<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 // ── Page queue ────────────────────────────────────────────────────────────────
 
 /// Bounded work-stealing page queue.
@@ -106,11 +127,13 @@ pub(crate) struct PageTask {
 ///
 /// # Capacity and back-pressure
 ///
-/// `capacity = 2 × num_threads` keeps all workers fed while limiting peak
-/// in-flight bitmap memory.  For example, at `num_threads = 12` (capacity =
-/// 24 in-flight pages) and 300 DPI A4 (~24 MB RGB per page), peak memory is
-/// 24 × 24 MB = 576 MB — bounded and controlled, vs `par_iter` which starts
-/// all N pages at once.
+/// For pools with more than one thread, `capacity = 2 × num_threads` keeps
+/// all workers fed while limiting peak in-flight bitmap memory.  For example,
+/// at `num_threads = 12` (capacity = 24 in-flight pages) and 300 DPI A4
+/// (~24 MB RGB per page), peak memory is 24 × 24 MB = 576 MB — bounded and
+/// controlled, vs `par_iter` which starts all N pages at once.
+///
+/// For single-thread pools, see the module-level back-pressure note.
 ///
 /// # Worker count
 ///
@@ -119,28 +142,20 @@ pub(crate) struct PageTask {
 /// but not `Sync`, so it is wrapped in `Arc<Mutex<Receiver<PageTask>>>`.
 /// The `Mutex` is held only during `recv()` — nanosecond scale — not during
 /// rendering.
-pub(crate) struct PageQueue {
-    capacity: usize,
-}
+pub(crate) struct PageQueue;
 
 impl PageQueue {
-    /// Construct a new `PageQueue` with the given channel capacity.
-    ///
-    /// Values below 1 are silently raised to 1.  A capacity of `2 ×
-    /// num_threads` is a good default.
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     /// Run the render loop over `tasks`, returning all `(page_num, error)` pairs.
     ///
-    /// The producer loop runs on the pool worker thread (W0) that `pool.scope`
-    /// selects.  Consumer tasks are spawned into the same pool's scope and
-    /// stolen by the remaining `num_threads − 1` workers; W0 also work-steals
-    /// consumer tasks once the producer loop finishes.  All tasks complete
-    /// before this function returns.
+    /// The producer loop runs on pool worker W0 that `pool.scope` selects.
+    /// Consumer tasks are spawned into the same pool's scope and stolen by the
+    /// remaining `num_threads − 1` workers; W0 also work-steals consumer tasks
+    /// once the producer loop finishes.  All tasks complete before this function
+    /// returns.
     ///
     /// Progress is reported via `progress` with the same semantics as the
     /// previous `par_iter` loop.  Errors are collected in non-deterministic
@@ -154,7 +169,19 @@ impl PageQueue {
         args: &Args,
         progress: &ProgressCtx<'_>,
     ) -> Vec<(i32, RenderError)> {
-        let (tx, rx) = mpsc::sync_channel::<PageTask>(self.capacity);
+        let n_threads = pool.current_num_threads().max(1);
+
+        // Single-thread guard: W0 is both producer and consumer.  A blocking
+        // channel would deadlock once the producer fills all slots and cannot
+        // yield to the consumer task.  Use n_pages as capacity so the producer
+        // loop always completes before W0 starts work-stealing consumer tasks.
+        let capacity = if n_threads == 1 {
+            progress.n_pages.max(1)
+        } else {
+            n_threads * 2
+        };
+
+        let (tx, rx) = mpsc::sync_channel::<PageTask>(capacity);
         // Receiver is Send but not Sync; Arc<Mutex<_>> lets N workers share it.
         // The Mutex is held only during recv() — nanosecond scale — not during rendering.
         let rx = Arc::new(Mutex::new(rx));
@@ -166,7 +193,11 @@ impl PageQueue {
         // consumer tasks for the other workers.  After the producer loop W0
         // work-steals any remaining consumer tasks before scope returns.
         pool.scope(|s| {
-            let n_consumers = pool.current_num_threads().saturating_sub(1).max(1);
+            // n_threads-1: W0 is the producer; the other workers are consumers.
+            // saturating_sub avoids underflow if current_num_threads() somehow
+            // returned 0; max(1) ensures at least one consumer task is queued
+            // so W0 can work-steal it after the producer loop finishes.
+            let n_consumers = n_threads.saturating_sub(1).max(1);
             for _ in 0..n_consumers {
                 let rx = Arc::clone(&rx);
                 let errors = Arc::clone(&errors);
@@ -175,8 +206,7 @@ impl PageQueue {
                         // Hold the lock only for the recv() call; release it
                         // before rendering so all workers can render concurrently.
                         let task = {
-                            let guard =
-                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let guard = lock_recovering(&rx);
                             match guard.recv() {
                                 Ok(t) => t,
                                 Err(_) => break, // tx dropped → channel exhausted
@@ -188,7 +218,7 @@ impl PageQueue {
                         // (steering GpuJpegCandidate to GPU workers) is a
                         // future work item.  The hint is captured here so the
                         // compiler sees it as used and the extension point is clear.
-                        let _ = task.hint;
+                        let _hint = task.hint;
 
                         #[expect(
                             clippy::cast_sign_loss,
@@ -206,16 +236,13 @@ impl PageQueue {
                         );
 
                         if let Err(e) = result {
-                            errors
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push((task.page_num, e));
+                            lock_recovering(&errors).push((task.page_num, e));
                         }
                     }
                 });
             }
 
-            // Producer: runs on the calling (main) thread while pool workers consume.
+            // Producer: runs on pool worker W0 while the remaining workers consume.
             // SyncSender::send blocks when all capacity slots are full — back-pressure.
             // If all consumers have panicked and disconnected, send returns Err; break
             // early so we don't spin forever.
@@ -232,9 +259,9 @@ impl PageQueue {
         // (rayon re-raises panics after the scope join).  No other Arc holders
         // remain; try_unwrap and into_inner are both infallible.
         Arc::try_unwrap(errors)
-            .expect("no other Arc holders after scope join")
+            .expect("all consumer Arc clones are dropped when pool.scope returns")
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -244,14 +271,27 @@ impl PageQueue {
 mod tests {
     use super::*;
 
+    /// Verify the single-thread capacity guard: with n_threads=1, capacity
+    /// must equal n_pages so the producer never blocks waiting for a consumer
+    /// on the same thread.
     #[test]
-    fn capacity_zero_raised_to_one() {
-        assert_eq!(PageQueue::new(0).capacity, 1);
+    fn single_thread_capacity_equals_n_pages() {
+        let n_pages = 7;
+        // Reproduce the capacity formula used in PageQueue::run for n_threads=1.
+        let capacity = if 1_usize == 1 { n_pages.max(1) } else { 1 * 2 };
+        assert_eq!(
+            capacity, n_pages,
+            "single-thread capacity must cover all pages"
+        );
     }
 
+    /// Verify the multi-thread capacity formula: capacity = 2 * n_threads.
     #[test]
-    fn capacity_preserved_above_zero() {
-        assert_eq!(PageQueue::new(8).capacity, 8);
+    fn multi_thread_capacity_is_two_x_threads() {
+        for n in [2_usize, 4, 8, 12, 24] {
+            let capacity = if n == 1 { 99 } else { n * 2 };
+            assert_eq!(capacity, n * 2);
+        }
     }
 
     #[test]

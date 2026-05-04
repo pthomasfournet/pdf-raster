@@ -87,10 +87,7 @@ fn main() {
         .iter()
         .zip(hints)
         .map(|(&page_num, hint)| page_queue::PageTask { page_num, hint });
-    // Use pool.current_num_threads() — args.num_threads may be 0 (meaning
-    // "auto-detect"), in which case the pool itself knows the actual count.
-    let queue_capacity = pool.current_num_threads().max(1) * 2;
-    let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new(queue_capacity).run(
+    let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new().run(
         tasks,
         &pool,
         &session,
@@ -199,17 +196,23 @@ pub(crate) fn report_progress(
     }
     let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
     let elapsed = start.elapsed().as_secs_f64();
-    let rate = f64::from(completed) / elapsed;
     // completed is a page counter; u32→usize is lossless on any 32-bit-or-wider target.
     let completed_usize = usize::try_from(completed).unwrap_or(n_pages);
     let remaining = n_pages.saturating_sub(completed_usize);
+    // Guard elapsed > 0.5s and at least 2 pages done before computing ETA;
+    // before that the rate estimate is too noisy to be useful.
     #[expect(
         clippy::cast_precision_loss,
         reason = "ETA display; ±1s accuracy is sufficient"
     )]
-    let eta_s = remaining as f64 / rate;
-    let eta_str = if eta_s.is_finite() {
-        format!("~{eta_s:.1}s remaining")
+    let eta_str = if elapsed > 0.5 && completed >= 2 {
+        let rate = f64::from(completed) / elapsed;
+        let eta_s = remaining as f64 / rate;
+        if eta_s.is_finite() {
+            format!("~{eta_s:.1}s remaining")
+        } else {
+            "~?s remaining".to_owned()
+        }
     } else {
         "~?s remaining".to_owned()
     };
