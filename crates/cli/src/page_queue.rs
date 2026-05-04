@@ -23,11 +23,13 @@
 //!
 //! # Routing hints
 //!
-//! [`RoutingHint`] classifies each page for GPU vs CPU dispatch.  Currently all
-//! pages are dispatched as [`RoutingHint::Unclassified`]; affinity steering
-//! (directing [`RoutingHint::GpuJpegCandidate`] pages to GPU workers) is a
-//! future work item.  [`routing_hint_from_diag`] translates [`pdf_raster::PageDiagnostics`]
-//! to [`RoutingHint`] and is ready for use once a second GPU thread pool is introduced.
+//! [`RoutingHint`] classifies each page for GPU vs CPU dispatch.  The prescan
+//! pass in `main` classifies each page before the render pool starts, then
+//! [`routing_hint_from_diag`] maps [`pdf_raster::PageDiagnostics`] to a hint
+//! that is stored on the [`PageTask`].  Inside the consumer loop the hint is
+//! forwarded to [`crate::render::render_page`], which passes it to
+//! `pdf_raster::render_page_rgb_hinted` so that `CpuOnly` pages skip GPU
+//! decoder initialisation entirely.
 //!
 //! # GPU slot model
 //!
@@ -102,9 +104,9 @@ impl ProgressCtx<'_> {
 
 /// Per-page routing signal for GPU vs CPU dispatch.
 ///
-/// The consumer inspects this hint to choose between GPU and CPU workers.
-/// Currently all pages are enqueued as [`Unclassified`](RoutingHint::Unclassified);
-/// affinity steering is a future work item.
+/// Set by the prescan pass in `main` before the render pool starts.  The
+/// consumer passes it through to `render_page` so `CpuOnly` pages skip GPU
+/// decoder initialisation and `GpuJpegCandidate` pages use the session policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutingHint {
     /// No content classification available; any worker may handle this page.
@@ -123,13 +125,6 @@ pub(crate) enum RoutingHint {
 /// - Otherwise → [`RoutingHint::Unclassified`]: any worker may handle.
 ///
 /// `None` (prescan error or prescan skipped) → [`RoutingHint::Unclassified`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "ready for use once GPU affinity dispatch is introduced"
-    )
-)]
 pub(crate) const fn routing_hint_from_diag(diag: Option<&PageDiagnostics>) -> RoutingHint {
     let Some(d) = diag else {
         return RoutingHint::Unclassified;
@@ -292,18 +287,15 @@ impl PageQueue {
                             // guard drops here, lock released before render
                         };
 
-                        // Affinity dispatch (steering GpuJpegCandidate to GPU
-                        // workers) is a future work item; hint is captured so
-                        // the extension point is visible to the compiler.
-                        let _hint = task.hint;
-
                         #[expect(
                             clippy::cast_sign_loss,
                             reason = "page_num ≥ 1, enforced by build_page_list"
                         )]
                         let page_u32 = task.page_num as u32;
 
-                        let result = crate::render::render_page(session, page_u32, total_u32, args);
+                        let result = crate::render::render_page(
+                            session, page_u32, total_u32, args, task.hint,
+                        );
                         progress.report(args, task.page_num);
 
                         if let Err(e) = result {

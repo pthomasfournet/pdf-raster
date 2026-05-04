@@ -156,6 +156,12 @@ impl RasterSession {
     pub const fn doc(&self) -> &lopdf::Document {
         &self.doc
     }
+
+    /// The backend policy this session was opened with.
+    #[must_use]
+    pub const fn policy(&self) -> BackendPolicy {
+        self.policy
+    }
 }
 
 // Compile-time assertions: RasterSession must be Sync (shared across rayon threads) and
@@ -267,15 +273,43 @@ pub fn render_page_rgb(
     scale: f64,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
     let geom = pdf_interp::page_size_pts(&session.doc, page_num)?;
-    render_page_rgb_with_geom(session, page_num, scale, geom).map(|(bmp, _diag)| bmp)
+    render_page_rgb_with_geom(session, page_num, scale, geom, session.policy)
+        .map(|(bmp, _diag)| bmp)
 }
 
-/// Inner implementation shared by [`render_page_rgb`] and [`render_one`].
+/// Like [`render_page_rgb`] but with an affinity-dispatch policy override.
+///
+/// When `effective_policy` is [`BackendPolicy::CpuOnly`], GPU decoder init is
+/// skipped entirely for this page even if the session policy would normally
+/// allow it.  The session policy is used as-is for all other variants.
+///
+/// Use this when content-aware routing has classified the page as not needing
+/// GPU decoding — e.g. a pure-vector page whose [`RoutingHint`] is `CpuOnly`.
+///
+/// # Errors
+///
+/// Same as [`render_page_rgb`].
+pub fn render_page_rgb_hinted(
+    session: &RasterSession,
+    page_num: u32,
+    scale: f64,
+    effective_policy: BackendPolicy,
+) -> Result<Bitmap<Rgb8>, RasterError> {
+    let geom = pdf_interp::page_size_pts(&session.doc, page_num)?;
+    render_page_rgb_with_geom(session, page_num, scale, geom, effective_policy)
+        .map(|(bmp, _diag)| bmp)
+}
+
+/// Inner implementation shared by [`render_page_rgb`], [`render_page_rgb_hinted`], and [`render_one`].
+///
+/// `effective_policy` overrides `session.policy` for GPU decoder selection only.
+/// All other session state (GPU context for AA/ICC, VA-API queue) is unaffected.
 fn render_page_rgb_with_geom(
     session: &RasterSession,
     page_num: u32,
     scale: f64,
     geom: pdf_interp::PageGeometry,
+    effective_policy: BackendPolicy,
 ) -> Result<(Bitmap<Rgb8>, pdf_interp::renderer::PageDiagnostics), RasterError> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(RasterError::InvalidOptions(format!(
@@ -338,7 +372,7 @@ fn render_page_rgb_with_geom(
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     renderer.set_gpu_ctx(session.gpu_ctx.as_ref().map(Arc::clone));
 
-    lend_decoders(session, &mut renderer)?;
+    lend_decoders(session, &mut renderer, effective_policy)?;
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
     reclaim_decoders(&mut renderer);
@@ -348,9 +382,12 @@ fn render_page_rgb_with_geom(
 
 /// Lend per-thread GPU JPEG decoders to the renderer for one page.
 ///
-/// Decoders are initialised lazily on first call.  On `CpuOnly` this is a
-/// no-op.  On `ForceCuda`/`ForceVaapi` init failure is returned as
-/// `RasterError::BackendUnavailable` rather than silently falling back.
+/// `effective_policy` is normally `session.policy` but callers may pass
+/// [`BackendPolicy::CpuOnly`] to skip GPU decoder init for this page regardless
+/// of the session-level policy — used by affinity dispatch for `CpuOnly` pages.
+///
+/// On `CpuOnly` this is a no-op.  On `ForceCuda`/`ForceVaapi` init failure is
+/// returned as `RasterError::BackendUnavailable` rather than silently falling back.
 #[cfg_attr(
     not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
     allow(
@@ -362,13 +399,16 @@ fn render_page_rgb_with_geom(
 fn lend_decoders(
     session: &RasterSession,
     renderer: &mut pdf_interp::renderer::PageRenderer,
+    effective_policy: BackendPolicy,
 ) -> Result<(), RasterError> {
-    let policy = session.policy;
+    let policy = effective_policy;
     if matches!(policy, BackendPolicy::CpuOnly) {
         return Ok(());
     }
-    // `renderer` is used inside `#[cfg]`-gated blocks below; suppress the
-    // unused-variable warning in CPU-only / no-GPU-decoder builds.
+    // `session` and `renderer` are used inside `#[cfg]`-gated blocks below;
+    // suppress unused-variable warnings in CPU-only / no-GPU-decoder builds.
+    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
+    let _ = session;
     #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
     let _ = renderer;
 
@@ -600,7 +640,8 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
 
     let geom = pdf_interp::page_size_pts(&state.session.doc, page_num)?;
 
-    let (rgb, diagnostics) = render_page_rgb_with_geom(&state.session, page_num, scale, geom)?;
+    let (rgb, diagnostics) =
+        render_page_rgb_with_geom(&state.session, page_num, scale, geom, state.session.policy)?;
     let mut gray = rgb_to_gray(&rgb);
 
     if state.opts.deskew {

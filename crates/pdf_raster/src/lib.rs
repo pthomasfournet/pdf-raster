@@ -118,7 +118,8 @@ pub use pdf_interp::prescan_page;
 pub use pdf_interp::renderer::PageDiagnostics;
 pub use pdf_interp::resources::ImageFilter;
 pub use render::{
-    MAX_PX_DIMENSION, RasterError, RasterSession, open_session, render_page_rgb, rgb_to_gray,
+    MAX_PX_DIMENSION, RasterError, RasterSession, open_session, render_page_rgb,
+    render_page_rgb_hinted, rgb_to_gray,
 };
 
 /// Eagerly release GPU decoders on every rayon worker thread.

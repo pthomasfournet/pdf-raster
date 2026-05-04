@@ -5,11 +5,12 @@ use std::io::{BufWriter, Write as _};
 
 use color::{Gray8, Rgb8};
 use encode::{EncodeError, write_pbm, write_pgm, write_png, write_ppm};
-use pdf_raster::{RasterError, RasterSession, render_page_rgb, rgb_to_gray};
+use pdf_raster::{BackendPolicy, RasterError, RasterSession, render_page_rgb_hinted, rgb_to_gray};
 use raster::Bitmap;
 
 use crate::args::{Args, OutputFormat};
 use crate::naming::output_path;
+use crate::page_queue::RoutingHint;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -73,8 +74,9 @@ impl From<EncodeError> for RenderError {
 
 /// Render one page and write it to the appropriate output file.
 ///
-/// `page_num` is 1-based.  Uses the GPU decoder lifecycle managed by
-/// `pdf_raster::render_page_rgb` — safe to call from multiple rayon threads.
+/// `page_num` is 1-based.  `hint` is the affinity-dispatch routing hint from
+/// the prescan pass: `CpuOnly` pages skip GPU decoder initialisation entirely.
+/// Safe to call from multiple rayon threads.
 ///
 /// JPEG and TIFF output are not yet implemented and return
 /// [`RenderError::UnsupportedFormatCombination`].
@@ -83,6 +85,7 @@ pub fn render_page(
     page_num: u32,
     total_pages: u32,
     args: &Args,
+    hint: RoutingHint,
 ) -> Result<(), RenderError> {
     let format = args.output_format();
 
@@ -95,7 +98,15 @@ pub fn render_page(
     let y_dpi = args.y_dpi();
     let scale = (x_dpi / 72.0 * (y_dpi / 72.0)).sqrt();
 
-    let rgb: Bitmap<Rgb8> = render_page_rgb(session, page_num, scale)?;
+    // CpuOnly hint: override to CpuOnly so lend_decoders skips GPU init.
+    // All other hints use the session policy (GPU auto/force as configured).
+    let effective_policy = if matches!(hint, RoutingHint::CpuOnly) {
+        BackendPolicy::CpuOnly
+    } else {
+        session.policy()
+    };
+
+    let rgb: Bitmap<Rgb8> = render_page_rgb_hinted(session, page_num, scale, effective_policy)?;
 
     #[expect(
         clippy::cast_possible_wrap,

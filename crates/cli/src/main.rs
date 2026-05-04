@@ -72,10 +72,27 @@ fn main() {
     )]
     let total_u32 = total as u32;
 
-    let tasks = pages.iter().map(|&page_num| page_queue::PageTask {
-        page_num,
-        hint: page_queue::RoutingHint::Unclassified,
-    });
+    // Prescan each page to classify it for affinity dispatch before the render
+    // pool starts.  prescan_page walks the XObject dict and content-stream
+    // operators without decoding pixels — fast enough to run sequentially.
+    // Errors are silently ignored: a failed prescan falls back to Unclassified,
+    // which is safe (the render path will use the session policy as usual).
+    let hints: Vec<page_queue::RoutingHint> = pages
+        .iter()
+        .map(|&p| {
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "page_num ≥ 1, enforced by build_page_list"
+            )]
+            let diag = pdf_raster::prescan_page(session.doc(), p as u32).ok();
+            page_queue::routing_hint_from_diag(diag.as_ref())
+        })
+        .collect();
+
+    let tasks = pages
+        .iter()
+        .zip(hints.iter())
+        .map(|(&page_num, &hint)| page_queue::PageTask { page_num, hint });
     let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new().run(
         tasks,
         &pool,
