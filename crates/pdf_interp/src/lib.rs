@@ -3,12 +3,13 @@
 //! # Architecture
 //!
 //! ```text
-//! lopdf::Document  →  parse_page()  →  Vec<Operator>  →  (renderer — next phase)
+//! lopdf::Document  →  parse_page()  →  Vec<Operator>  →  renderer::PageRenderer
+//!                  →  prescan_page() →  PageDiagnostics  (no pixels decoded)
 //! ```
 //!
-//! The [`content`] module handles tokenization and operator decoding.
-//! Rasterization will be wired in subsequent commits once the graphics-state
-//! machine and resource resolver are in place.
+//! The [`content`] module handles tokenisation and operator decoding.
+//! The [`renderer`] module rasterises operators to a pixel bitmap.
+//! The [`prescan`] module classifies pages cheaply before rendering.
 
 pub mod content;
 pub mod prescan;

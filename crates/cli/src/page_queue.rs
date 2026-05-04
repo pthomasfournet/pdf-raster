@@ -22,9 +22,7 @@
 //! VA-API back-pressure is structural: [`gpu::JpegQueueHandle::decode`] blocks
 //! the calling Rayon worker until the VA-API worker thread replies — no
 //! separate semaphore is needed here.  nvJPEG uses per-thread TLS slots; every
-//! Rayon worker has its own decoder after the first [`lend_decoders`] call.
-//!
-//! [`lend_decoders`]: pdf_raster::lend_decoders
+//! Rayon worker has its own decoder after the first page it renders.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -86,25 +84,35 @@ pub(crate) struct PageTask {
 
 /// Bounded work-stealing page queue.
 ///
-/// The producer (the calling thread inside `pool.install`) feeds
-/// [`PageTask`]s into a bounded [`mpsc::SyncSender`]; Rayon workers receive
-/// tasks, render pages, and collect errors.
+/// The producer runs on the **calling (main) thread** and feeds
+/// [`PageTask`]s into a bounded [`mpsc::SyncSender`].  Pool workers consume
+/// tasks, render pages, and collect errors via [`rayon::ThreadPool::scope`].
+///
+/// # Why `pool.scope`, not `pool.install` + `rayon::scope`
+///
+/// `pool.install(f)` runs `f` on a pool worker thread, occupying one worker
+/// slot for the duration.  If `f` then calls `rayon::scope` and spawns
+/// `num_threads` consumers, all worker slots are taken and the sender blocks
+/// forever waiting for a consumer that has no thread to run on — deadlock.
+///
+/// `pool.scope(f)` runs `f` on the calling thread while lending the pool's
+/// workers to the scope.  The calling thread stays outside the pool, so it
+/// can produce without consuming a worker slot.
 ///
 /// # Capacity and back-pressure
 ///
 /// `capacity = 2 × num_threads` keeps all workers fed while limiting peak
 /// in-flight bitmap memory.  For example, at `num_threads = 12` (capacity =
-/// 2 × 12 = 24 in-flight pages) and 300 DPI A4 (~24 MB RGB per page), peak
-/// memory is 24 pages × 24 MB = 576 MB — bounded and controlled, vs the old
-/// `par_iter` which could start all N pages at once.
+/// 24 in-flight pages) and 300 DPI A4 (~24 MB RGB per page), peak memory is
+/// 24 × 24 MB = 576 MB — bounded and controlled, vs `par_iter` which starts
+/// all N pages at once.
 ///
 /// # Worker count
 ///
-/// One consumer task is spawned per [`rayon::current_num_threads()`] inside
-/// the scope.  [`mpsc::Receiver`] is `Send` but not `Sync`, so it is wrapped
-/// in `Arc<Mutex<Receiver<PageTask>>>`.  The `Mutex` is held only during the
-/// `recv()` call (nanosecond scale) — not during rendering — so there is no
-/// meaningful contention on the hot path.
+/// One consumer task is spawned per [`rayon::ThreadPool::current_num_threads`].
+/// [`mpsc::Receiver`] is `Send` but not `Sync`, so it is wrapped in
+/// `Arc<Mutex<Receiver<PageTask>>>`.  The `Mutex` is held only during
+/// `recv()` — nanosecond scale — not during rendering.
 pub(crate) struct PageQueue {
     capacity: usize,
 }
@@ -122,9 +130,10 @@ impl PageQueue {
 
     /// Run the render loop over `tasks`, returning all `(page_num, error)` pairs.
     ///
-    /// The producer runs on the **calling thread** (which `pool.install` has
-    /// donated to the Rayon pool).  Consumer tasks are spawned via
-    /// [`rayon::scope`].  All consumers complete before this function returns.
+    /// The producer runs on the **calling (main) thread**.  Consumer tasks are
+    /// spawned into `pool` via [`rayon::ThreadPool::scope`], which lends the
+    /// pool's workers to the scope while the calling thread remains outside.
+    /// All consumers complete before this function returns.
     ///
     /// Progress is reported via `progress` with the same semantics as the
     /// previous `par_iter` loop.  Errors are collected in non-deterministic
@@ -132,6 +141,7 @@ impl PageQueue {
     pub(crate) fn run(
         &self,
         tasks: impl Iterator<Item = PageTask> + Send,
+        pool: &rayon::ThreadPool,
         session: &RasterSession,
         total_u32: u32,
         args: &Args,
@@ -144,10 +154,11 @@ impl PageQueue {
         // Arc lets each worker clone a handle to push errors without moving the Mutex.
         let errors: Arc<Mutex<Vec<(i32, RenderError)>>> = Arc::new(Mutex::new(Vec::new()));
 
-        rayon::scope(|s| {
-            // Spawn one consumer task per available Rayon worker thread.
-            // Each consumer loops until the channel is exhausted.
-            let n_workers = rayon::current_num_threads().max(1);
+        // pool.scope runs the closure on the calling thread and lends pool workers
+        // to the scope.  The calling thread is NOT a pool worker here (unlike
+        // pool.install), so all num_threads workers are free to consume.
+        pool.scope(|s| {
+            let n_workers = pool.current_num_threads().max(1);
             for _ in 0..n_workers {
                 let rx = Arc::clone(&rx);
                 let errors = Arc::clone(&errors);
@@ -160,7 +171,7 @@ impl PageQueue {
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
                                 Ok(t) => t,
-                                Err(_) => break, // channel exhausted → exit
+                                Err(_) => break, // tx dropped → channel exhausted
                             }
                             // guard drops here, lock released before render
                         };
@@ -196,20 +207,20 @@ impl PageQueue {
                 });
             }
 
-            // Producer runs on the calling thread (donated to the pool by pool.install).
-            // SyncSender::send blocks when all `capacity` slots are full — back-pressure.
-            // If all consumers have disconnected (e.g. due to a panic), send returns Err;
-            // we break early rather than spinning forever.
+            // Producer: runs on the calling (main) thread while pool workers consume.
+            // SyncSender::send blocks when all capacity slots are full — back-pressure.
+            // If all consumers have panicked and disconnected, send returns Err; break
+            // early so we don't spin forever.
             for task in tasks {
                 if tx.send(task).is_err() {
                     break;
                 }
             }
-            // drop(tx) here closes the sender side of the channel.
-            // Consumers see Err from recv() and exit their loops cleanly.
+            // tx drops here (end of scope closure) → channel closes → consumers see
+            // Err from recv() and exit their loops cleanly.
         });
 
-        // rayon::scope has returned — all consumer tasks have completed.
+        // pool.scope has returned — all consumer tasks have completed.
         // No other Arc holders exist; try_unwrap + into_inner are both infallible.
         Arc::try_unwrap(errors)
             .expect("no other Arc holders after scope")

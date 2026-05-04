@@ -87,22 +87,19 @@ fn main() {
         .iter()
         .zip(hints)
         .map(|(&page_num, hint)| page_queue::PageTask { page_num, hint });
-    // Capacity = 2× thread count keeps workers fed while bounding peak
-    // in-flight bitmap memory (vs par_iter which can start all N pages at once).
     let queue_capacity = args.num_threads.max(1) * 2;
-    let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
-        page_queue::PageQueue::new(queue_capacity).run(
-            tasks,
-            &session,
-            total_u32,
-            &args,
-            &page_queue::ProgressCtx {
-                done: &done,
-                n_pages,
-                start: &start,
-            },
-        )
-    });
+    let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new(queue_capacity).run(
+        tasks,
+        &pool,
+        &session,
+        total_u32,
+        &args,
+        &page_queue::ProgressCtx {
+            done: &done,
+            n_pages,
+            start: &start,
+        },
+    );
 
     // Eagerly drop GPU decoders on every worker thread while the CUDA driver is
     // still fully live, before the pool drops.  Avoids the process-exit teardown
