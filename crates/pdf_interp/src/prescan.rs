@@ -231,8 +231,11 @@ fn scan_image_dict(
         // Filter may be a Reference → Name; follow it.
         let resolved = match o {
             Object::Reference(id) => {
-                // Rare: Filter as an indirect reference. We don't have `doc` here,
-                // so treat as no filter (conservative).
+                // Rare: Filter as an indirect reference.  `scan_image_dict`
+                // does not have access to `doc` so the reference cannot be
+                // resolved here.  Fall back to Raw, which means this image
+                // will not be counted as a JPEG/JPX candidate — pessimistic
+                // for GPU routing but never causes a misrender.
                 let _ = id;
                 return None;
             }
@@ -269,9 +272,14 @@ fn scan_inline_image(
 
 /// Map a `filter_counts` array index back to [`ImageFilter`].
 ///
-/// Relies on `ImageFilter` discriminant values matching the array positions.
-/// The compile-time assert in `resources::image` (checked via `IMAGE_FILTER_COUNT`)
-/// enforces that both are kept in sync.
+/// Each arm must match the `ImageFilter` discriminant of the same value.
+/// If a new `ImageFilter` variant is added:
+///   1. `IMAGE_FILTER_COUNT` must be bumped (compile-time assert guards this).
+///   2. A new arm must be added here — the `unreachable!` wildcard will panic
+///      in tests if index 6+ appears without a matching arm.
+///
+/// The `idx_to_filter_round_trips` test verifies all `IMAGE_FILTER_COUNT`
+/// indices round-trip correctly.
 const fn idx_to_filter(idx: usize) -> ImageFilter {
     match idx {
         0 => ImageFilter::Dct,
@@ -279,7 +287,10 @@ const fn idx_to_filter(idx: usize) -> ImageFilter {
         2 => ImageFilter::CcittFax,
         3 => ImageFilter::Jbig2,
         4 => ImageFilter::Flate,
-        _ => ImageFilter::Raw,
+        5 => ImageFilter::Raw,
+        // Any index ≥ IMAGE_FILTER_COUNT is a logic bug — the caller always
+        // iterates 0..IMAGE_FILTER_COUNT, so this is unreachable in practice.
+        _ => unreachable!(),
     }
 }
 

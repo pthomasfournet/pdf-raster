@@ -237,6 +237,16 @@ impl PageQueue {
         args: &Args,
         progress: &ProgressCtx<'_>,
     ) -> Vec<(i32, RenderError)> {
+        // Invariant: build_page_list guarantees a non-empty page list, so
+        // n_pages ≥ 1.  The single-thread capacity guard below depends on
+        // this — if n_pages were 0, capacity = max(0, 1) = 1 but the
+        // producer would send 0 tasks, which is harmless.  The assert
+        // catches regressions in the call chain during development.
+        debug_assert!(
+            progress.n_pages >= 1,
+            "PageQueue::run called with n_pages == 0"
+        );
+
         let n_threads = pool.current_num_threads().max(1);
 
         // Single-thread guard: W0 is both producer and consumer.  A blocking
@@ -335,26 +345,47 @@ impl PageQueue {
 mod tests {
     use super::*;
 
-    /// Verify the single-thread capacity guard: with n_threads=1, capacity
-    /// must equal n_pages so the producer never blocks waiting for a consumer
-    /// on the same thread.
+    /// For n_threads=1 the capacity must be exactly n_pages: the producer loop
+    /// must be able to send every task without blocking (W0 is both producer
+    /// and consumer; blocking before all sends complete = deadlock).
+    ///
+    /// Verified by sending n_pages tasks into a sync_channel of that capacity
+    /// and confirming no send blocks (try_send always succeeds).
     #[test]
-    fn single_thread_capacity_equals_n_pages() {
-        let n_pages = 7;
-        // Reproduce the capacity formula used in PageQueue::run for n_threads=1.
-        let capacity = if 1_usize == 1 { n_pages.max(1) } else { 1 * 2 };
-        assert_eq!(
-            capacity, n_pages,
-            "single-thread capacity must cover all pages"
-        );
+    fn single_thread_capacity_allows_all_sends_without_blocking() {
+        let n_pages = 7_usize;
+        // Mirror the formula in PageQueue::run for n_threads == 1.
+        let capacity = n_pages.max(1);
+        let (tx, rx) = mpsc::sync_channel::<u32>(capacity);
+        for i in 0..n_pages as u32 {
+            tx.try_send(i).unwrap_or_else(|_| {
+                panic!("send {i} blocked — capacity {capacity} too small for {n_pages} pages")
+            });
+        }
+        // Drain to confirm all tasks are present.
+        for i in 0..n_pages as u32 {
+            assert_eq!(rx.recv().unwrap(), i);
+        }
     }
 
-    /// Verify the multi-thread capacity formula: capacity = 2 * n_threads.
+    /// For n_threads > 1 the capacity is 2 × n_threads (back-pressure window).
+    /// Verified by confirming try_send fails after the 2*n-th send.
     #[test]
-    fn multi_thread_capacity_is_two_x_threads() {
-        for n in [2_usize, 4, 8, 12, 24] {
-            let capacity = if n == 1 { 99 } else { n * 2 };
-            assert_eq!(capacity, n * 2);
+    fn multi_thread_capacity_limits_in_flight_to_two_x_threads() {
+        for n_threads in [2_usize, 4, 8, 12, 24] {
+            let capacity = n_threads * 2;
+            let (tx, _rx) = mpsc::sync_channel::<u32>(capacity);
+            // First `capacity` sends must succeed.
+            for i in 0..capacity as u32 {
+                tx.try_send(i).unwrap_or_else(|_| {
+                    panic!("send {i} should succeed within capacity {capacity}")
+                });
+            }
+            // One more must fail — back-pressure.
+            assert!(
+                tx.try_send(capacity as u32).is_err(),
+                "n_threads={n_threads}: send beyond capacity {capacity} must block (back-pressure)"
+            );
         }
     }
 

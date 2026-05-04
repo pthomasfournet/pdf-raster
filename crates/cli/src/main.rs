@@ -68,7 +68,7 @@ fn main() {
 
     #[expect(
         clippy::cast_sign_loss,
-        reason = "total validated ≥ 1 via i32::try_from above"
+        reason = "total ≥ 1 guaranteed by the n == 0 exit above; i32::try_from only guards the upper bound"
     )]
     let total_u32 = total as u32;
 

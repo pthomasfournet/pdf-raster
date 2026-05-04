@@ -206,7 +206,8 @@ pub struct Args {
 
     /// VA-API DRM render node (default: /dev/dri/renderD128).
     ///
-    /// Only used when `--backend vaapi` or `--backend auto` with VA-API enabled.
+    /// Only consulted when `--backend vaapi` or `--backend auto` with the
+    /// `vaapi` feature compiled in and a VA-API device detected at runtime.
     #[arg(
         long = "vaapi-device",
         value_name = "PATH",
