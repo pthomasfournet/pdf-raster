@@ -1,14 +1,13 @@
 mod args;
 mod naming;
+mod page_queue;
 mod render;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use clap::Parser;
-use rayon::prelude::*;
-
 use args::Args;
+use clap::Parser;
 
 fn main() {
     let _ = env_logger::try_init();
@@ -69,20 +68,25 @@ fn main() {
     )]
     let total_u32 = total as u32;
 
+    let tasks = pages.iter().map(|&page_num| page_queue::PageTask {
+        page_num,
+        hint: page_queue::RoutingHint::Unclassified,
+    });
+    // Capacity = 2× thread count keeps workers fed while bounding peak
+    // in-flight bitmap memory (vs par_iter which can start all N pages at once).
+    let queue_capacity = args.num_threads.max(1) * 2;
     let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
-        pages
-            .par_iter()
-            .filter_map(|&page_num| {
-                #[expect(
-                    clippy::cast_sign_loss,
-                    reason = "page_num ≥ 1, enforced by build_page_list"
-                )]
-                let page_u32 = page_num as u32;
-                let result = render::render_page(&session, page_u32, total_u32, &args);
-                report_progress(&args, &done, n_pages, &start, page_num);
-                result.err().map(|e| (page_num, e))
-            })
-            .collect()
+        page_queue::PageQueue::new(queue_capacity).run(
+            tasks,
+            &session,
+            total_u32,
+            &args,
+            &page_queue::ProgressCtx {
+                done: &done,
+                n_pages,
+                start: &start,
+            },
+        )
     });
 
     // Eagerly drop GPU decoders on every worker thread while the CUDA driver is
@@ -146,7 +150,13 @@ fn build_page_list(total: i32, args: &Args) -> Option<Vec<i32>> {
     Some(pages)
 }
 
-fn report_progress(args: &Args, done: &AtomicU32, n_pages: usize, start: &Instant, page_num: i32) {
+pub(crate) fn report_progress(
+    args: &Args,
+    done: &AtomicU32,
+    n_pages: usize,
+    start: &Instant,
+    page_num: i32,
+) {
     if !args.progress {
         return;
     }
