@@ -652,7 +652,7 @@ Currently every progressive JPEG incurs a full VA-API header parse + `BadJpeg` e
 - [x] Work-stealing page queue: bounded `mpsc::sync_channel` + `rayon::scope`; `RoutingHint` extension point; back-pressure at 2× thread count; `crates/cli/src/page_queue.rs`; deadlock fix + single-thread guard; `routing_hint_from_diag` + `ProgressCtx::report` live in `page_queue.rs`
 - [x] `PageDiagnostics` pre-scan pass: `pdf_interp::prescan_page` walks XObject dict + content stream operators without decoding pixels; sets `GpuJpegCandidate`/`CpuOnly` hints before enqueueing; `crates/pdf_interp/src/prescan.rs`; `count_filter` + `update_max_ppi` helpers extracted
 - [x] Serial prescan loop removed from CLI render path — all pages default to `RoutingHint::Unclassified`; `routing_hint_from_diag` retained as extension point for future affinity dispatch; recovered 15-20% throughput regression
-- [ ] Affinity dispatch: steer `GpuJpegCandidate` pages to a dedicated GPU worker thread pool; `CpuOnly` pages bypass GPU decoder init overhead
+- [x] Affinity dispatch: prescan all pages sequentially before pool start; `CpuOnly` hint → `BackendPolicy::CpuOnly` override in `render_page_rgb_hinted` → `lend_decoders` skips `ensure_nvjpeg` and `DECODER_INIT_LOCK` acquisition; `GpuJpegCandidate` uses session policy unchanged; single rayon pool (soft affinity)
 - [ ] Benchmark: re-run full corpus with heterogeneous dispatch; target corpus 08/09 GPU speedup ≥ 5× over current CPU path
 
 ---
