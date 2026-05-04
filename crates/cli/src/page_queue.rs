@@ -8,8 +8,7 @@
 //! Bounded work-stealing page queue for the CLI render loop.
 //!
 //! Replaces the static `par_iter()` dispatch with a producer/consumer pattern
-//! that provides back-pressure and content-aware GPU routing via [`RoutingHint`]
-//! hints set by the [`pdf_raster::prescan_page`] pre-scan pass.
+//! that provides back-pressure and content-aware GPU routing.
 //!
 //! # Back-pressure
 //!
@@ -22,20 +21,27 @@
 //! (the exact number of tasks to be sent), ensuring the producer loop completes
 //! before W0 starts consuming.
 //!
+//! # Routing hints
+//!
+//! [`RoutingHint`] classifies each page for GPU vs CPU dispatch.  Currently all
+//! pages are dispatched as [`RoutingHint::Unclassified`]; affinity steering
+//! (directing [`RoutingHint::GpuJpegCandidate`] pages to GPU workers) is a
+//! future work item.  [`routing_hint_from_diag`] translates [`pdf_raster::PageDiagnostics`]
+//! to [`RoutingHint`] and is ready for use once a second GPU thread pool is introduced.
+//!
 //! # GPU slot model
 //!
-//! VA-API back-pressure is structural: [`gpu::JpegQueueHandle::decode`] blocks
-//! the calling Rayon worker until the VA-API worker thread replies — no
-//! separate semaphore is needed here.  nvJPEG uses per-thread TLS slots; every
-//! Rayon worker has its own decoder after the first page it renders.
+//! VA-API back-pressure is structural: the calling Rayon worker blocks until the
+//! VA-API worker thread replies — no separate semaphore is needed here.  nvJPEG
+//! uses per-thread TLS slots; every Rayon worker has its own decoder after the
+//! first page it renders.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use std::sync::atomic::AtomicU32;
-
-use pdf_raster::RasterSession;
+use pdf_raster::{ImageFilter, PageDiagnostics, RasterSession};
 
 use crate::args::Args;
 use crate::render::RenderError;
@@ -44,35 +50,97 @@ use crate::render::RenderError;
 
 /// Progress-reporting state passed to [`PageQueue::run`].
 ///
-/// Groups the four progress-tracking arguments to keep the `run` signature
+/// Groups the progress-tracking arguments to keep the `run` signature
 /// within the 7-argument clippy limit and to make call sites self-documenting.
 pub(crate) struct ProgressCtx<'a> {
     /// Atomic counter incremented once per completed page.
     pub(crate) done: &'a AtomicU32,
-    /// Total number of pages being rendered (for the denominator in progress output).
+    /// Total number of pages being rendered (denominator in progress output).
     pub(crate) n_pages: usize,
     /// Wall-clock instant when rendering started (for ETA calculation).
     pub(crate) start: &'a Instant,
+}
+
+impl ProgressCtx<'_> {
+    /// Increment the completion counter and print a progress line to stderr.
+    ///
+    /// No-op when `args.progress` is false.  ETA is suppressed until at least
+    /// 2 pages are done and 0.5 s has elapsed so the first-page rate estimate
+    /// is not wildly wrong.
+    pub(crate) fn report(&self, args: &Args, page_num: i32) {
+        if !args.progress {
+            return;
+        }
+        let completed = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let completed_usize = usize::try_from(completed).unwrap_or(self.n_pages);
+        let remaining = self.n_pages.saturating_sub(completed_usize);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "ETA display; ±1s accuracy is sufficient"
+        )]
+        let eta_str = if elapsed > 0.5 && completed >= 2 {
+            let rate = f64::from(completed) / elapsed;
+            let eta_s = remaining as f64 / rate;
+            if eta_s.is_finite() {
+                format!("~{eta_s:.1}s remaining")
+            } else {
+                "~?s remaining".to_owned()
+            }
+        } else {
+            "~?s remaining".to_owned()
+        };
+        eprintln!(
+            "pdf-raster: page {page_num} done  [{completed}/{}]  \
+             {elapsed:.1}s elapsed  {eta_str}",
+            self.n_pages
+        );
+    }
 }
 
 // ── Routing hint ──────────────────────────────────────────────────────────────
 
 /// Per-page routing signal for GPU vs CPU dispatch.
 ///
-/// Set by the [`pdf_raster::prescan_page`] pass before tasks are enqueued.
 /// The consumer inspects this hint to choose between GPU and CPU workers.
+/// Currently all pages are enqueued as [`Unclassified`](RoutingHint::Unclassified);
+/// affinity steering is a future work item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutingHint {
     /// No content classification available; any worker may handle this page.
     Unclassified,
     /// Page has large baseline-JPEG images — prefer VA-API / nvJPEG worker.
-    ///
-    /// Set by the pre-scan pass when `dominant_filter == Dct`.
     GpuJpegCandidate,
     /// Page is text/vector only — skip GPU decoder setup overhead.
-    ///
-    /// Set by the pre-scan pass when `has_images == false`.
     CpuOnly,
+}
+
+/// Map [`PageDiagnostics`] to a [`RoutingHint`].
+///
+/// Rules (in priority order):
+/// - No images → [`RoutingHint::CpuOnly`]: skip GPU decoder setup overhead.
+/// - Dominant filter is DCT → [`RoutingHint::GpuJpegCandidate`]: VA-API / nvJPEG eligible.
+/// - Otherwise → [`RoutingHint::Unclassified`]: any worker may handle.
+///
+/// `None` (prescan error or prescan skipped) → [`RoutingHint::Unclassified`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "ready for use once GPU affinity dispatch is introduced"
+    )
+)]
+pub(crate) const fn routing_hint_from_diag(diag: Option<&PageDiagnostics>) -> RoutingHint {
+    let Some(d) = diag else {
+        return RoutingHint::Unclassified;
+    };
+    if !d.has_images {
+        return RoutingHint::CpuOnly;
+    }
+    if matches!(d.dominant_filter, Some(ImageFilter::Dct)) {
+        return RoutingHint::GpuJpegCandidate;
+    }
+    RoutingHint::Unclassified
 }
 
 // ── Page task ─────────────────────────────────────────────────────────────────
@@ -214,10 +282,9 @@ impl PageQueue {
                             // guard drops here, lock released before render
                         };
 
-                        // Hint is set by the prescan pass; affinity dispatch
-                        // (steering GpuJpegCandidate to GPU workers) is a
-                        // future work item.  The hint is captured here so the
-                        // compiler sees it as used and the extension point is clear.
+                        // Affinity dispatch (steering GpuJpegCandidate to GPU
+                        // workers) is a future work item; hint is captured so
+                        // the extension point is visible to the compiler.
                         let _hint = task.hint;
 
                         #[expect(
@@ -227,13 +294,7 @@ impl PageQueue {
                         let page_u32 = task.page_num as u32;
 
                         let result = crate::render::render_page(session, page_u32, total_u32, args);
-                        crate::report_progress(
-                            args,
-                            progress.done,
-                            progress.n_pages,
-                            progress.start,
-                            task.page_num,
-                        );
+                        progress.report(args, task.page_num);
 
                         if let Err(e) = result {
                             lock_recovering(&errors).push((task.page_num, e));
@@ -337,5 +398,37 @@ mod tests {
             hint: RoutingHint::Unclassified,
         };
         assert_eq!(task.hint, RoutingHint::Unclassified);
+    }
+
+    #[test]
+    fn routing_hint_from_diag_no_images_gives_cpu_only() {
+        use pdf_raster::PageDiagnostics;
+        let diag = PageDiagnostics {
+            has_images: false,
+            has_vector_text: true,
+            dominant_filter: None,
+            source_ppi_hint: None,
+        };
+        assert_eq!(routing_hint_from_diag(Some(&diag)), RoutingHint::CpuOnly);
+    }
+
+    #[test]
+    fn routing_hint_from_diag_dct_gives_gpu_candidate() {
+        use pdf_raster::{ImageFilter, PageDiagnostics};
+        let diag = PageDiagnostics {
+            has_images: true,
+            has_vector_text: false,
+            dominant_filter: Some(ImageFilter::Dct),
+            source_ppi_hint: Some(150.0),
+        };
+        assert_eq!(
+            routing_hint_from_diag(Some(&diag)),
+            RoutingHint::GpuJpegCandidate
+        );
+    }
+
+    #[test]
+    fn routing_hint_from_diag_none_gives_unclassified() {
+        assert_eq!(routing_hint_from_diag(None), RoutingHint::Unclassified);
     }
 }

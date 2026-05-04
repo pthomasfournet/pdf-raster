@@ -4,7 +4,7 @@ mod naming;
 mod page_queue;
 mod render;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use args::Args;
@@ -72,25 +72,10 @@ fn main() {
     )]
     let total_u32 = total as u32;
 
-    // Pre-scan: cheaply classify each page before enqueueing for full render.
-    // Errors are non-fatal — a page that can't be scanned gets Unclassified and
-    // is rendered normally.  The scan runs serially here (before the render loop)
-    // to avoid racing with lopdf's non-Sync internals.
-    let hints: Vec<page_queue::RoutingHint> = pages
-        .iter()
-        .map(|&page_num| {
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "page_num ≥ 1, enforced by build_page_list"
-            )]
-            let diag = pdf_raster::prescan_page(session.doc(), page_num as u32);
-            routing_hint_from_diag(diag.as_ref().ok())
-        })
-        .collect();
-    let tasks = pages
-        .iter()
-        .zip(hints)
-        .map(|(&page_num, hint)| page_queue::PageTask { page_num, hint });
+    let tasks = pages.iter().map(|&page_num| page_queue::PageTask {
+        page_num,
+        hint: page_queue::RoutingHint::Unclassified,
+    });
     let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new().run(
         tasks,
         &pool,
@@ -111,65 +96,4 @@ fn main() {
     let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
 
     diagnostics::report_errors(errors);
-}
-
-/// Map a [`pdf_raster::PageDiagnostics`] to a [`page_queue::RoutingHint`].
-///
-/// Rules:
-/// - No images → `CpuOnly` (skip GPU decoder setup overhead).
-/// - Dominant filter is `Dct` → `GpuJpegCandidate` (VA-API / nvJPEG eligible).
-/// - Otherwise → `Unclassified` (any worker may handle).
-///
-/// `None` (prescan error) → `Unclassified` so the page is rendered normally.
-const fn routing_hint_from_diag(
-    diag: Option<&pdf_raster::PageDiagnostics>,
-) -> page_queue::RoutingHint {
-    let Some(d) = diag else {
-        return page_queue::RoutingHint::Unclassified;
-    };
-    if !d.has_images {
-        return page_queue::RoutingHint::CpuOnly;
-    }
-    if matches!(d.dominant_filter, Some(pdf_raster::ImageFilter::Dct)) {
-        return page_queue::RoutingHint::GpuJpegCandidate;
-    }
-    page_queue::RoutingHint::Unclassified
-}
-
-pub(crate) fn report_progress(
-    args: &Args,
-    done: &AtomicU32,
-    n_pages: usize,
-    start: &Instant,
-    page_num: i32,
-) {
-    if !args.progress {
-        return;
-    }
-    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
-    let elapsed = start.elapsed().as_secs_f64();
-    // completed is a page counter; u32→usize is lossless on any 32-bit-or-wider target.
-    let completed_usize = usize::try_from(completed).unwrap_or(n_pages);
-    let remaining = n_pages.saturating_sub(completed_usize);
-    // Guard elapsed > 0.5s and at least 2 pages done before computing ETA;
-    // before that the rate estimate is too noisy to be useful.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "ETA display; ±1s accuracy is sufficient"
-    )]
-    let eta_str = if elapsed > 0.5 && completed >= 2 {
-        let rate = f64::from(completed) / elapsed;
-        let eta_s = remaining as f64 / rate;
-        if eta_s.is_finite() {
-            format!("~{eta_s:.1}s remaining")
-        } else {
-            "~?s remaining".to_owned()
-        }
-    } else {
-        "~?s remaining".to_owned()
-    };
-    eprintln!(
-        "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
-         {elapsed:.1}s elapsed  {eta_str}"
-    );
 }
