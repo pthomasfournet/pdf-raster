@@ -103,9 +103,10 @@ pub(crate) struct PageTask {
 /// # Capacity and back-pressure
 ///
 /// `capacity = 2 × num_threads` keeps all workers fed while limiting peak
-/// in-flight bitmap memory.  For example, at `num_threads = 12` and 300 DPI
-/// A4 (~24 MB RGB per page), peak memory is `24 × 24 MB = 576 MB` — bounded
-/// and controlled, vs the old `par_iter` which could start all N pages at once.
+/// in-flight bitmap memory.  For example, at `num_threads = 12` (capacity =
+/// 2 × 12 = 24 in-flight pages) and 300 DPI A4 (~24 MB RGB per page), peak
+/// memory is 24 pages × 24 MB = 576 MB — bounded and controlled, vs the old
+/// `par_iter` which could start all N pages at once.
 ///
 /// # Worker count
 ///
