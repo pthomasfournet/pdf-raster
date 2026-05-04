@@ -2,6 +2,176 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- Update Send safety comment and fix doc tense in CachedCtx
+- Correct misleading comments in create_surface_and_context and test
+- Destroy cached context+surface in Drop
+- Correct misleading comment in drop_impl_compiles_with_cached_ctx
+- Include is_gray in cache key to prevent YUV400/YUV420 mismatch
+- Replace pool.install+rayon::scope with pool.scope to fix deadlock
+- Spawn n_threads-1 consumers so W0 is free to produce
+- Drop tx inside pool.scope to unblock consumers
+
+### Chores
+
+- Untrack ROADMAP_INTEL.md (gitignored)
+- Add .worktrees/ to .gitignore
+
+### Documentation
+
+- Update VapiJpegDecoder and decode_sync docs to reflect context reuse
+- Clarify capacity arithmetic in PageQueue doc example
+- Update Phase 7 and v0.4.0 with CLI refactor and Rayon hardening
+
+### Features
+
+- Add CachedCtx struct and field to VapiJpegDecoder
+- Route JPEG decodes through a single-threaded DecodeQueue
+- Bounded work-stealing page queue replaces par_iter
+- PageDiagnostics pre-scan pass wires RoutingHint
+
+### Other
+
+- Wrap long log::warn! line to satisfy rustfmt
+- Address all 10-pass review findings
+- Fix pool.scope docs, capacity bug, ETA guard, dedup error chain
+- Hardening pass on page_queue and main
+- Hardening pass — debug_assert, accurate expect reasons, real capacity tests, clearer comments
+
+### Performance
+
+- Reuse VAContext+VASurface across same-dimension decodes
+
+### Refactor
+
+- Extract create_surface_and_context helper
+- Extract DEFAULT_VAAPI_DEVICE const, remove duplicate literals
+- Extract diagnostics module from main.rs
+- Move build_page_list into Args method, return Result with warnings vec
+- Move routing_hint_from_diag+report_progress into page_queue; remove serial prescan
+- Extract count_filter+update_max_ppi helpers, remove duplicate PPI code
+
+## [0.5.1] - 2026-05-02
+
+### Bug Fixes
+
+- Escalate GPU unexpected-component log to warn
+
+### Chores
+
+- Release v0.5.1
+
+### Documentation
+
+- Mark Phase 7 SOF detection + dispatch refactor complete
+- Audit and correct all Phase 7 documentation
+
+### Features
+
+- Add JpegVariant + jpeg_sof_type() peek — shared SOF detection
+- Content-aware JPEG dispatch — skip VA-API for progressive JPEG
+
+### Other
+
+- Bump actions/checkout v4 → v6 (Node.js 24)
+- Bump actions/cache v4 → v5 (Node.js 24)
+- Jpeg_sof — fix None/Other contract, SOS guard, 0xFF prefix check, TEM marker, test coverage
+- Jpeg_parser — fix 16-bit DQT, DHT truncation, range validation, SOS/EOI bounds, truncation error
+
+### Refactor
+
+- Remove SOF2 rejection from jpeg_parser — caller owns routing
+- Collapse decode_dct_gpu+vaapi into generic decode_dct_gpu_path
+
+### Testing
+
+- Mark sparse-page integration tests #[ignore]
+
+## [0.5.0] - 2026-05-02
+
+### Bug Fixes
+
+- Fix u32 overflow in PageIter; extract should_render; harden render_channel
+
+### Chores
+
+- Fmt and clippy fixes for PageSet feature
+- Release v0.5.0
+
+### Documentation
+
+- Update all version references to v0.4.0; add v0.4.0 release entry
+- Add render_channel streaming and PageSet sparse-selection examples
+- Fix streaming example — remove rayon::scope deadlock risk
+
+### Features
+
+- Add PageSet validated sparse-page-set type
+- Add pages field to RasterOptions
+- Wire PageSet sparse filtering into render_pages and render_channel
+
+### Refactor
+
+- Harden PageSet — PartialEq/Eq, IntoIterator, safer first/last, edge-case tests
+- Harden RasterOptions::pages field — test coverage and comment accuracy
+
+## [0.4.0] - 2026-05-02
+
+### Bug Fixes
+
+- Hardening pass on backend flag implementation
+- Resolve clippy warnings under vaapi feature
+- Evict PDF from page cache before each timed run
+- PTX compilation never triggered on gpu-aa/gpu-icc builds
+- Replace infallible expect in col_to_byte with saturating cast
+- Remove ncomps param from draw_image/blit_image; derive from P::BYTES
+- Propagate FreeType init error instead of panicking
+- Correct AA_GAMMA table values and add exhaustive test
+- Harden general pipe compositing — 5 bugs, 4 safety assertions
+- TJ kern ignores Tz; log path-builder failures
+- Minor hardening and log-level fixes
+
+### Chores
+
+- Add plugin runtime directories
+- Release v0.4.0
+
+### Documentation
+
+- Add benchmarks.md with full methodology and CPU-only results
+- Add VA-API iGPU results + Intel CPU 08 + corpus 09 regression note
+- Update all tables with fresh clean-build measurements
+- Fresh CPU benchmarks (both machines) + Phase 7 roadmap
+- Fresh VA-API corpora 01-05 (uncontested run)
+- Add storage type to hardware table, note cold-cache methodology
+- Intel GPU results (RTX 2080 Super, Turing sm_75)
+- Complete fresh VA-API table (corpora 06-10)
+
+### Features
+
+- Add --backend auto|cpu|cuda|vaapi flag
+- Expose vaapi feature flag on CLI crate; correct VA-API benchmark data
+- Add --corpus-dir flag for alternate PDF location
+
+### Other
+
+- Fix missing system deps — libfreetype6-dev + bundled FreeType for aarch64
+- Install libc6-dev-arm64-cross + LIBZ_SYS_STATIC for cross-compile
+
+### Refactor
+
+- Extract compute_a_src helper; eliminate duplicated alpha logic
+- Split page/mod.rs into focused sub-modules
+- Simplify pass over review-session changed files
+- Extract finish_pixel helper; clarify push_glyph comment
+
+### Testing
+
+- Add hardened corpus benchmark script
+
 ## [0.3.0] - 2026-05-01
 
 ### Bug Fixes
@@ -17,6 +187,8 @@ All notable changes to this project will be documented in this file.
 - Cargo fmt --all
 - Remove unused smallvec dependency
 - Remove unused proptest/tempfile dependencies; fix golden tempdir
+- Update CHANGELOG.md for v0.3.0
+- Release v0.3.0
 
 ### Documentation
 

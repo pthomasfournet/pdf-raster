@@ -67,7 +67,7 @@ Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1" }
 ```
 
 For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
@@ -75,10 +75,10 @@ For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
 ```toml
 [dependencies]
 # CUDA GPU features (NVIDIA only):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
 
 # VA-API (AMD/Intel iGPU on Linux — libva required):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0", features = ["vaapi"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1", features = ["vaapi"] }
 ```
 
 To track the latest commit on `master` instead of a pinned tag:
@@ -231,10 +231,10 @@ pdf-raster refuses to open PDFs that contain JavaScript entry points and returns
 
 ```bash
 # CPU-only (no CUDA dependency)
-cargo build --release -p cli
+cargo build --release -p pdf-raster
 
 # With all GPU features
-CUDA_ARCH=sm_120 cargo build --release -p cli \
+CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
   --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew"
 ```
 

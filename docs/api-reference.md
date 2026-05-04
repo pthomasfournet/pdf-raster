@@ -113,15 +113,50 @@ pub struct RasterOptions {
     pub first_page: u32,
     pub last_page: u32,
     pub deskew: bool,
+    pub pages: Option<PageSet>,
 }
 ```
 
 | Field | Constraints | Notes |
 |---|---|---|
 | `dpi` | `> 0`, finite | Render resolution. Pass `effective_dpi` (not `dpi`) to Tesseract. |
-| `first_page` | `≥ 1` | 1-based inclusive. |
-| `last_page` | `≥ first_page` | 1-based inclusive. Clamped to document length silently. |
+| `first_page` | `≥ 1` | 1-based inclusive. Ignored when `pages` is `Some`. |
+| `last_page` | `≥ first_page` | 1-based inclusive. Clamped to document length silently. Ignored when `pages` is `Some`. |
 | `deskew` | — | Applies intensity-weighted projection-profile deskew (±7°, sub-0.05° accuracy). Disable for native-text PDFs. |
+| `pages` | — | When `Some`, only the pages in the `PageSet` are rendered; `first_page`/`last_page` are ignored. |
+
+---
+
+### `PageSet`
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageSet(/* opaque Arc<[u32]> */);
+
+impl PageSet {
+    pub fn new(pages: impl IntoIterator<Item = u32>) -> Result<Self, RasterError>
+    pub fn contains(&self, page: u32) -> bool  // O(log n)
+    pub fn first(&self) -> u32
+    pub fn last(&self) -> u32
+    pub fn len(&self) -> usize
+    pub fn is_empty(&self) -> bool  // always false by invariant
+}
+```
+
+A validated, sorted, deduplicated set of 1-based page numbers. The internal storage is reference-counted (`Arc<[u32]>`); `clone()` is O(1). Used in `RasterOptions::pages` to render a sparse subset of pages without visiting intermediate ones.
+
+**`PageSet::new`** accepts any `IntoIterator<Item = u32>` (Vec, array, slice, range). The input is sorted and deduplicated before storage. Returns `RasterError::InvalidOptions` if the resulting set is empty or contains a zero page number.
+
+```rust
+let pages = PageSet::new(vec![1, 5, 23, 100])?;
+let opts = RasterOptions {
+    dpi: 300.0,
+    first_page: 1,       // ignored — PageSet controls the range
+    last_page: u32::MAX, // ignored — PageSet controls the range
+    deskew: true,
+    pages: Some(pages),
+};
+```
 
 ---
 

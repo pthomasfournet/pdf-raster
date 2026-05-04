@@ -6,7 +6,7 @@ Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tes
 
 ```toml
 # Cargo.toml
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.4.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1" }
 ```
 
 ```rust
@@ -63,7 +63,7 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 cargo build --release -p cli
 
 # With all GPU features (CUDA 12, RTX/NVIDIA GPU required)
-CUDA_ARCH=sm_120 cargo build --release -p cli \
+CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
   --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew"
 ```
 

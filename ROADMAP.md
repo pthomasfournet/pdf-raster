@@ -27,6 +27,20 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.5.1 (May 2026)
+
+**New since v0.5.0:**
+
+- **Phase 7 — SOF-aware JPEG dispatch** — `gpu::jpeg_sof_type()` peeks the JPEG SOF marker byte (`0xC0` baseline / `0xC2` progressive / other); progressive JPEG is now routed directly to nvJPEG, bypassing VA-API (which supports baseline only); VA-API early-returns on SOF2 without a wasted parse attempt. `decode_dct_gpu` + `decode_dct_vaapi` collapsed into a single generic `decode_dct_gpu_path<D: GpuJpegDecoder>`. Hardening: `jpeg_sof.rs` — fixed None/Other contract, SOS guard, `0xFF` prefix check, TEM marker handling, 8 unit tests; `jpeg_parser.rs` — fixed 16-bit DQT/DHT truncation, range validation, SOS/EOI bounds.
+- **Bug fixes** — `u32` overflow in `PageIter` fixed; `render_channel` streaming doc corrected (removed rayon::scope deadlock risk in example).
+- **CI** — `actions/cache` v4 → v5, `actions/checkout` v4 → v6 (Node.js 24).
+
+### v0.5.0 (May 2026)
+
+**New since v0.4.0:**
+
+- **`PageSet` sparse page selection** — `PageSet::new(pages)` creates a validated, sorted, deduplicated set of 1-based page numbers stored in an `Arc<[u32]>` (clone is O(1)). `RasterOptions::pages: Option<PageSet>` enables rendering a sparse subset of pages without visiting intermediates. `first_page`/`last_page` are ignored when `pages` is `Some`. Wired through `render_pages` and `render_channel`. 9 unit tests; sparse-page integration tests added (marked `#[ignore]` for CI).
+
 ### v0.4.0 (May 2026)
 
 **New since v0.3.0:**
