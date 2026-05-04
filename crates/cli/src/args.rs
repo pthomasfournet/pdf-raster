@@ -1,7 +1,7 @@
 //! Command-line argument definitions.
 
 use clap::Parser;
-use pdf_raster::{BackendPolicy, SessionConfig};
+use pdf_raster::{BackendPolicy, DEFAULT_VAAPI_DEVICE, SessionConfig};
 
 /// Parser that rejects non-positive or non-finite DPI values at the CLI boundary.
 fn parse_positive_dpi(s: &str) -> Result<f64, String> {
@@ -210,7 +210,7 @@ pub struct Args {
     #[arg(
         long = "vaapi-device",
         value_name = "PATH",
-        default_value = "/dev/dri/renderD128"
+        default_value = DEFAULT_VAAPI_DEVICE
     )]
     pub vaapi_device: String,
 }
@@ -366,7 +366,7 @@ impl Args {
             BackendArg::Vaapi => BackendPolicy::ForceVaapi,
         };
 
-        if self.vaapi_device != "/dev/dri/renderD128"
+        if self.vaapi_device != DEFAULT_VAAPI_DEVICE
             && matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceCuda)
         {
             let backend_name = match policy {

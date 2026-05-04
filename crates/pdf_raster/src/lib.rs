@@ -169,6 +169,9 @@ pub enum BackendPolicy {
 
 // ── Session configuration ─────────────────────────────────────────────────────
 
+/// Default VA-API DRM render node path used by [`SessionConfig`] and the CLI.
+pub const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
 /// Configuration for opening a [`RasterSession`].
 ///
 /// Passed to [`open_session`].  Use [`Default::default()`] for the behaviour
@@ -188,7 +191,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             policy: BackendPolicy::Auto,
-            vaapi_device: "/dev/dri/renderD128".to_owned(),
+            vaapi_device: DEFAULT_VAAPI_DEVICE.to_owned(),
         }
     }
 }
