@@ -251,8 +251,11 @@ impl PageQueue {
                     break;
                 }
             }
-            // tx drops here (end of scope closure) → channel closes → consumers see
-            // Err from recv() and exit their loops cleanly.
+            // Drop tx here — closing the channel — so consumers see Err from
+            // recv() and exit their loops.  Without this explicit drop, tx lives
+            // until the end of `run` (after the scope join), and consumers block
+            // on recv() forever.
+            drop(tx);
         });
 
         // pool.scope has returned — all consumer tasks have completed or panicked
