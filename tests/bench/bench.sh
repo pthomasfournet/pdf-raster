@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# bench.sh — throughput comparison: pdftoppm vs pdf-raster (+ optional extras).
+# bench.sh — throughput benchmark: pdf-raster (+ optional pdftoppm and extras).
 #
-# For each fixture PDF and each DPI, runs hyperfine with all enabled commands
-# rendering the same page range and reports wall-clock time + pages/sec.
+# For each fixture PDF and each DPI, runs hyperfine and reports wall-clock
+# time + pages/sec.  pdftoppm is skipped by default; use -R to include it.
 #
 # Usage:
 #   bench.sh [OPTIONS]
@@ -15,10 +15,12 @@
 #   -w N            Hyperfine warmup runs per benchmark (default: 1)
 #   -c N            Hyperfine measurement runs per benchmark (default: 5)
 #   -o FILE         Write JSON results to FILE (default: bench/bench-results.json)
+#   -R              Include pdftoppm as a reference (slow; skipped by default)
 #   -e              Include extra rasterisers: Ghostscript (gs) and MuPDF (mutool)
 #   -d              Dry run: print hyperfine commands without executing them
 #
-# Requires: hyperfine, pdftoppm, pdf-raster (release build), python3
+# Requires: hyperfine, pdf-raster (release build), python3
+# With -R: also requires pdftoppm
 # With -e: also requires gs (Ghostscript) and mutool (MuPDF)
 
 set -euo pipefail
@@ -36,6 +38,7 @@ LAST_PAGE=5
 WARMUP=1
 RUNS=5
 JSON_OUT="${SCRIPT_DIR}/bench-results.json"
+INCLUDE_REF=false
 EXTRAS=false
 DRY_RUN=false
 
@@ -47,7 +50,7 @@ usage() {
 die() { echo "Error: $*" >&2; exit 1; }
 is_positive_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 
-while getopts ":r:f:p:l:w:c:o:edh" opt; do
+while getopts ":r:f:p:l:w:c:o:Redh" opt; do
     case $opt in
         r) DPI_LIST="$OPTARG" ;;
         f) FIXTURES_DIR="$OPTARG" ;;
@@ -56,6 +59,7 @@ while getopts ":r:f:p:l:w:c:o:edh" opt; do
         w) WARMUP="$OPTARG" ;;
         c) RUNS="$OPTARG" ;;
         o) JSON_OUT="$OPTARG" ;;
+        R) INCLUDE_REF=true ;;
         e) EXTRAS=true ;;
         d) DRY_RUN=true ;;
         h) usage ;;
@@ -70,9 +74,12 @@ is_positive_int "$WARMUP"    || die "-w must be a positive integer, got: $WARMUP
 is_positive_int "$RUNS"      || die "-c must be a positive integer, got: $RUNS"
 
 # ── dependency check ──────────────────────────────────────────────────────────
-for cmd in hyperfine pdftoppm python3; do
+for cmd in hyperfine python3; do
     command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found in PATH"
 done
+if $INCLUDE_REF; then
+    command -v pdftoppm >/dev/null 2>&1 || die "-R requires pdftoppm but it was not found in PATH"
+fi
 if $EXTRAS; then
     for cmd in gs mutool; do
         command -v "$cmd" >/dev/null 2>&1 || die "-e requires $cmd but it was not found in PATH"
@@ -108,16 +115,16 @@ if $DRY_RUN; then
         pdf_name="$(basename "$pdf")"
         echo "  ── ${pdf_name} ──"
         for dpi in "${dpis[@]}"; do
-            ref_cmd="pdftoppm -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} <TMP>/ref/pg"
             new_cmd="${RASTER_BIN} -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} <TMP>/new/pg"
             frag="<TMP>/frag_${pdf_name//[^a-zA-Z0-9]/_}_${dpi}.json"
             echo "  hyperfine --warmup ${WARMUP} --runs ${RUNS} --export-json ${frag} \\"
-            echo "    --command-name 'pdftoppm  @${dpi}dpi' '${ref_cmd}' \\"
+            if $INCLUDE_REF; then
+                ref_cmd="pdftoppm -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} <TMP>/ref/pg"
+                echo "    --command-name 'pdftoppm  @${dpi}dpi' '${ref_cmd}' \\"
+            fi
             echo "    --command-name 'pdf-raster@${dpi}dpi' '${new_cmd}'"
             if $EXTRAS; then
-                # gs: ppmraw device, quiet mode (-q), batch (-dBATCH -dNOPAUSE)
                 gs_cmd="gs -q -sDEVICE=ppmraw -r${dpi} -dNOPAUSE -dBATCH -dFirstPage=1 -dLastPage=${LAST_PAGE} -sOutputFile=<TMP>/gs/pg_%d.ppm ${pdf}"
-                # mutool: draw subcommand, ppm format, page range 1-N
                 mut_cmd="mutool draw -q -r ${dpi} -F ppm -o <TMP>/mut/pg_%d.ppm ${pdf} 1-${LAST_PAGE}"
                 echo "    --command-name 'gs        @${dpi}dpi' '${gs_cmd}' \\"
                 echo "    --command-name 'mutool    @${dpi}dpi' '${mut_cmd}'"
@@ -135,11 +142,13 @@ trap 'rm -rf "$OUT_DIR"' EXIT
 
 json_fragments=()
 
+ref_label=""
+$INCLUDE_REF && ref_label=" vs pdftoppm"
 extras_label=""
 $EXTRAS && extras_label=" + gs + mutool"
 
 echo "══════════════════════════════════════════════════════════════════════════"
-printf " Benchmark: pdftoppm vs pdf-raster%s\n" "$extras_label"
+printf " Benchmark: pdf-raster%s%s\n" "$ref_label" "$extras_label"
 printf " Fixtures:  %s\n" "$FIXTURES_DIR"
 printf " DPIs:      %s\n" "$DPI_LIST"
 printf " Pages:     1-%s per run\n" "$LAST_PAGE"
@@ -148,7 +157,6 @@ echo "════════════════════════�
 
 for pdf in "${pdf_files[@]}"; do
     pdf_name="$(basename "$pdf")"
-    # Separate output dirs per DPI so stale pages from a prior DPI never linger.
     echo ""
     echo "── ${pdf_name} ──────────────────────────────────────────────────────────"
 
@@ -156,33 +164,36 @@ for pdf in "${pdf_files[@]}"; do
         echo ""
         printf "  DPI %s — pages 1-%s\n" "$dpi" "$LAST_PAGE"
 
-        ref_out="${OUT_DIR}/ref_${dpi}"
         new_out="${OUT_DIR}/new_${dpi}"
-        mkdir -p "$ref_out" "$new_out"
+        mkdir -p "$new_out"
 
-        ref_cmd="pdftoppm -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} ${ref_out}/pg"
         new_cmd="${RASTER_BIN} -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} ${new_out}/pg"
         frag_file="${OUT_DIR}/frag_${pdf_name//[^a-zA-Z0-9]/_}_${dpi}.json"
 
-        # Build the hyperfine invocation; extra rasterisers are appended when -e is set.
         hyperfine_args=(
             --warmup "$WARMUP"
             --runs "$RUNS"
             --export-json "$frag_file"
-            --command-name "pdftoppm  @${dpi}dpi" "$ref_cmd"
             --command-name "pdf-raster@${dpi}dpi" "$new_cmd"
         )
+
+        if $INCLUDE_REF; then
+            ref_out="${OUT_DIR}/ref_${dpi}"
+            mkdir -p "$ref_out"
+            ref_cmd="pdftoppm -r ${dpi} -f 1 -l ${LAST_PAGE} ${pdf} ${ref_out}/pg"
+            hyperfine_args+=(
+                --command-name "pdftoppm  @${dpi}dpi" "$ref_cmd"
+            )
+        fi
 
         if $EXTRAS; then
             gs_out="${OUT_DIR}/gs_${dpi}"
             mut_out="${OUT_DIR}/mut_${dpi}"
             mkdir -p "$gs_out" "$mut_out"
 
-            # Ghostscript: ppmraw device, quiet (-q), batch mode, per-page output files.
             gs_cmd="gs -q -sDEVICE=ppmraw -r${dpi} -dNOPAUSE -dBATCH \
                 -dFirstPage=1 -dLastPage=${LAST_PAGE} \
                 -sOutputFile=${gs_out}/pg_%d.ppm ${pdf}"
-            # MuPDF mutool: draw subcommand, ppm output, page range 1-N, quiet.
             mut_cmd="mutool draw -q -r ${dpi} -F ppm \
                 -o ${mut_out}/pg_%d.ppm ${pdf} 1-${LAST_PAGE}"
 
@@ -195,8 +206,8 @@ for pdf in "${pdf_files[@]}"; do
         hyperfine "${hyperfine_args[@]}"
         json_fragments+=("$frag_file")
 
-        # Discard rendered pages to keep disk usage bounded on large fixtures.
-        rm -rf "$ref_out" "$new_out"
+        rm -rf "$new_out"
+        $INCLUDE_REF && rm -rf "${OUT_DIR}/ref_${dpi}"
         $EXTRAS && rm -rf "${OUT_DIR}/gs_${dpi}" "${OUT_DIR}/mut_${dpi}"
     done
 done
@@ -259,8 +270,13 @@ ref_times = {
     if r["command"].strip().startswith("pdftoppm") and "@" in r["command"]
 }
 
-hdr = f"  {'Command':<32} {'Mean (s)':>9} {'Pages/s':>10} {'vs pdftoppm':>13}"
-sep = f"  {'-'*32} {'-'*9} {'-'*10} {'-'*13}"
+has_ref = bool(ref_times)
+if has_ref:
+    hdr = f"  {'Command':<32} {'Mean (s)':>9} {'Pages/s':>10} {'vs pdftoppm':>13}"
+    sep = f"  {'-'*32} {'-'*9} {'-'*10} {'-'*13}"
+else:
+    hdr = f"  {'Command':<32} {'Mean (s)':>9} {'Pages/s':>10}"
+    sep = f"  {'-'*32} {'-'*9} {'-'*10}"
 
 for group_label in sorted(groups):
     print()
@@ -273,11 +289,14 @@ for group_label in sorted(groups):
         mean = r["mean"]
         pps  = last_page / mean
         is_ref = name.strip().startswith("pdftoppm")
-        if is_ref or ref_t <= 0:
-            speedup = "  (ref)" if is_ref else ""
+        if has_ref:
+            if is_ref or ref_t <= 0:
+                speedup = "  (ref)" if is_ref else ""
+            else:
+                speedup = f"{ref_t / mean:.2f}×"
+            print(f"  {name:<32} {mean:>9.3f} {pps:>10.1f} {speedup:>13}")
         else:
-            speedup = f"{ref_t / mean:.2f}×"
-        print(f"  {name:<32} {mean:>9.3f} {pps:>10.1f} {speedup:>13}")
+            print(f"  {name:<32} {mean:>9.3f} {pps:>10.1f}")
 PYEOF
 
 echo ""
