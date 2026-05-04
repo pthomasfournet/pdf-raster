@@ -1,21 +1,20 @@
 mod args;
 mod diagnostics;
 mod naming;
-mod page_queue;
 mod render;
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use args::Args;
 use clap::Parser;
+use rayon::prelude::*;
 
 fn main() {
     let _ = env_logger::try_init();
 
     let args = Args::parse();
 
-    // Validate mutually exclusive flags before allocating any resources.
     if args.odd_only && args.even_only {
         eprintln!("pdf-raster: --odd and --even are mutually exclusive");
         std::process::exit(1);
@@ -62,6 +61,7 @@ fn main() {
     for w in &page_warnings {
         eprintln!("pdf-raster: warning: {w}");
     }
+
     let n_pages = pages.len();
     let done = AtomicU32::new(0);
     let start = Instant::now();
@@ -72,39 +72,48 @@ fn main() {
     )]
     let total_u32 = total as u32;
 
-    // Prescan each page to classify it for affinity dispatch before the render
-    // pool starts.  prescan_page walks the XObject dict and content-stream
-    // operators without decoding pixels — fast enough to run sequentially.
-    // Errors are silently ignored: a failed prescan falls back to Unclassified,
-    // which is safe (the render path will use the session policy as usual).
-    let hints: Vec<page_queue::RoutingHint> = pages
-        .iter()
-        .map(|&p| {
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "page_num ≥ 1, enforced by build_page_list"
-            )]
-            let diag = pdf_raster::prescan_page(session.doc(), p as u32).ok();
-            page_queue::routing_hint_from_diag(diag.as_ref())
-        })
-        .collect();
+    let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
+        pages
+            .par_iter()
+            .filter_map(|&page_num| {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "page_num ≥ 1, enforced by build_page_list"
+                )]
+                let page_u32 = page_num as u32;
 
-    let tasks = pages
-        .iter()
-        .zip(hints.iter())
-        .map(|(&page_num, &hint)| page_queue::PageTask { page_num, hint });
-    let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new().run(
-        tasks,
-        &pool,
-        &session,
-        total_u32,
-        &args,
-        &page_queue::ProgressCtx {
-            done: &done,
-            n_pages,
-            start: &start,
-        },
-    );
+                let result = render::render_page(&session, page_u32, total_u32, &args);
+
+                if args.progress {
+                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let elapsed = self::elapsed_secs(&start);
+                    let completed_usize = usize::try_from(completed).unwrap_or(n_pages);
+                    let remaining = n_pages.saturating_sub(completed_usize);
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "ETA display; ±1s accuracy is sufficient"
+                    )]
+                    let eta_str = if elapsed > 0.5 && completed >= 2 {
+                        let rate = f64::from(completed) / elapsed;
+                        let eta_s = remaining as f64 / rate;
+                        if eta_s.is_finite() {
+                            format!("~{eta_s:.1}s remaining")
+                        } else {
+                            "~?s remaining".to_owned()
+                        }
+                    } else {
+                        "~?s remaining".to_owned()
+                    };
+                    eprintln!(
+                        "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
+                         {elapsed:.1}s elapsed  {eta_str}"
+                    );
+                }
+
+                result.err().map(|e| (page_num, e))
+            })
+            .collect()
+    });
 
     // Eagerly drop GPU decoders on every worker thread while the CUDA driver is
     // still fully live, before the pool drops.  Avoids the process-exit teardown
@@ -113,4 +122,9 @@ fn main() {
     let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
 
     diagnostics::report_errors(errors);
+}
+
+#[inline]
+fn elapsed_secs(start: &Instant) -> f64 {
+    start.elapsed().as_secs_f64()
 }
