@@ -35,6 +35,8 @@ Phase 5 is complete. The API exists and is integrated.
 - **Compositing correctness hardening** — 5 bugs in the general pipe, 4 safety assertions; AA gamma table values corrected with exhaustive test; `ncomps` parameter removed from `draw_image`/`blit_image` (derived from pixel type instead).
 - **Bug fixes** — TJ kern ignores Tz correctly; FreeType init error propagated instead of panicking; `col_to_byte` uses saturating cast; PTX compilation now triggered correctly on `gpu-aa`/`gpu-icc` builds; PDF page cache evicted before each timed bench run.
 - **Refactors** — `finish_pixel` helper extracted; `compute_a_src` helper extracted eliminating duplicated alpha logic; `page/mod.rs` split into focused sub-modules.
+- **CLI shared-helper refactor** — `DEFAULT_VAAPI_DEVICE` const eliminates 3 independent string literals; `diagnostics.rs` module extracted from `main.rs` (4 error display functions); `build_page_list` moved into `Args::build_page_list(&self, total) -> Result<(Vec<i32>, Vec<String>), String>` (testable, side-effect-free); `routing_hint_from_diag` + `ProgressCtx::report` moved into `page_queue.rs` (eliminating cross-module call inversion); serial prescan loop removed (recovered 15-20% performance regression); `count_filter` + `update_max_ppi` helpers extracted in `prescan.rs` (eliminated duplicate PPI/filter-count blocks); `main.rs` reduced to ~100 lines of pure orchestration; 21 new unit tests.
+- **Rayon pool hardening** — deadlock fix: `tx` now explicitly dropped inside `pool.scope` closure; single-thread pool deadlock guard (`capacity = n_pages` when `n_threads == 1`); ETA guard prevents `~0.0s remaining` on first page; `debug_assert!(n_pages >= 1)` makes invariant explicit; capacity tests now verify actual channel back-pressure behavior.
 
 ### v0.3.0 (May 2026)
 
@@ -633,8 +635,10 @@ Currently every progressive JPEG incurs a full VA-API header parse + `BadJpeg` e
 
 - [x] Extract SOF marker detection into `gpu::jpeg_sof_type()` — `crates/gpu/src/jpeg_sof.rs`; `JpegVariant { Baseline, Progressive, Other }`; zero-allocation marker scan; `#[must_use]`; 8 unit tests; shared by VA-API and dispatch
 - [x] Update `decode_dct` dispatch: `jpeg_variant = gpu::jpeg_sof_type(data)` before threshold check; nvJPEG accepts `Baseline | Progressive`; VA-API accepts `Baseline` only — progressive skipped entirely; `VapiJpegDecoder::decode_sync` also guards with early return; `decode_dct_gpu` + `decode_dct_vaapi` collapsed into generic `decode_dct_gpu_path<D: GpuJpegDecoder>`
-- [x] Work-stealing page queue: bounded `mpsc::sync_channel` + `rayon::scope`; `RoutingHint` extension point; back-pressure at 2× thread count; `crates/cli/src/page_queue.rs`
-- [x] `PageDiagnostics` pre-scan pass: `pdf_interp::prescan_page` walks XObject dict + content stream operators without decoding pixels; sets `GpuJpegCandidate`/`CpuOnly` hints before enqueueing; `crates/pdf_interp/src/prescan.rs`
+- [x] Work-stealing page queue: bounded `mpsc::sync_channel` + `rayon::scope`; `RoutingHint` extension point; back-pressure at 2× thread count; `crates/cli/src/page_queue.rs`; deadlock fix + single-thread guard; `routing_hint_from_diag` + `ProgressCtx::report` live in `page_queue.rs`
+- [x] `PageDiagnostics` pre-scan pass: `pdf_interp::prescan_page` walks XObject dict + content stream operators without decoding pixels; sets `GpuJpegCandidate`/`CpuOnly` hints before enqueueing; `crates/pdf_interp/src/prescan.rs`; `count_filter` + `update_max_ppi` helpers extracted
+- [x] Serial prescan loop removed from CLI render path — all pages default to `RoutingHint::Unclassified`; `routing_hint_from_diag` retained as extension point for future affinity dispatch; recovered 15-20% throughput regression
+- [ ] Affinity dispatch: steer `GpuJpegCandidate` pages to a dedicated GPU worker thread pool; `CpuOnly` pages bypass GPU decoder init overhead
 - [ ] Benchmark: re-run full corpus with heterogeneous dispatch; target corpus 08/09 GPU speedup ≥ 5× over current CPU path
 
 ---
