@@ -84,20 +84,25 @@ pub(crate) struct PageTask {
 
 /// Bounded work-stealing page queue.
 ///
-/// The producer runs on the **calling (main) thread** and feeds
-/// [`PageTask`]s into a bounded [`mpsc::SyncSender`].  Pool workers consume
-/// tasks, render pages, and collect errors via [`rayon::ThreadPool::scope`].
+/// [`PageTask`]s are fed through a bounded [`mpsc::SyncSender`] into pool
+/// workers that render pages and collect errors.
 ///
 /// # Why `pool.scope`, not `pool.install` + `rayon::scope`
 ///
-/// `pool.install(f)` runs `f` on a pool worker thread, occupying one worker
-/// slot for the duration.  If `f` then calls `rayon::scope` and spawns
-/// `num_threads` consumers, all worker slots are taken and the sender blocks
-/// forever waiting for a consumer that has no thread to run on — deadlock.
+/// `pool.install(f)` runs `f` on a pool worker (W0) and blocks the calling
+/// thread until `f` returns.  If `f` then calls the global `rayon::scope`,
+/// the scope's task registry is the **global** Rayon pool — not the custom
+/// pool.  Custom pool workers cannot steal from the global registry, so
+/// consumer tasks never run, the sender eventually blocks, and the scope
+/// waits for tasks that never start — deadlock.
 ///
-/// `pool.scope(f)` runs `f` on the calling thread while lending the pool's
-/// workers to the scope.  The calling thread stays outside the pool, so it
-/// can produce without consuming a worker slot.
+/// `pool.scope(f)` is `self.install(|| scope(f))` internally (rayon-core
+/// source), so `f` still runs on a pool worker thread (W0).  The difference
+/// is that `scope(f)` here captures W0's registry, which belongs to the
+/// custom pool.  Consumer tasks are therefore injected into the correct pool
+/// and stolen by the other `num_threads − 1` workers.  After the producer
+/// loop finishes, W0 itself work-steals remaining consumer tasks before
+/// scope completes.
 ///
 /// # Capacity and back-pressure
 ///
@@ -109,10 +114,11 @@ pub(crate) struct PageTask {
 ///
 /// # Worker count
 ///
-/// One consumer task is spawned per [`rayon::ThreadPool::current_num_threads`].
-/// [`mpsc::Receiver`] is `Send` but not `Sync`, so it is wrapped in
-/// `Arc<Mutex<Receiver<PageTask>>>`.  The `Mutex` is held only during
-/// `recv()` — nanosecond scale — not during rendering.
+/// `num_threads − 1` workers actively consume while W0 produces; W0 also
+/// consumes after the producer loop finishes.  [`mpsc::Receiver`] is `Send`
+/// but not `Sync`, so it is wrapped in `Arc<Mutex<Receiver<PageTask>>>`.
+/// The `Mutex` is held only during `recv()` — nanosecond scale — not during
+/// rendering.
 pub(crate) struct PageQueue {
     capacity: usize,
 }
@@ -130,10 +136,11 @@ impl PageQueue {
 
     /// Run the render loop over `tasks`, returning all `(page_num, error)` pairs.
     ///
-    /// The producer runs on the **calling (main) thread**.  Consumer tasks are
-    /// spawned into `pool` via [`rayon::ThreadPool::scope`], which lends the
-    /// pool's workers to the scope while the calling thread remains outside.
-    /// All consumers complete before this function returns.
+    /// The producer loop runs on the pool worker thread (W0) that `pool.scope`
+    /// selects.  Consumer tasks are spawned into the same pool's scope and
+    /// stolen by the remaining `num_threads − 1` workers; W0 also work-steals
+    /// consumer tasks once the producer loop finishes.  All tasks complete
+    /// before this function returns.
     ///
     /// Progress is reported via `progress` with the same semantics as the
     /// previous `par_iter` loop.  Errors are collected in non-deterministic
@@ -154,9 +161,10 @@ impl PageQueue {
         // Arc lets each worker clone a handle to push errors without moving the Mutex.
         let errors: Arc<Mutex<Vec<(i32, RenderError)>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // pool.scope runs the closure on the calling thread and lends pool workers
-        // to the scope.  The calling thread is NOT a pool worker here (unlike
-        // pool.install), so all num_threads workers are free to consume.
+        // pool.scope is self.install(|| scope(op)) — the closure runs on pool
+        // worker W0.  Consumer tasks are injected into the pool's own registry
+        // (not the global one), so the remaining num_threads-1 workers can steal
+        // them.  After the producer loop, W0 itself work-steals consumer tasks.
         pool.scope(|s| {
             let n_workers = pool.current_num_threads().max(1);
             for _ in 0..n_workers {
@@ -220,10 +228,11 @@ impl PageQueue {
             // Err from recv() and exit their loops cleanly.
         });
 
-        // pool.scope has returned — all consumer tasks have completed.
-        // No other Arc holders exist; try_unwrap + into_inner are both infallible.
+        // pool.scope has returned — all consumer tasks have completed or panicked
+        // (rayon re-raises panics after the scope join).  No other Arc holders
+        // remain; try_unwrap and into_inner are both infallible.
         Arc::try_unwrap(errors)
-            .expect("no other Arc holders after scope")
+            .expect("no other Arc holders after scope join")
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

@@ -70,7 +70,7 @@ fn main() {
 
     // Pre-scan: cheaply classify each page before enqueueing for full render.
     // Errors are non-fatal — a page that can't be scanned gets Unclassified and
-    // is rendered normally.  The scan runs serially here (before pool.install)
+    // is rendered normally.  The scan runs serially here (before the render loop)
     // to avoid racing with lopdf's non-Sync internals.
     let hints: Vec<page_queue::RoutingHint> = pages
         .iter()
@@ -87,7 +87,9 @@ fn main() {
         .iter()
         .zip(hints)
         .map(|(&page_num, hint)| page_queue::PageTask { page_num, hint });
-    let queue_capacity = args.num_threads.max(1) * 2;
+    // Use pool.current_num_threads() — args.num_threads may be 0 (meaning
+    // "auto-detect"), in which case the pool itself knows the actual count.
+    let queue_capacity = pool.current_num_threads().max(1) * 2;
     let errors: Vec<(i32, render::RenderError)> = page_queue::PageQueue::new(queue_capacity).run(
         tasks,
         &pool,
@@ -197,8 +199,6 @@ pub(crate) fn report_progress(
     }
     let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
     let elapsed = start.elapsed().as_secs_f64();
-    // elapsed > 0 always: Instant::now() is taken before the pool starts work,
-    // and progress is only reported after at least one page completes.
     let rate = f64::from(completed) / elapsed;
     // completed is a page counter; u32→usize is lossless on any 32-bit-or-wider target.
     let completed_usize = usize::try_from(completed).unwrap_or(n_pages);
@@ -208,10 +208,24 @@ pub(crate) fn report_progress(
         reason = "ETA display; ±1s accuracy is sufficient"
     )]
     let eta_s = remaining as f64 / rate;
+    let eta_str = if eta_s.is_finite() {
+        format!("~{eta_s:.1}s remaining")
+    } else {
+        "~?s remaining".to_owned()
+    };
     eprintln!(
         "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
-         {elapsed:.1}s elapsed  ~{eta_s:.1}s remaining"
+         {elapsed:.1}s elapsed  {eta_str}"
     );
+}
+
+/// Print the `source()` chain of `e` to stderr, one line per level.
+fn print_error_chain(e: &dyn std::error::Error) {
+    let mut src = e.source();
+    while let Some(cause) = src {
+        eprintln!("  caused by: {cause}");
+        src = cause.source();
+    }
 }
 
 /// Print a human-readable error (and actionable hints) when `open_session` fails.
@@ -221,11 +235,7 @@ fn report_open_error(e: &pdf_raster::RasterError, args: &Args) {
         print_backend_hint(args);
     } else {
         eprintln!("pdf-raster: failed to open PDF: {e}");
-        let mut src = std::error::Error::source(e);
-        while let Some(cause) = src {
-            eprintln!("  caused by: {cause}");
-            src = cause.source();
-        }
+        print_error_chain(e);
     }
 }
 
@@ -266,11 +276,7 @@ fn report_errors(mut errors: Vec<(i32, render::RenderError)>) {
     errors.sort_by_key(|(p, _)| *p);
     for (page, err) in &errors {
         eprintln!("pdf-raster: page {page}: {err}");
-        let mut src = std::error::Error::source(err);
-        while let Some(cause) = src {
-            eprintln!("  caused by: {cause}");
-            src = cause.source();
-        }
+        print_error_chain(err);
     }
     std::process::exit(1);
 }
