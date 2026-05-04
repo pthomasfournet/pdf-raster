@@ -242,20 +242,9 @@ fn scan_image_dict(
     });
 
     let img_filter = ImageFilter::from_filter_str(filter.as_deref());
-    filter_counts[img_filter as usize] = filter_counts[img_filter as usize].saturating_add(1);
-
-    // PPI estimate: image width pixels / page width pts × 72.
-    if page_pts_width > 0.0
-        && let Some(w_px) = dict_integer(dict, b"Width")
-    {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "image width in pixels; values up to ~10k; f32 is sufficient for routing"
-        )]
-        let ppi = (w_px as f32 / page_pts_width) * 72.0;
-        if ppi > *max_ppi {
-            *max_ppi = ppi;
-        }
+    count_filter(filter_counts, img_filter);
+    if let Some(w_px) = dict_integer(dict, b"Width") {
+        update_max_ppi(max_ppi, w_px, page_pts_width);
     }
 }
 
@@ -270,20 +259,9 @@ fn scan_inline_image(
     // b"W" → b"Width") so we only need the full names here.
     let filter = dict.get(b"Filter").ok().and_then(filter_name);
     let img_filter = ImageFilter::from_filter_str(filter.as_deref());
-    filter_counts[img_filter as usize] = filter_counts[img_filter as usize].saturating_add(1);
-
-    if page_pts_width > 0.0 {
-        let w_px = dict_integer(dict, b"Width");
-        if let Some(w) = w_px {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "inline image width; values up to ~10k; f32 is sufficient for routing"
-            )]
-            let ppi = (w as f32 / page_pts_width) * 72.0;
-            if ppi > *max_ppi {
-                *max_ppi = ppi;
-            }
-        }
+    count_filter(filter_counts, img_filter);
+    if let Some(w_px) = dict_integer(dict, b"Width") {
+        update_max_ppi(max_ppi, w_px, page_pts_width);
     }
 }
 
@@ -320,6 +298,31 @@ fn dict_integer(dict: &Dictionary, key: &[u8]) -> Option<u32> {
         Object::Integer(i) if *i > 0 => Some(*i as u32),
         Object::Real(r) if *r > 0.0 => Some(*r as u32),
         _ => None,
+    }
+}
+
+/// Increment the filter count slot for `filter`, saturating at `u32::MAX`.
+#[inline]
+fn count_filter(filter_counts: &mut [u32; IMAGE_FILTER_COUNT], filter: ImageFilter) {
+    filter_counts[filter as usize] = filter_counts[filter as usize].saturating_add(1);
+}
+
+/// Update `max_ppi` with the PPI implied by an image of width `w_px` on a
+/// page of width `page_pts_width` PDF points.  No-op if `page_pts_width` is
+/// zero (degenerate page) or if the computed PPI is not larger than the
+/// current maximum.
+#[inline]
+fn update_max_ppi(max_ppi: &mut f32, w_px: u32, page_pts_width: f32) {
+    if page_pts_width <= 0.0 {
+        return;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "image width ≤ ~65 535 px; f32 is sufficient for PPI routing"
+    )]
+    let ppi = (w_px as f32 / page_pts_width) * 72.0;
+    if ppi > *max_ppi {
+        *max_ppi = ppi;
     }
 }
 
@@ -469,5 +472,51 @@ mod tests {
 
         assert_eq!(filter_counts[ImageFilter::Dct as usize], 1);
         assert!(max_ppi > 0.0, "PPI should be computed for wide image");
+    }
+
+    #[test]
+    fn update_max_ppi_updates_when_larger() {
+        let mut max_ppi = 72.0f32;
+        update_max_ppi(&mut max_ppi, 1440, 612.0); // 1440/612*72 ≈ 169 ppi
+        assert!(
+            max_ppi > 150.0,
+            "expected max_ppi to increase, got {max_ppi}"
+        );
+    }
+
+    #[test]
+    fn update_max_ppi_ignores_when_smaller() {
+        let mut max_ppi = 300.0f32;
+        update_max_ppi(&mut max_ppi, 72, 612.0); // 72/612*72 ≈ 8.5 ppi
+        assert!(
+            (max_ppi - 300.0).abs() < 0.001,
+            "expected max_ppi unchanged, got {max_ppi}"
+        );
+    }
+
+    #[test]
+    fn update_max_ppi_zero_page_width_is_noop() {
+        let mut max_ppi = 0.0f32;
+        update_max_ppi(&mut max_ppi, 1000, 0.0);
+        assert_eq!(max_ppi, 0.0);
+    }
+
+    #[test]
+    fn count_filter_increments_correct_slot() {
+        let mut counts = [0u32; IMAGE_FILTER_COUNT];
+        count_filter(&mut counts, ImageFilter::Dct);
+        count_filter(&mut counts, ImageFilter::Dct);
+        count_filter(&mut counts, ImageFilter::Flate);
+        assert_eq!(counts[ImageFilter::Dct as usize], 2);
+        assert_eq!(counts[ImageFilter::Flate as usize], 1);
+        assert_eq!(counts[ImageFilter::Jpx as usize], 0);
+    }
+
+    #[test]
+    fn count_filter_saturates_at_u32_max() {
+        let mut counts = [0u32; IMAGE_FILTER_COUNT];
+        counts[ImageFilter::Raw as usize] = u32::MAX;
+        count_filter(&mut counts, ImageFilter::Raw);
+        assert_eq!(counts[ImageFilter::Raw as usize], u32::MAX);
     }
 }
