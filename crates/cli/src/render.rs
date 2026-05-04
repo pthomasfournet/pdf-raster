@@ -5,9 +5,9 @@ use std::io::{BufWriter, Write as _};
 
 use color::{Gray8, Rgb8};
 use encode::{EncodeError, write_pbm, write_pgm, write_png, write_ppm};
-use pdf_raster::{
-    BackendPolicy, ImageFilter, RasterError, RasterSession, render_page_rgb_hinted, rgb_to_gray,
-};
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+use pdf_raster::{BackendPolicy, ImageFilter};
+use pdf_raster::{RasterError, RasterSession, render_page_rgb_hinted, rgb_to_gray};
 use raster::Bitmap;
 
 use crate::args::{Args, OutputFormat};
@@ -95,9 +95,9 @@ pub fn render_page(
         return Err(RenderError::UnsupportedFormatCombination { output: format });
     }
 
-    // Prescan on the render thread — cost is hidden inside parallel render time.
-    // No images → CpuOnly skips ensure_nvjpeg on this thread for this page.
-    // Prescan errors fall back to the session policy (safe).
+    // Prescan only when a GPU decoder is compiled in — otherwise it's pure overhead
+    // with no benefit (CpuOnly is already the effective policy for every page).
+    #[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
     let effective_policy = match pdf_raster::prescan_page(session.doc(), page_num).ok() {
         Some(ref diag) if !diag.has_images => BackendPolicy::CpuOnly,
         Some(ref diag) if matches!(diag.dominant_filter, Some(ImageFilter::Dct)) => {
@@ -105,6 +105,8 @@ pub fn render_page(
         }
         _ => session.policy(),
     };
+    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
+    let effective_policy = session.policy();
 
     // Geometric-mean scale matches the pixel-box aspect ratio when x/y DPI differ.
     let x_dpi = args.x_dpi();
