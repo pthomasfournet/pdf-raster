@@ -1,12 +1,12 @@
 //! Core render pipeline: PDF page → pixel buffer.
 
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "vaapi"))]
 use std::sync::Arc;
 
 use color::{Gray8, Rgb8};
 use raster::Bitmap;
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
 use crate::gpu_init;
 use crate::{BackendPolicy, RasterOptions, RenderedPage, SessionConfig};
 
@@ -115,26 +115,32 @@ impl From<pdf_interp::InterpError> for RasterError {
 /// ([`raster_pdf`](crate::raster_pdf)) and a direct per-page call
 /// ([`render_page_rgb`]) for parallel consumers such as the CLI.
 ///
-/// `Sync` because the document is read-only after construction and GPU context
-/// is wrapped in `Arc`.  Per-thread GPU image decoders are managed via
-/// `thread_local!` inside `render_page_rgb`.
+/// `Sync` because the document is read-only after construction, the GPU context
+/// is `Arc`-wrapped, and the VA-API decode queue is `Arc`-wrapped (its inner
+/// `mpsc::Sender` is `Send + Sync`).
 pub struct RasterSession {
     pub(crate) doc: lopdf::Document,
     /// Page-number → object-ID map, built once at construction.
     pub(crate) pages: std::collections::BTreeMap<u32, lopdf::ObjectId>,
     pub(crate) total_pages: u32,
     pub(crate) policy: BackendPolicy,
-    /// VA-API DRM render node.  Only accessed when the `vaapi` feature is active.
-    #[cfg_attr(
-        not(feature = "vaapi"),
-        expect(
-            dead_code,
-            reason = "accessed only when the `vaapi` feature is enabled"
-        )
+    /// VA-API DRM render node path. Retained in non-vaapi builds for forward
+    /// compatibility; in vaapi builds the path is consumed during `open_session`
+    /// to construct `vaapi_queue` and is not needed afterward.
+    #[cfg(not(feature = "vaapi"))]
+    #[expect(
+        dead_code,
+        reason = "stored but not read back; retained for SessionConfig symmetry"
     )]
     pub(crate) vaapi_device: String,
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
     pub(crate) gpu_ctx: Option<Arc<gpu::GpuCtx>>,
+    /// Single-threaded VA-API JPEG decode queue.  One worker thread owns the
+    /// `VapiJpegDecoder`; all Rayon page-render threads share handles to it.
+    /// `None` when the `vaapi` feature is disabled, policy is `CpuOnly` /
+    /// `ForceCuda`, or VA-API initialisation failed (soft failure on `Auto`).
+    #[cfg(feature = "vaapi")]
+    pub(crate) vaapi_queue: Option<Arc<gpu::DecodeQueue<gpu::vaapi::VapiJpegDecoder>>>,
 }
 
 impl RasterSession {
@@ -183,14 +189,22 @@ pub fn open_session(
 
     let vaapi_device = config.vaapi_device.clone();
 
+    #[cfg(feature = "vaapi")]
+    let vaapi_queue = crate::decode_queue::build_vaapi_queue(&vaapi_device, config.policy)
+        .map_err(RasterError::BackendUnavailable)?
+        .map(Arc::new);
+
     Ok(RasterSession {
         doc,
         pages,
         total_pages,
         policy: config.policy,
+        #[cfg(not(feature = "vaapi"))]
         vaapi_device,
         #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
         gpu_ctx,
+        #[cfg(feature = "vaapi")]
+        vaapi_queue,
     })
 }
 
@@ -331,8 +345,8 @@ fn render_page_rgb_with_geom(
 /// no-op.  On `ForceCuda`/`ForceVaapi` init failure is returned as
 /// `RasterError::BackendUnavailable` rather than silently falling back.
 #[cfg_attr(
-    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")),
-    expect(
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
+    allow(
         clippy::unnecessary_wraps,
         clippy::missing_const_for_fn,
         reason = "return type and body vary with GPU feature flags"
@@ -372,29 +386,27 @@ fn lend_decoders(
     }
 
     #[cfg(feature = "vaapi")]
-    if !matches!(policy, BackendPolicy::ForceCuda) {
-        gpu_init::ensure_vaapi(&session.vaapi_device, policy)
-            .map_err(RasterError::BackendUnavailable)?;
-        gpu_init::VAAPI_JPEG_DEC.with(|cell| {
-            if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
-                renderer.set_vaapi_jpeg(slot.take());
-            }
-        });
+    if let Some(queue) = &session.vaapi_queue {
+        renderer.set_vaapi_queue(queue.handle());
     }
 
     Ok(())
 }
 
 /// Return GPU JPEG decoders from the renderer back into TLS slots for reuse.
+///
+/// The VA-API path is omitted here: `JpegQueueHandle` is cheaply cloneable and
+/// is simply dropped with the renderer — no reclaim step is needed.  The
+/// `Arc<DecodeQueue>` in `RasterSession` keeps the worker alive across pages.
 #[cfg_attr(
-    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")),
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
     expect(
         clippy::missing_const_for_fn,
         reason = "non-const only in GPU-decoder builds"
     )
 )]
 fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
-    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
+    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k")))]
     let _ = renderer;
     #[cfg(feature = "nvjpeg")]
     gpu_init::NVJPEG_DEC.with(|cell| {
@@ -406,12 +418,6 @@ fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
     gpu_init::NVJPEG2K_DEC.with(|cell| {
         if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_nvjpeg2k();
-        }
-    });
-    #[cfg(feature = "vaapi")]
-    gpu_init::VAAPI_JPEG_DEC.with(|cell| {
-        if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
-            *slot = renderer.take_vaapi_jpeg();
         }
     });
 }

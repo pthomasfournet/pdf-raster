@@ -255,7 +255,7 @@ impl<'doc> PageResources<'doc> {
         &self,
         name: &[u8],
         #[cfg(feature = "nvjpeg")] gpu: Option<&mut gpu::nvjpeg::NvJpegDecoder>,
-        #[cfg(feature = "vaapi")] vaapi: Option<&mut gpu::vaapi::VapiJpegDecoder>,
+        #[cfg(feature = "vaapi")] vaapi: Option<&gpu::JpegQueueHandle>,
         #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut gpu::nvjpeg2k::NvJpeg2kDecoder>,
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
         #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut image::IccClutCache>,

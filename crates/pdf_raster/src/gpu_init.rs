@@ -4,20 +4,26 @@
 // that is only conditionally compiled and accessed from a single call site.
 #![allow(clippy::redundant_pub_crate)]
 //!
-//! Each rayon worker thread owns one instance of each decoder type via
-//! `thread_local!`.  `DecoderInit<T>` is a three-state machine that prevents
-//! retry-spam after a one-time init failure without holding a lock on the hot
-//! path.  The `DECODER_INIT_LOCK` mutex serialises the *construction* calls
-//! (`nvjpegCreateEx`, `vaInitialize`) which are not safe to call concurrently.
+//! nvJPEG and nvJPEG2000 decoders are held in per-thread `thread_local!` slots
+//! so each Rayon worker gets its own instance without locking on the hot path.
+//!
+//! VA-API JPEG decoding uses a different model: one `DecodeQueue<VapiJpegDecoder>`
+//! per session (constructed in `open_session`, owned by `RasterSession`), which
+//! routes all submissions through a single OS thread.  There is therefore no TLS
+//! slot for VA-API — see `crate::decode_queue` instead.
+//!
+//! `DECODER_INIT_LOCK` serialises construction calls (`nvjpegCreateEx`,
+//! `vaInitialize`) which are not safe to call concurrently.  It is also used by
+//! `crate::decode_queue::build_vaapi_queue`.
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
 use crate::BackendPolicy;
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
 use std::cell::RefCell;
 
 // ── Three-state decoder slot ──────────────────────────────────────────────────
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
 #[derive(Default)]
 pub(crate) enum DecoderInit<T> {
     #[default]
@@ -26,8 +32,9 @@ pub(crate) enum DecoderInit<T> {
     Failed,
 }
 
-// nvjpegCreateEx races if called concurrently; vaInitialize is serialised here
-// out of caution too.  Only held during construction, never during render.
+// nvjpegCreateEx races if called concurrently; vaInitialize is serialised through
+// this lock too (used by crate::decode_queue::build_vaapi_queue).
+// Only held during construction, never during render.
 #[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
 pub(crate) static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -42,12 +49,6 @@ thread_local! {
 #[cfg(feature = "nvjpeg2k")]
 thread_local! {
     pub(crate) static NVJPEG2K_DEC: RefCell<DecoderInit<gpu::nvjpeg2k::NvJpeg2kDecoder>> =
-        const { RefCell::new(DecoderInit::Uninitialised) };
-}
-
-#[cfg(feature = "vaapi")]
-thread_local! {
-    pub(crate) static VAAPI_JPEG_DEC: RefCell<DecoderInit<gpu::vaapi::VapiJpegDecoder>> =
         const { RefCell::new(DecoderInit::Uninitialised) };
 }
 
@@ -132,47 +133,6 @@ pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
                     log::warn!(
                         "pdf_raster: nvJPEG2000 unavailable ({e}); \
                          JPEG 2000 images will be decoded on CPU for this thread"
-                    );
-                    Ok(())
-                }
-            }
-        }
-    })
-}
-
-/// Try to initialise this thread's VA-API JPEG decoder.
-#[cfg(feature = "vaapi")]
-pub(crate) fn ensure_vaapi(drm_node: &str, policy: BackendPolicy) -> Result<(), String> {
-    VAAPI_JPEG_DEC.with(|cell| {
-        match *cell.borrow() {
-            DecoderInit::Uninitialised => {}
-            DecoderInit::Failed if matches!(policy, BackendPolicy::ForceVaapi) => {
-                return Err(
-                    "VA-API JPEG decoder failed to initialise on a previous attempt".to_owned(),
-                );
-            }
-            _ => return Ok(()),
-        }
-
-        let guard = DECODER_INIT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = gpu::vaapi::VapiJpegDecoder::new(drm_node);
-        drop(guard);
-
-        match result {
-            Ok(dec) => {
-                *cell.borrow_mut() = DecoderInit::Ready(Some(dec));
-                Ok(())
-            }
-            Err(e) => {
-                *cell.borrow_mut() = DecoderInit::Failed;
-                if matches!(policy, BackendPolicy::ForceVaapi) {
-                    Err(format!("VA-API unavailable on {drm_node}: {e}"))
-                } else {
-                    log::warn!(
-                        "pdf_raster: VA-API JPEG unavailable ({e}); \
-                         JPEG images will be decoded on CPU for this thread"
                     );
                     Ok(())
                 }

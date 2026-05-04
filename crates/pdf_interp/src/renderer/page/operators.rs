@@ -301,7 +301,7 @@ impl PageRenderer<'_> {
                     #[cfg(feature = "nvjpeg")]
                     self.nvjpeg.as_mut(),
                     #[cfg(feature = "vaapi")]
-                    self.vaapi_jpeg.as_mut(),
+                    self.vaapi_jpeg_queue.as_ref(),
                     #[cfg(feature = "nvjpeg2k")]
                     self.nvjpeg2k.as_mut(),
                     #[cfg(feature = "gpu-icc")]
