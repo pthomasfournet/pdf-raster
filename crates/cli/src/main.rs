@@ -55,10 +55,13 @@ fn main() {
         std::process::exit(1);
     });
 
-    let pages = build_page_list(total, &args).unwrap_or_else(|| {
-        // build_page_list already printed the reason.
+    let (pages, page_warnings) = args.build_page_list(total).unwrap_or_else(|e| {
+        eprintln!("pdf-raster: {e}");
         std::process::exit(1);
     });
+    for w in &page_warnings {
+        eprintln!("pdf-raster: warning: {w}");
+    }
     let n_pages = pages.len();
     let done = AtomicU32::new(0);
     let start = Instant::now();
@@ -131,58 +134,6 @@ const fn routing_hint_from_diag(
         return page_queue::RoutingHint::GpuJpegCandidate;
     }
     page_queue::RoutingHint::Unclassified
-}
-
-/// Build the filtered, clamped list of 1-based page numbers to render.
-///
-/// Returns `None` (after printing a message to stderr) if no pages fall within
-/// the requested range.  Never calls `std::process::exit`; callers decide how
-/// to handle `None`.
-fn build_page_list(total: i32, args: &Args) -> Option<Vec<i32>> {
-    let requested_first = args.first_page;
-    let requested_last = args.last_page.unwrap_or(total);
-
-    let first = requested_first.max(1);
-    let last = requested_last.min(total);
-
-    if requested_first < 1 {
-        eprintln!("pdf-raster: warning: first page {requested_first} < 1; clamped to 1");
-    }
-    if requested_last > total {
-        eprintln!(
-            "pdf-raster: warning: last page {requested_last} exceeds document length ({total}); \
-             clamped to {total}"
-        );
-    }
-
-    if first > last {
-        eprintln!(
-            "pdf-raster: first page ({first}) is after last page ({last}); nothing to render"
-        );
-        return None;
-    }
-
-    let pages: Vec<i32> = (first..=last)
-        .filter(|&p| {
-            // odd_only and even_only are mutually exclusive; main() enforces this
-            // before build_page_list is called, so (true, true) is unreachable.
-            if args.odd_only {
-                p % 2 == 1
-            } else if args.even_only {
-                p % 2 == 0
-            } else {
-                true
-            }
-        })
-        .take(if args.single_file { 1 } else { usize::MAX })
-        .collect();
-
-    if pages.is_empty() {
-        eprintln!("pdf-raster: no pages selected by the current filter combination");
-        return None;
-    }
-
-    Some(pages)
 }
 
 pub(crate) fn report_progress(

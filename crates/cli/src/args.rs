@@ -385,4 +385,137 @@ impl Args {
             vaapi_device: self.vaapi_device.clone(),
         })
     }
+
+    /// Build the filtered, clamped list of 1-based page numbers to render.
+    ///
+    /// Returns `Err(message)` if no pages fall within the requested range so the
+    /// caller can handle display and exit uniformly.  Clamping warnings are
+    /// returned alongside the page list so the caller decides how to display them.
+    ///
+    /// Precondition: `total >= 1`, validated by the caller before this is invoked.
+    pub fn build_page_list(&self, total: i32) -> Result<(Vec<i32>, Vec<String>), String> {
+        let requested_first = self.first_page;
+        let requested_last = self.last_page.unwrap_or(total);
+
+        let first = requested_first.max(1);
+        let last = requested_last.min(total);
+
+        let mut warnings = Vec::new();
+        if requested_first < 1 {
+            warnings.push(format!("first page {requested_first} < 1; clamped to 1"));
+        }
+        if requested_last > total {
+            warnings.push(format!(
+                "last page {requested_last} exceeds document length ({total}); clamped to {total}"
+            ));
+        }
+
+        if first > last {
+            return Err(format!(
+                "first page ({first}) is after last page ({last}); nothing to render"
+            ));
+        }
+
+        let pages: Vec<i32> = (first..=last)
+            .filter(|&p| {
+                // odd_only and even_only are mutually exclusive; caller enforces this.
+                if self.odd_only {
+                    p % 2 == 1
+                } else if self.even_only {
+                    p % 2 == 0
+                } else {
+                    true
+                }
+            })
+            .take(if self.single_file { 1 } else { usize::MAX })
+            .collect();
+
+        if pages.is_empty() {
+            return Err("no pages selected by the current filter combination".to_owned());
+        }
+
+        Ok((pages, warnings))
+    }
+}
+
+#[cfg(test)]
+mod page_list_tests {
+    use super::*;
+
+    fn base_args() -> Args {
+        Args::parse_from(["pdf-raster", "in.pdf", "out"])
+    }
+
+    #[test]
+    fn all_pages_when_no_filter() {
+        let args = base_args();
+        let (pages, warnings) = args.build_page_list(3).unwrap();
+        assert_eq!(pages, vec![1, 2, 3]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn clamps_first_page_below_one() {
+        let mut args = base_args();
+        args.first_page = -5;
+        let (pages, warnings) = args.build_page_list(3).unwrap();
+        assert_eq!(pages[0], 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("clamped to 1"));
+    }
+
+    #[test]
+    fn clamps_last_page_beyond_total() {
+        let mut args = base_args();
+        args.last_page = Some(999);
+        let (pages, warnings) = args.build_page_list(3).unwrap();
+        assert_eq!(*pages.last().unwrap(), 3);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("clamped to 3"));
+    }
+
+    #[test]
+    fn odd_only_filter() {
+        let mut args = base_args();
+        args.odd_only = true;
+        let (pages, _) = args.build_page_list(5).unwrap();
+        assert_eq!(pages, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn even_only_filter() {
+        let mut args = base_args();
+        args.even_only = true;
+        let (pages, _) = args.build_page_list(5).unwrap();
+        assert_eq!(pages, vec![2, 4]);
+    }
+
+    #[test]
+    fn err_when_first_after_last() {
+        let mut args = base_args();
+        args.first_page = 5;
+        args.last_page = Some(3);
+        let result = args.build_page_list(10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nothing to render"));
+    }
+
+    #[test]
+    fn err_when_no_pages_match_filter() {
+        let mut args = base_args();
+        args.first_page = 2;
+        args.last_page = Some(2);
+        args.odd_only = true;
+        let result = args.build_page_list(5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no pages selected"));
+    }
+
+    #[test]
+    fn single_file_takes_first_page_only() {
+        let mut args = base_args();
+        args.single_file = true;
+        let (pages, _) = args.build_page_list(10).unwrap();
+        assert_eq!(pages, vec![1]);
+    }
 }
