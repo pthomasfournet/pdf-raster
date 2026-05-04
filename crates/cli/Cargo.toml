@@ -38,6 +38,7 @@ clap        = { version = "4", features = ["derive"] }
 rayon       = "1"
 log         = { workspace = true }
 env_logger  = { workspace = true }
+mimalloc    = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -10,7 +10,7 @@ use crate::args::{Args, BackendArg};
 use crate::render::RenderError;
 
 /// Print the `source()` chain of `e` to stderr, one line per level.
-pub(crate) fn print_error_chain(e: &dyn std::error::Error) {
+pub fn print_error_chain(e: &dyn std::error::Error) {
     let mut src = e.source();
     while let Some(cause) = src {
         eprintln!("  caused by: {cause}");
@@ -19,7 +19,7 @@ pub(crate) fn print_error_chain(e: &dyn std::error::Error) {
 }
 
 /// Print a human-readable error (and actionable hints) when `open_session` fails.
-pub(crate) fn report_open_error(e: &RasterError, args: &Args) {
+pub fn report_open_error(e: &RasterError, args: &Args) {
     if matches!(e, RasterError::BackendUnavailable(_)) {
         eprintln!("pdf-raster: {e}");
         print_backend_hint(args);
@@ -30,7 +30,7 @@ pub(crate) fn report_open_error(e: &RasterError, args: &Args) {
 }
 
 /// Print a backend-specific hint after a `BackendUnavailable` error.
-pub(crate) fn print_backend_hint(args: &Args) {
+pub fn print_backend_hint(args: &Args) {
     match args.backend {
         BackendArg::Cuda => {
             eprintln!("  hint: --backend cuda requires a working CUDA driver and GPU.");
@@ -62,7 +62,7 @@ pub(crate) fn print_backend_hint(args: &Args) {
 /// Sort errors by page number, print each with its cause chain, then exit 1.
 ///
 /// No-op if `errors` is empty.
-pub(crate) fn report_errors(mut errors: Vec<(i32, RenderError)>) {
+pub fn report_errors(mut errors: Vec<(i32, RenderError)>) {
     if errors.is_empty() {
         return;
     }

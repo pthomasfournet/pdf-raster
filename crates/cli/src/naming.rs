@@ -68,6 +68,7 @@ mod tests {
             separator: sep,
             force_num_digits: force,
             progress: false,
+            timings: false,
             backend: BackendArg::Auto,
             vaapi_device: "/dev/dri/renderD128".into(),
         }

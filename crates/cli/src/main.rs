@@ -8,7 +8,11 @@ use std::time::Instant;
 
 use args::Args;
 use clap::Parser;
+use mimalloc::MiMalloc;
 use rayon::prelude::*;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     let _ = env_logger::try_init();
@@ -72,6 +76,8 @@ fn main() {
     )]
     let total_u32 = total as u32;
 
+    let timings = args.timings;
+
     let errors: Vec<(i32, render::RenderError)> = pool.install(|| {
         pages
             .par_iter()
@@ -82,11 +88,17 @@ fn main() {
                 )]
                 let page_u32 = page_num as u32;
 
+                let t0 = timings.then(Instant::now);
                 let result = render::render_page(&session, page_u32, total_u32, &args);
+                if let Some(t0) = t0 {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let tid = rayon::current_thread_index().unwrap_or(99);
+                    eprintln!("timing: page {page_num:4}  {ms:7.1}ms  thread {tid}");
+                }
 
                 if args.progress {
                     let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    let elapsed = self::elapsed_secs(&start);
+                    let elapsed = start.elapsed().as_secs_f64();
                     let completed_usize = usize::try_from(completed).unwrap_or(n_pages);
                     let remaining = n_pages.saturating_sub(completed_usize);
                     #[expect(
@@ -122,9 +134,4 @@ fn main() {
     let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
 
     diagnostics::report_errors(errors);
-}
-
-#[inline]
-fn elapsed_secs(start: &Instant) -> f64 {
-    start.elapsed().as_secs_f64()
 }

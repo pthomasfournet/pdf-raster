@@ -189,6 +189,10 @@ pub struct Args {
     #[arg(short = 'P', long = "progress")]
     pub progress: bool,
 
+    /// Print per-page wall time and thread index to stderr for profiling.
+    #[arg(long = "timings")]
+    pub timings: bool,
+
     // ── Backend selection ─────────────────────────────────────────────────────
     /// Compute backend for image decoding and GPU fills.
     ///
