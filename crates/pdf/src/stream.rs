@@ -63,7 +63,11 @@ pub(crate) fn apply_flate(
         return Ok(Vec::new());
     }
 
-    let mut out = Vec::with_capacity(data.len() * 3);
+    // Cap the initial reservation: 3× input is a good guess for the typical
+    // text/PostScript-ish payload, but capping at 16 MiB avoids reserving
+    // gigabytes when called with a multi-hundred-MB compressed stream.
+    let initial_cap = data.len().saturating_mul(3).min(16 * 1024 * 1024);
+    let mut out = Vec::with_capacity(initial_cap);
     let mut decoder = ZlibDecoder::new(data);
     match decoder.read_to_end(&mut out) {
         Ok(_) => {}
@@ -98,16 +102,31 @@ fn apply_png_predictor(data: Vec<u8>, params: &dyn DictLookup) -> Result<Vec<u8>
     }
 
     // PNG predictors (10–15).
-    let colors = params.get_i64(b"Colors").unwrap_or(1).max(1) as usize;
-    let bits = params.get_i64(b"BitsPerComponent").unwrap_or(8).max(1) as usize;
-    let cols = params.get_i64(b"Columns").unwrap_or(1).max(1) as usize;
+    // Sanity-cap each parameter to defeat malformed PDFs that would otherwise
+    // request gigabyte-scale allocations.
+    let colors = (params.get_i64(b"Colors").unwrap_or(1).max(1) as usize).min(32);
+    let bits = (params.get_i64(b"BitsPerComponent").unwrap_or(8).max(1) as usize).min(32);
+    let cols = (params.get_i64(b"Columns").unwrap_or(1).max(1) as usize).min(1_000_000);
 
-    let stride = (cols * colors * bits).div_ceil(8);
+    let stride = cols
+        .checked_mul(colors)
+        .and_then(|x| x.checked_mul(bits))
+        .ok_or_else(|| "PNG predictor: stride overflow".to_string())?
+        .div_ceil(8);
     let row_len = stride + 1; // +1 for filter byte
 
     // Tolerate truncated data — process as many full rows as we have.
     let n_rows = data.len() / row_len;
-    let mut out = vec![0u8; n_rows * stride];
+    let total = n_rows
+        .checked_mul(stride)
+        .ok_or_else(|| "PNG predictor: output size overflow".to_string())?;
+    // 256 MiB ceiling — well above any realistic predictor output.
+    if total > 256 * 1024 * 1024 {
+        return Err(format!(
+            "PNG predictor output {total} bytes exceeds 256 MiB cap"
+        ));
+    }
+    let mut out = vec![0u8; total];
     let bytes_per_pixel = (colors * bits).div_ceil(8);
 
     for row in 0..n_rows {
@@ -185,12 +204,15 @@ fn apply_lzw(data: &[u8], params: Option<&Object>) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let result = decoder.into_stream(&mut out).decode_all(data);
     if let Err(e) = result.status {
-        log::warn!("LZWDecode partial error: {e}");
+        if out.is_empty() {
+            return Err(format!("LZWDecode failed with no output: {e}"));
+        }
+        log::warn!("LZWDecode partial error after {} bytes: {e}", out.len());
     }
 
     let pred_params = params.map(|o| o as &dyn DictLookup);
     if let Some(p) = pred_params {
-        out = apply_png_predictor(out, p).map_err(|s| s.to_string())?;
+        out = apply_png_predictor(out, p)?;
     }
     Ok(out)
 }
@@ -220,6 +242,10 @@ fn decode_ascii85(data: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     if count > 0 {
+        // ASCII85 final groups must be 2..=4 bytes (1 leftover char is invalid).
+        if count == 1 {
+            return Err("ASCII85: stray single character in final group".into());
+        }
         // Pad remaining group with 'u' (84).
         for slot in group.iter_mut().skip(count) {
             *slot = 84;

@@ -40,7 +40,8 @@ impl ObjStmCache {
         stream_content: &[u8],
         stream_dict: &HashMap<Vec<u8>, Object>,
     ) -> Result<Object, PdfError> {
-        let mut guard = self.cache.lock().unwrap();
+        // Poison recovery: cache stores immutable parses, safe to reuse.
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(objects) = guard.get(&container_id) {
             let objects = Arc::clone(objects);
@@ -62,15 +63,29 @@ impl ObjStmCache {
             })?;
 
         // Parse the object stream directory: N pairs of (obj_num, byte_offset).
-        let n = stream_dict
+        let n_raw = stream_dict
             .get(b"N".as_ref())
             .and_then(Object::as_i64)
-            .unwrap_or(0) as usize;
+            .unwrap_or(0);
+        if !(0..=1_000_000).contains(&n_raw) {
+            return Err(PdfError::BadObject {
+                id: container_id,
+                detail: format!("/N={n_raw} out of range"),
+            });
+        }
+        let n = n_raw as usize;
 
-        let first = stream_dict
+        let first_raw = stream_dict
             .get(b"First".as_ref())
             .and_then(Object::as_i64)
-            .unwrap_or(0) as usize;
+            .unwrap_or(0);
+        if first_raw < 0 {
+            return Err(PdfError::BadObject {
+                id: container_id,
+                detail: format!("/First={first_raw} is negative"),
+            });
+        }
+        let first = first_raw as usize;
 
         let objects =
             parse_objstm_objects(&decoded, n, first).map_err(|detail| PdfError::BadObject {
@@ -111,7 +126,16 @@ fn parse_objstm_objects(data: &[u8], n: usize, first: usize) -> Result<Vec<Objec
         let rel_off = parse_u64(data, &mut pos)
             .ok_or_else(|| format!("ObjStm directory: missing offset at pos {pos}"))?
             as usize;
-        offsets.push(first + rel_off);
+        let abs_off = first
+            .checked_add(rel_off)
+            .ok_or_else(|| format!("ObjStm: offset overflow first={first} rel={rel_off}"))?;
+        if abs_off > data.len() {
+            return Err(format!(
+                "ObjStm: object offset {abs_off} exceeds stream length {}",
+                data.len()
+            ));
+        }
+        offsets.push(abs_off);
     }
 
     // Parse each object at its computed offset.

@@ -104,12 +104,24 @@ fn read_traditional_xref(
             break;
         }
 
-        let first = parse_u64(data, &mut pos).ok_or_else(|| {
+        let first_raw = parse_u64(data, &mut pos).ok_or_else(|| {
             PdfError::BadXref("expected object number in subsection header".into())
-        })? as u32;
+        })?;
+        if first_raw > u64::from(u32::MAX) {
+            return Err(PdfError::BadXref(format!(
+                "subsection first object {first_raw} exceeds u32::MAX"
+            )));
+        }
+        let first = first_raw as u32;
         skip_ws(data, &mut pos);
         let count = parse_u64(data, &mut pos)
             .ok_or_else(|| PdfError::BadXref("expected count in subsection header".into()))?;
+        // Sanity cap: no real PDF has more than 10 M objects.
+        if count > 10_000_000 {
+            return Err(PdfError::BadXref(format!(
+                "xref subsection count {count} exceeds sanity limit"
+            )));
+        }
         // Consume the line ending after the subsection header.
         while pos < data.len() && matches!(data[pos], b'\r' | b'\n') {
             pos += 1;
@@ -133,7 +145,9 @@ fn read_traditional_xref(
                 pos += 1;
             }
 
-            let obj_num = first + i as u32;
+            let obj_num = first.checked_add(i as u32).ok_or_else(|| {
+                PdfError::BadXref(format!("object number overflow: first={first} i={i}"))
+            })?;
             // Only insert if not already present (newer xref sections win).
             if flag == b'n' && !table.entries.contains_key(&obj_num) {
                 table
@@ -181,13 +195,16 @@ fn parse_trailer_dict(
     }
 
     // Follow /Prev chain (older xref section).
-    if let Some(Object::Integer(prev)) = dict.get(b"Prev".as_ref()) {
-        let prev_off = *prev as u64;
-        read_xref_at(data, prev_off, table, visited)?;
+    if let Some(Object::Integer(prev)) = dict.get(b"Prev".as_ref())
+        && *prev > 0
+    {
+        read_xref_at(data, *prev as u64, table, visited)?;
     }
 
     // Handle hybrid files: /XRefStm points to an additional xref stream.
-    if let Some(Object::Integer(xrefstm)) = dict.get(b"XRefStm".as_ref()) {
+    if let Some(Object::Integer(xrefstm)) = dict.get(b"XRefStm".as_ref())
+        && *xrefstm > 0
+    {
         let stm_off = *xrefstm as u64;
         if !visited.contains(&stm_off) {
             read_xref_at(data, stm_off, table, visited)?;
@@ -220,40 +237,18 @@ fn read_xref_stream(
     pos += 3;
     skip_ws(data, &mut pos);
 
-    // Parse the stream dictionary.
+    // parse_object returns Object::Stream when it finds the "stream" keyword.
     let dict_obj = parse_object(data, &mut pos)
         .ok_or_else(|| PdfError::BadXref("could not parse xref stream dict".into()))?;
-    let dict = match dict_obj {
-        Object::Dictionary(ref d) => d.clone(),
-        _ => return Err(PdfError::BadXref("xref stream object is not a dict".into())),
+    let (dict, raw_stream) = match dict_obj {
+        Object::Stream(s) => (s.dict, s.content),
+        _ => {
+            return Err(PdfError::BadXref(
+                "xref stream object is not a Stream".into(),
+            ));
+        }
     };
-
-    // Find "stream" keyword and the raw stream bytes.
-    skip_ws(data, &mut pos);
-    if !data[pos..].starts_with(b"stream") {
-        return Err(PdfError::BadXref(
-            "xref stream: 'stream' keyword not found".into(),
-        ));
-    }
-    pos += 6;
-    // Consume exactly one newline after "stream" (spec: CR, LF, or CRLF).
-    if data.get(pos) == Some(&b'\r') {
-        pos += 1;
-    }
-    if data.get(pos) == Some(&b'\n') {
-        pos += 1;
-    }
-
-    let length = match dict.get(b"Length".as_ref()) {
-        Some(Object::Integer(n)) => *n as usize,
-        _ => return Err(PdfError::BadXref("xref stream: missing /Length".into())),
-    };
-    if pos + length > data.len() {
-        return Err(PdfError::BadXref(
-            "xref stream: /Length extends past EOF".into(),
-        ));
-    }
-    let raw_stream = &data[pos..pos + length];
+    let raw_stream = &raw_stream[..];
 
     // Decode the stream (almost always FlateDecode).
     let stream_bytes = decode_xref_stream(raw_stream, &dict)?;
@@ -279,19 +274,26 @@ fn read_xref_stream(
         return Err(PdfError::BadXref("xref stream: zero-width entry".into()));
     }
 
+    // Convert an `Object::Integer` to a non-negative u32, rejecting overflow.
+    let int_to_u32 = |o: &Object, label: &str| -> Result<u32, PdfError> {
+        match o {
+            Object::Integer(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Ok(*n as u32),
+            other => Err(PdfError::BadXref(format!(
+                "xref stream {label}: bad integer {other:?}"
+            ))),
+        }
+    };
+
     // Determine which object numbers this stream covers via /Index.
     let index_pairs: Vec<u32> = match dict.get(b"Index".as_ref()) {
         Some(Object::Array(a)) => a
             .iter()
-            .map(|o| match o {
-                Object::Integer(n) => *n as u32,
-                _ => 0,
-            })
-            .collect(),
+            .map(|o| int_to_u32(o, "/Index"))
+            .collect::<Result<Vec<_>, _>>()?,
         _ => {
             // Default: one subsection starting at 0, covering /Size objects.
             let size = match dict.get(b"Size".as_ref()) {
-                Some(Object::Integer(n)) => *n as u32,
+                Some(o @ Object::Integer(_)) => int_to_u32(o, "/Size")?,
                 _ => return Err(PdfError::BadXref("xref stream: missing /Size".into())),
             };
             vec![0, size]
@@ -311,6 +313,13 @@ fn read_xref_stream(
         let count = index_pairs[pair_idx + 1];
         pair_idx += 2;
 
+        // Sanity cap to defeat malformed PDFs claiming billions of entries.
+        if count > 10_000_000 {
+            return Err(PdfError::BadXref(format!(
+                "xref stream subsection count {count} exceeds sanity limit"
+            )));
+        }
+
         for i in 0..count {
             if byte_pos + entry_len > stream_bytes.len() {
                 break;
@@ -329,7 +338,9 @@ fn read_xref_stream(
             };
             byte_pos += entry_len;
 
-            let obj_num = first_obj + i;
+            let Some(obj_num) = first_obj.checked_add(i) else {
+                break; // object number overflow — stop processing this subsection
+            };
             if table.entries.contains_key(&obj_num) {
                 continue; // newer xref section already has this
             }
@@ -457,5 +468,45 @@ mod tests {
         assert_eq!(read_be_uint(&[0x00, 0x01, 0x23]), 0x0123);
         assert_eq!(read_be_uint(&[0xFF]), 0xFF);
         assert_eq!(read_be_uint(&[]), 0);
+    }
+
+    #[test]
+    fn xref_subsection_count_capped() {
+        // count = 99_999_999 exceeds the 10 M sanity limit and must error,
+        // not allocate ~2 GB of HashMap entries.
+        let data = b"\
+%PDF-1.4
+xref
+0 99999999
+0000000000 65535 f\r
+trailer
+<<>>
+startxref
+9
+%%EOF";
+        let err = read_xref(data).unwrap_err();
+        match err {
+            PdfError::BadXref(s) => assert!(s.contains("sanity limit"), "got: {s}"),
+            other => panic!("expected BadXref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xref_negative_prev_does_not_recurse() {
+        // /Prev = -1 used to be cast as u64 = 0xFFFF_FFFF_FFFF_FFFF and trigger
+        // a "beyond end of file" error from a bogus offset; now it is skipped.
+        let data = b"\
+%PDF-1.4
+xref
+0 1
+0000000000 65535 f\r
+trailer
+<</Size 1 /Prev -1>>
+startxref
+9
+%%EOF";
+        // Should succeed: /Prev=-1 is treated as no previous xref.
+        let table = read_xref(data).expect("xref parse");
+        assert_eq!(table.entries.len(), 0);
     }
 }

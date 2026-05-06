@@ -172,13 +172,14 @@ pub fn parse_object(data: &[u8], pos: &mut usize) -> Option<Object> {
                 if data.get(peek) == Some(&b'\n') {
                     peek += 1;
                 }
-                let stream_start = peek;
+                let stream_start = peek.min(data.len());
                 // Determine stream length from /Length in the dict.
                 let length = dict
                     .get(b"Length".as_ref())
                     .and_then(Object::as_i64)
-                    .unwrap_or(0) as usize;
-                let stream_end = (stream_start + length).min(data.len());
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let stream_end = stream_start.saturating_add(length).min(data.len());
                 let content = data[stream_start..stream_end].to_vec();
                 // Advance pos past "endstream".
                 *pos = stream_end;
@@ -237,20 +238,25 @@ fn parse_scalar(data: &[u8], pos: &mut usize) -> Option<Object> {
     // check for the "X Y R" reference pattern.
     if let Ok(s) = std::str::from_utf8(word) {
         if let Ok(n) = s.parse::<i64>() {
-            // Peek for "gen R" to form an indirect reference.
-            let mut peek = *pos;
-            skip_ws(data, &mut peek);
-            let gen_tok = scan_token(data, &mut peek);
-            if !gen_tok.is_empty()
-                && let Some(g) = std::str::from_utf8(gen_tok)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-            {
+            // Peek for "gen R" to form an indirect reference. Only valid when
+            // the object number fits in u32 and is non-negative; otherwise we
+            // fall through and emit a plain Integer.
+            if n >= 0 && n <= i64::from(u32::MAX) {
+                let mut peek = *pos;
                 skip_ws(data, &mut peek);
-                let r_tok = scan_token(data, &mut peek);
-                if r_tok == b"R" {
-                    *pos = peek;
-                    return Some(Object::Reference((n as u32, g as u16)));
+                let gen_tok = scan_token(data, &mut peek);
+                if !gen_tok.is_empty()
+                    && let Some(g) = std::str::from_utf8(gen_tok)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    && (0..=i64::from(u16::MAX)).contains(&g)
+                {
+                    skip_ws(data, &mut peek);
+                    let r_tok = scan_token(data, &mut peek);
+                    if r_tok == b"R" {
+                        *pos = peek;
+                        return Some(Object::Reference((n as u32, g as u16)));
+                    }
                 }
             }
             return Some(Object::Integer(n));
@@ -299,9 +305,17 @@ pub fn parse_indirect_object(data: &[u8], offset: usize) -> Option<(ObjectId, Ob
     let mut pos = offset;
     skip_ws(data, &mut pos);
 
-    let id_num = parse_u64(data, &mut pos)? as u32;
+    let id_raw = parse_u64(data, &mut pos)?;
+    if id_raw > u64::from(u32::MAX) {
+        return None;
+    }
+    let id_num = id_raw as u32;
     skip_ws(data, &mut pos);
-    let gen_num = parse_u64(data, &mut pos)? as u16;
+    let gen_raw = parse_u64(data, &mut pos)?;
+    if gen_raw > u64::from(u16::MAX) {
+        return None;
+    }
+    let gen_num = gen_raw as u16;
     skip_ws(data, &mut pos);
 
     if !data[pos..].starts_with(b"obj") {
@@ -406,5 +420,33 @@ mod tests {
         let (id, obj) = parse_indirect_object(src, 0).unwrap();
         assert_eq!(id, (1, 0));
         assert_eq!(obj, Object::Integer(42));
+    }
+
+    #[test]
+    fn stream_with_negative_length_does_not_panic() {
+        // /Length = -1 used to overflow when cast to usize; now clamped to 0.
+        let src = b"<</Length -1>>\nstream\nXY\nendstream";
+        let mut pos = 0;
+        let obj = parse_object(src, &mut pos).expect("parse");
+        match obj {
+            Object::Stream(s) => assert!(s.content.is_empty()),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_indirect_object_rejects_oversized_id() {
+        // Object ID > u32::MAX must be rejected, not silently truncated.
+        let src = b"99999999999 0 obj\n42\nendobj";
+        assert!(parse_indirect_object(src, 0).is_none());
+    }
+
+    #[test]
+    fn reference_with_oversized_id_falls_back_to_integer() {
+        // "X Y R" where X overflows u32 must NOT be recognised as a Reference.
+        let src = b"99999999999 0 R";
+        let mut pos = 0;
+        let obj = parse_object(src, &mut pos).expect("parse");
+        assert_eq!(obj, Object::Integer(99_999_999_999));
     }
 }

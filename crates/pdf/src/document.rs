@@ -86,7 +86,10 @@ impl Document {
     /// cached value.
     pub fn get_object(&self, id: ObjectId) -> Result<Arc<Object>, PdfError> {
         {
-            let guard = self.cache.lock().unwrap();
+            // Poison recovery: a previous panic while holding the lock left the
+            // mutex poisoned. The cache is just a memo of immutable parses, so
+            // the inner state is safe to keep using.
+            let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(obj) = guard.get(&id.0) {
                 return Ok(Arc::clone(obj));
             }
@@ -94,7 +97,10 @@ impl Document {
 
         let obj = self.parse_object_uncached(id)?;
         let arc = Arc::new(obj);
-        self.cache.lock().unwrap().insert(id.0, Arc::clone(&arc));
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.0, Arc::clone(&arc));
         Ok(arc)
     }
 
@@ -152,10 +158,8 @@ impl Document {
     pub fn get_dict(&self, id: ObjectId) -> Result<Arc<HashMap<Vec<u8>, Object>>, PdfError> {
         let obj = self.get_object(id)?;
         match obj.as_ref() {
-            Object::Dictionary(_) | Object::Stream(_) => {
-                // Return the dict without cloning by mapping the Arc.
-                Ok(Arc::new(obj.as_dict().unwrap().clone()))
-            }
+            Object::Dictionary(d) => Ok(Arc::new(d.clone())),
+            Object::Stream(s) => Ok(Arc::new(s.dict.clone())),
             _ => Err(PdfError::BadObject {
                 id: id.0,
                 detail: "not a dictionary".into(),
@@ -229,6 +233,9 @@ impl Document {
             let stream_obj = self.get_object(r)?;
             if let Object::Stream(s) = stream_obj.as_ref() {
                 let decoded = decode_stream(&s.content, &s.dict).map_err(PdfError::DecodeFailed)?;
+                if !out.is_empty() && !out.ends_with(b"\n") {
+                    out.push(b'\n');
+                }
                 out.extend_from_slice(&decoded);
             }
         }
@@ -248,9 +255,15 @@ impl Document {
         page_id: ObjectId,
         resource_name: &[u8],
     ) -> Result<HashMap<Vec<u8>, Object>, PdfError> {
-        // Walk up the page tree to find /Resources.
+        // Walk up the page tree to find /Resources. Bound to 64 hops to defeat
+        // cyclic /Parent references in malformed PDFs.
         let mut current_id = Some(page_id);
-        while let Some(id) = current_id {
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let Some(id) = current_id else { break };
+            if !visited.insert(id.0) {
+                break;
+            }
             let obj = self.get_object(id)?;
             let dict = match obj.as_dict() {
                 Some(d) => d.clone(),
@@ -292,20 +305,45 @@ struct PageIter<'a> {
     doc: &'a Document,
     /// Stack of (node_id, next_child_index) for page-tree traversal.
     stack: Vec<(ObjectId, usize)>,
+    /// Object numbers currently on the traversal stack — guards against cyclic
+    /// /Kids references (malformed PDFs would otherwise loop forever).
+    on_stack: std::collections::HashSet<u32>,
     page_num: u32,
 }
 
 impl<'a> PageIter<'a> {
     fn new(doc: &'a Document) -> Self {
-        let catalog = doc.catalog().unwrap_or_default();
+        // Catalog errors collapse to an empty iterator — same outcome as a PDF
+        // with no /Pages root. Logged so corruption doesn't go silent.
+        let catalog = match doc.catalog() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("PageIter: catalog unavailable, no pages will be yielded: {e:?}");
+                Default::default()
+            }
+        };
         let pages_id = catalog
             .get(b"Pages".as_ref())
             .and_then(Object::as_reference);
-        let stack = pages_id.map(|id| vec![(id, 0)]).unwrap_or_default();
+        let mut on_stack = std::collections::HashSet::new();
+        let stack = match pages_id {
+            Some(id) => {
+                on_stack.insert(id.0);
+                vec![(id, 0)]
+            }
+            None => Vec::new(),
+        };
         Self {
             doc,
             stack,
+            on_stack,
             page_num: 0,
+        }
+    }
+
+    fn pop(&mut self) {
+        if let Some((id, _)) = self.stack.pop() {
+            self.on_stack.remove(&id.0);
         }
     }
 }
@@ -321,14 +359,14 @@ impl Iterator for PageIter<'_> {
             let obj = match self.doc.get_object(node_id) {
                 Ok(o) => o,
                 Err(_) => {
-                    self.stack.pop();
+                    self.pop();
                     continue;
                 }
             };
             let dict = match obj.as_dict() {
                 Some(d) => d.clone(),
                 None => {
-                    self.stack.pop();
+                    self.pop();
                     continue;
                 }
             };
@@ -340,7 +378,7 @@ impl Iterator for PageIter<'_> {
 
             if node_type == b"Page" {
                 // Leaf page node.
-                self.stack.pop();
+                self.pop();
                 self.page_num += 1;
                 return Some((self.page_num, node_id));
             }
@@ -349,20 +387,27 @@ impl Iterator for PageIter<'_> {
             let kids = match dict.get(b"Kids".as_ref()) {
                 Some(Object::Array(a)) => a.clone(),
                 _ => {
-                    self.stack.pop();
+                    self.pop();
                     continue;
                 }
             };
 
             let idx = *child_idx;
             if idx >= kids.len() {
-                self.stack.pop();
+                self.pop();
                 continue;
             }
             *child_idx += 1;
 
             if let Some(kid_id) = kids[idx].as_reference() {
-                self.stack.push((kid_id, 0));
+                if self.on_stack.insert(kid_id.0) {
+                    self.stack.push((kid_id, 0));
+                } else {
+                    log::warn!(
+                        "PageIter: cyclic /Kids reference to obj {} skipped",
+                        kid_id.0
+                    );
+                }
             }
         }
     }
