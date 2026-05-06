@@ -63,29 +63,19 @@ impl ObjStmCache {
             })?;
 
         // Parse the object stream directory: N pairs of (obj_num, byte_offset).
-        let n_raw = stream_dict
-            .get(b"N".as_ref())
-            .and_then(Object::as_i64)
-            .unwrap_or(0);
-        if !(0..=1_000_000).contains(&n_raw) {
-            return Err(PdfError::BadObject {
+        let n = bounded_dict_int(stream_dict, b"N", 0, 1_000_000).map_err(|detail| {
+            PdfError::BadObject {
                 id: container_id,
-                detail: format!("/N={n_raw} out of range"),
-            });
-        }
-        let n = n_raw as usize;
+                detail,
+            }
+        })? as usize;
 
-        let first_raw = stream_dict
-            .get(b"First".as_ref())
-            .and_then(Object::as_i64)
-            .unwrap_or(0);
-        if first_raw < 0 {
-            return Err(PdfError::BadObject {
+        let first = bounded_dict_int(stream_dict, b"First", 0, i64::MAX).map_err(|detail| {
+            PdfError::BadObject {
                 id: container_id,
-                detail: format!("/First={first_raw} is negative"),
-            });
-        }
-        let first = first_raw as usize;
+                detail,
+            }
+        })? as usize;
 
         let objects =
             parse_objstm_objects(&decoded, n, first).map_err(|detail| PdfError::BadObject {
@@ -103,6 +93,23 @@ impl ObjStmCache {
                 id: container_id,
                 detail: format!("index {index} out of range (n={n})"),
             })
+    }
+}
+
+/// Read an integer dict entry (defaulting to 0 if absent), enforcing
+/// `min..=max`. Returns the offending value formatted into the error message.
+fn bounded_dict_int(
+    dict: &HashMap<Vec<u8>, Object>,
+    key: &[u8],
+    min: i64,
+    max: i64,
+) -> Result<i64, String> {
+    let value = dict.get(key).and_then(Object::as_i64).unwrap_or(0);
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        let key_str = String::from_utf8_lossy(key);
+        Err(format!("/{key_str}={value} out of range [{min}, {max}]"))
     }
 }
 

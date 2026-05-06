@@ -187,19 +187,7 @@ fn parse_trailer_dict(
         }
     };
 
-    // Merge into table.trailer — existing keys win (newer xref wins).
-    for (k, v) in &dict {
-        if !table.trailer.contains_key(k) {
-            table.trailer.insert(k.clone(), v.clone());
-        }
-    }
-
-    // Follow /Prev chain (older xref section).
-    if let Some(Object::Integer(prev)) = dict.get(b"Prev".as_ref())
-        && *prev > 0
-    {
-        read_xref_at(data, *prev as u64, table, visited)?;
-    }
+    merge_trailer_and_chain(data, &dict, table, visited)?;
 
     // Handle hybrid files: /XRefStm points to an additional xref stream.
     if let Some(Object::Integer(xrefstm)) = dict.get(b"XRefStm".as_ref())
@@ -211,6 +199,27 @@ fn parse_trailer_dict(
         }
     }
 
+    Ok(())
+}
+
+/// Merge `dict` into `table.trailer` (existing keys win — newer xref sections
+/// already populated the table) and recurse into the `/Prev` chain if present
+/// and positive.  Negative or zero `/Prev` values are silently ignored — they
+/// indicate "no previous xref section" rather than an error.
+fn merge_trailer_and_chain(
+    data: &[u8],
+    dict: &HashMap<Vec<u8>, Object>,
+    table: &mut XrefTable,
+    visited: &mut std::collections::HashSet<u64>,
+) -> Result<(), PdfError> {
+    for (k, v) in dict {
+        table.trailer.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    if let Some(Object::Integer(prev)) = dict.get(b"Prev".as_ref())
+        && *prev > 0
+    {
+        read_xref_at(data, *prev as u64, table, visited)?;
+    }
     Ok(())
 }
 
@@ -274,29 +283,18 @@ fn read_xref_stream(
         return Err(PdfError::BadXref("xref stream: zero-width entry".into()));
     }
 
-    // Convert an `Object::Integer` to a non-negative u32, rejecting overflow.
-    let int_to_u32 = |o: &Object, label: &str| -> Result<u32, PdfError> {
-        match o {
-            Object::Integer(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Ok(*n as u32),
-            other => Err(PdfError::BadXref(format!(
-                "xref stream {label}: bad integer {other:?}"
-            ))),
-        }
-    };
-
     // Determine which object numbers this stream covers via /Index.
     let index_pairs: Vec<u32> = match dict.get(b"Index".as_ref()) {
         Some(Object::Array(a)) => a
             .iter()
-            .map(|o| int_to_u32(o, "/Index"))
+            .map(|o| obj_to_u32(o, "/Index"))
             .collect::<Result<Vec<_>, _>>()?,
         _ => {
             // Default: one subsection starting at 0, covering /Size objects.
-            let size = match dict.get(b"Size".as_ref()) {
-                Some(o @ Object::Integer(_)) => int_to_u32(o, "/Size")?,
-                _ => return Err(PdfError::BadXref("xref stream: missing /Size".into())),
-            };
-            vec![0, size]
+            let size = dict
+                .get(b"Size".as_ref())
+                .ok_or_else(|| PdfError::BadXref("xref stream: missing /Size".into()))?;
+            vec![0, obj_to_u32(size, "/Size")?]
         }
     };
     if !index_pairs.len().is_multiple_of(2) {
@@ -370,20 +368,7 @@ fn read_xref_stream(
         }
     }
 
-    // Merge trailer entries.
-    for (k, v) in &dict {
-        if !table.trailer.contains_key(k) {
-            table.trailer.insert(k.clone(), v.clone());
-        }
-    }
-
-    // Follow /Prev chain.
-    if let Some(Object::Integer(prev)) = dict.get(b"Prev".as_ref()) {
-        let prev_off = *prev as u64;
-        read_xref_at(data, prev_off, table, visited)?;
-    }
-
-    Ok(())
+    merge_trailer_and_chain(data, &dict, table, visited)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -393,23 +378,18 @@ fn read_xref_stream(
 fn decode_xref_stream(raw: &[u8], dict: &HashMap<Vec<u8>, Object>) -> Result<Vec<u8>, PdfError> {
     use crate::stream::apply_flate;
 
-    let filter = match dict.get(b"Filter".as_ref()) {
-        Some(Object::Name(n)) => Some(n.as_slice()),
-        Some(Object::Array(a)) if a.len() == 1 => {
-            if let Object::Name(n) = &a[0] {
-                Some(n.as_slice())
-            } else {
-                None
-            }
-        }
+    // /Filter is optional, a Name, or a single-element array of a Name.
+    let filter: Option<&[u8]> = match dict.get(b"Filter".as_ref()) {
         None => None,
+        Some(Object::Name(n)) => Some(n),
+        Some(Object::Array(a)) if a.len() == 1 => a[0].as_name(),
         _ => None,
     };
 
     match filter {
         None => Ok(raw.to_vec()),
         Some(b"FlateDecode") => {
-            let params: Option<&dyn crate::stream::DictLookup> = dict
+            let params = dict
                 .get(b"DecodeParms".as_ref())
                 .map(|o| o as &dyn crate::stream::DictLookup);
             apply_flate(raw, params).map_err(|e| PdfError::DecodeFailed(e.to_string()))
@@ -417,6 +397,18 @@ fn decode_xref_stream(raw: &[u8], dict: &HashMap<Vec<u8>, Object>) -> Result<Vec
         Some(other) => Err(PdfError::DecodeFailed(format!(
             "unsupported xref stream filter: {}",
             String::from_utf8_lossy(other)
+        ))),
+    }
+}
+
+/// Convert an `Object::Integer` to a non-negative `u32`, rejecting negatives,
+/// non-integers, and values that would overflow.  `label` is interpolated into
+/// the error message to identify which dict key was being read.
+fn obj_to_u32(obj: &Object, label: &str) -> Result<u32, PdfError> {
+    match obj {
+        Object::Integer(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Ok(*n as u32),
+        other => Err(PdfError::BadXref(format!(
+            "xref stream {label}: bad integer {other:?}"
         ))),
     }
 }

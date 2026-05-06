@@ -59,10 +59,9 @@ impl Object {
     // ── lopdf-compatible as_* accessors ──────────────────────────────────────
 
     pub fn as_bool(&self) -> Option<bool> {
-        if let Self::Boolean(b) = self {
-            Some(*b)
-        } else {
-            None
+        match self {
+            Self::Boolean(b) => Some(*b),
+            _ => None,
         }
     }
 
@@ -87,26 +86,23 @@ impl Object {
     }
 
     pub fn as_name(&self) -> Option<&[u8]> {
-        if let Self::Name(n) = self {
-            Some(n)
-        } else {
-            None
+        match self {
+            Self::Name(n) => Some(n),
+            _ => None,
         }
     }
 
     pub fn as_str(&self) -> Option<&[u8]> {
-        if let Self::String(s, _) = self {
-            Some(s)
-        } else {
-            None
+        match self {
+            Self::String(s, _) => Some(s),
+            _ => None,
         }
     }
 
     pub fn as_array(&self) -> Option<&[Object]> {
-        if let Self::Array(a) = self {
-            Some(a)
-        } else {
-            None
+        match self {
+            Self::Array(a) => Some(a),
+            _ => None,
         }
     }
 
@@ -119,18 +115,16 @@ impl Object {
     }
 
     pub fn as_stream(&self) -> Option<&Stream> {
-        if let Self::Stream(s) = self {
-            Some(s)
-        } else {
-            None
+        match self {
+            Self::Stream(s) => Some(s),
+            _ => None,
         }
     }
 
     pub fn as_reference(&self) -> Option<ObjectId> {
-        if let Self::Reference(id) = self {
-            Some(*id)
-        } else {
-            None
+        match self {
+            Self::Reference(id) => Some(*id),
+            _ => None,
         }
     }
 }

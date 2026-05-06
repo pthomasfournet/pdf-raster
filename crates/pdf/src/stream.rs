@@ -291,13 +291,7 @@ fn collect_filters(dict: &HashMap<Vec<u8>, Object>) -> Vec<Vec<u8>> {
         Some(Object::Name(n)) => vec![n.clone()],
         Some(Object::Array(a)) => a
             .iter()
-            .filter_map(|o| {
-                if let Object::Name(n) = o {
-                    Some(n.clone())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|o| Object::as_name(o).map(<[u8]>::to_vec))
             .collect(),
         _ => vec![],
     }

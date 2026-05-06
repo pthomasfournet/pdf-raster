@@ -265,30 +265,14 @@ impl Document {
                 break;
             }
             let obj = self.get_object(id)?;
-            let dict = match obj.as_dict() {
-                Some(d) => d.clone(),
-                None => break,
+            let Some(dict) = obj.as_dict().cloned() else {
+                break;
             };
 
             if let Some(res) = dict.get(b"Resources".as_ref()) {
-                let res_dict = match res {
-                    Object::Dictionary(d) => d.clone(),
-                    Object::Reference(rid) => {
-                        let r = self.get_object(*rid)?;
-                        r.as_dict().cloned().unwrap_or_default()
-                    }
-                    _ => HashMap::new(),
-                };
+                let res_dict = self.dict_from_object(res)?;
                 if let Some(sub) = res_dict.get(resource_name) {
-                    let sub_dict = match sub {
-                        Object::Dictionary(d) => d.clone(),
-                        Object::Reference(rid) => {
-                            let r = self.get_object(*rid)?;
-                            r.as_dict().cloned().unwrap_or_default()
-                        }
-                        _ => HashMap::new(),
-                    };
-                    return Ok(sub_dict);
+                    return self.dict_from_object(sub);
                 }
             }
 
@@ -296,6 +280,20 @@ impl Document {
             current_id = dict.get(b"Parent".as_ref()).and_then(Object::as_reference);
         }
         Ok(HashMap::new())
+    }
+
+    /// Take a dictionary value out of an `Object`, resolving one level of
+    /// indirection if needed. Non-dict values yield an empty map (matches the
+    /// behaviour of malformed-but-recoverable PDFs).
+    fn dict_from_object(&self, obj: &Object) -> Result<HashMap<Vec<u8>, Object>, PdfError> {
+        match obj {
+            Object::Dictionary(d) => Ok(d.clone()),
+            Object::Reference(rid) => {
+                let r = self.get_object(*rid)?;
+                Ok(r.as_dict().cloned().unwrap_or_default())
+            }
+            _ => Ok(HashMap::new()),
+        }
     }
 }
 
