@@ -314,7 +314,7 @@ fn dict_integer(dict: &Dictionary, key: &[u8]) -> Option<u32> {
 
 /// Increment the filter count slot for `filter`, saturating at `u32::MAX`.
 #[inline]
-fn count_filter(filter_counts: &mut [u32; IMAGE_FILTER_COUNT], filter: ImageFilter) {
+const fn count_filter(filter_counts: &mut [u32; IMAGE_FILTER_COUNT], filter: ImageFilter) {
     filter_counts[filter as usize] = filter_counts[filter as usize].saturating_add(1);
 }
 
