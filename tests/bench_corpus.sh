@@ -117,7 +117,7 @@ monitored_run() {
         sum += util; n++
       }
     }
-    END { if (n > 0) printf "%.0f %.0f", sum/n, peak; else print "0 0" }
+    END { if (n > 0) printf "%.0f %.0f\n", sum/n, peak; else print "0 0" }
   ' "$stats_f")
 
   local disk_read
