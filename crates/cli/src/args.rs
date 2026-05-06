@@ -193,6 +193,26 @@ pub struct Args {
     #[arg(long = "timings")]
     pub timings: bool,
 
+    // ── RAM-backed output ─────────────────────────────────────────────────────
+    /// Write output to a freshly-created tmpfs directory under `/dev/shm`
+    /// instead of the path given by `OUTPUT_PREFIX`.
+    ///
+    /// The chosen directory is printed on stderr at startup and on stdout at
+    /// the end of the run (so callers can pipe it into a follow-on tool).
+    /// The directory is removed when the process exits cleanly; on crash it
+    /// is left behind but `/dev/shm` is tmpfs and clears on reboot.
+    ///
+    /// The basename of `OUTPUT_PREFIX` is reused as the file stem inside the
+    /// tmpfs dir so naming stays stable for downstream consumers — e.g.
+    /// `pdf-raster --ram doc.pdf out` writes `/dev/shm/pdf-raster-<pid>-<rand>/out-NNN.ppm`.
+    #[arg(long = "ram")]
+    pub ram: bool,
+
+    /// Override the tmpfs directory used by `--ram` (default: a fresh dir
+    /// under `/dev/shm`). Has no effect without `--ram`.
+    #[arg(long = "ram-path", value_name = "PATH")]
+    pub ram_path: Option<String>,
+
     // ── Backend selection ─────────────────────────────────────────────────────
     /// Compute backend for image decoding and GPU fills.
     ///

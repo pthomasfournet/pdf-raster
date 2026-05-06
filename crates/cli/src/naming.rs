@@ -2,19 +2,36 @@
 
 use crate::args::{Args, OutputFormat};
 
-/// Compute the output filename for a given page.
+/// Compute the output filename for a given page using `args.output_prefix`.
+///
+/// Kept as a thin wrapper around [`output_path_with_prefix`] so existing tests
+/// (and any future callers that don't need to override the prefix) stay simple.
+#[cfg(test)]
+pub fn output_path(args: &Args, page_num: i32, total_pages: i32, format: OutputFormat) -> String {
+    output_path_with_prefix(&args.output_prefix, args, page_num, total_pages, format)
+}
+
+/// Compute the output filename for a given page with an explicit prefix
+/// override. Used by `--ram` mode to redirect individual pages to disk when
+/// the [`SpillPolicy`](crate::ram::SpillPolicy) reports tight memory.
 ///
 /// Examples (prefix = "out", sep = '-', format = Ppm):
 /// - page 1, total 10 → `"out-1.ppm"`
 /// - page 1, total 100, `force_num_digits` = Some(3) → `"out-001.ppm"`
-pub fn output_path(args: &Args, page_num: i32, total_pages: i32, format: OutputFormat) -> String {
+pub fn output_path_with_prefix(
+    prefix: &str,
+    args: &Args,
+    page_num: i32,
+    total_pages: i32,
+    format: OutputFormat,
+) -> String {
     let digits = args
         .force_num_digits
         .unwrap_or_else(|| digit_width(total_pages));
 
     let sep = args.separator;
     let ext = format.extension_with_mode(args.gray, args.mono);
-    format!("{}{sep}{page_num:0digits$}.{ext}", args.output_prefix)
+    format!("{prefix}{sep}{page_num:0digits$}.{ext}")
 }
 
 /// Minimum number of digits needed to represent `n`.
@@ -71,6 +88,8 @@ mod tests {
             timings: false,
             backend: BackendArg::Auto,
             vaapi_device: "/dev/dri/renderD128".into(),
+            ram: false,
+            ram_path: None,
         }
     }
 

@@ -11,7 +11,8 @@ use pdf_raster::{RasterError, RasterSession, render_page_rgb_hinted, rgb_to_gray
 use raster::Bitmap;
 
 use crate::args::{Args, OutputFormat};
-use crate::naming::output_path;
+use crate::naming::output_path_with_prefix;
+use crate::ram::SpillPolicy;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -88,6 +89,7 @@ pub fn render_page(
     page_num: u32,
     total_pages: u32,
     args: &Args,
+    spill: &SpillPolicy,
 ) -> Result<(), RenderError> {
     let format = args.output_format();
 
@@ -115,17 +117,27 @@ pub fn render_page(
 
     let rgb: Bitmap<Rgb8> = render_page_rgb_hinted(session, page_num, scale, effective_policy)?;
 
+    // Pick RAM vs disk per page: when --ram is active, the SpillPolicy hands
+    // back the tmpfs prefix until free memory drops below the safety margin,
+    // then transparently spills the rest of the run to the user's disk path.
+    // When --ram is off, the policy is a passthrough that always returns the
+    // original prefix.
+    let prefix = spill.next_prefix();
     #[expect(
         clippy::cast_possible_wrap,
         reason = "total_pages ≤ i32::MAX; validated in main before calling this function"
     )]
-    let out_path = output_path(args, page_num as i32, total_pages as i32, format);
+    let out_path =
+        output_path_with_prefix(prefix, args, page_num as i32, total_pages as i32, format);
 
-    // Write to a sibling temp file then rename atomically so a failed encode
-    // never leaves a partial output file at the final path.
-    let tmp_path = format!("{out_path}.tmp");
+    // Write directly to the final path. The previous temp-file + atomic-rename
+    // dance triggered ext4 auto_da_alloc on every page, which forces dirty data
+    // out before the rename can complete — turning batch render into a serial
+    // disk-flush wait. For a many-page batch the safety guarantee (no partial
+    // file on encode failure) isn't worth that cost; the user re-runs on error
+    // anyway. We delete a partial file on encode failure to preserve the spirit.
     let encode_result = (|| -> Result<(), RenderError> {
-        let mut out = BufWriter::new(File::create(&tmp_path)?);
+        let mut out = BufWriter::new(File::create(&out_path)?);
         if args.mono {
             let mono = gray_to_mono(&rgb_to_gray(&rgb));
             match format {
@@ -151,15 +163,10 @@ pub fn render_page(
         Ok(())
     })();
 
-    if encode_result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-        return encode_result;
+    if let Err(e) = encode_result {
+        let _ = fs::remove_file(&out_path);
+        return Err(e);
     }
-
-    fs::rename(&tmp_path, &out_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        RenderError::Io(e)
-    })?;
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 mod args;
 mod diagnostics;
 mod naming;
+mod ram;
 mod render;
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,10 +15,14 @@ use rayon::prelude::*;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear startup sequence: arg parse → session open → page list → parallel render"
+)]
 fn main() {
     let _ = env_logger::try_init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if args.odd_only && args.even_only {
         eprintln!("pdf-raster: --odd and --even are mutually exclusive");
@@ -27,6 +32,19 @@ fn main() {
         eprintln!("pdf-raster: {e}");
         std::process::exit(1);
     }
+
+    // When --ram is set, redirect output_prefix into a fresh tmpfs directory.
+    // The guard removes the directory on Drop so a clean exit cleans up; on
+    // crash the dir is left behind but /dev/shm is tmpfs and clears on reboot.
+    // The SpillPolicy is consulted per-page: when free memory tightens, the
+    // writer falls back to the original on-disk prefix automatically.
+    let (_ram_guard, spill_policy) = match ram::redirect_to_ram(&mut args) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("pdf-raster: --ram setup failed: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let session_config = args.session_config().unwrap_or_else(|e| {
         eprintln!("pdf-raster: {e}");
@@ -89,7 +107,8 @@ fn main() {
                 let page_u32 = page_num as u32;
 
                 let t0 = timings.then(Instant::now);
-                let result = render::render_page(&session, page_u32, total_u32, &args);
+                let result =
+                    render::render_page(&session, page_u32, total_u32, &args, &spill_policy);
                 if let Some(t0) = t0 {
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
                     let tid = rayon::current_thread_index().unwrap_or(99);
