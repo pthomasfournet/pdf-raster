@@ -136,37 +136,41 @@ pub fn render_page(
     // disk-flush wait. For a many-page batch the safety guarantee (no partial
     // file on encode failure) isn't worth that cost; the user re-runs on error
     // anyway. We delete a partial file on encode failure to preserve the spirit.
-    let encode_result = (|| -> Result<(), RenderError> {
-        let mut out = BufWriter::new(File::create(&out_path)?);
-        if args.mono {
-            let mono = gray_to_mono(&rgb_to_gray(&rgb));
-            match format {
-                OutputFormat::Ppm => write_pbm::<Gray8, _>(&mono, &mut out)?,
-                OutputFormat::Png => write_png::<Gray8, _>(&mono, &mut out)?,
-                OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
-            }
-        } else if args.gray {
-            let gray = rgb_to_gray(&rgb);
-            match format {
-                OutputFormat::Ppm => write_pgm::<Gray8, _>(&gray, &mut out)?,
-                OutputFormat::Png => write_png::<Gray8, _>(&gray, &mut out)?,
-                OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
-            }
-        } else {
-            match format {
-                OutputFormat::Ppm => write_ppm(&rgb, &mut out)?,
-                OutputFormat::Png => write_png(&rgb, &mut out)?,
-                OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
-            }
-        }
-        out.flush()?;
-        Ok(())
-    })();
-
-    if let Err(e) = encode_result {
+    encode_to_path(&out_path, &rgb, args, format).inspect_err(|_| {
         let _ = fs::remove_file(&out_path);
-        return Err(e);
+    })
+}
+
+/// Encode `rgb` to `out_path` honouring `--mono` / `--gray` and the resolved format.
+fn encode_to_path(
+    out_path: &str,
+    rgb: &Bitmap<Rgb8>,
+    args: &Args,
+    format: OutputFormat,
+) -> Result<(), RenderError> {
+    let mut out = BufWriter::new(File::create(out_path)?);
+    if args.mono {
+        let mono = gray_to_mono(&rgb_to_gray(rgb));
+        match format {
+            OutputFormat::Ppm => write_pbm::<Gray8, _>(&mono, &mut out)?,
+            OutputFormat::Png => write_png::<Gray8, _>(&mono, &mut out)?,
+            OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+        }
+    } else if args.gray {
+        let gray = rgb_to_gray(rgb);
+        match format {
+            OutputFormat::Ppm => write_pgm::<Gray8, _>(&gray, &mut out)?,
+            OutputFormat::Png => write_png::<Gray8, _>(&gray, &mut out)?,
+            OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+        }
+    } else {
+        match format {
+            OutputFormat::Ppm => write_ppm(rgb, &mut out)?,
+            OutputFormat::Png => write_png(rgb, &mut out)?,
+            OutputFormat::Jpeg | OutputFormat::Tiff => unreachable!("rejected above"),
+        }
     }
+    out.flush()?;
     Ok(())
 }
 

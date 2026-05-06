@@ -93,9 +93,8 @@ impl SpillPolicy {
     /// Build a passthrough policy that always returns `disk_prefix` (used
     /// when `--ram` is off — keeps the renderer-side API uniform).
     fn passthrough(disk_prefix: String) -> Self {
+        // Both slots hold the user's prefix so next_prefix() short-circuits.
         Self {
-            // Both slots hold the user's prefix; next_prefix() returns it
-            // unconditionally because the equality check below short-circuits.
             targets: (disk_prefix.clone(), disk_prefix),
             probe: Mutex::new(MemoryProbe::new()),
             spill_announced: AtomicBool::new(false),
@@ -214,16 +213,16 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
     // user's pages with leftover files from a previous crashed run.
     let dir = if let Some(p) = &args.ram_path {
         let dir = PathBuf::from(p);
-        match fs::create_dir(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        if let Err(e) = fs::create_dir(&dir) {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
                 eprintln!(
                     "pdf-raster: warning: --ram-path {} already exists; \
                      leftover files will be removed alongside this run's output",
                     dir.display()
                 );
+            } else {
+                return Err(e);
             }
-            Err(e) => return Err(e),
         }
         dir
     } else {

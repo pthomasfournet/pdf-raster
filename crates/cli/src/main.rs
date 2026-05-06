@@ -38,13 +38,10 @@ fn main() {
     // crash the dir is left behind but /dev/shm is tmpfs and clears on reboot.
     // The SpillPolicy is consulted per-page: when free memory tightens, the
     // writer falls back to the original on-disk prefix automatically.
-    let (_ram_guard, spill_policy) = match ram::redirect_to_ram(&mut args) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("pdf-raster: --ram setup failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let (_ram_guard, spill_policy) = ram::redirect_to_ram(&mut args).unwrap_or_else(|e| {
+        eprintln!("pdf-raster: --ram setup failed: {e}");
+        std::process::exit(1);
+    });
 
     let session_config = args.session_config().unwrap_or_else(|e| {
         eprintln!("pdf-raster: {e}");
