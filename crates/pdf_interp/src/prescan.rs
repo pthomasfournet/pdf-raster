@@ -39,7 +39,7 @@
 //! silently skipped — the scan continues.  A partial result is still useful
 //! for routing.
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use pdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::{
     InterpError,
@@ -160,13 +160,13 @@ fn scan_xobjects(
     };
 
     let xobj_dict = {
-        let Ok(res_obj) = page_dict.get(b"Resources") else {
+        let Some(res_obj) = page_dict.get(b"Resources") else {
             return;
         };
         let Some(res) = resolve_dict(doc, res_obj) else {
             return;
         };
-        let Ok(xobj_obj) = res.get(b"XObject") else {
+        let Some(xobj_obj) = res.get(b"XObject") else {
             return;
         };
         let Some(d) = resolve_dict(doc, xobj_obj) else {
@@ -186,15 +186,14 @@ fn scan_xobjects(
         let Ok(xobj_stream) = doc.get_object(xobj_id) else {
             continue;
         };
-        let Object::Stream(stream) = xobj_stream else {
+        let Object::Stream(stream) = xobj_stream.as_ref() else {
             continue;
         };
 
         let subtype = stream
             .dict
             .get(b"Subtype")
-            .ok()
-            .and_then(|o| o.as_name().ok())
+            .and_then(Object::as_name)
             .map(<[u8]>::to_vec);
 
         match subtype.as_deref() {
@@ -227,7 +226,7 @@ fn scan_image_dict(
     max_ppi: &mut f32,
     page_pts_width: f32,
 ) {
-    let filter = dict.get(b"Filter").ok().and_then(|o| {
+    let filter = dict.get(b"Filter").and_then(|o| {
         // Filter may be a Reference → Name; follow it.
         let resolved = match o {
             Object::Reference(id) => {
@@ -260,7 +259,7 @@ fn scan_inline_image(
 ) {
     // `parse_inline_params` has already expanded abbreviated keys (b"F" → b"Filter",
     // b"W" → b"Width") so we only need the full names here.
-    let filter = dict.get(b"Filter").ok().and_then(filter_name);
+    let filter = dict.get(b"Filter").and_then(filter_name);
     let img_filter = ImageFilter::from_filter_str(filter.as_deref());
     count_filter(filter_counts, img_filter);
     if let Some(w_px) = dict_integer(dict, b"Width") {
@@ -305,7 +304,7 @@ fn dict_integer(dict: &Dictionary, key: &[u8]) -> Option<u32> {
         clippy::cast_possible_truncation,
         reason = "guarded by *i > 0; PDF image dimensions fit in u32 (max ~65 535 px)"
     )]
-    match dict.get(key).ok()? {
+    match dict.get(key)? {
         Object::Integer(i) if *i > 0 => Some(*i as u32),
         Object::Real(r) if *r > 0.0 => Some(*r as u32),
         _ => None,
@@ -342,43 +341,54 @@ fn update_max_ppi(max_ppi: &mut f32, w_px: u32, page_pts_width: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{Dictionary, Document, Object, Stream};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Build a minimal lopdf document with one page that has a content stream.
+    /// Build a minimal in-memory PDF with one page that has a content stream.
+    ///
+    /// Layout (object numbers):
+    ///   1: Catalog
+    ///   2: Pages
+    ///   3: Page (Type=Page, Parent=2, MediaBox=[0 0 612 792], Contents=4)
+    ///   4: Content stream (length = `content_bytes.len()`)
     fn doc_with_content(content_bytes: Vec<u8>) -> (Document, u32) {
-        let mut doc = Document::with_version("1.4");
-        let pages_id = doc.new_object_id();
-        let content_id = doc.add_object(Stream::new(Dictionary::new(), content_bytes));
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n".to_string();
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n".to_string();
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                    /Contents 4 0 R>>\nendobj\n"
+            .to_string();
+        let stream_len = content_bytes.len();
+        let obj4_header = format!("4 0 obj\n<</Length {stream_len}>>\nstream\n");
+        let obj4_footer = "\nendstream\nendobj\n";
 
-        let mut page_dict = Dictionary::new();
-        page_dict.set("Type", Object::Name(b"Page".to_vec()));
-        page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set(
-            "MediaBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(612),
-                Object::Integer(792),
-            ]),
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        let off4 = off3 + obj3.len();
+        let xref_start = off4 + obj4_header.len() + stream_len + obj4_footer.len();
+
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n\
+             {off2:010} 00000 n\r\n\
+             {off3:010} 00000 n\r\n\
+             {off4:010} 00000 n\r\n",
         );
-        page_dict.set("Contents", Object::Reference(content_id));
-        let page_id = doc.add_object(Object::Dictionary(page_dict));
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
 
-        let mut pages_dict = Dictionary::new();
-        pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-        pages_dict.set("Count", Object::Integer(1));
-        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+        let mut bytes = Vec::with_capacity(xref_start + xref.len() + trailer.len());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(obj1.as_bytes());
+        bytes.extend_from_slice(obj2.as_bytes());
+        bytes.extend_from_slice(obj3.as_bytes());
+        bytes.extend_from_slice(obj4_header.as_bytes());
+        bytes.extend_from_slice(&content_bytes);
+        bytes.extend_from_slice(obj4_footer.as_bytes());
+        bytes.extend_from_slice(xref.as_bytes());
+        bytes.extend_from_slice(trailer.as_bytes());
 
-        let mut catalog_dict = Dictionary::new();
-        catalog_dict.set("Type", Object::Name(b"Catalog".to_vec()));
-        catalog_dict.set("Pages", Object::Reference(pages_id));
-        let catalog_id = doc.add_object(Object::Dictionary(catalog_dict));
-
-        doc.trailer.set("Root", Object::Reference(catalog_id));
+        let doc = Document::from_bytes_owned(bytes).expect("test PDF parse");
         (doc, 1)
     }
 

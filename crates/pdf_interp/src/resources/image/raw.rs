@@ -4,7 +4,9 @@
 //! colour space.  Helper functions handle the common sub-cases: 8-bpp colour,
 //! indexed palette expansion, and CMYK→RGB conversion.
 
-use lopdf::{Dictionary, Document, Object};
+use std::sync::Arc;
+
+use pdf::{Dictionary, Document, Object};
 
 use super::bitpack::{downsample_16bpp, expand_nbpp, expand_nbpp_indexed, unpack_packed_bits};
 use super::colorspace::{ResolvedCs, indexed_palette, resolve_cs};
@@ -39,6 +41,7 @@ use gpu::GpuCtx;
                   the extra gpu-icc args push the count over the limit"
     )
 )]
+#[expect(clippy::too_many_lines, reason = "single-pass raw image decoder; cfg-gated arms preclude clean splits")]
 pub(super) fn decode_raw(
     doc: &Document,
     data: &[u8],
@@ -59,11 +62,19 @@ pub(super) fn decode_raw(
     // Resolve the ColorSpace entry, following indirect references.  We need the
     // raw Object to detect Indexed (which uses a different decode path) as well
     // as for subsequent color-space resolution.
-    let cs_obj_raw = dict.get(b"ColorSpace").ok();
+    let cs_obj_raw = dict.get(b"ColorSpace");
     // Follow a top-level Reference so Indexed detection below works correctly.
-    let cs_obj: Option<&Object> = match cs_obj_raw {
-        Some(Object::Reference(id)) => doc.get_object(*id).ok(),
-        other => other,
+    // `Document::get_object` returns `Arc<Object>`, so we keep the Arc alive in
+    // a local binding and borrow through it for the match below.
+    let cs_obj_arc: Option<Arc<Object>> = if let Some(Object::Reference(id)) = cs_obj_raw {
+        doc.get_object(*id).ok()
+    } else {
+        None
+    };
+    let cs_obj: Option<&Object> = if matches!(cs_obj_raw, Some(Object::Reference(_))) {
+        cs_obj_arc.as_deref()
+    } else {
+        cs_obj_raw
     };
 
     // Check for Indexed colour space: [/Indexed base hival lookup].
@@ -72,7 +83,7 @@ pub(super) fn decode_raw(
     if let Some(Object::Array(arr)) = cs_obj
         && arr
             .first()
-            .and_then(|o| o.as_name().ok())
+            .and_then(|o| o.as_name())
             .is_some_and(|n| n == b"Indexed")
     {
         return decode_raw_indexed(doc, data, width, height, bpc, arr);
@@ -353,12 +364,31 @@ fn decode_raw_indexed(
 mod tests {
     use super::*;
 
+    /// Build a minimal valid PDF document for tests that don't actually look
+    /// objects up through the document — `decode_raw` only hits `doc` when
+    /// `ColorSpace` is an indirect Reference, which none of these tests use.
+    /// Mirrors the byte-builder in `crate::js_guard_tests::make_doc`.
+    fn make_doc() -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF",);
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("test PDF parse")
+    }
+
     #[test]
     fn decode_raw_gray_8bpp() {
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
-        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
         let data = vec![0u8, 128, 255];
         let desc = decode_raw(
             &doc,
@@ -379,10 +409,10 @@ mod tests {
 
     #[test]
     fn decode_raw_rgb_8bpp() {
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
-        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
         let data = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255];
         let desc = decode_raw(
             &doc,
@@ -404,9 +434,9 @@ mod tests {
 
     #[test]
     fn decode_raw_mask_ignores_cs() {
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("BitsPerComponent", Object::Integer(8));
         let data = vec![0u8, 255];
         let desc = decode_raw(
             &doc,
@@ -426,10 +456,10 @@ mod tests {
 
     #[test]
     fn decode_raw_cmyk_converts_to_rgb() {
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceCMYK".to_vec()));
-        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceCMYK".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
         // Single pixel: C=0, M=0, Y=0, K=0 → white (255, 255, 255).
         let data = vec![0u8, 0, 0, 0];
         let desc = decode_raw(
@@ -451,10 +481,10 @@ mod tests {
 
     #[test]
     fn decode_raw_too_short_returns_none() {
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
-        dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
         // Claim 2×2 RGB but supply only 3 bytes (need 12).
         let data = vec![0u8, 0, 0];
         assert!(
@@ -477,10 +507,10 @@ mod tests {
     #[test]
     fn decode_raw_gray_1bpp() {
         // 2-pixel Gray image at bpc=1: byte 0b10_000000 → pixels [0xFF, 0x00].
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceGray".to_vec()));
-        dict.set("BitsPerComponent", lopdf::Object::Integer(1));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(1));
         let data = vec![0b1000_0000u8];
         let desc = decode_raw(
             &doc,
@@ -503,10 +533,10 @@ mod tests {
     fn decode_raw_rgb_1bpp() {
         // 1-pixel RGB image at bpc=1: 3 bits packed MSB-first in one byte.
         // Byte 0b110_00000: R=1→0xFF, G=1→0xFF, B=0→0x00.
-        let doc = lopdf::Document::new();
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
-        dict.set("BitsPerComponent", lopdf::Object::Integer(1));
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(1));
         let data = vec![0b1100_0000u8];
         let desc = decode_raw(
             &doc,

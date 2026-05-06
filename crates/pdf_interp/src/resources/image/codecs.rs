@@ -7,7 +7,7 @@
 
 use hayro_jbig2::Decoder as Jbig2Decoder;
 use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
-use lopdf::{Document, Object};
+use pdf::{Document, Object};
 
 use super::{ImageColorSpace, ImageDescriptor, ImageFilter};
 use crate::resources::dict_ext::DictExt;
@@ -96,7 +96,7 @@ pub(super) fn decode_ccitt(
     parms: Option<&Object>,
 ) -> Option<ImageDescriptor> {
     // Resolve DecodeParms once; all CCITT params live in the same dict.
-    let parms_dict = parms.and_then(|o| o.as_dict().ok());
+    let parms_dict = parms.and_then(|o| o.as_dict());
 
     let k = parms_dict.and_then(|d| d.get_i64(b"K")).unwrap_or(0);
 
@@ -980,12 +980,12 @@ pub(super) fn decode_jbig2(
 ) -> Option<ImageDescriptor> {
     // Resolve optional JBIG2Globals stream from DecodeParms.
     let globals_bytes: Option<Vec<u8>> = parms
-        .and_then(|o| o.as_dict().ok())
-        .and_then(|d| d.get(b"JBIG2Globals").ok())
+        .and_then(|o| o.as_dict())
+        .and_then(|d| d.get(b"JBIG2Globals"))
         .and_then(|o| {
             if let Object::Reference(id) = o {
                 let g_obj = doc.get_object(*id).ok()?;
-                let g_stream = g_obj.as_stream().ok()?;
+                let g_stream = g_obj.as_ref().as_stream()?;
                 // JBIG2Globals streams are typically not compressed, but
                 // decompressed_content handles both cases transparently.
                 g_stream.decompressed_content().ok()
@@ -1110,7 +1110,19 @@ mod tests {
     #[test]
     fn jbig2_decode_invalid_data_returns_none() {
         // Corrupt/empty JBIG2 data must not panic — it must return None.
-        let doc = lopdf::Document::new();
+        // Use a minimal valid PDF (no streams referenced) for the doc handle.
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF",);
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        let doc = Document::from_bytes_owned(bytes).expect("test PDF parse");
         let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
         assert!(result.is_none());
     }

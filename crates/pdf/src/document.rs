@@ -168,6 +168,11 @@ impl Document {
         }
     }
 
+    /// Lopdf-compatible alias for [`Self::get_dict`].
+    pub fn get_dictionary(&self, id: ObjectId) -> Result<Arc<Dictionary>, PdfError> {
+        self.get_dict(id)
+    }
+
     // ── Document structure ────────────────────────────────────────────────────
 
     /// Return the document catalogue dictionary.

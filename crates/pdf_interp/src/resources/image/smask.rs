@@ -4,7 +4,7 @@
 //! of the parent image.  This module decodes the `SMask` stream and resamples it
 //! to the parent image's dimensions when they differ.
 
-use lopdf::{Document, ObjectId};
+use pdf::{Document, ObjectId};
 
 use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp};
 use super::codecs::{decode_ccitt, decode_jbig2};
@@ -31,8 +31,9 @@ pub(super) fn decode_smask(
 ) -> Option<Vec<u8>> {
     use crate::resources::dict_ext::DictExt as _;
 
-    let obj = doc.get_object(id).ok()?;
-    let stream = obj.as_stream().ok()?;
+    // Bind the Arc to a local so the borrow into the stream below stays alive.
+    let obj_arc = doc.get_object(id).ok()?;
+    let stream = obj_arc.as_ref().as_stream()?;
 
     let w_raw = stream.dict.get_i64(b"Width")?;
     let h_raw = stream.dict.get_i64(b"Height")?;
@@ -41,7 +42,7 @@ pub(super) fn decode_smask(
         return None;
     };
 
-    let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
+    let filter = stream.dict.get(b"Filter").and_then(filter_name);
     let bpc = stream.dict.get_i64(b"BitsPerComponent").unwrap_or(8);
 
     // CCITTFaxDecode and JBIG2Decode return Mask-space (0x00 = paint, 0xFF = skip),
@@ -53,7 +54,7 @@ pub(super) fn decode_smask(
     // reports a different output size does not produce an out-of-bounds index.
     let alpha: Vec<u8> = match filter.as_deref() {
         Some("CCITTFaxDecode") => {
-            let parms = stream.dict.get(b"DecodeParms").ok();
+            let parms = stream.dict.get(b"DecodeParms");
             let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, true, parms)?;
             let actual_w = sm_desc.width;
             let actual_h = sm_desc.height;
@@ -65,7 +66,7 @@ pub(super) fn decode_smask(
             return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
         }
         Some("JBIG2Decode") => {
-            let parms = stream.dict.get(b"DecodeParms").ok();
+            let parms = stream.dict.get(b"DecodeParms");
             let sm_desc = decode_jbig2(doc, stream.content.as_slice(), sm_w, sm_h, true, parms)?;
             let actual_w = sm_desc.width;
             let actual_h = sm_desc.height;

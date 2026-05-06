@@ -35,7 +35,7 @@ pdf_interp  = { path = "../pdf_interp" }
 raster      = { path = "../raster" }
 color       = { path = "../color" }
 gpu         = { path = "../gpu", optional = true }
-lopdf       = "0.40"
+pdf         = { path = "../pdf" }
 rayon       = "1"
 log         = { workspace = true }
 

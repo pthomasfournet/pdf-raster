@@ -40,7 +40,7 @@ color  = { path = "../color" }
 font   = { path = "../font" }
 encode = { path = "../encode" }
 gpu    = { path = "../gpu", optional = true }
-lopdf  = "0.40"
+pdf    = { path = "../pdf" }
 log    = { workspace = true }
 fax = "0.2.6"
 hayro-ccitt = "0.3.0"

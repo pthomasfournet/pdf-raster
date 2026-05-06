@@ -52,6 +52,21 @@ impl Stream {
     pub fn new(dict: Dictionary, content: Vec<u8>) -> Self {
         Self { dict, content }
     }
+
+    /// Apply the stream's `/Filter` chain to its raw `content` and return the
+    /// decoded bytes (mirrors lopdf's `Stream::decompressed_content` so callers
+    /// can use this without threading a separate decode helper through every
+    /// call site).
+    ///
+    /// Image filters (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
+    /// are passed through unchanged — the codec layer in `pdf_interp` decodes
+    /// those.
+    ///
+    /// # Errors
+    /// Returns the underlying decode error string when a filter step fails.
+    pub fn decompressed_content(&self) -> Result<Vec<u8>, String> {
+        crate::stream::decode_stream(&self.content, &self.dict)
+    }
 }
 
 impl Object {

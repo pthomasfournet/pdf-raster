@@ -3,7 +3,7 @@
 //! Provides [`decode_type6_mesh`] and [`decode_type7_mesh`] which parse the
 //! packed bit-stream and adaptively tessellate each patch into Gouraud triangles.
 
-use lopdf::Dictionary;
+use pdf::Dictionary;
 use raster::shading::gouraud::GouraudVertex;
 
 use super::{

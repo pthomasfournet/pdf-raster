@@ -1,6 +1,6 @@
 //! PDF font resource extraction.
 //!
-//! Given a PDF font dictionary (as returned by `lopdf::Document::get_page_fonts`),
+//! Given a PDF font dictionary (as returned by `pdf::Document::get_page_fonts`),
 //! [`resolve_font`] extracts everything the rendering pipeline needs to load a
 //! `FreeType` face: the raw font bytes (from an embedded stream or a standard
 //! substitute), the font kind, and the char-to-glyph-index map.
@@ -23,7 +23,7 @@
 //! When no bytes are embedded (standard 14, or unembedded third-party fonts)
 //! we fall back to a hardcoded Helvetica substitute shipped with the `font` crate.
 
-use lopdf::{Dictionary, Document, Object};
+use pdf::{Dictionary, Document, Object};
 
 use crate::resources::cmap::{CMap, parse_cmap};
 use crate::resources::dict_ext::DictExt;
@@ -230,10 +230,13 @@ fn extract_bytes(doc: &Document, dict: &Dictionary) -> Option<Vec<u8>> {
 
 /// Dereference the `FontDescriptor` entry, which is almost always an indirect
 /// reference in practice.
-fn resolve_fd<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a Dictionary> {
-    match dict.get(b"FontDescriptor").ok()? {
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
-        Object::Dictionary(d) => Some(d),
+///
+/// Returns an owned [`Dictionary`] because `doc.get_dictionary` hands back an
+/// `Arc<Dictionary>` rather than a long-lived borrow.
+fn resolve_fd(doc: &Document, dict: &Dictionary) -> Option<Dictionary> {
+    match dict.get(b"FontDescriptor")? {
+        Object::Reference(id) => doc.get_dictionary(*id).ok().map(|a| (*a).clone()),
+        Object::Dictionary(d) => Some(d.clone()),
         _ => None,
     }
 }
@@ -248,11 +251,17 @@ const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
 /// necessary.  Returns `None` on any error or if the stream exceeds
 /// [`MAX_FONT_BYTES`] after decompression.
 fn read_stream(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<Vec<u8>> {
-    let obj = match dict.get(key).ok()? {
-        Object::Reference(id) => doc.get_object(*id).ok()?,
-        other => other,
+    // For inline objects we can read the stream directly; for references the
+    // resolved Arc<Object> must outlive the &Stream borrow, so we keep it.
+    let direct = dict.get(key)?;
+    let resolved;
+    let stream = match direct {
+        Object::Reference(id) => {
+            resolved = doc.get_object(*id).ok()?;
+            resolved.as_stream()?
+        }
+        other => other.as_stream()?,
     };
-    let stream = obj.as_stream().ok()?;
     let bytes = stream.decompressed_content().ok()?;
     if bytes.len() > MAX_FONT_BYTES {
         log::warn!(
@@ -287,8 +296,7 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
     )]
     let widths = dict
         .get(b"Widths")
-        .ok()
-        .and_then(|o| o.as_array().ok())
+        .and_then(Object::as_array)
         .map(|arr| {
             arr.iter()
                 .map(|o| o.as_i64().map_or(0, |v| v as i32))
@@ -335,7 +343,7 @@ fn extract_encoding(
     dict: &Dictionary,
     _kind: PdfFontKind,
 ) -> (Vec<u32>, Box<[Option<Box<str>>; 256]>) {
-    let Some(encoding) = dict.get(b"Encoding").ok() else {
+    let Some(encoding) = dict.get(b"Encoding") else {
         return (vec![], empty_differences());
     };
 
@@ -344,7 +352,7 @@ fn extract_encoding(
             let diffs = doc
                 .get_dictionary(*id)
                 .ok()
-                .map_or_else(empty_differences, parse_differences);
+                .map_or_else(empty_differences, |d| parse_differences(&d));
             (vec![], diffs)
         }
         Object::Dictionary(d) => (vec![], parse_differences(d)),
@@ -388,12 +396,12 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     // 5. CIDFont metrics: DW and W.
     let (default_width, widths) = descendant
         .as_ref()
-        .map_or((1000, vec![]), |d| extract_cid_widths(d));
+        .map_or((1000, vec![]), extract_cid_widths);
 
     // 6. Determine font kind from CIDFont Subtype.
     let kind = descendant
         .as_ref()
-        .map_or(PdfFontKind::Other, |d| classify_kind(d));
+        .map_or(PdfFontKind::Other, classify_kind);
 
     FontDescriptor {
         kind,
@@ -434,10 +442,11 @@ fn resolve_type3_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         extract_matrix(dict, b"FontMatrix").unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
 
     // Resolve CharProcs: maps glyph name → stream object.
-    let charprocs_obj = dict.get(b"CharProcs").ok();
-    let charprocs_dict: Option<&Dictionary> = charprocs_obj.and_then(|o| match o {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+    // We need an owned Dictionary because `doc.get_dictionary` returns Arc.
+    let charprocs_obj = dict.get(b"CharProcs");
+    let charprocs_dict: Option<Dictionary> = charprocs_obj.and_then(|o| match o {
+        Object::Dictionary(d) => Some(d.clone()),
+        Object::Reference(id) => doc.get_dictionary(*id).ok().map(|a| (*a).clone()),
         _ => None,
     });
 
@@ -461,23 +470,20 @@ fn resolve_type3_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
             let glyph_name = glyph_name.as_bytes();
 
             // Look up the CharProc stream.
-            let Some(stream_obj) = cp.get(glyph_name).ok() else {
+            let Some(stream_obj) = cp.get(glyph_name) else {
                 continue;
             };
-            let stream_obj_deref;
+            let resolved;
             let stream = match stream_obj {
                 Object::Stream(s) => s,
                 Object::Reference(id) => {
-                    stream_obj_deref = doc.get_object(*id).ok().and_then(|o| {
-                        if let Object::Stream(s) = o {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    match stream_obj_deref.as_ref() {
-                        Some(s) => s,
-                        None => continue,
+                    let Some(arc) = doc.get_object(*id).ok() else {
+                        continue;
+                    };
+                    resolved = arc;
+                    match resolved.as_ref() {
+                        Object::Stream(s) => s,
+                        _ => continue,
                     }
                 }
                 _ => continue,
@@ -528,7 +534,7 @@ fn resolve_type3_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
 
 /// Read a 6-element matrix from `dict[key]`.  Returns `None` if missing or malformed.
 fn extract_matrix(dict: &Dictionary, key: &[u8]) -> Option<[f64; 6]> {
-    let arr = dict.get(key).ok()?.as_array().ok()?;
+    let arr = dict.get(key)?.as_array()?;
     if arr.len() < 6 {
         return None;
     }
@@ -552,7 +558,7 @@ fn extract_matrix(dict: &Dictionary, key: &[u8]) -> Option<[f64; 6]> {
 /// `Identity-H` and `Identity-V` are predefined `CMaps` where char code == CID.
 /// We represent these as `None` (identity).  Any stream reference is parsed.
 fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap> {
-    let enc = dict.get(b"Encoding").ok()?;
+    let enc = dict.get(b"Encoding")?;
     match enc {
         // Named CMaps: Identity-H / Identity-V are identity (None = passthrough).
         Object::Name(n) if n == b"Identity-H" || n == b"Identity-V" => None,
@@ -569,7 +575,7 @@ fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap
         // Stream reference — parse the CMap.
         Object::Reference(id) => {
             let obj = doc.get_object(*id).ok()?;
-            let stream = obj.as_stream().ok()?;
+            let stream = obj.as_stream()?;
             let content = stream.decompressed_content().ok()?;
             let cmap = parse_cmap(&content);
             if cmap.is_none() {
@@ -588,30 +594,30 @@ fn extract_type0_encoding_cmap(doc: &Document, dict: &Dictionary) -> Option<CMap
 ///
 /// The PDF spec requires exactly one descendant; we take the first and warn if
 /// the array is absent or empty.
-fn extract_descendant<'a>(doc: &'a Document, dict: &'a Dictionary) -> Option<&'a Dictionary> {
-    let Ok(arr_obj) = dict.get(b"DescendantFonts") else {
+fn extract_descendant(doc: &Document, dict: &Dictionary) -> Option<Dictionary> {
+    let Some(arr_obj) = dict.get(b"DescendantFonts") else {
         log::warn!("font: Type0 font has no DescendantFonts — cannot load face");
         return None;
     };
-    let arr = match arr_obj {
-        Object::Array(a) => a,
+    match arr_obj {
+        Object::Array(a) => {
+            if a.is_empty() {
+                log::warn!("font: Type0 DescendantFonts array is empty");
+                return None;
+            }
+            super::resolve_dict(doc, &a[0])
+        }
         Object::Reference(id) => {
             let obj = doc.get_object(*id).ok()?;
-            return obj
-                .as_array()
-                .ok()?
-                .first()
-                .and_then(|o| super::resolve_dict(doc, o));
+            let arr = obj.as_array()?;
+            if arr.is_empty() {
+                log::warn!("font: Type0 DescendantFonts array is empty");
+                return None;
+            }
+            super::resolve_dict(doc, &arr[0])
         }
-        _ => return None,
-    };
-
-    if arr.is_empty() {
-        log::warn!("font: Type0 DescendantFonts array is empty");
-        return None;
+        _ => None,
     }
-
-    super::resolve_dict(doc, &arr[0])
 }
 
 /// Extract embedded font bytes from the `FontDescriptor` of a `CIDFont` dict.
@@ -633,7 +639,7 @@ fn extract_bytes_with_kind(
         _ => &[b"FontFile2", b"FontFile3", b"FontFile"],
     };
     for key in priority {
-        if let Some(bytes) = read_stream(doc, fd, key) {
+        if let Some(bytes) = read_stream(doc, &fd, key) {
             return Some(bytes);
         }
     }
@@ -646,11 +652,11 @@ fn extract_bytes_with_kind(
 /// `/Identity` (or absent) means CID == GID; we represent that as `None`.
 const MAX_CID_TO_GID_BYTES: usize = 65536 * 2;
 fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32>> {
-    let obj = descendant.get(b"CIDToGIDMap").ok()?;
+    let obj = descendant.get(b"CIDToGIDMap")?;
     match obj {
         Object::Reference(id) => {
             let stream_obj = doc.get_object(*id).ok()?;
-            let stream = stream_obj.as_stream().ok()?;
+            let stream = stream_obj.as_stream()?;
             let bytes = stream.decompressed_content().ok()?;
 
             // A CIDToGIDMap covers CIDs 0..65535 at most → max 65536 × 2 = 131072 bytes.
@@ -693,7 +699,7 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
     )]
     let dw = dict.get_i64(b"DW").map_or(1000, |v| v as i32);
 
-    let Some(w_arr) = dict.get(b"W").ok().and_then(|o| o.as_array().ok()) else {
+    let Some(w_arr) = dict.get(b"W").and_then(Object::as_array) else {
         return (dw, vec![]);
     };
 
@@ -702,7 +708,7 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
 
     while i < w_arr.len() {
         // Each segment starts with a non-negative CID integer.
-        let Some(first_cid_raw) = w_arr[i].as_i64().ok() else {
+        let Some(first_cid_raw) = w_arr[i].as_i64() else {
             i += 1;
             continue;
         };
@@ -789,10 +795,10 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
 fn parse_differences(dict: &Dictionary) -> Box<[Option<Box<str>>; 256]> {
     let mut table = empty_differences();
 
-    let Ok(arr_obj) = dict.get(b"Differences") else {
+    let Some(arr_obj) = dict.get(b"Differences") else {
         return table;
     };
-    let Ok(arr) = arr_obj.as_array() else {
+    let Some(arr) = arr_obj.as_array() else {
         return table;
     };
 
@@ -879,14 +885,32 @@ mod tests {
         assert!(ws.is_empty());
     }
 
+    /// Build a minimal valid PDF byte-stream with one empty page tree and
+    /// parse it via [`Document::from_bytes_owned`].  Used by tests that need a
+    /// real `Document` reference but do not depend on its contents.
+    fn empty_doc() -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF",);
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("test PDF parse")
+    }
+
     #[test]
     fn no_embedded_bytes_returns_none() {
         // A minimal font dict with no FontDescriptor.
         let d = make_dict(&[(b"Subtype", Object::Name(b"Type1".to_vec()))]);
         // We need a Document to call extract_bytes, but for simple cases without
-        // embedded streams the result is None.
-        // Build a trivial document stub via lopdf.
-        let doc = Document::new();
+        // embedded streams (no FontDescriptor key) the result is None regardless
+        // of what's in the document.
+        let doc = empty_doc();
         assert!(extract_bytes(&doc, &d).is_none());
     }
 }

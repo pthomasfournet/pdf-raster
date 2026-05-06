@@ -54,8 +54,3 @@ inherits   = "release"
 debug      = 1
 strip      = "none"
 
-[patch.crates-io]
-# lopdf v0.40.0 burns ~20% of corpus-07 cycles in nom_locate newline counting
-# (LocatedSpan::slice_by counts '\n' on every token boundary; result never read).
-# Fixed upstream in PR #486 (2026-04-02) but not yet tagged. Pin to fix commit.
-lopdf = { git = "https://github.com/J-F-Liu/lopdf.git", rev = "87f4204fc1ee156e3bbedfead335c7e3ba312cac" }

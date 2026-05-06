@@ -1,12 +1,12 @@
 //! PDF resource resolution — fonts, colour spaces, `XObject`s, shadings.
 //!
-//! The [`PageResources`] struct holds a reference to the lopdf [`Document`]
+//! The [`PageResources`] struct holds a reference to the [`pdf::Document`]
 //! and the current page's [`ObjectId`], and provides lazy-loading helpers
 //! for each resource category.
 //!
 //! # Design
 //!
-//! lopdf's `Document` is immutable after load; resource dicts are accessed
+//! `pdf::Document` is immutable after load; resource dicts are accessed
 //! via `get_page_fonts()` and friends, which traverse the page tree and
 //! dereference indirect objects.  All caching lives in the caller
 //! ([`super::renderer::font_cache`]) rather than here, so this module
@@ -19,7 +19,7 @@ pub mod image;
 pub mod shading;
 pub mod tiling;
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use pdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
 
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
@@ -75,13 +75,13 @@ impl ExtGStateParams {
 /// viewer uses the first one it supports).  Unknown names are silently ignored
 /// and `None` is returned, leaving the current blend mode unchanged.
 fn parse_blend_mode(d: &Dictionary) -> Option<BlendMode> {
-    let obj = d.get(b"BM").ok()?;
+    let obj = d.get(b"BM")?;
     match obj {
         Object::Name(n) => bm_name_to_mode(n),
         // Array is a viewer-preference priority list; use the first recognised name.
         Object::Array(arr) => arr
             .iter()
-            .find_map(|o| o.as_name().ok().and_then(bm_name_to_mode)),
+            .find_map(|o| o.as_name().and_then(bm_name_to_mode)),
         _ => None,
     }
 }
@@ -113,7 +113,7 @@ const fn bm_name_to_mode(name: &[u8]) -> Option<BlendMode> {
 
 /// Read a real or integer key from a dictionary as `f64`.
 fn real_or_int(d: &Dictionary, key: &[u8]) -> Option<f64> {
-    match d.get(key).ok()? {
+    match d.get(key)? {
         Object::Real(r) => Some(f64::from(*r)),
         #[expect(
             clippy::cast_precision_loss,
@@ -141,7 +141,7 @@ fn int_val(d: &Dictionary, key: &[u8]) -> Option<i32> {
         clippy::cast_possible_truncation,
         reason = "line cap/join values are 0–2"
     )]
-    d.get(key).ok()?.as_i64().ok().map(|n| n as i32)
+    d.get(key)?.as_i64().map(|n| n as i32)
 }
 
 /// Parsed Form `XObject` — content bytes and the CTM matrix to apply.
@@ -216,7 +216,7 @@ impl<'doc> PageResources<'doc> {
         }
     }
 
-    /// The underlying `lopdf` document (read-only).
+    /// The underlying [`pdf::Document`] (read-only).
     #[must_use]
     pub const fn doc(&self) -> &'doc Document {
         self.doc
@@ -237,8 +237,9 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn font_dict(&self, name: &[u8]) -> Option<font::FontDescriptor> {
         let fonts = self.doc.get_page_fonts(self.resource_context_id).ok()?;
-        let dict = fonts.get(name)?;
-        Some(font::resolve_font(self.doc, dict))
+        let entry = fonts.get(name)?;
+        let dict = resolve_dict(self.doc, entry)?;
+        Some(font::resolve_font(self.doc, &dict))
     }
 
     /// Decode the named image `XObject` from the resource dictionary.
@@ -263,7 +264,7 @@ impl<'doc> PageResources<'doc> {
         let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
         image::resolve_image(
             self.doc,
-            page_dict,
+            &page_dict,
             name,
             #[cfg(feature = "nvjpeg")]
             gpu,
@@ -285,11 +286,11 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn ext_gstate(&self, name: &[u8]) -> Option<ExtGStateParams> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
-        let eg_dict = resolve_dict(self.doc, res.get(b"ExtGState").ok()?)?;
-        let gs_ref_or_dict = eg_dict.get(name).ok()?;
+        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources")?)?;
+        let eg_dict = resolve_dict(self.doc, res.get(b"ExtGState")?)?;
+        let gs_ref_or_dict = eg_dict.get(name)?;
         let gs = resolve_dict(self.doc, gs_ref_or_dict)?;
-        Some(ExtGStateParams::from_dict(gs))
+        Some(ExtGStateParams::from_dict(&gs))
     }
 
     /// Resolve the named `XObject` and return it as a [`FormXObject`] if its
@@ -298,18 +299,18 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn form_xobject(&self, name: &[u8]) -> Option<FormXObject> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
-        let xobj_dict = resolve_dict(self.doc, res.get(b"XObject").ok()?)?;
-        let Object::Reference(id) = xobj_dict.get(name).ok()? else {
+        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources")?)?;
+        let xobj_dict = resolve_dict(self.doc, res.get(b"XObject")?)?;
+        let Object::Reference(id) = xobj_dict.get(name)? else {
             return None;
         };
         let stream_id = *id;
 
         let obj = self.doc.get_object(stream_id).ok()?;
-        let stream = obj.as_stream().ok()?;
+        let stream = obj.as_stream()?;
 
         // Must be a Form subtype.
-        if stream.dict.get(b"Subtype").ok()?.as_name().ok()? != b"Form" {
+        if stream.dict.get(b"Subtype")?.as_name()? != b"Form" {
             return None;
         }
 
@@ -320,7 +321,7 @@ impl<'doc> PageResources<'doc> {
 
         let bbox = read_bbox(&stream.dict).unwrap_or([0.0, 0.0, 1.0, 1.0]);
 
-        let has_own_resources = stream.dict.get(b"Resources").is_ok();
+        let has_own_resources = stream.dict.get(b"Resources").is_some();
 
         let transparency = read_transparency_group(self.doc, &stream.dict);
 
@@ -341,11 +342,11 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn form_from_stream_id(&self, stream_id: ObjectId) -> Option<FormXObject> {
         let obj = self.doc.get_object(stream_id).ok()?;
-        let stream = obj.as_stream().ok()?;
+        let stream = obj.as_stream()?;
         let content = stream.decompressed_content().ok()?;
         let matrix = read_matrix(&stream.dict).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         let bbox = read_bbox(&stream.dict).unwrap_or([0.0, 0.0, 1.0, 1.0]);
-        let has_own_resources = stream.dict.get(b"Resources").is_ok();
+        let has_own_resources = stream.dict.get(b"Resources").is_some();
         let transparency = read_transparency_group(self.doc, &stream.dict);
         Some(FormXObject {
             content,
@@ -365,7 +366,7 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub fn tiling_pattern(&self, name: &[u8]) -> Option<tiling::TilingDescriptor> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        tiling::resolve_tiling(self.doc, ctx_dict, name)
+        tiling::resolve_tiling(self.doc, &ctx_dict, name)
     }
 
     /// Resolve the named `Shading` resource.
@@ -380,7 +381,7 @@ impl<'doc> PageResources<'doc> {
         page_h: f64,
     ) -> Option<shading::ShadingResult> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        shading::resolve_shading(self.doc, ctx_dict, name, ctm, page_h)
+        shading::resolve_shading(self.doc, &ctx_dict, name, ctm, page_h)
     }
 
     /// Resolve a `Properties` resource entry to an OCG object ID.
@@ -390,11 +391,11 @@ impl<'doc> PageResources<'doc> {
     /// absent or the object has no object identity (inline dict OCGs are rare
     /// and not currently supported).
     #[must_use]
-    pub fn ocg_object_id(&self, props_key: &[u8]) -> Option<lopdf::ObjectId> {
+    pub fn ocg_object_id(&self, props_key: &[u8]) -> Option<ObjectId> {
         let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
-        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources").ok()?)?;
-        let props = resolve_dict(self.doc, res.get(b"Properties").ok()?)?;
-        match props.get(props_key).ok()? {
+        let res = resolve_dict(self.doc, ctx_dict.get(b"Resources")?)?;
+        let props = resolve_dict(self.doc, res.get(b"Properties")?)?;
+        match props.get(props_key)? {
             Object::Reference(id) => Some(*id),
             _ => None, // Inline-dict OCGs are not resolved (treat as visible).
         }
@@ -423,16 +424,20 @@ impl<'doc> PageResources<'doc> {
             .catalog()
             .ok()
             .and_then(|cat| {
-                cat.get(b"OCProperties").ok().and_then(|o| match o {
-                    Object::Dictionary(d) => Some(d),
-                    Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
+                cat.get(b"OCProperties").and_then(|o| match o {
+                    Object::Dictionary(d) => Some(d.clone()),
+                    Object::Reference(id) => {
+                        self.doc.get_dictionary(*id).ok().map(|a| (*a).clone())
+                    }
                     _ => None,
                 })
             })
             .and_then(|ocp| {
-                ocp.get(b"D").ok().and_then(|o| match o {
-                    Object::Dictionary(d) => Some(d),
-                    Object::Reference(id) => self.doc.get_dictionary(*id).ok(),
+                ocp.get(b"D").and_then(|o| match o {
+                    Object::Dictionary(d) => Some(d.clone()),
+                    Object::Reference(id) => {
+                        self.doc.get_dictionary(*id).ok().map(|a| (*a).clone())
+                    }
                     _ => None,
                 })
             })
@@ -442,8 +447,8 @@ impl<'doc> PageResources<'doc> {
 
         // Check the OFF list.  Per PDF §8.11.4.3, if a group appears in ON it
         // overrides OFF; in practice most documents use only one of the two.
-        let in_off = is_id_in_ref_array(self.doc, d_dict, b"OFF", ocg_id);
-        let in_on = is_id_in_ref_array(self.doc, d_dict, b"ON", ocg_id);
+        let in_off = is_id_in_ref_array(self.doc, &d_dict, b"OFF", ocg_id);
+        let in_on = is_id_in_ref_array(self.doc, &d_dict, b"ON", ocg_id);
 
         !in_off || in_on
     }
@@ -451,26 +456,22 @@ impl<'doc> PageResources<'doc> {
 
 /// Return `true` when `target_id` appears in the named array of object
 /// references inside `dict`.
-fn is_id_in_ref_array(
-    doc: &Document,
-    dict: &lopdf::Dictionary,
-    key: &[u8],
-    target_id: lopdf::ObjectId,
-) -> bool {
-    let Ok(arr_obj) = dict.get(key) else {
+fn is_id_in_ref_array(doc: &Document, dict: &Dictionary, key: &[u8], target_id: ObjectId) -> bool {
+    let Some(arr_obj) = dict.get(key) else {
         return false;
     };
-    let arr = match arr_obj {
+    let arr_owned: Vec<Object>;
+    let arr: &[Object] = match arr_obj {
         Object::Array(a) => a,
         Object::Reference(id) => {
             if let Ok(o) = doc.get_object(*id)
-                && let Ok(a) = o.as_array()
+                && let Some(a) = o.as_array()
             {
-                return a
-                    .iter()
-                    .any(|x| matches!(x, Object::Reference(r) if *r == target_id));
+                arr_owned = a.to_vec();
+                &arr_owned
+            } else {
+                return false;
             }
-            return false;
         }
         _ => return false,
     };
@@ -478,7 +479,7 @@ fn is_id_in_ref_array(
         .any(|x| matches!(x, Object::Reference(r) if *r == target_id))
 }
 
-/// Convert a [`lopdf::Object`] (Real or Integer) to `f64`.
+/// Convert a [`pdf::Object`] (Real or Integer) to `f64`.
 ///
 /// Returns `None` for any non-numeric object type.
 pub(crate) fn obj_to_f64(obj: &Object) -> Option<f64> {
@@ -496,16 +497,16 @@ pub(crate) fn obj_to_f64(obj: &Object) -> Option<f64> {
 /// Read a single numeric value from a dictionary key.
 ///
 /// Returns `None` if the key is absent or the value is not a Real or Integer.
-pub(crate) fn read_f64_1(dict: &lopdf::Dictionary, key: &[u8]) -> Option<f64> {
-    obj_to_f64(dict.get(key).ok()?)
+pub(crate) fn read_f64_1(dict: &Dictionary, key: &[u8]) -> Option<f64> {
+    obj_to_f64(dict.get(key)?)
 }
 
 /// Parse a fixed-length array of `f64` values from a PDF dictionary.
 ///
 /// Returns `None` if the key is absent, the value is not an array, the array
 /// has fewer than `N` elements, or any of the first `N` elements is not numeric.
-pub(crate) fn read_f64_n<const N: usize>(dict: &lopdf::Dictionary, key: &[u8]) -> Option<[f64; N]> {
-    let arr = dict.get(key).ok()?.as_array().ok()?;
+pub(crate) fn read_f64_n<const N: usize>(dict: &Dictionary, key: &[u8]) -> Option<[f64; N]> {
+    let arr = dict.get(key)?.as_array()?;
     if arr.len() < N {
         return None;
     }
@@ -521,7 +522,7 @@ pub(crate) fn read_f64_n<const N: usize>(dict: &lopdf::Dictionary, key: &[u8]) -
 /// Returns `None` if absent or fewer than 4 numeric entries.
 /// Normalises the result so that `llx ≤ urx` and `lly ≤ ury` — PDF allows
 /// inverted `BBox` values.
-pub(crate) fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+pub(crate) fn read_bbox(dict: &Dictionary) -> Option<[f64; 4]> {
     let mut r = read_f64_n::<4>(dict, b"BBox")?;
     if r[0] > r[2] {
         r.swap(0, 2);
@@ -535,26 +536,14 @@ pub(crate) fn read_bbox(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
 /// Extract transparency group parameters from a Form `XObject` stream dictionary.
 ///
 /// Returns `Some` when `Group /S /Transparency` is present; `None` otherwise.
-fn read_transparency_group(
-    doc: &Document,
-    dict: &lopdf::Dictionary,
-) -> Option<TransparencyGroupParams> {
-    let grp_obj = dict.get(b"Group").ok()?;
-    let grp = match grp_obj {
-        Object::Dictionary(d) => d,
-        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
-        _ => return None,
-    };
+fn read_transparency_group(doc: &Document, dict: &Dictionary) -> Option<TransparencyGroupParams> {
+    let grp_obj = dict.get(b"Group")?;
+    let grp = resolve_dict(doc, grp_obj)?;
     // Must be /S /Transparency.
-    if grp.get(b"S").ok()?.as_name().ok()? != b"Transparency" {
+    if grp.get(b"S")?.as_name()? != b"Transparency" {
         return None;
     }
-    let bool_flag = |key: &[u8]| {
-        grp.get(key)
-            .ok()
-            .and_then(|o| o.as_bool().ok())
-            .unwrap_or(false)
-    };
+    let bool_flag = |key: &[u8]| grp.get(key).and_then(Object::as_bool).unwrap_or(false);
     Some(TransparencyGroupParams {
         isolated: bool_flag(b"I"),
         knockout: bool_flag(b"K"),
@@ -563,37 +552,42 @@ fn read_transparency_group(
 
 /// Read a 6-element `Matrix` array from a dictionary, returning `None` if the
 /// key is absent or has fewer than 6 numeric entries.
-pub(crate) fn read_matrix(dict: &lopdf::Dictionary) -> Option<[f64; 6]> {
+pub(crate) fn read_matrix(dict: &Dictionary) -> Option<[f64; 6]> {
     read_f64_n::<6>(dict, b"Matrix")
 }
 
-/// Dereference a PDF `Object` to a `&Dictionary`.
+/// Dereference a PDF `Object` to an owned `Dictionary`.
 ///
-/// Accepts `Dictionary` (returned as-is) or `Reference` (dereferenced via `doc`).
+/// Accepts `Dictionary` (cloned) or `Reference` (dereferenced via `doc` and
+/// cloned).  Returns owned rather than borrowed because the underlying lazy
+/// document parser materialises objects on demand and hands back `Arc`s, not
+/// long-lived borrows.  Dicts are small (a few hundred entries at most), so
+/// the clone cost is negligible.
+///
 /// Use [`resolve_stream_dict`] when the referent may be a stream object.
-pub(crate) fn resolve_dict<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Dictionary> {
+pub(crate) fn resolve_dict(doc: &Document, obj: &Object) -> Option<Dictionary> {
     match obj {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        Object::Dictionary(d) => Some(d.clone()),
+        Object::Reference(id) => doc.get_dictionary(*id).ok().map(|a| (*a).clone()),
         _ => None,
     }
 }
 
-/// Like [`resolve_dict`] but also handles `Reference → Stream → &stream.dict`.
+/// Like [`resolve_dict`] but also handles `Reference → Stream → stream.dict`.
 ///
 /// Needed for `ICCBased` colour spaces where the second array element is a
 /// `Reference` to a stream whose dictionary carries the ICC metadata.
-pub(crate) fn resolve_stream_dict<'a>(
-    doc: &'a Document,
-    obj: &'a Object,
-) -> Option<&'a Dictionary> {
+pub(crate) fn resolve_stream_dict(doc: &Document, obj: &Object) -> Option<Dictionary> {
     match obj {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => match doc.get_object(*id).ok()? {
-            Object::Stream(s) => Some(&s.dict),
-            // Reference to a plain dictionary: share the plain-dict path.
-            other => resolve_dict(doc, other),
-        },
+        Object::Dictionary(d) => Some(d.clone()),
+        Object::Reference(id) => {
+            let referent = doc.get_object(*id).ok()?;
+            match referent.as_ref() {
+                Object::Stream(s) => Some(s.dict.clone()),
+                // Reference to a plain dictionary: share the plain-dict path.
+                other => resolve_dict(doc, other),
+            }
+        }
         _ => None,
     }
 }
@@ -641,20 +635,20 @@ mod tests {
 
     #[test]
     fn parse_blend_mode_bare_name() {
-        let mut dict = lopdf::Dictionary::new();
-        dict.set("BM", lopdf::Object::Name(b"Multiply".to_vec()));
+        let mut dict = Dictionary::new();
+        dict.set("BM", Object::Name(b"Multiply".to_vec()));
         assert_eq!(parse_blend_mode(&dict), Some(BlendMode::Multiply));
     }
 
     #[test]
     fn parse_blend_mode_array_picks_first_known() {
-        let mut dict = lopdf::Dictionary::new();
+        let mut dict = Dictionary::new();
         dict.set(
             "BM",
-            lopdf::Object::Array(vec![
-                lopdf::Object::Name(b"Unknown1".to_vec()),
-                lopdf::Object::Name(b"Screen".to_vec()),
-                lopdf::Object::Name(b"Normal".to_vec()),
+            Object::Array(vec![
+                Object::Name(b"Unknown1".to_vec()),
+                Object::Name(b"Screen".to_vec()),
+                Object::Name(b"Normal".to_vec()),
             ]),
         );
         assert_eq!(parse_blend_mode(&dict), Some(BlendMode::Screen));
@@ -662,18 +656,18 @@ mod tests {
 
     #[test]
     fn parse_blend_mode_absent_returns_none() {
-        let dict = lopdf::Dictionary::new();
+        let dict = Dictionary::new();
         assert!(parse_blend_mode(&dict).is_none());
     }
 
     #[test]
     fn parse_blend_mode_all_unknown_array_returns_none() {
-        let mut dict = lopdf::Dictionary::new();
+        let mut dict = Dictionary::new();
         dict.set(
             "BM",
-            lopdf::Object::Array(vec![
-                lopdf::Object::Name(b"Foo".to_vec()),
-                lopdf::Object::Name(b"Bar".to_vec()),
+            Object::Array(vec![
+                Object::Name(b"Foo".to_vec()),
+                Object::Name(b"Bar".to_vec()),
             ]),
         );
         assert!(parse_blend_mode(&dict).is_none());

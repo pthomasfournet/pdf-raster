@@ -33,7 +33,7 @@ mod patch;
 
 use std::sync::Arc;
 
-use lopdf::{Dictionary, Document, Object, Stream};
+use pdf::{Dictionary, Document, Object, Stream};
 use raster::pipe::Pattern;
 use raster::shading::axial::AxialPattern;
 use raster::shading::function::FunctionPattern;
@@ -77,56 +77,61 @@ pub fn resolve_shading(
     ctm: &[f64; 6],
     page_h: f64,
 ) -> Option<ShadingResult> {
-    let res = resolve_dict(doc, resource_context_dict.get(b"Resources").ok()?)?;
-    let sh_res = resolve_dict(doc, res.get(b"Shading").ok()?)?;
-    let sh_obj = sh_res.get(name).ok()?;
+    let res = resolve_dict(doc, resource_context_dict.get(b"Resources")?)?;
+    let sh_res = resolve_dict(doc, res.get(b"Shading")?)?;
+    let sh_obj = sh_res.get(name)?;
 
     // Shading types 2–3 are plain dicts; types 4–7 are streams.
     // Try stream first (stream has a dict too), then fall back to plain dict.
-    let (sh_dict, stream_data): (&Dictionary, Option<Vec<u8>>) = match sh_obj {
-        Object::Stream(s) => (&s.dict, stream_content(s)),
-        Object::Reference(id) => match doc.get_object(*id).ok()? {
-            Object::Stream(s) => (&s.dict, stream_content(s)),
-            obj => (resolve_dict(doc, obj)?, None),
-        },
+    // Owned Dictionary because the new pdf crate hands back Arc<Object> from
+    // get_object — we can't keep a borrow into a temporary Arc.
+    let (sh_dict, stream_data): (Dictionary, Option<Vec<u8>>) = match sh_obj {
+        Object::Stream(s) => (s.dict.clone(), stream_content(s)),
+        Object::Reference(id) => {
+            let referent = doc.get_object(*id).ok()?;
+            match referent.as_ref() {
+                Object::Stream(s) => (s.dict.clone(), stream_content(s)),
+                obj => (resolve_dict(doc, obj)?, None),
+            }
+        }
         obj => (resolve_dict(doc, obj)?, None),
     };
 
     let shading_type = sh_dict.get_i64(b"ShadingType")?;
 
-    let cs_obj = sh_dict.get(b"ColorSpace").ok()?;
+    let cs_obj = sh_dict.get(b"ColorSpace")?;
     let cs = cs_to_image_color_space(doc, cs_obj);
     let n_channels = cs_channel_count(cs);
 
     match shading_type {
-        1 => resolve_function_based(doc, sh_dict, cs, n_channels, ctm, page_h)
+        1 => resolve_function_based(doc, &sh_dict, cs, n_channels, ctm, page_h)
             .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
-        2 => resolve_axial(doc, sh_dict, cs, n_channels, ctm, page_h)
+        2 => resolve_axial(doc, &sh_dict, cs, n_channels, ctm, page_h)
             .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
-        3 => resolve_radial(doc, sh_dict, cs, n_channels, ctm, page_h)
+        3 => resolve_radial(doc, &sh_dict, cs, n_channels, ctm, page_h)
             .map(|(p, bb)| ShadingResult::Pattern(p, bb)),
         4 => {
             let data = stream_data?;
             Some(ShadingResult::Mesh(decode_type4_mesh(
-                sh_dict, &data, cs, n_channels, ctm, page_h,
+                &sh_dict, &data, cs, n_channels, ctm, page_h,
             )))
         }
         5 => {
             let data = stream_data?;
             Some(ShadingResult::Mesh(decode_type5_mesh(
-                sh_dict, &data, cs, n_channels, ctm, page_h,
+                &sh_dict, &data, cs, n_channels, ctm, page_h,
             )))
         }
         6 => {
             let data = stream_data?;
             Some(ShadingResult::Mesh(decode_type6_mesh(
-                sh_dict, &data, cs, n_channels, ctm, page_h,
+                &sh_dict, &data, cs, n_channels, ctm, page_h,
             )))
         }
         7 => {
             let data = stream_data?;
             Some(ShadingResult::Mesh(decode_type7_mesh(
-                sh_dict, &data, cs, n_channels, ctm, page_h,
+                &sh_dict, &data, cs, n_channels, ctm, page_h,
             )))
         }
         other => {
@@ -167,7 +172,7 @@ fn resolve_axial(
     let (ext_s, ext_e) = read_extend(sh);
 
     // Evaluate the function at t0 and t1 to get the two colours.
-    let fn_obj = sh.get(b"Function").ok()?;
+    let fn_obj = sh.get(b"Function")?;
     let c0_user = eval_function(doc, fn_obj, t0, n)?;
     let c1_user = eval_function(doc, fn_obj, t1, n)?;
 
@@ -211,7 +216,7 @@ fn resolve_radial(
     let (t0, t1) = read_fn_domain(sh);
     let (ext_s, ext_e) = read_extend(sh);
 
-    let fn_obj = sh.get(b"Function").ok()?;
+    let fn_obj = sh.get(b"Function")?;
     let c0_user = eval_function(doc, fn_obj, t0, n)?;
     let c1_user = eval_function(doc, fn_obj, t1, n)?;
 
@@ -287,7 +292,7 @@ fn resolve_function_based(
         return None;
     }
 
-    let fn_obj = sh.get(b"Function").ok()?;
+    let fn_obj = sh.get(b"Function")?;
 
     // Invert the CTM so fill_span can map device pixels → user space.
     let [a, b, c, d, e, f] = *ctm;
@@ -735,8 +740,7 @@ pub(super) fn read_decode_array(sh: &Dictionary, n_channels: usize) -> Vec<f64> 
 
     let parsed: Option<Vec<f64>> = sh
         .get(b"Decode")
-        .ok()
-        .and_then(|o| o.as_array().ok())
+        .and_then(|o| o.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|o| match o {
@@ -907,11 +911,11 @@ pub(super) fn bbox_from_coords(pts: &[f64]) -> [f64; 4] {
 
 /// Read the `Extend` array `[extend_start, extend_end]`; both default to `false`.
 fn read_extend(sh: &Dictionary) -> (bool, bool) {
-    let arr = sh.get(b"Extend").ok().and_then(|o| o.as_array().ok());
+    let arr = sh.get(b"Extend").and_then(|o| o.as_array());
     let Some(a) = arr.filter(|a| a.len() >= 2) else {
         return (false, false);
     };
-    let b = |i: usize| a.get(i).and_then(|o| o.as_bool().ok()).unwrap_or(false);
+    let b = |i: usize| a.get(i).and_then(pdf::Object::as_bool).unwrap_or(false);
     (b(0), b(1))
 }
 

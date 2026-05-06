@@ -50,7 +50,7 @@ mod patterns;
 mod text;
 mod text_ops;
 
-use lopdf::{Document, ObjectId};
+use pdf::{Document, ObjectId};
 
 use color::Rgb8;
 use font::{

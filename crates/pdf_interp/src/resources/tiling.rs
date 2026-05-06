@@ -18,7 +18,7 @@
 //! rasterised at the scale implied by `ctm * matrix` so that one pattern-space
 //! unit maps to the correct number of device pixels.
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use pdf::{Dictionary, Document, Object, ObjectId};
 
 use super::{read_bbox, read_f64_1, read_matrix, resolve_dict};
 
@@ -59,9 +59,9 @@ pub fn resolve_tiling(
     name: &[u8],
 ) -> Option<TilingDescriptor> {
     // Navigate Resources → Pattern → name.
-    let res = resolve_dict(doc, ctx_dict.get(b"Resources").ok()?)?;
-    let pat_dict = resolve_dict(doc, res.get(b"Pattern").ok()?)?;
-    let pat_obj = pat_dict.get(name).ok()?;
+    let res = resolve_dict(doc, ctx_dict.get(b"Resources")?)?;
+    let pat_dict = resolve_dict(doc, res.get(b"Pattern")?)?;
+    let pat_obj = pat_dict.get(name)?;
 
     let Object::Reference(id) = pat_obj else {
         log::debug!(
@@ -72,10 +72,11 @@ pub fn resolve_tiling(
     };
     let stream_id = *id;
 
-    let stream = doc.get_object(stream_id).ok()?.as_stream().ok()?;
+    let obj = doc.get_object(stream_id).ok()?;
+    let stream = obj.as_ref().as_stream()?;
 
     // Must be `PatternType` 1 (tiling).
-    let pattern_type = stream.dict.get(b"PatternType").ok()?.as_i64().ok()?;
+    let pattern_type = stream.dict.get(b"PatternType")?.as_i64()?;
     if pattern_type != 1 {
         log::debug!(
             "pdf_interp: Pattern /{} has PatternType {pattern_type} (only 1 supported for tiling)",
@@ -84,7 +85,7 @@ pub fn resolve_tiling(
         return None;
     }
 
-    let paint_type = stream.dict.get(b"PaintType").ok()?.as_i64().ok()?;
+    let paint_type = stream.dict.get(b"PaintType")?.as_i64()?;
 
     let bbox = read_bbox(&stream.dict)?;
     let x_step = read_f64_1(&stream.dict, b"XStep")?;
@@ -110,7 +111,7 @@ pub fn resolve_tiling(
             );
         })
         .ok()?;
-    let has_own_resources = stream.dict.get(b"Resources").is_ok();
+    let has_own_resources = stream.dict.get(b"Resources").is_some();
 
     Some(TilingDescriptor {
         content,

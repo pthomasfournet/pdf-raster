@@ -1,16 +1,16 @@
-//! Typed accessor helpers for [`lopdf::Dictionary`].
+//! Typed accessor helpers for [`pdf::Dictionary`].
 //!
 //! The [`DictExt`] trait adds concise `get_name`, `get_i64`, and `get_bool`
-//! methods that collapse the common `.get(key).ok()?.as_TYPE().ok()?` chain
+//! methods that collapse the common `.get(key)?.as_TYPE()` chain
 //! into a single call, returning `Option<T>` in all cases.
 //!
 //! Import with `use crate::resources::dict_ext::DictExt;` (or via the
 //! resources prelude once one is added).
 
-use lopdf::Dictionary;
+use pdf::Dictionary;
 
-/// Convenience accessors for [`lopdf::Dictionary`] that return `Option<T>`
-/// instead of `lopdf::Error`.
+/// Convenience accessors for [`pdf::Dictionary`] that fold the typical
+/// "get + cast" chain into a single call.
 pub trait DictExt {
     /// Return the value at `key` as a byte-slice name (`/Name`), or `None`.
     fn get_name(&self, key: &[u8]) -> Option<&[u8]>;
@@ -24,14 +24,14 @@ pub trait DictExt {
 
 impl DictExt for Dictionary {
     fn get_name(&self, key: &[u8]) -> Option<&[u8]> {
-        self.get(key).ok()?.as_name().ok()
+        self.get(key)?.as_name()
     }
 
     fn get_i64(&self, key: &[u8]) -> Option<i64> {
-        self.get(key).ok()?.as_i64().ok()
+        self.get(key)?.as_i64()
     }
 
     fn get_bool(&self, key: &[u8]) -> Option<bool> {
-        self.get(key).ok()?.as_bool().ok()
+        self.get(key)?.as_bool()
     }
 }

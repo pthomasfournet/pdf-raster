@@ -7,7 +7,7 @@
 //! The `Cmyk` variant is always converted to `Rgb` before the descriptor
 //! leaves this module; callers never see raw CMYK pixels.
 
-use lopdf::{Dictionary, Document, Object};
+use pdf::{Dictionary, Document, Object};
 
 use super::ImageColorSpace;
 use crate::resources::dict_ext::DictExt as _;
@@ -72,12 +72,12 @@ fn resolve_cs_depth(doc: &Document, cs_obj: &Object, depth: u8) -> ResolvedCs {
         Object::Name(n) => device_cs_name(n),
         Object::Reference(id) => {
             // Indirect colour space reference — dereference and resolve.
-            doc.get_object(*id)
-                .ok()
-                .map_or(ResolvedCs::Gray, |obj| resolve_cs_depth(doc, obj, depth))
+            doc.get_object(*id).ok().map_or(ResolvedCs::Gray, |obj| {
+                resolve_cs_depth(doc, obj.as_ref(), depth)
+            })
         }
         Object::Array(arr) => {
-            let name = arr.first().and_then(|o| o.as_name().ok()).unwrap_or(b"");
+            let name = arr.first().and_then(Object::as_name).unwrap_or(b"");
             match name {
                 b"DeviceRGB" | b"CalRGB" => ResolvedCs::Rgb,
                 b"DeviceCMYK" => ResolvedCs::Cmyk,
@@ -86,7 +86,7 @@ fn resolve_cs_depth(doc: &Document, cs_obj: &Object, depth: u8) -> ResolvedCs {
                     let stream_dict = arr
                         .get(1)
                         .and_then(|o| super::super::resolve_stream_dict(doc, o));
-                    icc_based_cs(stream_dict)
+                    icc_based_cs(stream_dict.as_ref())
                 }
                 b"Indexed" => {
                     // [/Indexed base hival lookup] — base is element 1.
@@ -151,14 +151,15 @@ fn icc_based_cs(stream_dict: Option<&Dictionary>) -> ResolvedCs {
 /// be dereferenced, or decompression fails.  Only compiled under `gpu-icc`.
 #[cfg(feature = "gpu-icc")]
 pub(super) fn extract_icc_bytes(doc: &Document, cs_obj: &Object) -> Option<Vec<u8>> {
-    let arr = cs_obj.as_array().ok()?;
-    if arr.first().and_then(|o| o.as_name().ok()) != Some(b"ICCBased") {
+    let arr = cs_obj.as_array()?;
+    if arr.first().and_then(Object::as_name) != Some(b"ICCBased") {
         return None;
     }
     let Object::Reference(id) = arr.get(1)? else {
         return None;
     };
-    let stream = doc.get_object(*id).ok()?.as_stream().ok()?;
+    let obj_arc = doc.get_object(*id).ok()?;
+    let stream = obj_arc.as_ref().as_stream()?;
     stream
         .decompressed_content()
         .map_err(|e| log::debug!("image: ICCBased stream decompression failed: {e}"))
@@ -189,17 +190,20 @@ pub(super) fn indexed_palette(doc: &Document, cs_arr: &[Object]) -> Option<(Vec<
         clippy::cast_sign_loss,
         reason = "clamped to [0, 255] — never negative"
     )]
-    let hival = cs_arr[2].as_i64().ok()?.clamp(0, 255) as usize;
+    let hival = cs_arr[2].as_i64()?.clamp(0, 255) as usize;
     let n_entries = hival + 1;
 
     // Lookup is either a string (literal bytes) or a reference to a stream.
     let lookup_bytes: Vec<u8> = match &cs_arr[3] {
         Object::String(bytes, _) => bytes.clone(),
-        Object::Reference(id) => match doc.get_object(*id).ok()? {
-            Object::Stream(s) => s.decompressed_content().ok()?,
-            Object::String(bytes, _) => bytes.clone(),
-            _ => return None,
-        },
+        Object::Reference(id) => {
+            let obj_arc = doc.get_object(*id).ok()?;
+            match obj_arc.as_ref() {
+                Object::Stream(s) => s.decompressed_content().ok()?,
+                Object::String(bytes, _) => bytes.clone(),
+                _ => return None,
+            }
+        }
         _ => return None,
     };
 
@@ -268,8 +272,21 @@ mod tests {
     #[test]
     fn resolve_cs_indirect_reference_falls_back_to_gray() {
         // An unresolvable Reference should not panic — it falls back to Gray.
-        let doc = lopdf::Document::new();
-        let obj = lopdf::Object::Reference((999, 0));
+        // Build a minimal valid PDF so we have a Document; reference (999, 0)
+        // is absent from the xref so resolution fails and we get the fallback.
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF",);
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        let doc = Document::from_bytes_owned(bytes).expect("test PDF parse");
+        let obj = Object::Reference((999, 0));
         assert_eq!(resolve_cs(&doc, &obj), ResolvedCs::Gray);
     }
 }

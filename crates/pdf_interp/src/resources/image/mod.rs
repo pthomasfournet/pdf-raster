@@ -43,7 +43,7 @@
 
 use std::borrow::Cow;
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use pdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::resources::dict_ext::DictExt;
 
@@ -105,7 +105,7 @@ pub use inline::decode_inline_image;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzz_entry {
-    use lopdf::{Document, Object};
+    use pdf::{Document, Object};
 
     use super::ImageDescriptor;
     use super::codecs;
@@ -237,8 +237,9 @@ pub fn resolve_image(
     use smask::decode_smask;
 
     let stream_id = xobject_id(doc, page_dict, name)?;
-    let obj = doc.get_object(stream_id).ok()?;
-    let stream = obj.as_stream().ok()?;
+    // Bind the Arc to a local so the borrow into the stream below stays alive.
+    let obj_arc = doc.get_object(stream_id).ok()?;
+    let stream = obj_arc.as_ref().as_stream()?;
 
     // Must be an Image subtype.
     if stream.dict.get_name(b"Subtype")? != b"Image" {
@@ -254,7 +255,7 @@ pub fn resolve_image(
 
     let is_mask = stream.dict.get_bool(b"ImageMask").unwrap_or(false);
 
-    let filter = stream.dict.get(b"Filter").ok().and_then(filter_name);
+    let filter = stream.dict.get(b"Filter").and_then(filter_name);
 
     let img_filter = ImageFilter::from_filter_str(filter.as_deref());
 
@@ -290,7 +291,7 @@ pub fn resolve_image(
             }
         },
         Some("CCITTFaxDecode") => {
-            let parms = stream.dict.get(b"DecodeParms").ok();
+            let parms = stream.dict.get(b"DecodeParms");
             decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
         }
         Some("DCTDecode") => decode_dct(
@@ -317,7 +318,7 @@ pub fn resolve_image(
             }
         }
         Some("JBIG2Decode") => {
-            let parms = stream.dict.get(b"DecodeParms").ok();
+            let parms = stream.dict.get(b"DecodeParms");
             decode_jbig2(doc, stream.content.as_slice(), w, h, is_mask, parms)
         }
         Some(other) => {
@@ -328,7 +329,7 @@ pub fn resolve_image(
     img.filter = img_filter;
 
     // Resolve and decode the soft mask (`SMask`), if present.
-    if let Ok(Object::Reference(smask_id)) = stream.dict.get(b"SMask") {
+    if let Some(Object::Reference(smask_id)) = stream.dict.get(b"SMask") {
         if let Some(alpha) = decode_smask(doc, *smask_id, img.width, img.height) {
             img.smask = Some(alpha);
         } else {
@@ -407,7 +408,7 @@ pub(crate) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
                 return None;
             }
             arr.first()
-                .and_then(|o| o.as_name().ok())
+                .and_then(|o| o.as_name())
                 .map(String::from_utf8_lossy)
         }
         _ => None,
@@ -416,9 +417,9 @@ pub(crate) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
 
 /// Resolve the `XObject` resource named `name` to its stream `ObjectId`.
 fn xobject_id(doc: &Document, page_dict: &Dictionary, name: &[u8]) -> Option<ObjectId> {
-    let res = super::resolve_dict(doc, page_dict.get(b"Resources").ok()?)?;
-    let xobj = super::resolve_dict(doc, res.get(b"XObject").ok()?)?;
-    match xobj.get(name).ok()? {
+    let res = super::resolve_dict(doc, page_dict.get(b"Resources")?)?;
+    let xobj = super::resolve_dict(doc, res.get(b"XObject")?)?;
+    match xobj.get(name)? {
         Object::Reference(id) => Some(*id),
         _ => None,
     }

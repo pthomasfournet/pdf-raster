@@ -119,9 +119,9 @@ impl From<pdf_interp::InterpError> for RasterError {
 /// is `Arc`-wrapped, and the VA-API decode queue is `Arc`-wrapped (its inner
 /// `mpsc::Sender` is `Send + Sync`).
 pub struct RasterSession {
-    pub(crate) doc: lopdf::Document,
+    pub(crate) doc: pdf::Document,
     /// Page-number → object-ID map, built once at construction.
-    pub(crate) pages: std::collections::BTreeMap<u32, lopdf::ObjectId>,
+    pub(crate) pages: std::collections::BTreeMap<u32, pdf::ObjectId>,
     pub(crate) total_pages: u32,
     pub(crate) policy: BackendPolicy,
     /// VA-API DRM render node path. Retained in non-vaapi builds for forward
@@ -150,10 +150,10 @@ impl RasterSession {
         self.total_pages
     }
 
-    /// Borrow the underlying `lopdf::Document` for read-only operations such as
+    /// Borrow the underlying [`pdf::Document`] for read-only operations such as
     /// the [`pdf_raster::prescan_page`] pre-scan pass.
     #[must_use]
-    pub const fn doc(&self) -> &lopdf::Document {
+    pub const fn doc(&self) -> &pdf::Document {
         &self.doc
     }
 
@@ -189,7 +189,7 @@ pub fn open_session(
     config: &SessionConfig,
 ) -> Result<RasterSession, RasterError> {
     let doc = pdf_interp::open(path).map_err(RasterError::from)?;
-    let pages = doc.get_pages();
+    let pages: std::collections::BTreeMap<u32, pdf::ObjectId> = doc.get_pages().collect();
     let total_pages = u32::try_from(pages.len()).map_err(|_| {
         RasterError::InvalidPageGeometry(format!(
             "document has {} pages which exceeds u32::MAX — this is not a valid PDF",

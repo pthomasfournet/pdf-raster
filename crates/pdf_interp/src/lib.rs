@@ -3,8 +3,8 @@
 //! # Architecture
 //!
 //! ```text
-//! lopdf::Document  →  parse_page()  →  Vec<Operator>  →  renderer::PageRenderer
-//!                  →  prescan_page() →  PageDiagnostics  (no pixels decoded)
+//! pdf::Document  →  parse_page()  →  Vec<Operator>  →  renderer::PageRenderer
+//!                →  prescan_page() →  PageDiagnostics  (no pixels decoded)
 //! ```
 //!
 //! The [`content`] module handles tokenisation and operator decoding.
@@ -30,13 +30,13 @@ pub mod fuzz_helpers {
 
 use std::path::Path;
 
-use lopdf::Document;
+use pdf::Document;
 
 /// Errors that can occur during PDF loading or content stream interpretation.
 #[derive(Debug)]
 pub enum InterpError {
-    /// lopdf failed to load or parse the document.
-    Pdf(lopdf::Error),
+    /// The lazy PDF parser failed to load or parse the document.
+    Pdf(pdf::PdfError),
     /// The requested page number is outside the document's page range.
     PageOutOfRange {
         /// The requested page (1-based).
@@ -83,19 +83,14 @@ impl std::fmt::Display for InterpError {
 
 impl std::error::Error for InterpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Pdf(e) => Some(e),
-            Self::FontInit(_)
-            | Self::PageOutOfRange { .. }
-            | Self::MissingResource(_)
-            | Self::JavaScript { .. }
-            | Self::InvalidPageGeometry(_) => None,
-        }
+        // pdf::PdfError doesn't implement std::error::Error yet; surface it
+        // via Display only.
+        None
     }
 }
 
-impl From<lopdf::Error> for InterpError {
-    fn from(e: lopdf::Error) -> Self {
+impl From<pdf::PdfError> for InterpError {
+    fn from(e: pdf::PdfError) -> Self {
         Self::Pdf(e)
     }
 }
@@ -116,7 +111,7 @@ impl From<lopdf::Error> for InterpError {
 /// - [`InterpError::Pdf`] if the file cannot be read or is not a valid PDF.
 /// - [`InterpError::JavaScript`] if any JavaScript entry point is detected.
 pub fn open(path: impl AsRef<Path>) -> Result<Document, InterpError> {
-    let doc = Document::load(path)?;
+    let doc = Document::open(path.as_ref())?;
     reject_javascript(&doc)?;
     Ok(doc)
 }
@@ -132,7 +127,7 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
     };
 
     // 1. OpenAction with /S /JavaScript
-    if let Ok(action) = catalog.get(b"OpenAction")
+    if let Some(action) = catalog.get(b"OpenAction")
         && action_is_js(doc, action)
     {
         return Err(InterpError::JavaScript {
@@ -141,16 +136,16 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
     }
 
     // 2. Catalog-level additional actions (/AA)
-    if catalog.get(b"AA").is_ok() {
+    if catalog.get(b"AA").is_some() {
         return Err(InterpError::JavaScript {
             location: "/AA (catalog additional actions)",
         });
     }
 
     // 3. Document JS name tree (/Names/JavaScript)
-    if let Ok(names_obj) = catalog.get(b"Names")
+    if let Some(names_obj) = catalog.get(b"Names")
         && let Some(names_dict) = resources::resolve_dict(doc, names_obj)
-        && names_dict.get(b"JavaScript").is_ok()
+        && names_dict.get(b"JavaScript").is_some()
     {
         return Err(InterpError::JavaScript {
             location: "/Names/JavaScript",
@@ -158,9 +153,9 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
     }
 
     // 4. AcroForm additional actions
-    if let Ok(acroform_obj) = catalog.get(b"AcroForm")
+    if let Some(acroform_obj) = catalog.get(b"AcroForm")
         && let Some(acroform) = resources::resolve_dict(doc, acroform_obj)
-        && acroform.get(b"AA").is_ok()
+        && acroform.get(b"AA").is_some()
     {
         return Err(InterpError::JavaScript {
             location: "/AcroForm/AA",
@@ -171,10 +166,12 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
 }
 
 /// Return `true` if `obj` (or the dict it resolves to) has `/S /JavaScript`.
-fn action_is_js(doc: &Document, obj: &lopdf::Object) -> bool {
-    resources::resolve_dict(doc, obj)
-        .and_then(|d| d.get(b"S").ok())
-        .and_then(|s| s.as_name().ok())
+fn action_is_js(doc: &Document, obj: &pdf::Object) -> bool {
+    let Some(d) = resources::resolve_dict(doc, obj) else {
+        return false;
+    };
+    d.get(b"S")
+        .and_then(pdf::Object::as_name)
         .is_some_and(|name| name == b"JavaScript")
 }
 
@@ -183,35 +180,35 @@ fn action_is_js(doc: &Document, obj: &lopdf::Object) -> bool {
 /// Saturates at [`u32::MAX`] for pathological documents (>4 billion pages).
 #[must_use]
 pub fn page_count(doc: &Document) -> u32 {
-    u32::try_from(doc.get_pages().len()).unwrap_or(u32::MAX)
+    doc.page_count()
 }
 
-/// Resolve a 1-based page number to its lopdf object ID.
+/// Resolve a 1-based page number to its `pdf::ObjectId`.
 ///
-/// Calls `doc.get_pages()` once and derives the total from the map, avoiding a
-/// redundant second call when both the count and the ID are needed.
+/// Iterates `doc.get_pages()` once and tracks the total so a single pass
+/// produces both the count and the requested entry.
 ///
 /// # Errors
 /// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document.
-pub(crate) fn resolve_page_id(
-    doc: &Document,
-    page_num: u32,
-) -> Result<lopdf::ObjectId, InterpError> {
-    let pages = doc.get_pages();
-    let total = u32::try_from(pages.len()).unwrap_or(u32::MAX);
-    if page_num == 0 || page_num > total {
+pub(crate) fn resolve_page_id(doc: &Document, page_num: u32) -> Result<pdf::ObjectId, InterpError> {
+    if page_num == 0 {
         return Err(InterpError::PageOutOfRange {
-            page: page_num,
-            total,
+            page: 0,
+            total: doc.page_count(),
         });
     }
-    pages
-        .get(&page_num)
-        .copied()
-        .ok_or(InterpError::PageOutOfRange {
-            page: page_num,
-            total,
-        })
+    let mut found: Option<pdf::ObjectId> = None;
+    let mut total: u32 = 0;
+    for (n, id) in doc.get_pages() {
+        total = n;
+        if n == page_num {
+            found = Some(id);
+        }
+    }
+    found.ok_or(InterpError::PageOutOfRange {
+        page: page_num,
+        total,
+    })
 }
 
 /// Page geometry: visible dimensions in PDF points, rotation, and user-space scale.
@@ -262,7 +259,7 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
         user_unit: 1.0,
     };
 
-    let Ok(dict) = doc.get_dictionary(page_id) else {
+    let Ok(dict) = doc.get_dict(page_id) else {
         return Ok(fallback);
     };
 
@@ -270,15 +267,15 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
         clippy::cast_precision_loss,
         reason = "PDF page sizes are at most a few thousand points; i64 → f64 precision loss is negligible"
     )]
-    let to_f64 = |o: &lopdf::Object| match o {
-        lopdf::Object::Real(r) => f64::from(*r),
-        lopdf::Object::Integer(i) => *i as f64,
+    let to_f64 = |o: &pdf::Object| match o {
+        pdf::Object::Real(r) => f64::from(*r),
+        pdf::Object::Integer(i) => *i as f64,
         _ => 0.0,
     };
 
     let box_wh = |key: &[u8]| -> Option<(f64, f64)> {
         let arr = match dict.get(key) {
-            Ok(lopdf::Object::Array(a)) if a.len() == 4 => a,
+            Some(pdf::Object::Array(a)) if a.len() == 4 => a,
             _ => return None,
         };
         let (x0, y0, x1, y1) = (
@@ -309,7 +306,7 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
         reason = "rem_euclid(360) is always 0..=359, which fits u16"
     )]
     let rotate_cw: u16 = match dict.get(b"Rotate") {
-        Ok(lopdf::Object::Integer(n)) => (*n).rem_euclid(360) as u16 / 90 * 90,
+        Some(pdf::Object::Integer(n)) => (*n).rem_euclid(360) as u16 / 90 * 90,
         _ => 0,
     };
 
@@ -321,10 +318,10 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
     // are rejected explicitly because the range check (NaN comparisons are always false)
     // would otherwise silently pass them through.
     let user_unit: f64 = match dict.get(b"UserUnit") {
-        Err(_) => 1.0, // absent — use default
-        Ok(obj) => {
+        None => 1.0, // absent — use default
+        Some(obj) => {
             match obj {
-                lopdf::Object::Real(_) | lopdf::Object::Integer(_) => {}
+                pdf::Object::Real(_) | pdf::Object::Integer(_) => {}
                 other => {
                     return Err(InterpError::InvalidPageGeometry(format!(
                         "UserUnit on page {page_num} is not a number (got {})",
@@ -373,64 +370,35 @@ pub fn parse_page(doc: &Document, page_num: u32) -> Result<Vec<content::Operator
 
 #[cfg(test)]
 mod js_guard_tests {
-    use lopdf::{Dictionary, Document, Object};
+    use pdf::Document;
 
     use super::{InterpError, reject_javascript};
 
-    fn make_doc_with_open_action(subtype: &str) -> Document {
-        let mut doc = Document::with_version("1.4");
-        let action =
-            Dictionary::from_iter([(b"S".to_vec(), Object::Name(subtype.as_bytes().to_vec()))]);
-        let pages_id = doc.add_object(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
-            (b"Kids".to_vec(), Object::Array(vec![])),
-            (b"Count".to_vec(), Object::Integer(0)),
-        ]));
-        let catalog_id = doc.add_object(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Catalog".to_vec())),
-            (b"Pages".to_vec(), Object::Reference(pages_id)),
-            (b"OpenAction".to_vec(), Object::Dictionary(action)),
-        ]));
-        doc.trailer.set("Root", Object::Reference(catalog_id));
-        doc
-    }
-
-    fn make_doc_with_names_js() -> Document {
-        let mut doc = Document::with_version("1.4");
-        let js_tree = Dictionary::from_iter([(b"Names".to_vec(), Object::Array(vec![]))]);
-        let names = Dictionary::from_iter([(b"JavaScript".to_vec(), Object::Dictionary(js_tree))]);
-        let pages_id = doc.add_object(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
-            (b"Kids".to_vec(), Object::Array(vec![])),
-            (b"Count".to_vec(), Object::Integer(0)),
-        ]));
-        let catalog_id = doc.add_object(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Catalog".to_vec())),
-            (b"Pages".to_vec(), Object::Reference(pages_id)),
-            (b"Names".to_vec(), Object::Dictionary(names)),
-        ]));
-        doc.trailer.set("Root", Object::Reference(catalog_id));
-        doc
-    }
-
-    fn make_doc_clean() -> Document {
-        let mut doc = Document::with_version("1.4");
-        let pages_id = doc.add_object(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
-            (b"Kids".to_vec(), Object::Array(vec![])),
-            (b"Count".to_vec(), Object::Integer(0)),
-        ]));
-        let catalog_id = doc.add_object(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Catalog".to_vec())),
-            (b"Pages".to_vec(), Object::Reference(pages_id)),
-        ]));
-        doc.trailer.set("Root", Object::Reference(catalog_id));
-        doc
+    /// Build a tiny in-memory PDF with one empty page tree.  `extra_catalog`
+    /// is appended verbatim into the Catalog dictionary (e.g. an /OpenAction
+    /// or /Names entry) so each test can express only the bit it cares about.
+    ///
+    /// The byte offsets and the xref table are recomputed from the actual
+    /// section lengths below — change a line above the xref and the offsets
+    /// stay correct.
+    fn make_doc(extra_catalog: &str) -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = format!("1 0 obj\n<</Type /Catalog /Pages 2 0 R{extra_catalog}>>\nendobj\n");
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF",);
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("test PDF parse")
     }
 
     #[test]
     fn open_action_javascript_is_rejected() {
-        let doc = make_doc_with_open_action("JavaScript");
+        let doc = make_doc(" /OpenAction <</S /JavaScript>>");
         let err = reject_javascript(&doc).unwrap_err();
         assert!(
             matches!(err, InterpError::JavaScript { location } if location.contains("OpenAction")),
@@ -440,13 +408,13 @@ mod js_guard_tests {
 
     #[test]
     fn open_action_goto_is_allowed() {
-        let doc = make_doc_with_open_action("GoTo");
+        let doc = make_doc(" /OpenAction <</S /GoTo>>");
         assert!(reject_javascript(&doc).is_ok());
     }
 
     #[test]
     fn names_javascript_is_rejected() {
-        let doc = make_doc_with_names_js();
+        let doc = make_doc(" /Names <</JavaScript <</Names []>>>>");
         let err = reject_javascript(&doc).unwrap_err();
         assert!(
             matches!(err, InterpError::JavaScript { location } if location.contains("Names")),
@@ -456,7 +424,7 @@ mod js_guard_tests {
 
     #[test]
     fn clean_document_is_allowed() {
-        let doc = make_doc_clean();
+        let doc = make_doc("");
         assert!(reject_javascript(&doc).is_ok());
     }
 }
