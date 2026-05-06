@@ -185,8 +185,8 @@ pub fn page_count(doc: &Document) -> u32 {
 
 /// Resolve a 1-based page number to its `pdf::ObjectId`.
 ///
-/// Iterates `doc.get_pages()` once and tracks the total so a single pass
-/// produces both the count and the requested entry.
+/// Iterates `doc.get_pages()` once and counts as it goes so a single pass
+/// produces both the actual page count and the requested entry.
 ///
 /// # Errors
 /// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document.
@@ -199,9 +199,9 @@ pub(crate) fn resolve_page_id(doc: &Document, page_num: u32) -> Result<pdf::Obje
     }
     let mut found: Option<pdf::ObjectId> = None;
     let mut total: u32 = 0;
-    for (n, id) in doc.get_pages() {
-        total = n;
-        if n == page_num {
+    for (_, id) in doc.get_pages() {
+        total = total.saturating_add(1);
+        if total == page_num {
             found = Some(id);
         }
     }

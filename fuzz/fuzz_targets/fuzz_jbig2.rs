@@ -33,9 +33,26 @@ fuzz_target!(|data: &[u8]| {
 
     // An empty document satisfies the `&Document` requirement; no globals stream
     // is looked up because parms=None short-circuits before any document access.
-    // Constructing the document once per input (not once per process) is the
-    // cheapest correct approach — lopdf::Document::new() is a plain allocation.
-    let doc = lopdf::Document::new();
-    let _ =
-        pdf_interp::fuzz_helpers::decode_jbig2(&doc, payload, width, height, false, None);
+    // The lazy parser only walks the xref table at construction — no objects
+    // resolve unless we ask for them — so this is cheap to do per iteration.
+    let doc = minimal_doc();
+    let _ = pdf_interp::fuzz_helpers::decode_jbig2(&doc, payload, width, height, false, None);
 });
+
+/// Build the smallest valid PDF the lazy parser accepts: catalog → empty pages
+/// tree.  Offsets are computed from section lengths so the xref stays correct
+/// when the byte layout changes.
+fn minimal_doc() -> pdf::Document {
+    let header = "%PDF-1.4\n";
+    let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+    let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+    let off1 = header.len();
+    let off2 = off1 + obj1.len();
+    let xref_start = off2 + obj2.len();
+    let xref = format!(
+        "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n"
+    );
+    let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+    let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+    pdf::Document::from_bytes_owned(bytes).expect("hand-built minimal PDF parses")
+}

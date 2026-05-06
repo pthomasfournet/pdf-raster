@@ -41,7 +41,10 @@ use gpu::GpuCtx;
                   the extra gpu-icc args push the count over the limit"
     )
 )]
-#[expect(clippy::too_many_lines, reason = "single-pass raw image decoder; cfg-gated arms preclude clean splits")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass raw image decoder; cfg-gated arms preclude clean splits"
+)]
 pub(super) fn decode_raw(
     doc: &Document,
     data: &[u8],

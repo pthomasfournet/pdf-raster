@@ -78,13 +78,10 @@ fuzz_target!(|data: &[u8]| {
 ///
 /// `BlackIs1` is derived from the low bit of `extra` so the fuzzer can
 /// flip it without needing a separate byte.
-fn make_ccitt_parms(k: i64, extra: u8) -> lopdf::Object {
+fn make_ccitt_parms(k: i64, extra: u8) -> pdf::Object {
     let black_is_1 = extra & 0b1000_0000 != 0;
-    lopdf::Object::Dictionary(lopdf::Dictionary::from_iter([
-        (b"K".to_vec(), lopdf::Object::Integer(k)),
-        (
-            b"BlackIs1".to_vec(),
-            lopdf::Object::Boolean(black_is_1),
-        ),
+    pdf::Object::Dictionary(pdf::Dictionary::from_iter([
+        (b"K".to_vec(), pdf::Object::Integer(k)),
+        (b"BlackIs1".to_vec(), pdf::Object::Boolean(black_is_1)),
     ]))
 }

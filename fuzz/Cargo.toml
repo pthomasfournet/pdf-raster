@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 pdf_interp    = { path = "../crates/pdf_interp" }
-lopdf         = "0.40"
+pdf           = { path = "../crates/pdf" }
 
 # Direct dependency so we can fuzz hayro-jbig2 both through pdf_interp
 # and standalone (raw segment data without a PDF wrapper).

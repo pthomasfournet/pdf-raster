@@ -19,6 +19,8 @@ pub mod image;
 pub mod shading;
 pub mod tiling;
 
+use std::sync::{Arc, OnceLock};
+
 use pdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
 
@@ -185,6 +187,11 @@ pub struct PageResources<'doc> {
     doc: &'doc Document,
     /// Object whose `Resources` key is consulted for font/XObject lookups.
     resource_context_id: ObjectId,
+    /// Cached context dictionary (page or form stream dict). `pdf::Document::get_dict`
+    /// clones the underlying [`Dictionary`] on every call; resolving 5–6 resource
+    /// types per page would otherwise pay that cost every time. Populated lazily on
+    /// first access so error-path call sites that never look up resources don't pay.
+    ctx_dict: OnceLock<Option<Arc<Dictionary>>>,
 }
 
 impl<'doc> PageResources<'doc> {
@@ -194,6 +201,7 @@ impl<'doc> PageResources<'doc> {
         Self {
             doc,
             resource_context_id: page_id,
+            ctx_dict: OnceLock::new(),
         }
     }
 
@@ -203,16 +211,15 @@ impl<'doc> PageResources<'doc> {
     /// use `self` (the parent) directly instead of calling this.
     #[must_use]
     pub const fn for_form(&self, form: &FormXObject) -> Self {
-        if form.has_own_resources {
-            Self {
-                doc: self.doc,
-                resource_context_id: form.resources_id,
-            }
+        let resource_context_id = if form.has_own_resources {
+            form.resources_id
         } else {
-            Self {
-                doc: self.doc,
-                resource_context_id: self.resource_context_id,
-            }
+            self.resource_context_id
+        };
+        Self {
+            doc: self.doc,
+            resource_context_id,
+            ctx_dict: OnceLock::new(),
         }
     }
 
@@ -229,6 +236,17 @@ impl<'doc> PageResources<'doc> {
     #[must_use]
     pub const fn resource_context_id(&self) -> ObjectId {
         self.resource_context_id
+    }
+
+    /// Return the cached context dictionary, resolving it on first call.
+    ///
+    /// The dict is shared via `Arc` so repeated lookups across `image()`,
+    /// `ext_gstate()`, `form_xobject()`, etc. all hit the same allocation
+    /// instead of cloning the (potentially large) page dict 5–6 times per page.
+    fn ctx_dict(&self) -> Option<Arc<Dictionary>> {
+        self.ctx_dict
+            .get_or_init(|| self.doc.get_dictionary(self.resource_context_id).ok())
+            .clone()
     }
 
     /// Resolve the font dictionary for the named resource (e.g. `b"F1"`).
@@ -261,7 +279,7 @@ impl<'doc> PageResources<'doc> {
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
         #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut image::IccClutCache>,
     ) -> Option<image::ImageDescriptor> {
-        let page_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let page_dict = self.ctx_dict()?;
         image::resolve_image(
             self.doc,
             &page_dict,
@@ -285,7 +303,7 @@ impl<'doc> PageResources<'doc> {
     /// Unknown or unsupported keys in the dict are silently ignored.
     #[must_use]
     pub fn ext_gstate(&self, name: &[u8]) -> Option<ExtGStateParams> {
-        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let ctx_dict = self.ctx_dict()?;
         let res = resolve_dict(self.doc, ctx_dict.get(b"Resources")?)?;
         let eg_dict = resolve_dict(self.doc, res.get(b"ExtGState")?)?;
         let gs_ref_or_dict = eg_dict.get(name)?;
@@ -298,7 +316,7 @@ impl<'doc> PageResources<'doc> {
     /// or unreadable streams.
     #[must_use]
     pub fn form_xobject(&self, name: &[u8]) -> Option<FormXObject> {
-        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let ctx_dict = self.ctx_dict()?;
         let res = resolve_dict(self.doc, ctx_dict.get(b"Resources")?)?;
         let xobj_dict = resolve_dict(self.doc, res.get(b"XObject")?)?;
         let Object::Reference(id) = xobj_dict.get(name)? else {
@@ -365,7 +383,7 @@ impl<'doc> PageResources<'doc> {
     /// `PatternType` 2 (shading patterns referenced via `scn`).
     #[must_use]
     pub fn tiling_pattern(&self, name: &[u8]) -> Option<tiling::TilingDescriptor> {
-        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let ctx_dict = self.ctx_dict()?;
         tiling::resolve_tiling(self.doc, &ctx_dict, name)
     }
 
@@ -380,7 +398,7 @@ impl<'doc> PageResources<'doc> {
         ctm: &[f64; 6],
         page_h: f64,
     ) -> Option<shading::ShadingResult> {
-        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let ctx_dict = self.ctx_dict()?;
         shading::resolve_shading(self.doc, &ctx_dict, name, ctm, page_h)
     }
 
@@ -392,7 +410,7 @@ impl<'doc> PageResources<'doc> {
     /// and not currently supported).
     #[must_use]
     pub fn ocg_object_id(&self, props_key: &[u8]) -> Option<ObjectId> {
-        let ctx_dict = self.doc.get_dictionary(self.resource_context_id).ok()?;
+        let ctx_dict = self.ctx_dict()?;
         let res = resolve_dict(self.doc, ctx_dict.get(b"Resources")?)?;
         let props = resolve_dict(self.doc, res.get(b"Properties")?)?;
         match props.get(props_key)? {

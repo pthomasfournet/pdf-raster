@@ -156,6 +156,13 @@ impl Document {
     // ── Typed dictionary accessors ────────────────────────────────────────────
 
     /// Resolve `id` and return it as a dictionary.
+    ///
+    /// Currently clones the dictionary out of the cached `Arc<Object>` because
+    /// stable Rust has no zero-copy way to project an `Arc<Object>` to an
+    /// `Arc<Dictionary>` (the dict lives inside the enum variant). Hot
+    /// repeat-lookup callers (e.g. per-page resource resolution) should cache
+    /// the result themselves; the dict is hashed and small (~tens of entries)
+    /// so the clone cost is bounded.
     pub fn get_dict(&self, id: ObjectId) -> Result<Arc<Dictionary>, PdfError> {
         let obj = self.get_object(id)?;
         match obj.as_ref() {
@@ -163,7 +170,7 @@ impl Document {
             Object::Stream(s) => Ok(Arc::new(s.dict.clone())),
             _ => Err(PdfError::BadObject {
                 id: id.0,
-                detail: "not a dictionary".into(),
+                detail: format!("expected Dictionary or Stream, got {}", obj.enum_variant()),
             }),
         }
     }
