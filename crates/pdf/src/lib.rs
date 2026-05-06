@@ -13,6 +13,7 @@
 //! Public types mirror `lopdf` naming so `pdf_interp` can migrate
 //! file-by-file with mostly mechanical changes.
 
+mod dictionary;
 mod document;
 mod error;
 mod lexer;
@@ -21,11 +22,7 @@ mod objstm;
 mod stream;
 mod xref;
 
+pub use dictionary::Dictionary;
 pub use document::Document;
 pub use error::PdfError;
 pub use object::{Object, ObjectId, Stream, StringFormat};
-
-/// Convenience re-export of the `HashMap` type used for PDF dictionaries.
-///
-/// Saves callers from writing `std::collections::HashMap<Vec<u8>, pdf::Object>`.
-pub type Dictionary = std::collections::HashMap<Vec<u8>, Object>;

@@ -4,15 +4,14 @@
 //! Image-format filters (DCT, JBIG2, JPX, CCITTFax) are intentionally
 //! excluded — those bytes are passed raw to the codec layer in `pdf_interp`.
 
-use std::collections::HashMap;
-
+use crate::dictionary::Dictionary;
 use crate::object::Object;
 
 /// Decode a raw stream byte slice according to its /Filter chain.
 ///
 /// `dict` is the stream dictionary; `raw` is the undecoded content bytes.
 /// Returns the fully-decoded bytes, or `raw` unchanged if there is no filter.
-pub fn decode_stream(raw: &[u8], dict: &HashMap<Vec<u8>, Object>) -> Result<Vec<u8>, String> {
+pub fn decode_stream(raw: &[u8], dict: &Dictionary) -> Result<Vec<u8>, String> {
     let filters = collect_filters(dict);
     if filters.is_empty() {
         return Ok(raw.to_vec());
@@ -190,7 +189,7 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 fn apply_lzw(data: &[u8], params: Option<&Object>) -> Result<Vec<u8>, String> {
     let early_change = params
         .and_then(Object::as_dict)
-        .and_then(|d| d.get(b"EarlyChange".as_ref()))
+        .and_then(|d| d.get(b"EarlyChange"))
         .and_then(Object::as_i64)
         .map(|v| v != 0)
         .unwrap_or(true);
@@ -286,8 +285,8 @@ fn decode_ascii_hex(data: &[u8]) -> Result<Vec<u8>, String> {
 
 // ── Filter/DecodeParms helpers ────────────────────────────────────────────────
 
-fn collect_filters(dict: &HashMap<Vec<u8>, Object>) -> Vec<Vec<u8>> {
-    match dict.get(b"Filter".as_ref()) {
+fn collect_filters(dict: &Dictionary) -> Vec<Vec<u8>> {
+    match dict.get(b"Filter") {
         Some(Object::Name(n)) => vec![n.clone()],
         Some(Object::Array(a)) => a
             .iter()
@@ -297,8 +296,8 @@ fn collect_filters(dict: &HashMap<Vec<u8>, Object>) -> Vec<Vec<u8>> {
     }
 }
 
-fn collect_decode_parms(dict: &HashMap<Vec<u8>, Object>, count: usize) -> Vec<Option<Object>> {
-    match dict.get(b"DecodeParms".as_ref()) {
+fn collect_decode_parms(dict: &Dictionary, count: usize) -> Vec<Option<Object>> {
+    match dict.get(b"DecodeParms") {
         Some(Object::Array(a)) => a.iter().cloned().map(Some).collect(),
         Some(o) => {
             let mut v = vec![Some(o.clone())];
@@ -311,13 +310,14 @@ fn collect_decode_parms(dict: &HashMap<Vec<u8>, Object>, count: usize) -> Vec<Op
 
 // ── DictLookup trait (avoid coupling stream.rs to the full Document) ──────────
 
-/// Minimal dictionary lookup used inside this module to avoid importing
-/// `HashMap` specialisation at every call site.
+/// Minimal dictionary lookup used inside this module to avoid coupling its
+/// callers to a specific dictionary type (it's used by both [`Dictionary`] and
+/// the raw [`Object`] variants returned from xref-stream parsing).
 pub trait DictLookup {
     fn get_i64(&self, key: &[u8]) -> Option<i64>;
 }
 
-impl DictLookup for HashMap<Vec<u8>, Object> {
+impl DictLookup for Dictionary {
     fn get_i64(&self, key: &[u8]) -> Option<i64> {
         self.get(key)?.as_i64()
     }

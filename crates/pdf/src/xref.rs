@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use crate::{
+    dictionary::Dictionary,
     error::PdfError,
     lexer::{is_ws, parse_u64, skip_ws},
     object::{Object, parse_object},
@@ -39,7 +40,7 @@ pub(crate) struct XrefTable {
     pub entries: HashMap<u32, XrefEntry>,
     /// The document trailer dictionary bytes.  We keep the raw bytes and parse
     /// on demand so this module does not depend on a full object graph.
-    pub trailer: HashMap<Vec<u8>, Object>,
+    pub trailer: Dictionary,
 }
 
 impl XrefTable {
@@ -190,7 +191,7 @@ fn parse_trailer_dict(
     merge_trailer_and_chain(data, &dict, table, visited)?;
 
     // Handle hybrid files: /XRefStm points to an additional xref stream.
-    if let Some(Object::Integer(xrefstm)) = dict.get(b"XRefStm".as_ref())
+    if let Some(Object::Integer(xrefstm)) = dict.get(b"XRefStm")
         && *xrefstm > 0
     {
         let stm_off = *xrefstm as u64;
@@ -208,14 +209,16 @@ fn parse_trailer_dict(
 /// indicate "no previous xref section" rather than an error.
 fn merge_trailer_and_chain(
     data: &[u8],
-    dict: &HashMap<Vec<u8>, Object>,
+    dict: &Dictionary,
     table: &mut XrefTable,
     visited: &mut std::collections::HashSet<u64>,
 ) -> Result<(), PdfError> {
     for (k, v) in dict {
-        table.trailer.entry(k.clone()).or_insert_with(|| v.clone());
+        if !table.trailer.contains_key(k) {
+            table.trailer.insert(k.clone(), v.clone());
+        }
     }
-    if let Some(Object::Integer(prev)) = dict.get(b"Prev".as_ref())
+    if let Some(Object::Integer(prev)) = dict.get(b"Prev")
         && *prev > 0
     {
         read_xref_at(data, *prev as u64, table, visited)?;
@@ -263,7 +266,7 @@ fn read_xref_stream(
     let stream_bytes = decode_xref_stream(raw_stream, &dict)?;
 
     // Read /W field widths.
-    let w = match dict.get(b"W".as_ref()) {
+    let w = match dict.get(b"W") {
         Some(Object::Array(a)) => a.clone(),
         _ => return Err(PdfError::BadXref("xref stream: missing /W array".into())),
     };
@@ -284,7 +287,7 @@ fn read_xref_stream(
     }
 
     // Determine which object numbers this stream covers via /Index.
-    let index_pairs: Vec<u32> = match dict.get(b"Index".as_ref()) {
+    let index_pairs: Vec<u32> = match dict.get(b"Index") {
         Some(Object::Array(a)) => a
             .iter()
             .map(|o| obj_to_u32(o, "/Index"))
@@ -292,7 +295,7 @@ fn read_xref_stream(
         _ => {
             // Default: one subsection starting at 0, covering /Size objects.
             let size = dict
-                .get(b"Size".as_ref())
+                .get(b"Size")
                 .ok_or_else(|| PdfError::BadXref("xref stream: missing /Size".into()))?;
             vec![0, obj_to_u32(size, "/Size")?]
         }
@@ -375,11 +378,11 @@ fn read_xref_stream(
 
 /// Decode an xref stream's raw bytes.  Almost always FlateDecode; may be
 /// uncompressed (no /Filter key).
-fn decode_xref_stream(raw: &[u8], dict: &HashMap<Vec<u8>, Object>) -> Result<Vec<u8>, PdfError> {
+fn decode_xref_stream(raw: &[u8], dict: &Dictionary) -> Result<Vec<u8>, PdfError> {
     use crate::stream::apply_flate;
 
     // /Filter is optional, a Name, or a single-element array of a Name.
-    let filter: Option<&[u8]> = match dict.get(b"Filter".as_ref()) {
+    let filter: Option<&[u8]> = match dict.get(b"Filter") {
         None => None,
         Some(Object::Name(n)) => Some(n),
         Some(Object::Array(a)) if a.len() == 1 => a[0].as_name(),
@@ -390,7 +393,7 @@ fn decode_xref_stream(raw: &[u8], dict: &HashMap<Vec<u8>, Object>) -> Result<Vec
         None => Ok(raw.to_vec()),
         Some(b"FlateDecode") => {
             let params = dict
-                .get(b"DecodeParms".as_ref())
+                .get(b"DecodeParms")
                 .map(|o| o as &dyn crate::stream::DictLookup);
             apply_flate(raw, params).map_err(|e| PdfError::DecodeFailed(e.to_string()))
         }

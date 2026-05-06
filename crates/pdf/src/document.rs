@@ -12,6 +12,7 @@ use std::{
 use memmap2::Mmap;
 
 use crate::{
+    dictionary::Dictionary,
     error::PdfError,
     object::{Object, ObjectId, parse_indirect_object},
     objstm::ObjStmCache,
@@ -155,7 +156,7 @@ impl Document {
     // ── Typed dictionary accessors ────────────────────────────────────────────
 
     /// Resolve `id` and return it as a dictionary.
-    pub fn get_dict(&self, id: ObjectId) -> Result<Arc<HashMap<Vec<u8>, Object>>, PdfError> {
+    pub fn get_dict(&self, id: ObjectId) -> Result<Arc<Dictionary>, PdfError> {
         let obj = self.get_object(id)?;
         match obj.as_ref() {
             Object::Dictionary(d) => Ok(Arc::new(d.clone())),
@@ -170,7 +171,7 @@ impl Document {
     // ── Document structure ────────────────────────────────────────────────────
 
     /// Return the document catalogue dictionary.
-    pub fn catalog(&self) -> Result<Arc<HashMap<Vec<u8>, Object>>, PdfError> {
+    pub fn catalog(&self) -> Result<Arc<Dictionary>, PdfError> {
         let id = self.catalog_id()?;
         self.get_dict(id)
     }
@@ -182,7 +183,7 @@ impl Document {
         let root = self
             .xref
             .trailer
-            .get(b"Root".as_ref())
+            .get(b"Root")
             .ok_or(PdfError::MissingKey("Root"))?;
         let id = match root {
             Object::Reference(id) => *id,
@@ -216,7 +217,7 @@ impl Document {
             detail: "page is not a dict".into(),
         })?;
 
-        let contents = match page_dict.get(b"Contents".as_ref()) {
+        let contents = match page_dict.get(b"Contents") {
             None => return Ok(Vec::new()),
             Some(obj) => obj.clone(),
         };
@@ -244,7 +245,7 @@ impl Document {
 
     /// Return a merged font dictionary for the page (all /Font entries from
     /// /Resources, with parent-chain inheritance).
-    pub fn get_page_fonts(&self, page_id: ObjectId) -> Result<HashMap<Vec<u8>, Object>, PdfError> {
+    pub fn get_page_fonts(&self, page_id: ObjectId) -> Result<Dictionary, PdfError> {
         self.get_page_resource_dict(page_id, b"Font")
     }
 
@@ -254,7 +255,7 @@ impl Document {
         &self,
         page_id: ObjectId,
         resource_name: &[u8],
-    ) -> Result<HashMap<Vec<u8>, Object>, PdfError> {
+    ) -> Result<Dictionary, PdfError> {
         // Walk up the page tree to find /Resources. Bound to 64 hops to defeat
         // cyclic /Parent references in malformed PDFs.
         let mut current_id = Some(page_id);
@@ -269,7 +270,7 @@ impl Document {
                 break;
             };
 
-            if let Some(res) = dict.get(b"Resources".as_ref()) {
+            if let Some(res) = dict.get(b"Resources") {
                 let res_dict = self.dict_from_object(res)?;
                 if let Some(sub) = res_dict.get(resource_name) {
                     return self.dict_from_object(sub);
@@ -277,22 +278,22 @@ impl Document {
             }
 
             // Walk to parent.
-            current_id = dict.get(b"Parent".as_ref()).and_then(Object::as_reference);
+            current_id = dict.get(b"Parent").and_then(Object::as_reference);
         }
-        Ok(HashMap::new())
+        Ok(Dictionary::new())
     }
 
     /// Take a dictionary value out of an `Object`, resolving one level of
     /// indirection if needed. Non-dict values yield an empty map (matches the
     /// behaviour of malformed-but-recoverable PDFs).
-    fn dict_from_object(&self, obj: &Object) -> Result<HashMap<Vec<u8>, Object>, PdfError> {
+    fn dict_from_object(&self, obj: &Object) -> Result<Dictionary, PdfError> {
         match obj {
             Object::Dictionary(d) => Ok(d.clone()),
             Object::Reference(rid) => {
                 let r = self.get_object(*rid)?;
                 Ok(r.as_dict().cloned().unwrap_or_default())
             }
-            _ => Ok(HashMap::new()),
+            _ => Ok(Dictionary::new()),
         }
     }
 }
@@ -320,9 +321,7 @@ impl<'a> PageIter<'a> {
                 Default::default()
             }
         };
-        let pages_id = catalog
-            .get(b"Pages".as_ref())
-            .and_then(Object::as_reference);
+        let pages_id = catalog.get(b"Pages").and_then(Object::as_reference);
         let mut on_stack = std::collections::HashSet::new();
         let stack = match pages_id {
             Some(id) => {
@@ -369,10 +368,7 @@ impl Iterator for PageIter<'_> {
                 }
             };
 
-            let node_type = dict
-                .get(b"Type".as_ref())
-                .and_then(Object::as_name)
-                .unwrap_or(b"");
+            let node_type = dict.get(b"Type").and_then(Object::as_name).unwrap_or(b"");
 
             if node_type == b"Page" {
                 // Leaf page node.
@@ -382,7 +378,7 @@ impl Iterator for PageIter<'_> {
             }
 
             // Pages node: iterate /Kids.
-            let kids = match dict.get(b"Kids".as_ref()) {
+            let kids = match dict.get(b"Kids") {
                 Some(Object::Array(a)) => a.clone(),
                 _ => {
                     self.pop();

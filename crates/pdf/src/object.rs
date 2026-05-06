@@ -4,8 +4,7 @@
 //! swap the import with minimal churn.  The parser is a hand-rolled recursive
 //! descent over a borrowed byte slice — no allocator-heavy parser combinators.
 
-use std::collections::HashMap;
-
+use crate::dictionary::Dictionary;
 use crate::lexer::{
     parse_u64, read_hex_string, read_literal_string, read_name, scan_token, skip_ws,
 };
@@ -28,7 +27,7 @@ pub enum Object {
     Name(Vec<u8>),
     String(Vec<u8>, StringFormat),
     Array(Vec<Object>),
-    Dictionary(HashMap<Vec<u8>, Object>),
+    Dictionary(Dictionary),
     Stream(Stream),
     /// Indirect reference — resolved lazily by `Document::get_object`.
     Reference(ObjectId),
@@ -44,13 +43,13 @@ pub enum StringFormat {
 /// A PDF stream: a dictionary plus raw (undecoded) bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stream {
-    pub dict: HashMap<Vec<u8>, Object>,
+    pub dict: Dictionary,
     /// Raw (compressed) stream bytes.
     pub content: Vec<u8>,
 }
 
 impl Stream {
-    pub fn new(dict: HashMap<Vec<u8>, Object>, content: Vec<u8>) -> Self {
+    pub fn new(dict: Dictionary, content: Vec<u8>) -> Self {
         Self { dict, content }
     }
 }
@@ -106,7 +105,7 @@ impl Object {
         }
     }
 
-    pub fn as_dict(&self) -> Option<&HashMap<Vec<u8>, Object>> {
+    pub fn as_dict(&self) -> Option<&Dictionary> {
         match self {
             Self::Dictionary(d) => Some(d),
             Self::Stream(s) => Some(&s.dict),
@@ -125,6 +124,25 @@ impl Object {
         match self {
             Self::Reference(id) => Some(*id),
             _ => None,
+        }
+    }
+
+    /// Return the variant name as a static string (mirrors lopdf's
+    /// `Object::enum_variant` so error messages can describe a value's kind
+    /// without dumping the full Debug representation).
+    #[must_use]
+    pub fn enum_variant(&self) -> &'static str {
+        match self {
+            Self::Null => "Null",
+            Self::Boolean(_) => "Boolean",
+            Self::Integer(_) => "Integer",
+            Self::Real(_) => "Real",
+            Self::Name(_) => "Name",
+            Self::String(_, _) => "String",
+            Self::Array(_) => "Array",
+            Self::Dictionary(_) => "Dictionary",
+            Self::Stream(_) => "Stream",
+            Self::Reference(_) => "Reference",
         }
     }
 }
@@ -169,7 +187,7 @@ pub fn parse_object(data: &[u8], pos: &mut usize) -> Option<Object> {
                 let stream_start = peek.min(data.len());
                 // Determine stream length from /Length in the dict.
                 let length = dict
-                    .get(b"Length".as_ref())
+                    .get(b"Length")
                     .and_then(Object::as_i64)
                     .unwrap_or(0)
                     .max(0) as usize;
@@ -263,10 +281,10 @@ fn parse_scalar(data: &[u8], pos: &mut usize) -> Option<Object> {
     None
 }
 
-fn parse_dict(data: &[u8], pos: &mut usize) -> Option<HashMap<Vec<u8>, Object>> {
+fn parse_dict(data: &[u8], pos: &mut usize) -> Option<Dictionary> {
     // Caller has ensured data[*pos..] starts with "<<".
     *pos += 2;
-    let mut dict = HashMap::new();
+    let mut dict = Dictionary::new();
 
     loop {
         skip_ws(data, pos);
@@ -396,11 +414,8 @@ mod tests {
     fn dictionary() {
         let obj = parse(b"<</Type /Page /Width 100>>");
         let dict = obj.as_dict().unwrap();
-        assert_eq!(
-            dict.get(b"Type".as_ref()).unwrap().as_name().unwrap(),
-            b"Page"
-        );
-        assert_eq!(dict.get(b"Width".as_ref()).unwrap().as_i64().unwrap(), 100);
+        assert_eq!(dict.get(b"Type").unwrap().as_name().unwrap(), b"Page");
+        assert_eq!(dict.get(b"Width").unwrap().as_i64().unwrap(), 100);
     }
 
     #[test]

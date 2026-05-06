@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::{
+    dictionary::Dictionary,
     error::PdfError,
     lexer::{parse_u64, skip_ws},
     object::{Object, parse_object},
@@ -38,7 +39,7 @@ impl ObjStmCache {
         container_id: u32,
         index: u32,
         stream_content: &[u8],
-        stream_dict: &HashMap<Vec<u8>, Object>,
+        stream_dict: &Dictionary,
     ) -> Result<Object, PdfError> {
         // Poison recovery: cache stores immutable parses, safe to reuse.
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -98,12 +99,7 @@ impl ObjStmCache {
 
 /// Read an integer dict entry (defaulting to 0 if absent), enforcing
 /// `min..=max`. Returns the offending value formatted into the error message.
-fn bounded_dict_int(
-    dict: &HashMap<Vec<u8>, Object>,
-    key: &[u8],
-    min: i64,
-    max: i64,
-) -> Result<i64, String> {
+fn bounded_dict_int(dict: &Dictionary, key: &[u8], min: i64, max: i64) -> Result<i64, String> {
     let value = dict.get(key).and_then(Object::as_i64).unwrap_or(0);
     if (min..=max).contains(&value) {
         Ok(value)
