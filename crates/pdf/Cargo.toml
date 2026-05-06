@@ -1,0 +1,14 @@
+[package]
+name        = "pdf"
+description = "Lazy, zero-copy PDF file parser for the pdf-raster render pipeline"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+flate2   = { version = "1" }
+memmap2  = { version = "0.9" }
+weezl    = { version = "0.1" }
+log      = { workspace = true }

@@ -6,6 +6,7 @@ members = [
     "crates/raster",
     "crates/encode",
     "crates/font",
+    "crates/pdf",
     "crates/pdf_bridge",
     "crates/pdf_interp",
     "crates/pdf_raster",
