@@ -147,6 +147,80 @@ Built with nvJPEG, GPU AA fill, and ICC CLUT features. nvJPEG2000 is not availab
 
 ---
 
+## Version regression history (CPU-only, cold cache)
+
+All five minor versions benchmarked on the Ryzen 9 9900X3D, CPU-only backend, 150 DPI, cold cache. No pdftoppm reference — this table is purely for tracking regression and improvement across releases.
+
+Built with `RUSTFLAGS="-C target-cpu=native"` at each tagged commit. v0.1.0–v0.3.0 use `glibc malloc`; v0.4.0+ use `mimalloc`.
+
+| Corpus | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.1 |
+|---|---|---|---|---|---|
+| 01 native text, small | 45 ms | 50 ms | 41 ms | 47 ms | 48 ms |
+| 02 native vector + text | 129 ms | 138 ms | 126 ms | 138 ms | 145 ms |
+| 03 native text, dense | 598 ms | 622 ms | 591 ms | 599 ms | 595 ms |
+| 04 ebook, mixed | 1 784 ms | 1 944 ms | 1 824 ms | 1 836 ms | 1 916 ms |
+| 05 academic book | 743 ms | 763 ms | 751 ms | 760 ms | 785 ms |
+| 06 modern layout, DCT | 2 663 ms | 2 718 ms | 2 658 ms | 2 698 ms | 2 662 ms |
+| 07 journal, DCT-heavy | 768 ms | 776 ms | 761 ms | 760 ms | 757 ms |
+| 08 1927 scan, DCT | 11 431 ms | 12 882 ms | 12 616 ms | 13 711 ms | 12 601 ms |
+| **09 1836 scan, DCT** | **35 502 ms** | **77 132 ms** | **58 232 ms** | **60 137 ms** | **36 661 ms** |
+| 10 scan, JBIG2+JPX | 18 703 ms | 18 405 ms | 18 350 ms | 18 492 ms | 18 069 ms |
+
+### What the numbers show
+
+**Corpora 01–07 and 10 are essentially flat.** The native text, vector, JBIG2, and JPEG 2000 render paths have not regressed or improved in wall time across any release — variance is noise. This is both reassuring (no regressions) and honest (no CPU-path gains either).
+
+**Corpus 08 (baseline JPEG, 390 pages)** shows mild drift: +1–2 s added over v0.1.0 baseline. The renderer adds overhead with each release — more dispatch layers, more feature flag branches, more plumbing through the call stack — and it accumulates. At ~12 s total the regression is ~10% over five versions. Not catastrophic but real.
+
+**Corpus 09 (progressive JPEG, 490 pages) is the headline.** v0.1.0 ran in 35 s. v0.2.0 blew up to 77 s — a 2.2× regression. v0.3.0 partially recovered (58 s), v0.4.0 remained slow (60 s), and v0.5.1 recovered to 36 s, nearly back to v0.1.0.
+
+The cause: v0.2.0 introduced VA-API JPEG dispatch (`feat(gpu/interp): GPU decoder traits + inline image GPU dispatch`). Even on a CPU-only build, every progressive JPEG frame attempted VA-API decode first, failed (VA-API is baseline-only), and fell through to zune-jpeg — paying parse overhead for every single frame in a 490-page progressive-JPEG corpus. v0.5.1 fixed this with SOF-aware routing (`feat(pdf_interp): content-aware JPEG dispatch`) that short-circuits progressive JPEG directly to zune-jpeg without touching VA-API.
+
+### Lessons
+
+The version history makes one thing clear: **every new dispatch layer has a cost that shows up in cold benchmarks even when the feature is not active.** Adding GPU/VA-API paths adds branching and initialization overhead that runs on every JPEG frame regardless of backend. This is the nature of a feature-rich pipeline — each capability added to the fast path is overhead added to all paths.
+
+The practical implication: **re-run this table before every release.** A new feature that looks neutral in isolation may show a corpus-09-style blowup only when measured across a full cold-cache run. `tests/bench_versions.sh` automates the build and timing for all versions.
+
+---
+
+## Parallelism diagnostic traps
+
+These are failure modes that have caused multi-day benchmark investigations. Check them in order before touching domain code.
+
+### 1. Low CPU utilisation ≠ I/O bound
+
+20–30% CPU across all threads on a JPEG-heavy corpus is not a sign of disk bottleneck. It can be allocator contention. glibc malloc serializes under concurrent large allocations via a futex — threads appear idle but are queued on a lock. This is invisible in `top`/`htop` (blocked threads show ~0% user and ~0% sys).
+
+**First check:** run with `--timings`. If pages of similar size show wildly different wall times on different threads, something shared is serializing them.
+
+```bash
+./target/release/pdf-raster --timings corpus.pdf /tmp/out/ 2>&1 | grep timing
+```
+
+**Second check:** `perf record`, then look for allocator symbols.
+
+```bash
+perf record -g ./target/release/pdf-raster corpus.pdf /tmp/out/
+perf report   # look for: malloc, free, __lll_lock_wait, _int_malloc
+```
+
+If allocator symbols are hot: the fix is already in place (mimalloc is the global allocator in the CLI binary). Any new binary or benchmark harness must also use mimalloc.
+
+### 2. GPU backend serialization
+
+`NVJPEG_BACKEND_HARDWARE` routes all decodes through a single hardware engine — effective single-threading regardless of Rayon pool size. The CLI uses `GPU_HYBRID` (per-thread software pipeline + hardware assist), which is correct for multi-threaded workloads. If a new GPU path shows unexpected serialization, verify the backend constant.
+
+### 3. VA-API per-frame context overhead
+
+VA-API creates/destroys `VAContext`+`VASurface` per decode unless context reuse is active (added in `perf(vaapi): reuse VAContext+VASurface`). This overhead eats the decode win for high-frequency small JPEG pages. If VA-API benchmarks show no gain over CPU, check whether context reuse is triggering (same dimensions across frames required).
+
+### 4. Serial prescan on the hot path
+
+A serial pre-scan pass over all pages before rendering starts blocks the first render thread until all pages are scanned. This was removed (see `refactor(cli): remove serial prescan`). If prescan-like logic is re-introduced, ensure it runs inline per render thread, not as a sequential preflight.
+
+---
+
 ## Reproducing
 
 ```bash
