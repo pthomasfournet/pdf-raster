@@ -1067,63 +1067,178 @@ impl<'doc> PageRenderer<'doc> {
 
         let img_w = f64::from(img.width);
         let img_h = f64::from(img.height);
+        let img_width_usize = img.width as usize;
 
         let data = self.bitmap.data_mut();
         let stride = self.width as usize * 3; // Rgb8: 3 bytes per pixel
 
-        for dy in by0..by1 {
-            let dy_pdf = page_h - f64::from(dy);
-            let dy_rel = dy_pdf - f;
-            // Precompute the row-constant parts of the u/v formulas.
-            let u_row = (-c * dy_rel) * inv_det;
-            let v_row = (a * dy_rel) * inv_det;
-            for dx in bx0..bx1 {
-                let dx_rel = f64::from(dx) - e;
-                // Image-space coordinates ∈ [0, 1]; clamp to guard edges.
-                let u = (d * dx_rel).mul_add(inv_det, u_row).clamp(0.0, 1.0);
-                let v = ((-b) * dx_rel).mul_add(inv_det, v_row).clamp(0.0, 1.0);
+        // Axis-aligned fast path: when b ≈ 0 and c ≈ 0, the CTM has no rotation
+        // or shear.  The inverse mapping simplifies to:
+        //   u = (dx − e) / a        (constant step per column)
+        //   v = (dy_pdf − f) / d    (constant per row)
+        //
+        // We convert both to fixed-point (Q32) so the inner loop is pure integer
+        // arithmetic — no per-pixel f64 multiply, no clamp, no int→float conversion.
+        //
+        // Threshold: |b|, |c| < 0.5 device pixels across the full image extent.
+        let is_axis_aligned = b.abs() * img_w < 0.5 && c.abs() * img_h < 0.5;
 
-                // Nearest-neighbour sample.  Clamp so ix < img.width, iy < img.height.
-                // u maps to image column (left→right);
-                // v maps to image row, flipped: v=0 is top, v=1 is bottom (PDF origin=bottom-left).
-                let ix = (u * img_w).min(img_w - 1.0) as usize;
+        if is_axis_aligned {
+            // Fixed-point scale: 1 image pixel = FP_SCALE units.
+            const FP_SCALE: i64 = 1 << 32;
+
+            // ix step per output column: img_w / a pixels per device pixel.
+            // a may be negative (x-flipped image).
+            // FP_SCALE is 2^32, exactly representable in f64; cast is lossless.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "FP_SCALE = 1<<32 is exactly representable in f64; img_w/a fits easily"
+            )]
+            let ix_step_fp: i64 = ((img_w / a) * FP_SCALE as f64) as i64;
+
+            // iy step per output row: -img_h / d  (v = (dy_pdf - f)/d, iy = (1-v)*img_h).
+            // d is negative when PDF y-axis is flipped to device space.
+            // Precomputed per-row below.
+
+            // img dimensions are u32, so the usize values fit well within i64.
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "img dims are u32; usize→i64 cast is safe on 64-bit targets"
+            )]
+            let img_max_x = (img_width_usize - 1) as i64;
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "img dims are u32; usize→i64 cast is safe on 64-bit targets"
+            )]
+            let img_max_y = (img.height as usize - 1) as i64;
+
+            let smask = img.smask.as_deref();
+
+            for dy in by0..by1 {
+                let dy_pdf = page_h - f64::from(dy);
+                // v = (dy_pdf - f) / d; iy = (1 - v) * img_h, clamped.
+                let v = ((dy_pdf - f) / d).clamp(0.0, 1.0);
                 let iy = ((1.0 - v) * img_h).min(img_h - 1.0) as usize;
-                let img_idx = iy * img.width as usize + ix;
+                let row_base = iy * img_width_usize;
 
-                // If a soft mask is present, skip fully-transparent pixels.
-                // Out-of-bounds access (smask shorter than expected) defaults to
-                // 0xFF (opaque) so a truncated mask never silently erases pixels.
-                if img
-                    .smask
-                    .as_deref()
-                    .is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0)
-                {
-                    continue;
-                }
+                // ix at bx0: u = (bx0 - e) / a.
+                let u0 = ((f64::from(bx0) - e) / a).clamp(0.0, 1.0);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "FP_SCALE = 1<<32 is exactly representable in f64"
+                )]
+                let mut ix_fp: i64 = (u0 * img_w * FP_SCALE as f64) as i64;
 
-                // Safety: bx0..bx1 and by0..by1 are clamped to bitmap bounds above,
-                // so pixel_off is always in range for a valid Rgb8 bitmap.
-                let pixel_off = dy as usize * stride + dx as usize * 3;
+                let row_off = dy as usize * stride;
 
                 match img.color_space {
                     ImageColorSpace::Rgb => {
-                        let src = img_idx * 3;
-                        // img.data length is validated in decode_raw.
-                        if let Some(rgb) = img.data.get(src..src + 3) {
+                        for dx in bx0..bx1 {
+                            let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
+                            ix_fp = ix_fp.wrapping_add(ix_step_fp);
+                            let img_idx = row_base + ix;
+                            if smask.is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0) {
+                                continue;
+                            }
+                            let src = img_idx * 3;
+                            // SAFETY: ix ∈ [0, img_width-1] and iy ∈ [0, img_height-1]
+                            // by the clamp above, so src+3 ≤ img.data.len().
+                            #[expect(
+                                unsafe_code,
+                                reason = "bounds proven by clamp: ix < img_width, iy < img_height"
+                            )]
+                            let rgb = unsafe { img.data.get_unchecked(src..src + 3) };
+                            let pixel_off = row_off + dx as usize * 3;
                             data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                         }
                     }
                     ImageColorSpace::Gray => {
-                        if let Some(&v) = img.data.get(img_idx) {
+                        for dx in bx0..bx1 {
+                            let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
+                            ix_fp = ix_fp.wrapping_add(ix_step_fp);
+                            let img_idx = row_base + ix;
+                            if smask.is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0) {
+                                continue;
+                            }
+                            // SAFETY: same bounds proof as RGB arm.
+                            #[expect(
+                                unsafe_code,
+                                reason = "bounds proven by clamp: ix < img_width, iy < img_height"
+                            )]
+                            let v = unsafe { *img.data.get_unchecked(img_idx) };
+                            let pixel_off = row_off + dx as usize * 3;
                             data[pixel_off] = v;
                             data[pixel_off + 1] = v;
                             data[pixel_off + 2] = v;
                         }
                     }
                     ImageColorSpace::Mask => {
-                        // 0x00 = paint with fill colour; any other value = transparent.
-                        if img.data.get(img_idx) == Some(&0x00) {
-                            data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
+                        for dx in bx0..bx1 {
+                            let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
+                            ix_fp = ix_fp.wrapping_add(ix_step_fp);
+                            let img_idx = row_base + ix;
+                            // SAFETY: same bounds proof as RGB arm.
+                            #[expect(
+                                unsafe_code,
+                                reason = "bounds proven by clamp: ix < img_width, iy < img_height"
+                            )]
+                            if unsafe { *img.data.get_unchecked(img_idx) } == 0x00 {
+                                let pixel_off = row_off + dx as usize * 3;
+                                data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
+                            }
+                        }
+                    }
+                }
+
+                // Suppress unused-variable warning in non-GPU builds.
+                let _ = img_max_y;
+            }
+        } else {
+            // General path: arbitrary affine CTM (rotation, shear, non-axis-aligned scale).
+            for dy in by0..by1 {
+                let dy_pdf = page_h - f64::from(dy);
+                let dy_rel = dy_pdf - f;
+                // Precompute the row-constant parts of the u/v formulas.
+                let u_row = (-c * dy_rel) * inv_det;
+                let v_row = (a * dy_rel) * inv_det;
+                for dx in bx0..bx1 {
+                    let dx_rel = f64::from(dx) - e;
+                    // Image-space coordinates ∈ [0, 1]; clamp to guard edges.
+                    let u = (d * dx_rel).mul_add(inv_det, u_row).clamp(0.0, 1.0);
+                    let v = ((-b) * dx_rel).mul_add(inv_det, v_row).clamp(0.0, 1.0);
+
+                    let ix = (u * img_w).min(img_w - 1.0) as usize;
+                    let iy = ((1.0 - v) * img_h).min(img_h - 1.0) as usize;
+                    let img_idx = iy * img_width_usize + ix;
+
+                    if img
+                        .smask
+                        .as_deref()
+                        .is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0)
+                    {
+                        continue;
+                    }
+
+                    let pixel_off = dy as usize * stride + dx as usize * 3;
+
+                    match img.color_space {
+                        ImageColorSpace::Rgb => {
+                            let src = img_idx * 3;
+                            if let Some(rgb) = img.data.get(src..src + 3) {
+                                data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
+                            }
+                        }
+                        ImageColorSpace::Gray => {
+                            if let Some(&v) = img.data.get(img_idx) {
+                                data[pixel_off] = v;
+                                data[pixel_off + 1] = v;
+                                data[pixel_off + 2] = v;
+                            }
+                        }
+                        ImageColorSpace::Mask => {
+                            if img.data.get(img_idx) == Some(&0x00) {
+                                data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
+                            }
                         }
                     }
                 }
