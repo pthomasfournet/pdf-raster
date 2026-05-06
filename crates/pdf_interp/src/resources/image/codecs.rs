@@ -31,6 +31,52 @@ use gpu::GpuCtx;
 #[cfg(feature = "gpu-icc")]
 use super::icc::{self, IccClutCache};
 
+// ── JPEG SOF peek ─────────────────────────────────────────────────────────────
+
+/// Scan `data` for the first JPEG SOF marker and return the component count
+/// (`Nf` field). Returns `None` if `data` is not a valid JPEG or the SOF
+/// payload is too short. Zero allocations; stops at the first SOF found.
+///
+/// This avoids a full header-decode probe pass to determine the component count
+/// before calling the main decode. The `gpu` crate has the same logic but is an
+/// optional dependency (requires CUDA at link time), so we replicate the tiny
+/// scan here for the unconditional CPU path.
+fn jpeg_sof_components(data: &[u8]) -> Option<u8> {
+    if data.get(0..2) != Some(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut pos = 2usize;
+    loop {
+        let ff_start = pos;
+        while data.get(pos).copied() == Some(0xFF) {
+            pos += 1;
+        }
+        if pos == ff_start {
+            return None;
+        }
+        let &marker = data.get(pos)?;
+        pos += 1;
+        if matches!(marker, 0x01 | 0xD0..=0xD9) {
+            continue;
+        }
+        let hi = *data.get(pos)?;
+        let lo = *data.get(pos + 1)?;
+        let seg_len = ((hi as usize) << 8) | (lo as usize);
+        if seg_len < 2 {
+            return None;
+        }
+        // SOF markers carry the component count at payload offset +5 (after P, Y, X).
+        // Layout: length(2) P(1) Y(2) X(2) Nf(1) → Nf at pos+7.
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xCC) {
+            return data.get(pos + 7).copied();
+        }
+        if marker == 0xDA {
+            return None;
+        }
+        pos = pos.checked_add(seg_len)?;
+    }
+}
+
 // ── CCITTFaxDecode ─────────────────────────────────────────────────────────────
 
 /// Decode a `CCITTFaxDecode` stream.
@@ -381,6 +427,9 @@ pub(super) fn decode_dct(
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
     let area = pdf_w.saturating_mul(pdf_h);
 
+    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
+    let area = pdf_w.saturating_mul(pdf_h);
+
     // Peek at the JPEG SOF marker to route to the correct decoder.
     // Prevents sending progressive JPEG to VA-API (baseline-only).
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
@@ -414,24 +463,26 @@ pub(super) fn decode_dct(
     }
 
     // ── CPU path ──────────────────────────────────────────────────────────────
-    // First pass: decode only the JPEG headers to learn the component count,
-    // which determines the output colourspace we request on the second decode.
-    // Two passes are necessary because the decoder requires the output colourspace
-    // to be set before `decode()` is called.
-    let mut probe = JpegDecoder::new(ZCursor::new(data));
-    probe.decode_headers().ok()?;
-    let components = probe.info()?.components;
+    // SOF peek gives us the component count with zero decoder overhead, removing
+    // the old header-only probe pass that preceded every full decode.
+    let components = match jpeg_sof_components(data) {
+        Some(n @ (1 | 3 | 4)) => n,
+        Some(n) => {
+            log::warn!("image: DCTDecode: unexpected component count {n}");
+            return None;
+        }
+        None => {
+            log::warn!("image: DCTDecode: not a valid JPEG stream");
+            return None;
+        }
+    };
 
     // Choose the output colorspace to request from the decoder.
     let out_cs = match components {
         1 => ZColorSpace::Luma,
         3 => ZColorSpace::RGB,
         // CMYK — request raw CMYK output (4 bytes/pixel), convert to RGB below.
-        4 => ZColorSpace::CMYK,
-        n => {
-            log::warn!("image: DCTDecode: unexpected component count {n}");
-            return None;
-        }
+        _ => ZColorSpace::CMYK,
     };
 
     let options = DecoderOptions::default().jpeg_set_out_colorspace(out_cs);

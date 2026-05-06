@@ -11,14 +11,24 @@ pub enum JpegVariant {
     Other,
 }
 
-/// Peek into `data` and return the JPEG coding variant.
+/// SOF marker information extracted in a single zero-allocation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JpegSof {
+    /// Coding variant determined by the SOF marker byte.
+    pub variant: JpegVariant,
+    /// Number of image components (1 = grayscale, 3 = YCbCr/RGB, 4 = CMYK).
+    /// `0` means the SOF payload was too short to read the field.
+    pub components: u8,
+}
+
+/// Peek into `data` and return SOF variant + component count.
 ///
 /// Returns `None` only if `data` does not start with a valid JPEG SOI marker
-/// (`0xFF 0xD8`). Returns `Some(Other)` for any malformed content encountered
-/// after the SOI, or when no SOF marker is found before the stream is exhausted.
+/// (`0xFF 0xD8`). Returns `Some` with `variant = Other` for any malformed
+/// content encountered after the SOI, or when no SOF marker is found.
 /// Zero allocations; stops scanning at the first SOF marker found.
 #[must_use]
-pub fn jpeg_sof_type(data: &[u8]) -> Option<JpegVariant> {
+pub fn jpeg_sof_info(data: &[u8]) -> Option<JpegSof> {
     if data.get(0..2) != Some(&[0xFF, 0xD8]) {
         return None;
     }
@@ -31,12 +41,16 @@ pub fn jpeg_sof_type(data: &[u8]) -> Option<JpegVariant> {
             pos += 1;
         }
         if pos == ff_start {
-            // No 0xFF prefix found — not a valid marker position.
-            return Some(JpegVariant::Other);
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
         }
         let Some(&marker) = data.get(pos) else {
-            // Stream exhausted without finding a SOF marker.
-            return Some(JpegVariant::Other);
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
         };
         pos += 1;
 
@@ -47,34 +61,70 @@ pub fn jpeg_sof_type(data: &[u8]) -> Option<JpegVariant> {
 
         // Read the 2-byte segment length (includes the length field itself).
         let Some(&hi) = data.get(pos) else {
-            return Some(JpegVariant::Other);
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
         };
         let Some(&lo) = data.get(pos + 1) else {
-            return Some(JpegVariant::Other);
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
         };
         let seg_len = ((hi as usize) << 8) | (lo as usize);
         if seg_len < 2 {
-            return Some(JpegVariant::Other); // malformed
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
+        }
+
+        // SOS signals end of the header section; no SOF will appear after this.
+        if marker == 0xDA {
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
         }
 
         // SOF markers: 0xC0–0xCF excluding DHT (0xC4) and DAC (0xCC).
-        match marker {
-            0xC0 => return Some(JpegVariant::Baseline),
-            0xC2 | 0xCA => return Some(JpegVariant::Progressive),
-            0xC1 | 0xC3 | 0xC5..=0xC7 | 0xC9 | 0xCB | 0xCD..=0xCF => {
-                return Some(JpegVariant::Other);
-            }
-            // SOS signals end of header section; no SOF will appear after this.
-            0xDA => return Some(JpegVariant::Other),
-            _ => {}
+        // SOF payload layout: P(1) Y(2) X(2) Nf(1) → component count at offset +5
+        // from the start of the payload (i.e. data[pos + 2 + 5] = data[pos + 7]).
+        let variant = match marker {
+            0xC0 => Some(JpegVariant::Baseline),
+            0xC2 | 0xCA => Some(JpegVariant::Progressive),
+            0xC1 | 0xC3 | 0xC5..=0xC7 | 0xC9 | 0xCB | 0xCD..=0xCF => Some(JpegVariant::Other),
+            _ => None,
+        };
+
+        if let Some(variant) = variant {
+            // pos points at the length field; payload starts at pos+2.
+            // SOF payload: P(1) Y(2) X(2) Nf(1) → Nf is at pos+2+5 = pos+7.
+            let components = data.get(pos + 7).copied().unwrap_or(0);
+            return Some(JpegSof {
+                variant,
+                components,
+            });
         }
 
         // Skip over this segment's payload.
         let Some(new_pos) = pos.checked_add(seg_len) else {
-            return Some(JpegVariant::Other);
+            return Some(JpegSof {
+                variant: JpegVariant::Other,
+                components: 0,
+            });
         };
         pos = new_pos;
     }
+}
+
+/// Peek into `data` and return the JPEG coding variant.
+///
+/// Thin wrapper around [`jpeg_sof_info`] for callers that only need the variant.
+#[must_use]
+pub fn jpeg_sof_type(data: &[u8]) -> Option<JpegVariant> {
+    jpeg_sof_info(data).map(|s| s.variant)
 }
 
 #[cfg(test)]
@@ -190,5 +240,35 @@ mod tests {
         data.extend_from_slice(&[0xFF, 0xD9]);
         // No SOF found → Other
         assert_eq!(jpeg_sof_type(&data), Some(JpegVariant::Other));
+    }
+
+    #[test]
+    fn jpeg_sof_info_returns_component_count() {
+        // SOF0 payload: P(1)=8, Y(2)=0x00,0x10, X(2)=0x00,0x10, Nf(1)=3 → RGB
+        let payload = [8u8, 0x00, 0x10, 0x00, 0x10, 3];
+        let data = make_jpeg(0xC0, &payload);
+        let sof = jpeg_sof_info(&data).unwrap();
+        assert_eq!(sof.variant, JpegVariant::Baseline);
+        assert_eq!(sof.components, 3);
+    }
+
+    #[test]
+    fn jpeg_sof_info_grayscale() {
+        let payload = [8u8, 0x00, 0x10, 0x00, 0x10, 1];
+        let data = make_jpeg(0xC0, &payload);
+        let sof = jpeg_sof_info(&data).unwrap();
+        assert_eq!(sof.variant, JpegVariant::Baseline);
+        assert_eq!(sof.components, 1);
+    }
+
+    #[test]
+    fn jpeg_sof_info_stream_ends_before_nf_returns_zero_components() {
+        // SOI + SOF0 length field + 4 payload bytes, then EOF (no EOI).
+        // data[pos+7] is past end of slice → get() returns None → components=0.
+        // Bytes: FF D8 FF C0 00 06 08 00 10 00  (10 bytes, truncated before Nf)
+        let data = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x06, 0x08, 0x00, 0x10, 0x00];
+        let sof = jpeg_sof_info(&data).unwrap();
+        assert_eq!(sof.variant, JpegVariant::Baseline);
+        assert_eq!(sof.components, 0);
     }
 }

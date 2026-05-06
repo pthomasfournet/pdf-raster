@@ -37,7 +37,7 @@ pub use composite::{apply_soft_mask_cpu, composite_rgba8_cpu};
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub use decode_queue::{DecodeQueue, JpegQueueHandle};
 pub use fill::{TileRecord, aa_fill_cpu, build_tile_records};
-pub use jpeg_sof::{JpegVariant, jpeg_sof_type};
+pub use jpeg_sof::{JpegSof, JpegVariant, jpeg_sof_info, jpeg_sof_type};
 pub use traits::{DecodedImage, GpuCompute, GpuDecodeError, GpuJpeg2kDecoder, GpuJpegDecoder};
 
 #[cfg(feature = "nvjpeg")]
