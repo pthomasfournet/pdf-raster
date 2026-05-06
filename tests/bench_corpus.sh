@@ -1,18 +1,14 @@
 #!/bin/bash
-# Benchmark all corpus PDFs against pdftoppm at 150 DPI.
+# Benchmark pdf-raster across all corpus PDFs.
 #
 # Usage:
 #   bench_corpus.sh [--backend cpu|vaapi|cuda] [--vaapi-device /dev/dri/renderD129]
 #                   [--runs N] [--warmup N] [--corpus-dir <path>]
 #
-# For each corpus PDF, runs pdf-raster and pdftoppm under hyperfine (statistical
-# multi-run timing), captures CPU utilisation (mpstat) and disk throughput
-# (iostat) during each run, and reports:
+# Reports per-corpus: hyperfine mean ± stddev, avg CPU%, peak CPU%, disk MB/s.
+# Flags contaminated runs automatically (high stddev, low CPU utilisation).
 #
-#   mean ± stddev  cpu_avg%  cpu_peak%  disk_read MB/s  speedup
-#
-# This catches contaminated runs: a high stddev or low cpu_avg% on a corpus
-# that should saturate all threads means background activity is interfering.
+# For comparison against pdftoppm, use tests/bench_compare.sh.
 #
 # Requirements: hyperfine, mpstat (sysstat), iostat (sysstat), python3
 # Recommended:  kernel.perf_event_paranoid=1 (set via /etc/sysctl.d/60-perf-profiling.conf)
@@ -40,97 +36,90 @@ done
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 [[ -x "$BIN" ]] || { echo "ERROR: binary not found or not executable: $BIN" >&2; exit 1; }
-command -v hyperfine >/dev/null || { echo "ERROR: hyperfine not found — install with: cargo install hyperfine" >&2; exit 1; }
-command -v mpstat    >/dev/null || { echo "ERROR: mpstat not found — install with: sudo apt install sysstat" >&2; exit 1; }
-command -v iostat    >/dev/null || { echo "ERROR: iostat not found — install with: sudo apt install sysstat" >&2; exit 1; }
-if [[ "$BACKEND" != "vaapi" ]]; then
-  command -v pdftoppm >/dev/null || { echo "ERROR: pdftoppm not found in PATH" >&2; exit 1; }
-fi
+command -v hyperfine >/dev/null || { echo "ERROR: hyperfine not found — install: cargo install hyperfine" >&2; exit 1; }
+command -v mpstat    >/dev/null || { echo "ERROR: mpstat not found — install: sudo apt install sysstat" >&2; exit 1; }
+command -v iostat    >/dev/null || { echo "ERROR: iostat not found — install: sudo apt install sysstat" >&2; exit 1; }
 
-# ── Pre-flight: disk space ────────────────────────────────────────────────────
-check_disk() {
-  local dir="$1" min_kb=1048576
-  local avail_kb
-  avail_kb=$(df --output=avail -k "$dir" 2>/dev/null | tail -1)
-  if [[ -z "$avail_kb" || "$avail_kb" -lt "$min_kb" ]]; then
-    echo "ERROR: less than 1 GB free on $(df --output=target "$dir" | tail -1) — aborting" >&2
-    exit 1
-  fi
-}
-
-# ── Pre-flight: warn if perf_event_paranoid blocks profiling ─────────────────
+# ── Pre-flight: perf_event_paranoid ──────────────────────────────────────────
 PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "unknown")
 if [[ "$PARANOID" != "1" && "$PARANOID" != "0" && "$PARANOID" != "-1" ]]; then
-  echo "WARN: kernel.perf_event_paranoid=$PARANOID — perf/flamegraph unavailable." >&2
-  echo "      Fix permanently: echo 'kernel.perf_event_paranoid = 1' | sudo tee /etc/sysctl.d/60-perf-profiling.conf && sudo sysctl -p /etc/sysctl.d/60-perf-profiling.conf" >&2
+  echo "WARN: kernel.perf_event_paranoid=$PARANOID — perf/flamegraph blocked." >&2
+  echo "      Fix: echo 'kernel.perf_event_paranoid = 1' | sudo tee /etc/sysctl.d/60-perf-profiling.conf" >&2
 fi
 
 # ── Pre-flight: system load gate ─────────────────────────────────────────────
-# Refuse to run if 1-min load average exceeds 2× the number of physical cores.
-# A contaminated system produces meaningless numbers and wastes 30+ minutes.
+# Refuse to run if 1-min load > 2× core count — contaminated system wastes 30+ min.
 NCORES=$(nproc)
 LOAD1=$(cut -d' ' -f1 /proc/loadavg)
 LOAD_INT=$(echo "$LOAD1" | awk '{print int($1)}')
 if [[ "$LOAD_INT" -gt $((NCORES * 2)) ]]; then
-  echo "ERROR: system load ($LOAD1) is too high for reliable benchmarking (threshold: $((NCORES*2)))." >&2
-  echo "       Wait for background activity to settle before running benchmarks." >&2
+  echo "ERROR: load ($LOAD1) too high — threshold $((NCORES*2)). Wait for system to settle." >&2
   exit 1
 fi
 
+# ── Pre-flight: disk space ────────────────────────────────────────────────────
+check_disk() {
+  local avail_kb
+  avail_kb=$(df --output=avail -k /tmp 2>/dev/null | tail -1)
+  if [[ -z "$avail_kb" || "$avail_kb" -lt 1048576 ]]; then
+    echo "ERROR: less than 1 GB free on /tmp — aborting" >&2; exit 1
+  fi
+}
+
 # ── Cache eviction ────────────────────────────────────────────────────────────
-# posix_fadvise(FADV_DONTNEED) evicts the file from the OS page cache without root.
+# posix_fadvise(FADV_DONTNEED=4) evicts without root.
 evict_file() {
   python3 -c "
 import ctypes, os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)
 ctypes.CDLL(None).posix_fadvise(fd, 0, os.fstat(fd).st_size, 4)
 os.close(fd)
-" "$1" 2>/dev/null || echo "WARN: cache eviction failed for $1 (non-fatal — run may be warm-cache)" >&2
+" "$1" 2>/dev/null || echo "WARN: cache eviction failed for $1 (run may be warm)" >&2
 }
 
 # ── Monitored single run ──────────────────────────────────────────────────────
-# Runs a command once while sampling mpstat + iostat in the background.
-# Prints: wall_ms cpu_avg cpu_peak iowait_avg disk_read_mb
+# Runs the command once with mpstat + iostat sampling in the background.
+# Stdout: wall_ms cpu_avg cpu_peak disk_read_mb
 monitored_run() {
-  local cmd=("$@")
-  local stats_f iostat_f
+  local stats_f iostat_f dev
   stats_f=$(mktemp)
   iostat_f=$(mktemp)
+  dev=$(df --output=source /tmp | tail -1 | sed 's|.*/||')
 
-  # Detect the storage device backing /tmp (where output goes)
-  local dev
-  dev=$(df --output=source /tmp | tail -1 | sed 's|/dev/||')
-
-  mpstat -P ALL 1 9999 > "$stats_f"  2>/dev/null &
+  mpstat -P ALL 1 9999 > "$stats_f" 2>/dev/null &
   local mpstat_pid=$!
   iostat -d -m "$dev" 1 9999 > "$iostat_f" 2>/dev/null &
   local iostat_pid=$!
 
-  sleep 0.3  # let samplers emit a baseline sample
+  sleep 0.3  # let samplers emit one baseline interval
 
   local t0 t1
   t0=$(date +%s%3N)
-  "${cmd[@]}"
+  "$@" > /dev/null 2>&1
   t1=$(date +%s%3N)
+  local wall=$(( t1 - t0 ))
 
   sleep 0.3  # capture trailing samples
   kill "$mpstat_pid" "$iostat_pid" 2>/dev/null
   wait "$mpstat_pid" "$iostat_pid" 2>/dev/null || true
 
-  local wall=$(( t1 - t0 ))
-
-  # mpstat: parse all-CPU rows (field 2 == "all"), compute util = 100 - %idle (last field)
+  # mpstat output: "HH:MM:SS AM/PM  all  %usr %nice %sys %iowait ... %idle"
+  # Match lines where the CPU column (field after timestamp) is "all".
+  # Timestamp format varies (12h with AM/PM = 3 fields; 24h = 2 fields) so
+  # match on the "all" token appearing anywhere before the numeric columns.
   local cpu_avg cpu_peak
   read -r cpu_avg cpu_peak < <(awk '
-    /^[0-9]/ && $2=="all" {
-      util = 100 - $NF
-      if (util > peak) peak = util
-      sum += util; n++
+    /[[:space:]]all[[:space:]]/ {
+      idle = $NF + 0
+      if (idle > 0 && idle <= 100) {
+        util = 100 - idle
+        if (util > peak) peak = util
+        sum += util; n++
+      }
     }
-    END { if (n>0) printf "%.0f %.0f", sum/n, peak; else print "0 0" }
+    END { if (n > 0) printf "%.0f %.0f", sum/n, peak; else print "0 0" }
   ' "$stats_f")
 
-  # iostat: average MB/s read on the detected device
   local disk_read
   disk_read=$(awk -v d="$dev" '$1==d {sum+=$3; n++} END {if(n>0) printf "%.0f", sum/n; else print "0"}' "$iostat_f")
 
@@ -138,23 +127,26 @@ monitored_run() {
   echo "$wall $cpu_avg $cpu_peak $disk_read"
 }
 
-# ── Hyperfine timing (mean ± stddev) ─────────────────────────────────────────
-# Returns "mean_ms stddev_ms" parsed from hyperfine JSON output.
+# ── Hyperfine mean ± stddev ───────────────────────────────────────────────────
+# hyperfine_ms PREPARE_CMD BENCH_CMD  →  prints "mean_ms stddev_ms"
+# Uses a temp JSON file; /dev/stdout is unreliable (hyperfine also writes there).
 hyperfine_ms() {
-  local json
-  json=$(hyperfine --runs "$RUNS" --warmup "$WARMUP" \
-    --export-json /dev/stdout --output null \
-    -- "$@" 2>/dev/null)
-  echo "$json" | python3 -c "
+  local prepare_cmd="$1" bench_cmd="$2" json_f
+  json_f=$(mktemp --suffix=.json)
+  hyperfine --runs "$RUNS" --warmup "$WARMUP" \
+    --prepare "$prepare_cmd" \
+    --export-json "$json_f" \
+    -- "$bench_cmd" > /dev/null 2>&1
+  python3 - "$json_f" <<'EOF'
 import json, sys
-r = json.load(sys.stdin)['results'][0]
-mean_ms   = r['mean']   * 1000
-stddev_ms = r['stddev'] * 1000
-print(f'{mean_ms:.0f} {stddev_ms:.0f}')
-"
+with open(sys.argv[1]) as f:
+    r = json.load(f)['results'][0]
+print(f"{r['mean']*1000:.0f} {r['stddev']*1000:.0f}")
+EOF
+  rm -f "$json_f"
 }
 
-# ── Build argument lists ──────────────────────────────────────────────────────
+# ── Argument list for pdf-raster ─────────────────────────────────────────────
 PDF_RASTER_ARGS=(--backend "$BACKEND" -r 150)
 [[ "$BACKEND" == "vaapi" ]] && PDF_RASTER_ARGS+=(--vaapi-device "$VAAPI_DEVICE")
 
@@ -173,111 +165,64 @@ corpora=(
 )
 
 # ── Header ────────────────────────────────────────────────────────────────────
-REF_LABEL="pdftoppm"
-[[ "$BACKEND" == "vaapi" ]] && REF_LABEL="cpu-only"
+printf "\nSystem: load=%-5s  cores=%d  perf_paranoid=%s\n" "$LOAD1" "$NCORES" "$PARANOID"
+printf "Binary: %s  backend=%s\n" "$BIN" "$BACKEND"
+printf "Runs:   %d (warmup %d) — hyperfine mean±σ + mpstat/iostat\n\n" "$RUNS" "$WARMUP"
 
-printf "\nSystem: load=%-5s cores=%d  perf_paranoid=%s\n" "$LOAD1" "$NCORES" "$PARANOID"
-printf "Binary: %s\n" "$BIN"
-printf "Runs:   %d (warmup %d) via hyperfine + mpstat/iostat monitoring\n\n" "$RUNS" "$WARMUP"
+printf "%-32s  %18s  %8s  %8s  %9s  %s\n" \
+  "corpus" "mean ± σ" "cpu avg" "cpu peak" "disk MB/s" "flags"
+printf "%-32s  %18s  %8s  %8s  %9s\n" \
+  "------" "--------" "-------" "--------" "---------"
 
-printf "%-32s  %18s  %8s  %8s  %8s  %10s  %10s\n" \
-  "PDF" "pdf-raster mean±σ" "cpu avg" "cpu peak" "disk MB/s" "$REF_LABEL" "speedup"
-printf "%-32s  %18s  %8s  %8s  %8s  %10s  %10s\n" \
-  "---" "-----------------" "-------" "--------" "---------" "----------" "-------"
-
-# ── Per-corpus run ────────────────────────────────────────────────────────────
+# ── Per-corpus ────────────────────────────────────────────────────────────────
 for name in "${corpora[@]}"; do
   pdf="$FIXTURES/corpus-${name}.pdf"
   if [[ ! -f "$pdf" ]]; then
-    echo "SKIP: corpus-${name}.pdf not found" >&2
+    printf "SKIP  %-32s  (file not found)\n" "$name" >&2
     continue
   fi
 
-  check_disk /tmp
+  check_disk
 
-  # ── pdf-raster: cold-cache monitored run for CPU/disk metrics ──
+  # Cold-cache monitored run — captures CPU% and disk MB/s for this corpus.
   evict_file "$pdf"
-  OUTDIR=$(mktemp -d -p /tmp)
+  mon_outdir=$(mktemp -d -p /tmp)
   read -r mon_wall mon_cpu_avg mon_cpu_peak mon_disk < <(
-    monitored_run "$BIN" "${PDF_RASTER_ARGS[@]}" "$pdf" "$OUTDIR/" > /dev/null 2>&1
-  ) || { rm -rf "$OUTDIR"; echo "ERROR: monitored run failed for $name" >&2; exit 1; }
-  rm -rf "$OUTDIR"
+    monitored_run "$BIN" "${PDF_RASTER_ARGS[@]}" "$pdf" "$mon_outdir/"
+  ) || { rm -rf "$mon_outdir"; echo "ERROR: monitored run failed for $name" >&2; exit 1; }
+  rm -rf "$mon_outdir"
 
-  # ── pdf-raster: hyperfine for stable mean ± stddev ──
-  # Warmup runs serve as additional cache-eviction; we rely on hyperfine's
-  # --warmup to prime the binary's startup path, not the file cache.
-  evict_file "$pdf"
-  HYPERFINE_PREPARE="$(which python3) -c \"
-import ctypes,os,sys; fd=os.open('$pdf',os.O_RDONLY); ctypes.CDLL(None).posix_fadvise(fd,0,os.fstat(fd).st_size,4); os.close(fd)
-\""
-  OUTDIR=$(mktemp -d -p /tmp)
-  read -r mean1 stddev1 < <(
-    hyperfine --runs "$RUNS" --warmup "$WARMUP" \
-      --prepare "$HYPERFINE_PREPARE" \
-      --export-json /dev/stdout --output null \
-      -- "$BIN ${PDF_RASTER_ARGS[*]} '$pdf' '$OUTDIR/r'" 2>/dev/null \
-    | python3 -c "
-import json,sys
-r=json.load(sys.stdin)['results'][0]
-print(f\"{r['mean']*1000:.0f} {r['stddev']*1000:.0f}\")
-"
-  ) || { rm -rf "$OUTDIR"; echo "ERROR: hyperfine failed for $name" >&2; exit 1; }
-  rm -rf "$OUTDIR"
+  # Hyperfine: cold-cache eviction before each run via --prepare.
+  PREPARE="$(which python3) -c \"import ctypes,os,sys; fd=os.open('$pdf',os.O_RDONLY); ctypes.CDLL(None).posix_fadvise(fd,0,os.fstat(fd).st_size,4); os.close(fd)\""
+  hf_outdir=$(mktemp -d -p /tmp)
+  read -r mean_ms stddev_ms < <(
+    hyperfine_ms "$PREPARE" "$BIN ${PDF_RASTER_ARGS[*]} '$pdf' '$hf_outdir/r'"
+  ) || { rm -rf "$hf_outdir"; echo "ERROR: hyperfine failed for $name" >&2; exit 1; }
+  rm -rf "$hf_outdir"
 
-  # ── reference (pdftoppm or cpu-only baseline) ──
-  evict_file "$pdf"
-  OUTDIR=$(mktemp -d -p /tmp)
-  if [[ "$BACKEND" == "vaapi" ]]; then
-    read -r mean2 _ < <(
-      hyperfine --runs "$RUNS" --warmup "$WARMUP" \
-        --prepare "$HYPERFINE_PREPARE" \
-        --export-json /dev/stdout --output null \
-        -- "$BIN --backend cpu -r 150 '$pdf' '$OUTDIR/c'" 2>/dev/null \
-      | python3 -c "
-import json,sys
-r=json.load(sys.stdin)['results'][0]
-print(f\"{r['mean']*1000:.0f} 0\")
-"
-    ) || { rm -rf "$OUTDIR"; echo "ERROR: hyperfine ref failed for $name" >&2; exit 1; }
-  else
-    read -r mean2 _ < <(
-      hyperfine --runs "$RUNS" --warmup "$WARMUP" \
-        --prepare "$HYPERFINE_PREPARE" \
-        --export-json /dev/stdout --output null \
-        -- "pdftoppm -r 150 '$pdf' '$OUTDIR/p'" 2>/dev/null \
-      | python3 -c "
-import json,sys
-r=json.load(sys.stdin)['results'][0]
-print(f\"{r['mean']*1000:.0f} 0\")
-"
-    ) || { rm -rf "$OUTDIR"; echo "ERROR: hyperfine ref failed for $name" >&2; exit 1; }
-  fi
-  rm -rf "$OUTDIR"
+  # ── Quality flags ─────────────────────────────────────────────────────────
+  flags=""
+  stddev_pct=$(awk "BEGIN{printf \"%.0f\", ($mean_ms>0) ? 100*$stddev_ms/$mean_ms : 0}")
+  [[ "$stddev_pct" -gt 15 ]] && flags+="[high-σ ${stddev_pct}%] "
 
-  [[ "$mean1" -le 0 ]] && { echo "ERROR: zero mean for $name" >&2; exit 1; }
-
-  speedup=$(awk "BEGIN{printf \"%.2fx\", $mean2/$mean1}")
-
-  # Flag suspect runs: stddev > 15% of mean, or cpu_avg < 30% on a multi-page corpus
-  flag=""
-  stddev_pct=$(awk "BEGIN{printf \"%.0f\", 100*$stddev1/$mean1}")
-  [[ "$stddev_pct" -gt 15 ]] && flag+="[high-σ] "
-  # Short corpora (01,02) legitimately have low CPU% due to startup dominance
-  pages=$(echo "$name" | cut -d'-' -f1)
-  [[ "$mon_cpu_avg" -lt 30 && "$pages" -gt 2 ]] && flag+="[low-cpu] "
-
-  # mon_wall is the single cold-cache wall time used to validate hyperfine mean
-  # (if mon_wall >> mean1 the monitored run was contaminated by a warm-cache effect
-  # on the hyperfine runs or vice versa; flag it so the reader can investigate)
-  if [[ "$mon_wall" -gt $((mean1 * 3)) ]]; then
-    flag+="[mon-wall=${mon_wall}ms>>mean] "
+  # Corpora 01-02 are short enough that startup overhead dominates CPU%;
+  # only flag low utilisation on corpora 03+.
+  corpus_num="${name:0:2}"
+  if [[ "$mon_cpu_avg" -lt 30 && "$corpus_num" -gt "02" ]]; then
+    flags+="[low-cpu ${mon_cpu_avg}%] "
   fi
 
-  printf "%-32s  %9dms ±%4dms  %7s%%  %7s%%  %7s MB/s  %9dms  %9s  %s\n" \
-    "$name" "$mean1" "$stddev1" "$mon_cpu_avg" "$mon_cpu_peak" "$mon_disk" \
-    "$mean2" "$speedup" "$flag"
+  # Flag if the cold single-run is >3× slower than the hyperfine mean —
+  # suggests the monitored run hit unusual I/O or scheduling pressure.
+  if [[ "$mon_wall" -gt $((mean_ms * 3)) ]]; then
+    flags+="[cold=${mon_wall}ms>>mean] "
+  fi
+
+  printf "%-32s  %9dms ±%5dms  %7s%%  %7s%%  %8s MB/s  %s\n" \
+    "$name" "$mean_ms" "$stddev_ms" "$mon_cpu_avg" "$mon_cpu_peak" "$mon_disk" "$flags"
 done
 
-echo ""
-echo "Flags: [high-σ] = stddev > 15% of mean (background interference likely)"
-echo "       [low-cpu] = avg CPU < 30% on multi-page corpus (allocator/IO contention?)"
+printf "\nFlags:\n"
+printf "  [high-σ N%%]    stddev > 15%% of mean — background interference likely\n"
+printf "  [low-cpu N%%]   avg CPU < 30%% on multi-page corpus — contention or I/O bound\n"
+printf "  [cold=Nms>>mean] cold-cache single run >> hyperfine mean — scheduling outlier\n"
