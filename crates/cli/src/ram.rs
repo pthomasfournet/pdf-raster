@@ -70,17 +70,19 @@ impl Drop for RamDirGuard {
 }
 
 /// Per-page write-target policy: RAM (the tmpfs dir) or disk (the user's
-/// original `OUTPUT_PREFIX` location). When `--ram` is off, this always
-/// returns the original disk prefix (the policy is a no-op).
+/// original `OUTPUT_PREFIX` location). When `--ram` is off, this still wraps
+/// the user's prefix and is a no-op — `ram_prefix == disk_prefix` so every
+/// page lands on disk regardless of memory conditions.
 ///
-/// Cloning is cheap — the inner state is `Arc`-like (atomics + a Mutex on
-/// the cached probe). One instance is shared across all worker threads.
+/// One instance is shared across all worker threads via a borrowed reference;
+/// the inner state (atomics + mutex) is cheap to read concurrently.
 pub struct SpillPolicy {
-    /// `Some` when --ram is active. `(ram_prefix, disk_prefix)`.
-    targets: Option<(String, String)>,
+    /// `(ram_prefix, disk_prefix)`. When `--ram` is off both slots hold the
+    /// user's original prefix and `next_prefix` short-circuits.
+    targets: (String, String),
     /// Cached `MemAvailable` reading + when it was taken. Refreshed on TTL
-    /// expiry; the lock is contended only while reading the cached value
-    /// is older than [`PROBE_TTL`].
+    /// expiry; the lock is contended only when the cached value is older
+    /// than [`PROBE_TTL`].
     probe: Mutex<MemoryProbe>,
     /// Latched once we spill the first page so the warning prints exactly
     /// once across all worker threads.
@@ -92,9 +94,9 @@ impl SpillPolicy {
     /// when `--ram` is off — keeps the renderer-side API uniform).
     fn passthrough(disk_prefix: String) -> Self {
         Self {
-            // Both slots hold the user's prefix; next_prefix() will return
-            // it regardless of memory conditions because they're equal.
-            targets: Some((disk_prefix.clone(), disk_prefix)),
+            // Both slots hold the user's prefix; next_prefix() returns it
+            // unconditionally because the equality check below short-circuits.
+            targets: (disk_prefix.clone(), disk_prefix),
             probe: Mutex::new(MemoryProbe::new()),
             spill_announced: AtomicBool::new(false),
         }
@@ -105,15 +107,11 @@ impl SpillPolicy {
     /// while free RAM is comfortable, `disk_prefix` once it tightens.
     #[must_use]
     pub fn next_prefix(&self) -> &str {
-        let Some((ram_prefix, disk_prefix)) = &self.targets else {
-            // Defensive: targets is always Some after construction. An empty
-            // string here is preferable to a panic — the caller's open() will
-            // fail with a clear ENOENT.
-            return "";
-        };
+        let (ram_prefix, disk_prefix) = &self.targets;
 
-        // Fast path: passthrough policy has equal prefixes; skip the probe.
-        if std::ptr::eq(ram_prefix.as_str(), disk_prefix.as_str()) || ram_prefix == disk_prefix {
+        // Passthrough fast path: --ram off means both prefixes are equal,
+        // so skip the memory probe entirely.
+        if ram_prefix == disk_prefix {
             return ram_prefix;
         }
 
@@ -201,17 +199,38 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
     let original_prefix = args.output_prefix.clone();
 
     if !args.ram {
+        if args.ram_path.is_some() {
+            eprintln!("pdf-raster: warning: --ram-path has no effect without --ram");
+        }
         return Ok((
             RamDirGuard { dir: None },
             SpillPolicy::passthrough(original_prefix),
         ));
     }
 
-    let dir = args
-        .ram_path
-        .as_ref()
-        .map_or_else(default_ram_dir, PathBuf::from);
-    fs::create_dir_all(&dir)?;
+    // Auto-generated paths use create_dir_all (parent dirs may need creation
+    // on exotic /dev/shm setups). User-supplied --ram-path uses create_dir so
+    // pre-existing dirs surface as a warning rather than silently mixing the
+    // user's pages with leftover files from a previous crashed run.
+    let dir = if let Some(p) = &args.ram_path {
+        let dir = PathBuf::from(p);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!(
+                    "pdf-raster: warning: --ram-path {} already exists; \
+                     leftover files will be removed alongside this run's output",
+                    dir.display()
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        dir
+    } else {
+        let dir = default_ram_dir();
+        fs::create_dir_all(&dir)?;
+        dir
+    };
 
     // Preserve the basename of the user's prefix as the file stem inside the
     // tmpfs dir so naming stays predictable. Falls back to "out" if the user
@@ -238,7 +257,7 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
     Ok((
         RamDirGuard { dir: Some(dir) },
         SpillPolicy {
-            targets: Some((ram_prefix, original_prefix)),
+            targets: (ram_prefix, original_prefix),
             probe: Mutex::new(MemoryProbe::new()),
             spill_announced: AtomicBool::new(false),
         },
