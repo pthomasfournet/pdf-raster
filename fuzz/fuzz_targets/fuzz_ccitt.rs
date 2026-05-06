@@ -31,7 +31,7 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Exercise the three K-dispatch paths explicitly.  parms=None only reaches K=0,
-    // so we must build synthetic lopdf Objects for the other two paths.
+    // so we must build synthetic pdf::Objects for the other two paths.
     match selector & 0b11 {
         // K=0: Group 3 1D — no parms needed (decode_ccitt defaults K=0).
         0 => {
