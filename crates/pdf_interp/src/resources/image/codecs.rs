@@ -9,7 +9,7 @@ use hayro_jbig2::Decoder as Jbig2Decoder;
 use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
 use pdf::{Document, Object};
 
-use super::{ImageColorSpace, ImageDescriptor, ImageFilter};
+use super::{ImageColorSpace, ImageData, ImageDescriptor, ImageFilter};
 use crate::resources::dict_ext::DictExt;
 
 // ── GPU JPEG acceleration (nvJPEG and/or VA-API) ──────────────────────────────
@@ -157,7 +157,7 @@ const fn ccitt_descriptor(p: &CcittParams, data: Vec<u8>) -> ImageDescriptor {
         width: p.width,
         height: p.height,
         color_space,
-        data,
+        data: ImageData::Cpu(data),
         smask: None,
         filter: ImageFilter::Raw,
     }
@@ -544,7 +544,7 @@ pub(super) fn decode_dct(
             width: jw,
             height: jh,
             color_space: ImageColorSpace::Gray,
-            data: pixels,
+            data: ImageData::Cpu(pixels),
             smask: None,
             filter: ImageFilter::Raw,
         }),
@@ -552,7 +552,7 @@ pub(super) fn decode_dct(
             width: jw,
             height: jh,
             color_space: ImageColorSpace::Rgb,
-            data: pixels,
+            data: ImageData::Cpu(pixels),
             smask: None,
             filter: ImageFilter::Raw,
         }),
@@ -575,7 +575,7 @@ pub(super) fn decode_dct(
                 width: jw,
                 height: jh,
                 color_space: ImageColorSpace::Rgb,
-                data: rgb,
+                data: ImageData::Cpu(rgb),
                 smask: None,
                 filter: ImageFilter::Raw,
             })
@@ -619,7 +619,7 @@ fn decode_dct_gpu_path<D: gpu::GpuJpegDecoder>(
         width: decoded.width,
         height: decoded.height,
         color_space,
-        data: decoded.data,
+        data: ImageData::Cpu(decoded.data),
         filter: ImageFilter::Raw,
         smask: None,
     })
@@ -661,7 +661,7 @@ fn decode_dct_queue_path(
         width: decoded.width,
         height: decoded.height,
         color_space,
-        data: decoded.data,
+        data: ImageData::Cpu(decoded.data),
         filter: ImageFilter::Raw,
         smask: None,
     })
@@ -940,7 +940,7 @@ fn decode_jpx_gpu(
         width: img.width,
         height: img.height,
         color_space,
-        data: img.data,
+        data: ImageData::Cpu(img.data),
         smask: None,
         filter: ImageFilter::Raw,
     })
@@ -953,7 +953,7 @@ pub(super) const fn jpx_gray(width: u32, height: u32, data: Vec<u8>) -> ImageDes
         width,
         height,
         color_space: ImageColorSpace::Gray,
-        data,
+        data: ImageData::Cpu(data),
         smask: None,
         filter: ImageFilter::Raw,
     }
@@ -966,7 +966,7 @@ pub(super) const fn jpx_rgb(width: u32, height: u32, data: Vec<u8>) -> ImageDesc
         width,
         height,
         color_space: ImageColorSpace::Rgb,
-        data,
+        data: ImageData::Cpu(data),
         smask: None,
         filter: ImageFilter::Raw,
     }
@@ -1055,7 +1055,7 @@ pub(super) fn decode_jbig2(
         width: jw,
         height: jh,
         color_space: cs,
-        data: collector.data,
+        data: ImageData::Cpu(collector.data),
         smask: None,
         filter: ImageFilter::Raw,
     })
@@ -1265,7 +1265,7 @@ mod tests {
             assert_eq!(img.color_space, ImageColorSpace::Gray);
             assert_eq!(img.width, 2);
             assert_eq!(img.height, 2);
-            assert_eq!(img.data, vec![128u8; 4]);
+            assert_eq!(img.data.as_cpu().unwrap(), &vec![128u8; 4]);
         }
 
         #[test]

@@ -215,6 +215,59 @@ impl ImageFilter {
 /// `PageRenderer`.  The const assert in that module enforces this at compile time.
 pub const IMAGE_FILTER_COUNT: usize = 6;
 
+/// Backing storage for decoded image pixels.
+///
+/// Today the only producer is CPU-side decode and the only consumer is the
+/// CPU blit path; both use [`ImageData::Cpu`].  Phase 9 introduces a `Gpu`
+/// variant for cache-managed VRAM allocations; that variant is added here
+/// (currently behind `#[non_exhaustive]` in spirit only) so subsequent
+/// tasks can produce it without re-touching every consumer.
+///
+/// Hot-path access goes through [`Self::as_cpu`] which returns
+/// `Option<&[u8]>` — `Some(&[..])` for the CPU variant, `None` for any
+/// future GPU variant where the bytes don't live in host memory.
+#[derive(Debug)]
+pub enum ImageData {
+    /// Host-resident pixel bytes — layout defined by [`ImageColorSpace`].
+    /// All decoders today produce this variant.
+    Cpu(Vec<u8>),
+}
+
+impl ImageData {
+    /// Borrow the host-resident pixel bytes if this is a CPU-backed image.
+    /// Returns `None` for variants whose pixels live in device memory.
+    #[must_use]
+    pub const fn as_cpu(&self) -> Option<&[u8]> {
+        match self {
+            Self::Cpu(bytes) => Some(bytes.as_slice()),
+        }
+    }
+
+    /// Mutable variant of [`Self::as_cpu`].  Used by the soft-mask pipeline
+    /// which post-processes alpha on a CPU-backed image after decode.
+    #[must_use]
+    pub const fn as_cpu_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            Self::Cpu(bytes) => Some(bytes),
+        }
+    }
+
+    /// Length in bytes of the underlying pixel storage.  Cheap for either
+    /// variant — no host memory access required for a future GPU variant.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Cpu(bytes) => bytes.len(),
+        }
+    }
+
+    /// Whether the underlying pixel storage is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Decoded image data, ready for blitting onto the page bitmap.
 ///
 /// See the module-level table for the exact byte layout per [`ImageColorSpace`].
@@ -226,8 +279,9 @@ pub struct ImageDescriptor {
     pub height: u32,
     /// Colour interpretation of `data`.
     pub color_space: ImageColorSpace,
-    /// Raw pixel bytes — layout defined by `color_space` (see module doc).
-    pub data: Vec<u8>,
+    /// Pixel storage — host or (in future) device-resident.  Layout defined
+    /// by `color_space` (see module doc).
+    pub data: ImageData,
     /// Optional soft-mask (`SMask`): one alpha byte per pixel, with exactly
     /// `width × height` entries matching the image grid.  `0x00` = fully
     /// transparent (pixel is skipped during blit); `0xFF` = fully opaque.

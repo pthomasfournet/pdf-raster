@@ -10,7 +10,7 @@ use pdf::{Dictionary, Document, Object};
 
 use super::bitpack::{downsample_16bpp, expand_nbpp, expand_nbpp_indexed, unpack_packed_bits};
 use super::colorspace::{ResolvedCs, indexed_palette, resolve_cs};
-use super::{ImageColorSpace, ImageDescriptor, ImageFilter};
+use super::{ImageColorSpace, ImageData, ImageDescriptor, ImageFilter};
 use crate::resources::dict_ext::DictExt as _;
 
 #[cfg(feature = "gpu-icc")]
@@ -199,7 +199,7 @@ fn decode_mask_raw(data: &[u8], width: u32, height: u32, bpc: i64) -> Option<Ima
                 width,
                 height,
                 color_space: ImageColorSpace::Mask,
-                data: pixels,
+                data: ImageData::Cpu(pixels),
                 smask: None,
                 filter: ImageFilter::Raw,
             })
@@ -217,7 +217,7 @@ fn decode_mask_raw(data: &[u8], width: u32, height: u32, bpc: i64) -> Option<Ima
                 width,
                 height,
                 color_space: ImageColorSpace::Mask,
-                data: data[..expected].to_vec(),
+                data: ImageData::Cpu(data[..expected].to_vec()),
                 smask: None,
                 filter: ImageFilter::Raw,
             })
@@ -273,7 +273,7 @@ fn decode_raw_8bpp(
             width,
             height,
             color_space: ImageColorSpace::Rgb,
-            data: rgb,
+            data: ImageData::Cpu(rgb),
             smask: None,
             filter: ImageFilter::Raw,
         })
@@ -282,7 +282,7 @@ fn decode_raw_8bpp(
             width,
             height,
             color_space: resolved.to_image_cs(),
-            data: raw.to_vec(),
+            data: ImageData::Cpu(raw.to_vec()),
             smask: None,
             filter: ImageFilter::Raw,
         })
@@ -355,7 +355,7 @@ fn decode_raw_indexed(
         width,
         height,
         color_space: out_cs.to_image_cs(),
-        data: out,
+        data: ImageData::Cpu(out),
         smask: None,
         filter: ImageFilter::Raw,
     })
@@ -407,7 +407,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Gray);
-        assert_eq!(desc.data, &[0, 128, 255]);
+        assert_eq!(desc.data.as_cpu().unwrap(), &[0, 128, 255]);
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
-        assert_eq!(desc.data, &[255, 255, 255]);
+        assert_eq!(desc.data.as_cpu().unwrap(), &[255, 255, 255]);
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Gray);
-        assert_eq!(desc.data, &[0xFF, 0x00]);
+        assert_eq!(desc.data.as_cpu().unwrap(), &[0xFF, 0x00]);
     }
 
     #[test]
@@ -555,6 +555,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
-        assert_eq!(desc.data, &[0xFF, 0xFF, 0x00]);
+        assert_eq!(desc.data.as_cpu().unwrap(), &[0xFF, 0xFF, 0x00]);
     }
 }

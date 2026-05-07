@@ -60,6 +60,8 @@ pub(super) fn decode_smask(
             let actual_h = sm_desc.height;
             let inverted: Vec<u8> = sm_desc
                 .data
+                .as_cpu()
+                .expect("CCITT decoder produces CPU-resident bytes")
                 .iter()
                 .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
                 .collect();
@@ -72,6 +74,8 @@ pub(super) fn decode_smask(
             let actual_h = sm_desc.height;
             let inverted: Vec<u8> = sm_desc
                 .data
+                .as_cpu()
+                .expect("JBIG2 decoder produces CPU-resident bytes")
                 .iter()
                 .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
                 .collect();

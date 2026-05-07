@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.color_space, ImageColorSpace::Gray);
-        assert_eq!(img.data, data.to_vec());
+        assert_eq!(img.data.as_cpu().unwrap(), &data.to_vec());
     }
 
     #[test]
@@ -545,9 +545,10 @@ mod tests {
         )
         .expect("decode should succeed");
         assert_eq!(img.color_space, ImageColorSpace::Mask);
+        let bytes = img.data.as_cpu().unwrap();
         // Expanded 1-bpp: bit 7 = 1 → 0xFF, bit 6 = 0 → 0x00
-        assert_eq!(img.data[0], 0xFF); // first pixel: transparent
-        assert_eq!(img.data[1], 0x00); // second pixel: paint
+        assert_eq!(bytes[0], 0xFF); // first pixel: transparent
+        assert_eq!(bytes[1], 0x00); // second pixel: paint
     }
 
     #[test]

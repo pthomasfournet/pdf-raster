@@ -1068,6 +1068,9 @@ impl<'doc> PageRenderer<'doc> {
         let img_w = f64::from(img.width);
         let img_h = f64::from(img.height);
         let img_width_usize = img.width as usize;
+        let img_bytes: &[u8] = img.data.as_cpu().expect(
+            "renderer blit requires CPU-resident image; GPU variant unreachable in legacy path",
+        );
 
         let data = self.bitmap.data_mut();
         let stride = self.width as usize * 3; // Rgb8: 3 bytes per pixel
@@ -1147,7 +1150,7 @@ impl<'doc> PageRenderer<'doc> {
                                 unsafe_code,
                                 reason = "bounds proven by clamp: ix < img_width, iy < img_height"
                             )]
-                            let rgb = unsafe { img.data.get_unchecked(src..src + 3) };
+                            let rgb = unsafe { img_bytes.get_unchecked(src..src + 3) };
                             let pixel_off = row_off + dx as usize * 3;
                             data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                         }
@@ -1165,7 +1168,7 @@ impl<'doc> PageRenderer<'doc> {
                                 unsafe_code,
                                 reason = "bounds proven by clamp: ix < img_width, iy < img_height"
                             )]
-                            let v = unsafe { *img.data.get_unchecked(img_idx) };
+                            let v = unsafe { *img_bytes.get_unchecked(img_idx) };
                             let pixel_off = row_off + dx as usize * 3;
                             data[pixel_off] = v;
                             data[pixel_off + 1] = v;
@@ -1182,7 +1185,7 @@ impl<'doc> PageRenderer<'doc> {
                                 unsafe_code,
                                 reason = "bounds proven by clamp: ix < img_width, iy < img_height"
                             )]
-                            if unsafe { *img.data.get_unchecked(img_idx) } == 0x00 {
+                            if unsafe { *img_bytes.get_unchecked(img_idx) } == 0x00 {
                                 let pixel_off = row_off + dx as usize * 3;
                                 data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
                             }
@@ -1224,19 +1227,19 @@ impl<'doc> PageRenderer<'doc> {
                     match img.color_space {
                         ImageColorSpace::Rgb => {
                             let src = img_idx * 3;
-                            if let Some(rgb) = img.data.get(src..src + 3) {
+                            if let Some(rgb) = img_bytes.get(src..src + 3) {
                                 data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                             }
                         }
                         ImageColorSpace::Gray => {
-                            if let Some(&v) = img.data.get(img_idx) {
+                            if let Some(&v) = img_bytes.get(img_idx) {
                                 data[pixel_off] = v;
                                 data[pixel_off + 1] = v;
                                 data[pixel_off + 2] = v;
                             }
                         }
                         ImageColorSpace::Mask => {
-                            if img.data.get(img_idx) == Some(&0x00) {
+                            if img_bytes.get(img_idx) == Some(&0x00) {
                                 data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
                             }
                         }
