@@ -166,7 +166,77 @@ builds() {
   log "Build phase OK"
 }
 
+# ─── Bench phase ──────────────────────────────────────────────────────────────
+# Drop kernel caches so the file read is genuinely cold. Hyperfine warmup
+# runs go on top of this — they'll be hot, which is the same protocol as v0.5.1.
+drop_caches() {
+  sync
+  sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+}
+
+# Run hyperfine for one (corpus, mode) cell. Idempotent: skips if the JSON
+# already exists and --force was not passed.
+bench_one() {
+  local corpus="$1"
+  local mode="$2"
+  local pdf="$FIXTURES/$corpus.pdf"
+  local bin="target/release/pdf-raster-$mode"
+  local json="$OUT_DIR/$corpus-$mode.json"
+
+  if [[ -f "$json" && $FORCE -eq 0 ]]; then
+    log "bench[$corpus/$mode]: SKIP (already done)"
+    return 0
+  fi
+
+  if [[ ! -x "$bin" ]]; then
+    log "bench[$corpus/$mode]: SKIP (binary missing)"
+    return 0
+  fi
+
+  drop_caches
+  log "bench[$corpus/$mode]: starting"
+
+  # Bare-stem prefix routes pdf-raster output to /dev/shm (RAM) by default
+  # in v0.6.0, which is the protocol we want to measure.
+  local out_prefix="v060-out-$$-$corpus"
+
+  local extra_env=""
+  if [[ "$mode" == "nvjpeg" || "$mode" == "full" ]]; then
+    extra_env="LD_LIBRARY_PATH=$NVJPEG2K_LIB:$CUDA_LIB:\${LD_LIBRARY_PATH:-}"
+  fi
+
+  hyperfine \
+    --warmup "$WARMUP" \
+    --runs "$RUNS" \
+    --export-json "$json" \
+    --shell=bash \
+    "$extra_env $bin -r $DPI $pdf $out_prefix"
+
+  # Clean up the per-cell output directory in /dev/shm to keep RAM tidy.
+  # (pdf-raster routes bare-stem prefix to /dev/shm/pdf-raster-<pid>-<nanos>/.)
+  rm -rf "/dev/shm/pdf-raster-"* 2>/dev/null || true
+
+  log "bench[$corpus/$mode]: done — $(jq -r '.results[0].mean * 1000 | floor' "$json")ms mean"
+}
+
+benches() {
+  log "Bench phase: 10 corpora × 4 modes = 40 cells"
+  for corpus in "${CORPORA[@]}"; do
+    for mode in "${MODES[@]}"; do
+      # Mode-skip gates mirror the build phase so we never try to bench a
+      # binary that wasn't built.
+      if [[ "$mode" == "vaapi" && $SKIP_VAAPI -eq 1 ]]; then continue; fi
+      if [[ ("$mode" == "nvjpeg" || "$mode" == "full") && $SKIP_NVJPEG -eq 1 ]]; then continue; fi
+      bench_one "$corpus" "$mode"
+    done
+  done
+  log "Bench phase OK"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 preflight
 builds
-log "Build phase complete; bench phase not yet implemented"
+benches
+log "Aggregating results"
+./scripts/aggregate_v060.sh "$OUT_DIR" "$OUT_DIR/results.md"
+log "All done. Results: $OUT_DIR/results.md"
