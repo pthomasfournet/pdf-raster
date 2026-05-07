@@ -28,6 +28,8 @@ mod composite;
 pub(crate) mod cuda;
 
 #[cfg(feature = "cache")]
+pub mod blit;
+#[cfg(feature = "cache")]
 pub mod cache;
 
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
@@ -69,6 +71,8 @@ const PTX_SOFT_MASK: &str = include_str!(concat!(env!("OUT_DIR"), "/apply_soft_m
 const PTX_AA_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/aa_fill.ptx"));
 const PTX_TILE_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/tile_fill.ptx"));
 const PTX_ICC_CLUT: &str = include_str!(concat!(env!("OUT_DIR"), "/icc_clut.ptx"));
+#[cfg(feature = "cache")]
+const PTX_BLIT_IMAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/blit_image.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
 pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
@@ -113,6 +117,8 @@ struct GpuKernels {
     tile_fill: CudaFunction,
     icc_cmyk_matrix: CudaFunction,
     icc_cmyk_clut: CudaFunction,
+    #[cfg(feature = "cache")]
+    blit_image: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -158,6 +164,8 @@ impl GpuCtx {
                 tile_fill: load(PTX_TILE_FILL, "tile_fill")?,
                 icc_cmyk_matrix: load(PTX_ICC_CLUT, "icc_cmyk_matrix")?,
                 icc_cmyk_clut: load(PTX_ICC_CLUT, "icc_cmyk_clut")?,
+                #[cfg(feature = "cache")]
+                blit_image: load(PTX_BLIT_IMAGE, "blit_image")?,
             },
         })
     }

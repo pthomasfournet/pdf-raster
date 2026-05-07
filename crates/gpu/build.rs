@@ -36,6 +36,7 @@ const KERNELS: &[&str] = &[
     "aa_fill",
     "tile_fill",
     "icc_clut",
+    "blit_image",
 ];
 
 /// Candidate directories for CUDA toolkit libraries, in preference order.
@@ -154,6 +155,12 @@ fn main() {
         "CARGO_FEATURE_NVJPEG",
         "CARGO_FEATURE_NVJPEG2K",
         "CARGO_FEATURE_GPU_DESKEW",
+        // Phase 9 image cache: ships its own PTX (blit_image) and
+        // also loads the existing kernels via GpuCtx::init.
+        "CARGO_FEATURE_CACHE",
+        // gpu-validation tests touch every kernel, including those
+        // not gated by a specific feature.
+        "CARGO_FEATURE_GPU_VALIDATION",
     ]
     .iter()
     .any(|f| env::var(f).is_ok());

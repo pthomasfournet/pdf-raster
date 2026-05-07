@@ -22,9 +22,11 @@
 //! pulling memory from under an in-flight kernel would corrupt the page.
 
 mod host_tier;
+mod page_buffer;
 
 pub use host_tier::HostBudget;
 pub(crate) use host_tier::HostTier;
+pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
