@@ -45,6 +45,26 @@ use crate::resources::resolve_image;
 /// anyway.
 pub const MAX_PREFETCH_WORKERS: usize = 16;
 
+// Compile-time invariant: the `clamp(1, MAX_PREFETCH_WORKERS)` in
+// `spawn_prefetch` would panic at runtime if MAX_PREFETCH_WORKERS
+// were ever set to 0 (clamp requires min ≤ max).  Catch that at
+// build time so the panic can't happen.
+const _: () = assert!(MAX_PREFETCH_WORKERS >= 1);
+
+/// Clamp a caller-supplied worker count to `[1, MAX_PREFETCH_WORKERS]`.
+/// Extracted so the unit-tested clamp is the same code the spawn
+/// site runs — a regression that drops the clamp in one place
+/// alone would only escape detection if both copies were dropped.
+const fn clamp_workers(n: usize) -> usize {
+    if n < 1 {
+        1
+    } else if n > MAX_PREFETCH_WORKERS {
+        MAX_PREFETCH_WORKERS
+    } else {
+        n
+    }
+}
+
 /// Tunables for [`spawn_prefetch`].
 #[derive(Debug, Clone, Copy)]
 pub struct PrefetchConfig {
@@ -192,9 +212,10 @@ impl Drop for PrefetchHandle {
 /// # Concurrency
 ///
 /// `Document` is `Send + Sync` and the cache is internally
-/// thread-safe, so handing `Arc`s to multiple workers is safe.  The
-/// prefetcher does its own coarse dedup via a `Mutex<HashSet<ObjId>>`
-/// so an image referenced from many pages is only decoded once.
+/// thread-safe, so handing `Arc`s to multiple workers is safe.
+/// Discovery dedupes via a single-threaded `HashSet<ObjId>` local
+/// to [`discover_pages`]; an image referenced from many pages is
+/// only decoded once.
 ///
 /// # Panics
 ///
@@ -223,7 +244,7 @@ pub fn spawn_prefetch(
     let rx = Arc::new(Mutex::new(rx));
 
     // Spawn workers first so they're ready when discovery begins.
-    let workers = config.workers.clamp(1, MAX_PREFETCH_WORKERS);
+    let workers = clamp_workers(config.workers);
     let mut handles = Vec::with_capacity(workers + 1);
     for worker_idx in 0..workers {
         let rx = Arc::clone(&rx);
@@ -292,8 +313,11 @@ struct PrefetchState {
 fn discover_pages(state: &PrefetchState, max_images: usize, tx: &mpsc::Sender<PrefetchJob>) {
     // Discovery is single-threaded so the dedup set is a plain
     // local — no Mutex / Arc.  An image referenced from N pages
-    // therefore generates one PrefetchJob, not N.
-    let mut seen: HashSet<ObjId> = HashSet::new();
+    // therefore generates one PrefetchJob, not N.  Pre-sized so
+    // logo-heavy decks (thousands of XObjects) skip the first few
+    // rehashes; capped at max_images so the prefetcher never
+    // allocates more dedup space than it'd ever populate.
+    let mut seen: HashSet<ObjId> = HashSet::with_capacity(max_images.min(256));
     let mut emitted = 0usize;
     'pages: for (_page_num, page_id) in state.doc.get_pages() {
         if state.cancel.load(Ordering::Acquire) {
@@ -497,19 +521,23 @@ startxref\n180\n%%EOF"
     }
 
     #[test]
-    fn max_prefetch_workers_caps_high_caller_value() {
-        // The clamp lives inside spawn_prefetch; assert the constant
-        // exists and is at the expected bound so an accidental
-        // bump shows up in review.
+    fn clamp_workers_caps_high_and_lifts_zero() {
+        // Pin the bound so an accidental bump shows up in review.
         assert_eq!(MAX_PREFETCH_WORKERS, 16);
-        // Sanity: a config with workers=10_000 would clamp to 16.
-        let c = PrefetchConfig {
-            workers: 10_000,
-            max_images: 1,
-        };
-        assert_eq!(c.workers.clamp(1, MAX_PREFETCH_WORKERS), 16);
-        // Zero clamps up to one — single-worker minimum.
-        assert_eq!(0usize.clamp(1, MAX_PREFETCH_WORKERS), 1);
+        // Real call into the production helper — a regression that
+        // drops the clamp in `spawn_prefetch` would still be caught
+        // here so long as both this test and the helper aren't
+        // deleted together.
+        assert_eq!(clamp_workers(0), 1);
+        assert_eq!(clamp_workers(1), 1);
+        assert_eq!(clamp_workers(8), 8);
+        assert_eq!(clamp_workers(MAX_PREFETCH_WORKERS), MAX_PREFETCH_WORKERS);
+        assert_eq!(
+            clamp_workers(MAX_PREFETCH_WORKERS + 1),
+            MAX_PREFETCH_WORKERS
+        );
+        assert_eq!(clamp_workers(10_000), MAX_PREFETCH_WORKERS);
+        assert_eq!(clamp_workers(usize::MAX), MAX_PREFETCH_WORKERS);
     }
 
     #[test]
