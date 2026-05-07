@@ -26,7 +26,9 @@ impl PageRenderer<'_> {
                 return;
             }
             Operator::EndOptionalContent => {
-                self.ocg_stack.pop();
+                // Unmatched EMC is tolerated to match real-world PDF readers;
+                // the popped visibility flag is intentionally discarded.
+                let _ = self.ocg_stack.pop();
                 return;
             }
             _ => {}

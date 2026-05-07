@@ -228,7 +228,7 @@ impl GStateStack {
     pub fn restore(&mut self) {
         // Never pop the bottom state; unmatched Q is lenient.
         if self.stack.len() > 1 {
-            self.stack.pop();
+            let _ = self.stack.pop();
         }
     }
 }

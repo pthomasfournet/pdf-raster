@@ -137,7 +137,8 @@ impl FontCache {
                     String::from_utf8_lossy(name)
                 );
             }
-            self.faces.insert(key, face);
+            // First insert for this key; the prior value (if any) is intentionally dropped.
+            let _ = self.faces.insert(key, face);
             // key was moved into insert; re-box to look up what we just stored.
             let lookup: FaceKey = (name.into(), mat_key);
             return self.faces.get(&lookup)?.as_ref();

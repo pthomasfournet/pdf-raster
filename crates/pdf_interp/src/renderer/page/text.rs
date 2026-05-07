@@ -240,7 +240,10 @@ impl PageRenderer<'_> {
                     h: rec.height as i32,
                     aa: rec.aa,
                 };
-                fill_glyph::<Rgb8>(
+                // The ClipResult return value is only relevant for accumulating
+                // text-as-clip paths (text render modes 4–7), which Phase 3 below
+                // handles separately via glyph_path; per-glyph fill output is unused.
+                let _ = fill_glyph::<Rgb8>(
                     &mut self.bitmap,
                     &clip,
                     &pipe,

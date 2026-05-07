@@ -55,8 +55,9 @@ env_logger = { workspace = true }
 
 
 [lints.rust]
-unsafe_code  = "deny"
-missing_docs = "warn"
+unsafe_code     = "deny"
+missing_docs    = "warn"
+unused_results  = "warn"  # parity with workspace defaults; the local block overrides them
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]

@@ -6,10 +6,30 @@
 
 use pdf::{Document, ObjectId};
 
+use super::ImageDescriptor;
 use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp};
 use super::codecs::{decode_ccitt, decode_jbig2};
 use super::filter_name;
 use super::validated_dims;
+
+/// Invert a bitonal mask buffer to alpha space (`0x00` ↔ `0xFF`).
+///
+/// Used for `CCITTFaxDecode` / `JBIG2Decode` `SMask` streams whose decoders
+/// emit Mask-space bytes (paint = 0x00, skip = 0xFF) that must be flipped to
+/// alpha-space (transparent = 0x00, opaque = 0xFF) before composition.
+///
+/// Returns `None` when the descriptor's pixel storage is not host-resident —
+/// today this never happens (CCITT and JBIG2 always decode to CPU), but the
+/// graceful skip future-proofs against the Phase 9 GPU variant landing.
+fn invert_bitonal_alpha(desc: &ImageDescriptor) -> Option<Vec<u8>> {
+    let bytes = desc.data.as_cpu()?;
+    Some(
+        bytes
+            .iter()
+            .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
+            .collect(),
+    )
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -58,13 +78,7 @@ pub(super) fn decode_smask(
             let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, true, parms)?;
             let actual_w = sm_desc.width;
             let actual_h = sm_desc.height;
-            let inverted: Vec<u8> = sm_desc
-                .data
-                .as_cpu()
-                .expect("CCITT decoder produces CPU-resident bytes")
-                .iter()
-                .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
-                .collect();
+            let inverted: Vec<u8> = invert_bitonal_alpha(&sm_desc)?;
             return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
         }
         Some("JBIG2Decode") => {
@@ -72,13 +86,7 @@ pub(super) fn decode_smask(
             let sm_desc = decode_jbig2(doc, stream.content.as_slice(), sm_w, sm_h, true, parms)?;
             let actual_w = sm_desc.width;
             let actual_h = sm_desc.height;
-            let inverted: Vec<u8> = sm_desc
-                .data
-                .as_cpu()
-                .expect("JBIG2 decoder produces CPU-resident bytes")
-                .iter()
-                .map(|&v| if v == 0x00 { 0xFF } else { 0x00 })
-                .collect();
+            let inverted: Vec<u8> = invert_bitonal_alpha(&sm_desc)?;
             return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
         }
         Some("FlateDecode") => {

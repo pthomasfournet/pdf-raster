@@ -171,6 +171,18 @@ pub enum ImageColorSpace {
     Mask,
 }
 
+impl ImageColorSpace {
+    /// Decoded bytes per pixel after the codec produces an [`ImageDescriptor`].
+    /// `Mask` is byte-expanded by the decoders (one byte per pixel, not bit-packed).
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Gray | Self::Mask => 1,
+            Self::Rgb => 3,
+        }
+    }
+}
+
 /// The compression filter used to store an image in the PDF stream.
 ///
 /// Used by [`PageDiagnostics`](crate::renderer::page::PageDiagnostics) to
@@ -218,15 +230,15 @@ pub const IMAGE_FILTER_COUNT: usize = 6;
 /// Backing storage for decoded image pixels.
 ///
 /// Today the only producer is CPU-side decode and the only consumer is the
-/// CPU blit path; both use [`ImageData::Cpu`].  Phase 9 introduces a `Gpu`
-/// variant for cache-managed VRAM allocations; that variant is added here
-/// (currently behind `#[non_exhaustive]` in spirit only) so subsequent
-/// tasks can produce it without re-touching every consumer.
+/// CPU blit path; both use [`ImageData::Cpu`].  Phase 9 will add a `Gpu`
+/// variant for cache-managed VRAM allocations.  The enum is
+/// [`#[non_exhaustive]`] so adding that variant is non-breaking.
 ///
 /// Hot-path access goes through [`Self::as_cpu`] which returns
 /// `Option<&[u8]>` — `Some(&[..])` for the CPU variant, `None` for any
 /// future GPU variant where the bytes don't live in host memory.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ImageData {
     /// Host-resident pixel bytes — layout defined by [`ImageColorSpace`].
     /// All decoders today produce this variant.
@@ -240,15 +252,6 @@ impl ImageData {
     pub const fn as_cpu(&self) -> Option<&[u8]> {
         match self {
             Self::Cpu(bytes) => Some(bytes.as_slice()),
-        }
-    }
-
-    /// Mutable variant of [`Self::as_cpu`].  Used by the soft-mask pipeline
-    /// which post-processes alpha on a CPU-backed image after decode.
-    #[must_use]
-    pub const fn as_cpu_mut(&mut self) -> Option<&mut Vec<u8>> {
-        match self {
-            Self::Cpu(bytes) => Some(bytes),
         }
     }
 

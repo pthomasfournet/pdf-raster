@@ -924,7 +924,9 @@ impl<'doc> PageRenderer<'doc> {
         if let Some(mut g) = group {
             std::mem::swap(&mut self.bitmap, &mut g.bitmap);
             let pipe = Self::make_pipe(parent_fill_alpha, parent_blend_mode);
-            paint_group(&mut self.bitmap, g, &pipe);
+            // paint_group returns the residual Clip; not needed here since we're
+            // restoring the parent gstate immediately below.
+            let _ = paint_group(&mut self.bitmap, g, &pipe);
         }
 
         // Restore resources and graphics state.
@@ -1068,8 +1070,23 @@ impl<'doc> PageRenderer<'doc> {
         let img_w = f64::from(img.width);
         let img_h = f64::from(img.height);
         let img_width_usize = img.width as usize;
-        let img_bytes: &[u8] = img.data.as_cpu().expect(
-            "renderer blit requires CPU-resident image; GPU variant unreachable in legacy path",
+        // Future-proof for the Phase 9 GPU variant: degrade gracefully rather
+        // than panicking if a device-resident image reaches this CPU blit path.
+        let Some(img_bytes) = img.data.as_cpu() else {
+            log::warn!(
+                "blit_image: image data not host-resident — skipping (Phase 9 device-resident path is not yet wired through this renderer)"
+            );
+            return;
+        };
+        // Decoder contract: bytes.len() == width × height × bpp.  A truncated
+        // buffer would silently invite the unsafe `get_unchecked` arms below
+        // to read out of bounds; assert in debug builds.
+        debug_assert_eq!(
+            img_bytes.len(),
+            img_width_usize
+                .saturating_mul(img.height as usize)
+                .saturating_mul(img.color_space.bytes_per_pixel()),
+            "img_bytes length does not match width × height × bpp; decoder produced a truncated buffer",
         );
 
         let data = self.bitmap.data_mut();
