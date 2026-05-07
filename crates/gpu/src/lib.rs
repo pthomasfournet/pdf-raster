@@ -26,6 +26,10 @@
 mod cmyk;
 mod composite;
 pub(crate) mod cuda;
+
+#[cfg(feature = "cache")]
+pub mod cache;
+
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub mod decode_queue;
 mod fill;

@@ -34,12 +34,18 @@ nvjpeg-gpu = []
 # claim that consumer Blackwell's single NVJPG engine serialises 24-thread
 # workloads. This flag exists so we can measure rather than assume.
 nvjpeg-hardware = ["nvjpeg"]
+# Phase 9 device-resident image cache (VRAM tier today; host RAM and disk
+# tiers land in tasks 3 and 5).  Pulls in blake3 (content hashing) and
+# dashmap (concurrent dual-key indexing).
+cache = ["dep:blake3", "dep:dashmap"]
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }
 color    = { path = "../color" }
 log      = "0.4"
 bytemuck = { workspace = true }
+blake3   = { workspace = true, optional = true }
+dashmap  = { workspace = true, optional = true }
 
 # unsafe_code must be "allow" here because cudarc requires unsafe blocks.
 # We do not inherit workspace lints so we can override unsafe_code.
