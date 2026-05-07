@@ -162,9 +162,12 @@ bench_mode() {
   fi
 
   log "bench[$mode/$label]: starting (BIN=$bin --backend $backend)"
-  # nvjpeg2k library is in a non-standard location; preload it for cuda mode.
+  # Both nvjpeg and full binaries dynamically link libnvjpeg2k.so.0 (and
+  # CUDA libs), regardless of which runtime --backend is selected. The
+  # loader needs LD_LIBRARY_PATH set whenever the binary has those
+  # dependencies, not only when --backend cuda is used.
   local ld_path=""
-  if [[ "$backend" == "cuda" ]]; then
+  if [[ "$bin_suffix" == "nvjpeg" || "$bin_suffix" == "full" ]]; then
     ld_path="LD_LIBRARY_PATH=$NVJPEG2K_LIB:$CUDA_LIB:${LD_LIBRARY_PATH:-}"
   fi
 
