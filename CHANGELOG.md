@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.0] - 2026-05-07
 
 ### Bug Fixes
 
@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
 - Replace pool.install+rayon::scope with pool.scope to fix deadlock
 - Spawn n_threads-1 consumers so W0 is free to produce
 - Drop tx inside pool.scope to unblock consumers
+- Make count_filter const fn to satisfy clippy nursery lint
+- Add trailing newline to awk printf to satisfy set -e
+- Hardening pass on lazy parser — xref streams, DOS caps, overflow
+- Post-rip-out review fixes
+- Post-review fixes for --ram (drop dead code, warn on stale dirs)
+- PageIter now resolves indirect /Kids references
 
 ### Chores
 
@@ -25,6 +31,11 @@ All notable changes to this project will be documented in this file.
 - Update VapiJpegDecoder and decode_sync docs to reflect context reuse
 - Clarify capacity arithmetic in PageQueue doc example
 - Update Phase 7 and v0.4.0 with CLI refactor and Rayon hardening
+- Audit and update all documentation to v0.5.1
+- Mark affinity dispatch complete in Phase 7 work items
+- Add version regression history table and bench_versions.sh
+- Fix stale lopdf reference in fuzz_ccitt comment
+- Update for v0.6.0 (lopdf rip-out, RAM-default output, new bench numbers)
 
 ### Features
 
@@ -32,6 +43,12 @@ All notable changes to this project will be documented in this file.
 - Route JPEG decodes through a single-threaded DecodeQueue
 - Bounded work-stealing page queue replaces par_iter
 - PageDiagnostics pre-scan pass wires RoutingHint
+- Wire affinity dispatch — CpuOnly pages skip GPU decoder init
+- Add lazy zero-copy PDF parser crate to replace lopdf
+- Wrap dict in Dictionary newtype; add Object::enum_variant
+- Rip lopdf out of pdf_interp + pdf_raster, switch to in-tree pdf crate
+- Add --ram mode — write output to /dev/shm with dynamic spill-to-disk
+- RAM output by default for bare-stem prefixes; --no-ram opts out
 
 ### Other
 
@@ -44,6 +61,11 @@ All notable changes to this project will be documented in this file.
 ### Performance
 
 - Reuse VAContext+VASurface across same-dimension decodes
+- Gate prescan behind GPU feature flags; no-op on CPU-only builds
+- Switch global allocator to mimalloc; add --timings flag
+- Pin lopdf to fix commit; add profiling build profile
+- Axis-aligned fast path in blit_image inner loop
+- Eliminate probe decode in decode_dct CPU path
 
 ### Refactor
 
@@ -53,6 +75,15 @@ All notable changes to this project will be documented in this file.
 - Move build_page_list into Args method, return Result with warnings vec
 - Move routing_hint_from_diag+report_progress into page_queue; remove serial prescan
 - Extract count_filter+update_max_ppi helpers, remove duplicate PPI code
+- Replace PageQueue with par_iter; prescan inline per render thread
+- Skip pdftoppm by default; add -R flag to include it
+- Split pdftoppm comparison into bench_compare.sh
+- Simplify hardened parser — extract dup helpers, normalize accessors
+- Simplify --ram wiring (extract encode helper, normalise error style)
+
+### Testing
+
+- Upgrade bench_corpus.sh with hyperfine + mpstat/iostat monitoring
 
 ## [0.5.1] - 2026-05-02
 
