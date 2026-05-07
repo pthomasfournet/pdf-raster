@@ -327,19 +327,6 @@ impl<'a> JpegHeaders<'a> {
             return Err(JpegHeaderError::MissingSoi);
         }
 
-        // Fail fast on streams whose SOF marker explicitly flags a non-
-        // baseline variant (SOF2/SOF10 = progressive, etc.) so the caller
-        // gets a precise routing signal rather than the eventual
-        // MissingSof0 / Truncated. We only reject when the SOF byte is
-        // unambiguous; truncated-before-SOF or non-JPEG inputs fall through
-        // to the regular error paths.
-        if matches!(
-            crate::jpeg_sof::jpeg_sof_type(data),
-            Some(crate::jpeg_sof::JpegVariant::Progressive)
-        ) {
-            return Err(JpegHeaderError::NotBaseline);
-        }
-
         let mut width: u16 = 0;
         let mut height: u16 = 0;
         let mut components: u8 = 0;
@@ -378,6 +365,14 @@ impl<'a> JpegHeaders<'a> {
                         &mut components,
                         &mut frame_components,
                     )?;
+                }
+
+                // Non-baseline SOF (SOF1/SOF2/SOF3/SOF5..SOF7/SOF9..SOF11/SOF13..SOF15).
+                // 0xC4 (DHT) and 0xCC (DAC) sit in the same numeric range and
+                // are handled separately above / below; everything else in
+                // 0xC1..=0xCF is an SOF we do not support.
+                0xC1..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+                    return Err(JpegHeaderError::NotBaseline);
                 }
 
                 // DQT — quantisation tables.
@@ -475,20 +470,21 @@ pub fn mcu_count(width: u16, height: u16, frame_components: &[JpegFrameComponent
     if frame_components.is_empty() {
         return 0;
     }
-    let max_h = frame_components
-        .iter()
-        .map(|c| c.h_sampling)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let max_v = frame_components
-        .iter()
-        .map(|c| c.v_sampling)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let mcu_w = u32::from(max_h) * 8;
-    let mcu_h = u32::from(max_v) * 8;
+    let (max_h, max_v) = frame_components.iter().fold((1u8, 1u8), |(h, v), c| {
+        (h.max(c.h_sampling), v.max(c.v_sampling))
+    });
+    mcu_count_from_max_sampling(width, height, max_h, max_v)
+}
+
+/// MCU-count core, parameterised on the folded max sampling factors.
+///
+/// Adapter callers (e.g. VA-API) hold flat arrays and can fold
+/// themselves; this entry point lets them avoid rebuilding a
+/// `[JpegFrameComponent; N]`.
+#[must_use]
+pub fn mcu_count_from_max_sampling(width: u16, height: u16, max_h: u8, max_v: u8) -> u32 {
+    let mcu_w = u32::from(max_h.max(1)) * 8;
+    let mcu_h = u32::from(max_v.max(1)) * 8;
     let w = u32::from(width);
     let h = u32::from(height);
     w.div_ceil(mcu_w) * h.div_ceil(mcu_h)

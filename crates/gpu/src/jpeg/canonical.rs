@@ -205,9 +205,7 @@ fn fill_table(entries: &mut [CanonicalEntry; 65_536], code: u32, length: u8, sym
         num_bits: length,
         symbol,
     };
-    for slot in &mut entries[start..start + span] {
-        *slot = entry;
-    }
+    entries[start..start + span].fill(entry);
 }
 
 #[cfg(test)]

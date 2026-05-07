@@ -172,8 +172,10 @@ impl std::error::Error for DcChainError {}
 /// produce a precise error if anything fails.
 #[derive(Debug, Clone, Copy)]
 struct ScanStep<'a> {
-    sc_idx: u8,
-    sc_idx_usize: usize,
+    /// Scan-component index (0..=3).  Stored as `usize` to match every
+    /// hot-path use; the few error sites that need a `u8` cast at the
+    /// boundary (the bound is enforced at construction).
+    sc_idx: usize,
     blocks_per_mcu: usize,
     dc_cb: &'a CanonicalCodebook,
     ac_cb: &'a CanonicalCodebook,
@@ -264,10 +266,8 @@ pub fn resolve_dc_chain(
                 selector: sc.ac_table,
             },
         )?;
-        let sc_idx_u8 = u8::try_from(sc_idx).expect("scan_components ≤ 4 guarantees fit in u8");
         steps[sc_idx] = Some(ScanStep {
-            sc_idx: sc_idx_u8,
-            sc_idx_usize: sc_idx,
+            sc_idx,
             blocks_per_mcu: bpm,
             dc_cb,
             ac_cb,
@@ -275,9 +275,7 @@ pub fn resolve_dc_chain(
         total_blocks_per_mcu = total_blocks_per_mcu.saturating_add(bpm as u64);
     }
 
-    // Cap the output allocation before we honour an adversarial SOF0.
-    // Compare in u64 throughout — MAX_SAFE_MCUS fits in usize on every
-    // target we ship to, but on a 32-bit host casting `u64 as usize`
+    // Compare in u64 throughout: on a 32-bit host casting `u64 as usize`
     // would silently truncate before the comparison.
     let total_blocks = n_mcus.saturating_mul(total_blocks_per_mcu);
     let max_safe_mcus_u64 = MAX_SAFE_MCUS as u64;
@@ -294,37 +292,45 @@ pub fn resolve_dc_chain(
     let mut per_component = allocate_dc_output(scan_components, n_mcus, &steps);
 
     // Per-component running DC predictor; reset to 0 at start and at every
-    // RST boundary.  RST positions are sorted in ascending byte order by
-    // construction (unstuff_into emits them as it walks the input).
+    // RST boundary.  RST i (the i-th `RstPosition`) lives at MCU index
+    // `(i + 1) * restart_interval`, per JPEG ISO/IEC 10918-1 § F.1.1.5.
     let mut dc_predictor = [0i32; 4];
     let mut bits = BitReader::new(unstuffed);
-    let mut rst_iter = rst_positions.iter().peekable();
+    let mut rst_iter = rst_positions.iter();
+    let restart_interval = u32::from(headers.restart_interval);
 
     let n_mcus_u32 = u32::try_from(n_mcus).expect("MAX_SAFE_MCUS guarantees fit in u32");
     for mcu_idx in 0..n_mcus_u32 {
-        // Consume every RST boundary the bit reader has crossed (or reached)
-        // before decoding this MCU.  At each crossing the DC predictor resets
-        // to zero and the bit reader realigns to a byte boundary, per
-        // JPEG § F.1.1.5.
-        while rst_iter
-            .peek()
-            .is_some_and(|&&r| bits.byte_position() >= r.byte_offset_in_dst)
+        // Reset on MCU index, not on the bit reader's byte position.  A
+        // truncated MCU could leave the cursor short of the marker and a
+        // byte-position chase would silently skip the predictor reset; the
+        // index-driven check is robust to that case.
+        // If we run out of RST entries before MCUs end, decoding will
+        // fail naturally on the next codeword; the resulting
+        // `UnexpectedEnd` carries `mcu_idx`.
+        if restart_interval > 0
+            && mcu_idx > 0
+            && mcu_idx.is_multiple_of(restart_interval)
+            && let Some(rst) = rst_iter.next()
         {
-            let rst = rst_iter
-                .next()
-                .expect("peek returned Some immediately above");
             bits.realign_to_byte_at(rst.byte_offset_in_dst);
             dc_predictor = [0i32; 4];
         }
 
         for step in steps.iter().take(scan_components) {
             let step = step.expect("steps[..scan_components] populated above");
+            // sc_idx is bounded by scan_components ≤ 4 (validated at the
+            // top of `resolve_dc_chain`), so the cast is provably lossless.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "sc_idx ≤ 3 by construction; scan_components is validated ≤ 4"
+            )]
+            let sc_idx_u8 = step.sc_idx as u8;
             for _block in 0..step.blocks_per_mcu {
-                let delta = decode_dc_delta(&mut bits, step.dc_cb, mcu_idx, step.sc_idx)?;
-                dc_predictor[step.sc_idx_usize] =
-                    dc_predictor[step.sc_idx_usize].wrapping_add(delta);
-                per_component[step.sc_idx_usize].push(dc_predictor[step.sc_idx_usize]);
-                skip_ac_coefficients(&mut bits, step.ac_cb, mcu_idx, step.sc_idx)?;
+                let delta = decode_dc_delta(&mut bits, step.dc_cb, mcu_idx, sc_idx_u8)?;
+                dc_predictor[step.sc_idx] = dc_predictor[step.sc_idx].wrapping_add(delta);
+                per_component[step.sc_idx].push(dc_predictor[step.sc_idx]);
+                skip_ac_coefficients(&mut bits, step.ac_cb, mcu_idx, sc_idx_u8)?;
             }
         }
     }
@@ -497,6 +503,20 @@ impl<'a> BitReader<'a> {
     /// Refill `buf` with as many full bytes as fit, up to 8 bytes / 64 bits
     /// or until input runs out.
     fn refill(&mut self) {
+        // Fast path: when the buffer is empty and at least 8 bytes
+        // remain, fill all 64 bits in one big-endian load.  This avoids
+        // 8× the branches and shifts of the scalar loop on the typical
+        // Huffman codeword path.  The byte-by-byte loop below handles
+        // the tail and any case where we're already mid-byte.
+        if self.cap == 0 && self.byte_pos + 8 <= self.src.len() {
+            let bytes: [u8; 8] = self.src[self.byte_pos..self.byte_pos + 8]
+                .try_into()
+                .expect("slice length checked above");
+            self.buf = u64::from_be_bytes(bytes);
+            self.byte_pos += 8;
+            self.cap = 64;
+            return;
+        }
         while self.cap <= 56 && self.byte_pos < self.src.len() {
             let byte = u64::from(self.src[self.byte_pos]);
             self.byte_pos += 1;
@@ -572,13 +592,13 @@ impl<'a> BitReader<'a> {
     /// bytes.  Used to detect when the reader has crossed an RST boundary.
     ///
     /// `byte_pos` is "next byte to load into the buffer".  Bytes still in
-    /// `buf` are partly emitted: each fully-buffered byte (8 bits) hasn't
-    /// been emitted yet, while a fractional byte (`cap % 8 != 0`) means the
-    /// reader is mid-byte.  We use a ceiling division (`(cap + 7) / 8`) so
-    /// a mid-byte read still reports the byte index the reader is **inside**
-    /// rather than the next one.  This is the correct comparand for
-    /// `RstPosition::byte_offset_in_dst`, which by construction falls on a
-    /// byte boundary in the unstuffed stream.
+    /// Test-only.  Production RST handling is now index-driven (see
+    /// `resolve_dc_chain`), so the only callers live in unit tests.
+    /// Reports the byte the reader is currently inside (`cap % 8 != 0`)
+    /// or about to read next (`cap % 8 == 0`); the ceiling division
+    /// gives the inside-byte semantics, which matches what the tests
+    /// pin down.
+    #[cfg(test)]
     const fn byte_position(&self) -> usize {
         let bytes_unconsumed = (self.cap as usize).div_ceil(8);
         self.byte_pos.saturating_sub(bytes_unconsumed)

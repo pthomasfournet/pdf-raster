@@ -14,6 +14,7 @@ use super::error::{Result, VapiError};
 use super::ffi::VaHuffmanEntry;
 use crate::jpeg::headers::{
     DhtClass, JpegHeaderError, JpegHeaders as SharedHeaders, JpegHuffmanTable,
+    mcu_count_from_max_sampling,
 };
 
 /// Extracted JPEG headers in the shape VA-API parameter buffers expect.
@@ -46,9 +47,6 @@ pub(super) struct JpegHeaders {
     pub(super) scan_data_offset: usize,
     /// Length of the compressed scan data in bytes.
     pub(super) scan_data_size: usize,
-    /// Pre-computed MCU count, delegated to the shared parser at parse time
-    /// so the formula lives in exactly one place.
-    num_mcus_cached: u32,
 }
 
 impl JpegHeaders {
@@ -64,7 +62,6 @@ impl JpegHeaders {
     )]
     pub(super) fn parse(data: &[u8]) -> Result<Self> {
         let shared = SharedHeaders::parse(data).map_err(|e| jpeg_header_to_vapi(&e))?;
-        let num_mcus_cached = shared.num_mcus();
 
         let mut comp_ids = [0u8; 4];
         let mut h_samp = [0u8; 4];
@@ -115,14 +112,17 @@ impl JpegHeaders {
             restart_interval: shared.restart_interval,
             scan_data_offset: shared.scan_data_offset,
             scan_data_size: shared.scan_data.len(),
-            num_mcus_cached,
         })
     }
 
-    /// Number of MCUs (minimum coded units) in the image.  Cached at parse
-    /// time using the shared `SharedHeaders::num_mcus()` formula.
-    pub(super) const fn num_mcus(&self) -> u32 {
-        self.num_mcus_cached
+    /// Number of MCUs (minimum coded units) in the image.  Derived
+    /// on demand from the stored sampling arrays via the shared
+    /// formula in [`crate::jpeg::headers::mcu_count_from_max_sampling`].
+    pub(super) fn num_mcus(&self) -> u32 {
+        let n = self.components as usize;
+        let max_h = self.h_samp[..n].iter().copied().max().unwrap_or(1);
+        let max_v = self.v_samp[..n].iter().copied().max().unwrap_or(1);
+        mcu_count_from_max_sampling(self.width, self.height, max_h, max_v)
     }
 }
 
