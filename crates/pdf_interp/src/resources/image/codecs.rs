@@ -427,25 +427,32 @@ pub(super) fn decode_dct(
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
     let area = pdf_w.saturating_mul(pdf_h);
 
-    #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
-    let area = pdf_w.saturating_mul(pdf_h);
-
     // Peek at the JPEG SOF marker to route to the correct decoder.
     // Prevents sending progressive JPEG to VA-API (baseline-only).
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
     let jpeg_variant = gpu::jpeg_sof_type(data);
 
     // ── nvJPEG fast path (baseline + progressive) ─────────────────────────────
+    // The `>= GPU_JPEG_THRESHOLD_PX` comparison can be `false` for any input
+    // when the threshold is `u32::MAX` (current consumer-Blackwell setting —
+    // see the constant's docs). The expect is on the per-call site; the
+    // threshold itself is not a constant truth.
     #[cfg(feature = "nvjpeg")]
     if let Some(dec) = gpu {
         let is_eligible = matches!(
             jpeg_variant,
-            Some(gpu::JpegVariant::Baseline) | Some(gpu::JpegVariant::Progressive)
+            Some(gpu::JpegVariant::Baseline | gpu::JpegVariant::Progressive)
         );
-        if is_eligible && area >= super::GPU_JPEG_THRESHOLD_PX {
-            if let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec) {
-                return Some(img);
-            }
+        #[expect(
+            clippy::absurd_extreme_comparisons,
+            reason = "GPU_JPEG_THRESHOLD_PX is u32::MAX on consumer Blackwell to disable nvJPEG dispatch; tunable per hardware"
+        )]
+        let area_above_threshold = area >= super::GPU_JPEG_THRESHOLD_PX;
+        if is_eligible
+            && area_above_threshold
+            && let Some(img) = decode_dct_gpu_path(data, pdf_w, pdf_h, dec)
+        {
+            return Some(img);
         }
     }
 
@@ -456,7 +463,14 @@ pub(super) fn decode_dct(
     #[cfg(feature = "vaapi")]
     if let Some(handle) = vaapi
         && matches!(jpeg_variant, Some(gpu::JpegVariant::Baseline))
-        && area >= super::GPU_JPEG_THRESHOLD_PX
+        && {
+            #[expect(
+                clippy::absurd_extreme_comparisons,
+                reason = "see GPU_JPEG_THRESHOLD_PX docs — set to u32::MAX on consumer Blackwell"
+            )]
+            let above = area >= super::GPU_JPEG_THRESHOLD_PX;
+            above
+        }
         && let Some(img) = decode_dct_queue_path(data, pdf_w, pdf_h, handle)
     {
         return Some(img);

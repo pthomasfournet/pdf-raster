@@ -72,12 +72,38 @@ pub use icc::IccClutCache;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `DCTDecode`.
 ///
-/// Below this threshold transfer and decode setup overhead dominates and the
-/// CPU decoder is faster.  512 × 512 = 262 144 pixels — empirically the
-/// crossover between nvJPEG (~10 GB/s) and the CPU JPEG path (~1 GB/s) after
-/// DMA latency, and a similarly effective threshold for VA-API.
+/// **Currently set to `u32::MAX` — nvJPEG dispatch is disabled on consumer
+/// Blackwell.**  Verified on RTX 5070 (Blackwell, one NVJPG engine) running
+/// the v0.6.0 baseline (10-corpus matrix, 2026-05-06): the GPU JPEG path was
+/// 5–13× *slower* than 24-thread CPU zune-jpeg on every DCT-heavy corpus.
+/// The mechanism is documented in the v0.6.0 baseline spec; the short
+/// version is:
+///
+/// - `NVJPEG_BACKEND_HARDWARE` would serialise all 24 worker threads
+///   through one on-die engine (consumer Blackwell has 1 NVJPG engine,
+///   not multiple as on A100/H100/Ada datacenter parts).
+/// - `NVJPEG_BACKEND_GPU_HYBRID` (currently selected; see
+///   `crates/gpu/src/nvjpeg.rs`) only uses GPU for Huffman decoding when
+///   batch size > 50–100; for single-image-per-call workloads it falls
+///   back to CPU work behind a CUDA stream-sync wrapper, paying GPU-API
+///   overhead for a CPU decode that is slower than calling zune-jpeg
+///   directly.
+/// - The batched nvJPEG API would fit, but requires collecting images
+///   across pages, decoding them in batches of ≥ 100, then routing
+///   results back to the per-page renderers — a major architectural
+///   change not yet done.
+///
+/// On a datacenter GPU with multiple NVJPG engines (A100, H100, A30),
+/// the `HARDWARE` backend should win at the original 512 × 512 threshold.
+/// When that hardware becomes available the threshold should drop back
+/// to `262_144`, the backend selector should be revisited, and the
+/// matrix re-measured.
+///
+/// nvJPEG2000 (`GPU_JPEG2K_THRESHOLD_PX`) is *not* affected by this:
+/// JPX decode on the same matrix was 1.7× faster on GPU than CPU on
+/// corpus 10, validating the original threshold for JPEG 2000.
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
-pub const GPU_JPEG_THRESHOLD_PX: u32 = 262_144;
+pub const GPU_JPEG_THRESHOLD_PX: u32 = u32::MAX;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
 ///

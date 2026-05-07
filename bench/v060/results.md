@@ -6,13 +6,13 @@ Cells show `mean±stddev` in milliseconds. Per-corpus measurement uses hyperfine
 
 | Corpus | A. CPU-only | C. nvJPEG | D. Full GPU | Flags |
 |---|---|---|---|---|
-| 01 native text small | 54±2ms | 53±1ms | 231±7ms |  |
-| 02 native vector+text | 22±2ms | 223±15ms | 221±19ms |  |
-| 03 native text dense | 328±5ms | 460±4ms | 496±10ms | A:[low-cpu 0%] C:[low-cpu 17%] D:[low-cpu 22%] |
-| 04 ebook mixed | 673±6ms | 731±4ms | 847±12ms |  |
-| 05 academic book | 1120±24ms | 1198±17ms | 1303±17ms |  |
-| 06 modern layout DCT | 2449±17ms | 2459±17ms | 2708±17ms |  |
-| 07 journal DCT heavy | 685±5ms | 22043±58ms | 22436±946ms | C:[low-cpu 12%] D:[low-cpu 21%] |
-| 08 scan DCT 1927 (baseline JPEG) | 1882±3ms | 18533±66ms | 24909±353ms |  |
-| 09 scan DCT 1836 (progressive JPEG) | 2424±6ms | 22181±174ms | 23275±608ms |  |
-| 10 scan JBIG2+JPX | 17394±282ms | 10334±67ms | 10406±120ms | C:[low-cpu 27%] D:[low-cpu 29%] |
+| 01 native text small | 52±1ms | 52±2ms | 234±11ms |  |
+| 02 native vector+text | 19±1ms | 217±16ms | 218±8ms |  |
+| 03 native text dense | 308±6ms | 466±21ms | 492±1ms | A:[low-cpu 0%] C:[low-cpu 25%] D:[low-cpu 23%] |
+| 04 ebook mixed | 655±4ms | 741±7ms | 850±11ms |  |
+| 05 academic book | 1155±17ms | 1251±38ms | 1320±8ms |  |
+| 06 modern layout DCT | 2494±28ms | 2516±44ms | 2655±5ms |  |
+| 07 journal DCT heavy | 668±6ms | 843±14ms | 863±18ms |  |
+| 08 scan DCT 1927 (baseline JPEG) | 1847±27ms | 2008±21ms | 2100±160ms |  |
+| 09 scan DCT 1836 (progressive JPEG) | 2385±12ms | 2590±13ms | 2554±16ms |  |
+| 10 scan JBIG2+JPX | 17292±178ms | 10326±96ms | 10247±125ms | C:[low-cpu 23%] D:[low-cpu 22%] |
