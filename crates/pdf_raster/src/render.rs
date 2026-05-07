@@ -254,6 +254,14 @@ pub fn open_session(
     // per page.  Path-hashing was an earlier expedient that didn't
     // detect content changes.
     //
+    // TODO(perf): we re-read the file here even though `pdf_interp::open`
+    // above already mmapped it.  The hash could share the mmap if
+    // `pdf::Document` exposed a `bytes() -> &[u8]` accessor.  For a
+    // 10 MB PDF the wasted IO is ~40 ms (page cache makes the second
+    // read essentially free in practice, but it still allocates a
+    // `Vec` we throw away).  Deferred because the fix touches
+    // `pdf` → `pdf_interp` → `pdf_raster` API surface.
+    //
     // If the file becomes unreadable between `pdf_interp::open` (which
     // succeeded above) and now, fall back to a path-hash so the cache
     // still functions in-process — disk-tier invalidation is sacrificed

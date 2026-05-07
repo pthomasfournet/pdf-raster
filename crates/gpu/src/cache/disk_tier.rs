@@ -121,9 +121,25 @@ pub struct DiskTier {
     /// (filesystem mtimes drive eviction; the counter avoids a
     /// directory scan on every insert).
     budget: u64,
-    /// Bytes written by *this process* since startup.  Counter rolls
-    /// in `insert`; `evict_to_fit` does the real reconciliation by
-    /// reading directory sizes when the counter exceeds the budget.
+    /// Bytes written by *this process* since startup — **not** a
+    /// global view of the on-disk cache.  Two consequences:
+    ///
+    /// 1. A fresh process starts at zero even if `<root>/` already
+    ///    holds gigabytes from prior runs.  The first `insert` that
+    ///    pushes the counter past `budget` triggers `evict_to_fit`,
+    ///    which scans the directory and reconciles the counter
+    ///    against actual size.  Until then, the counter understates
+    ///    real usage.
+    /// 2. Multiple concurrent processes sharing the same `<root>/`
+    ///    each run their own counter; budget enforcement is
+    ///    eventual rather than strict.  In practice eviction is
+    ///    triggered by whichever process exceeds *its own* budget
+    ///    first, which is fine for a single-user dev box but worth
+    ///    knowing for shared-cache deployments.
+    ///
+    /// Strict enforcement would require a directory scan on every
+    /// insert (too expensive) or a cross-process lock file (added
+    /// complexity for marginal benefit).
     used_estimate: AtomicU64,
 }
 
@@ -163,32 +179,71 @@ impl DiskTier {
     }
 
     /// Probe the disk tier for `(doc, hash)`.  On hit, returns the
-    /// decoded image as `(width, height, layout, pixels)` — caller
+    /// decoded image with pixels owned in a fresh `Vec<u8>`.  Caller
     /// builds a `HostEntry` and promotes through the upper tiers.
     /// Returns `None` on miss, malformed file, or any I/O error.
+    ///
+    /// Prefer [`Self::lookup_into`] when the caller can supply a
+    /// pre-allocated pinned-host slab to read directly into — that
+    /// avoids the transient `Vec` + memcpy.
     #[must_use]
-    pub fn lookup(&self, doc: DocId, hash: &ContentHash) -> Option<DiskEntry> {
+    #[cfg(test)]
+    pub(crate) fn lookup(&self, doc: DocId, hash: &ContentHash) -> Option<DiskEntry> {
         let path = entry_path(&self.root, doc, *hash);
         match read_entry(&path) {
             Ok(entry) => Some(entry),
             Err(DiskReadError::Missing) => None,
             Err(e) => {
-                // Corrupt or truncated file — log, treat as miss, and
-                // delete the bad file so a future write can replace it.
-                log::warn!(
-                    "disk-tier: bad cache entry at {}: {e}; removing",
-                    path.display()
-                );
-                let _ = fs::remove_file(&path);
+                report_bad_entry(&path, &e);
+                None
+            }
+        }
+    }
+
+    /// Probe the disk tier for `(doc, hash)` and stream the pixel
+    /// payload through a caller-supplied callback.  On hit, opens
+    /// the file, validates the header, then calls `fill` with the
+    /// parsed [`DiskHeaderInfo`] and a `&mut dyn Read` positioned at
+    /// the pixel bytes.  The callback is responsible for reading
+    /// exactly `header.expected_pixel_bytes` bytes — typically via
+    /// `read_exact` into its own pinned-host slab.
+    ///
+    /// This avoids the transient `Vec<u8>` that the test-only
+    /// `lookup` helper allocates: the disk pixels land straight in
+    /// the caller's destination buffer.
+    ///
+    /// Returns `Some(header)` on success, `None` on miss or any
+    /// validation/I/O failure (the bad entry is removed so a future
+    /// write can replace it).  Errors raised by the callback
+    /// propagate via the [`io::Result`] return and surface here as
+    /// `None` after `report_bad_entry`.
+    pub fn lookup_into<F>(&self, doc: DocId, hash: &ContentHash, fill: F) -> Option<DiskHeaderInfo>
+    where
+        F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> io::Result<()>,
+    {
+        let path = entry_path(&self.root, doc, *hash);
+        match read_entry_into(&path, fill) {
+            Ok(header) => Some(header),
+            Err(DiskReadError::Missing) => None,
+            Err(e) => {
+                report_bad_entry(&path, &e);
                 None
             }
         }
     }
 
     /// Write an entry to disk.  Idempotent: a same-content rewrite
-    /// is a no-op via the atomic-rename pattern.  Errors are logged
-    /// and swallowed; disk-tier writes are best-effort and never
-    /// block the caller's render path.
+    /// overwrites with bit-identical bytes via the atomic-rename
+    /// pattern.  Errors are logged and swallowed (caller's render
+    /// path always sees `()`), but the call itself is **synchronous**:
+    /// `write_all` + `sync_all` + `rename` block the calling thread
+    /// for ~1–5 ms on `NVMe` and ~10–50 ms on a slow HDD per image.
+    /// On a 1000-image render that's seconds added to first-render
+    /// time.  A future revision should dispatch the write to a
+    /// background thread (small bounded mpsc + dedicated worker) so
+    /// the renderer is genuinely never blocked; the spec calls out
+    /// this expectation but v0.7.0 ships sync to keep the patch
+    /// surface small.
     pub fn insert(
         &self,
         doc: DocId,
@@ -279,17 +334,36 @@ impl std::fmt::Debug for DiskTier {
     }
 }
 
-/// Decoded contents of a disk cache hit, ready for promotion.
+/// Decoded contents of a disk cache hit (allocating variant).
+///
+/// Retained for the in-crate tests of [`DiskTier::lookup`].  The
+/// production hot path uses [`DiskTier::lookup_into`] + a pinned slab
+/// to avoid the transient `Vec`.
+#[cfg(test)]
 #[derive(Debug)]
-pub struct DiskEntry {
+pub(crate) struct DiskEntry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) layout: ImageLayout,
+    pub(crate) pixels: Vec<u8>,
+}
+
+/// Header read from a disk cache entry — all metadata fields, no
+/// pixels.  Returned from [`DiskTier::lookup_into`] to let the caller
+/// size + allocate a destination buffer (typically a pinned-host
+/// slab) before the pixel bytes are read.
+#[derive(Debug, Clone, Copy)]
+pub struct DiskHeaderInfo {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
     /// Pixel layout — determines bytes per pixel.
     pub layout: ImageLayout,
-    /// Raw pixel bytes; length = `width × height × layout.bytes_per_pixel()`.
-    pub pixels: Vec<u8>,
+    /// Total pixel bytes the caller's destination buffer must hold:
+    /// `width × height × layout.bytes_per_pixel()`.  Validated to
+    /// fit in `usize` before being returned.
+    pub expected_pixel_bytes: usize,
 }
 
 /// Error variants for [`read_entry`] — internal type, callers see
@@ -336,8 +410,22 @@ impl From<io::Error> for DiskReadError {
     }
 }
 
-/// Read and validate a single disk entry.
-fn read_entry(path: &Path) -> Result<DiskEntry, DiskReadError> {
+/// Log + delete a bad disk entry so a future write can replace it.
+/// Free function (no `&self`) because it touches only the path; the
+/// `DiskTier::used_estimate` counter is reconciled by the next
+/// `evict_to_fit` pass and doesn't need a per-removal touch here.
+fn report_bad_entry(path: &Path, e: &DiskReadError) {
+    log::warn!(
+        "disk-tier: bad cache entry at {}: {e}; removing",
+        path.display()
+    );
+    let _ = fs::remove_file(path);
+}
+
+/// Open the entry file and parse + validate its header.  Returns
+/// the file (positioned just past the header) plus the parsed
+/// metadata.  Caller reads the pixel payload from the same file.
+fn open_and_parse_header(path: &Path) -> Result<(File, DiskHeaderInfo), DiskReadError> {
     let mut f = File::open(path)?;
     advise_will_need(&f);
 
@@ -368,28 +456,70 @@ fn read_entry(path: &Path) -> Result<DiskEntry, DiskReadError> {
         other => return Err(DiskReadError::UnsupportedComponents(other)),
     };
 
-    let expected = (width as usize)
+    let expected_pixel_bytes = (width as usize)
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(layout.bytes_per_pixel()))
         .ok_or(DiskReadError::DimensionOverflow)?;
-    let mut pixels = vec![0u8; expected];
+    Ok((
+        f,
+        DiskHeaderInfo {
+            width,
+            height,
+            layout,
+            expected_pixel_bytes,
+        },
+    ))
+}
+
+/// Read and validate a single disk entry, allocating a fresh `Vec`
+/// for the pixel payload.  Only used by in-crate tests; production
+/// uses [`read_entry_into`] + a caller-supplied pinned slab.
+#[cfg(test)]
+fn read_entry(path: &Path) -> Result<DiskEntry, DiskReadError> {
+    let (mut f, info) = open_and_parse_header(path)?;
+    let mut pixels = vec![0u8; info.expected_pixel_bytes];
     f.read_exact(&mut pixels).map_err(|e| match e.kind() {
         io::ErrorKind::UnexpectedEof => DiskReadError::PixelsTruncated {
-            expected,
+            expected: info.expected_pixel_bytes,
             got: pixels.len(),
         },
         _ => DiskReadError::Io(e),
     })?;
     Ok(DiskEntry {
-        width,
-        height,
-        layout,
+        width: info.width,
+        height: info.height,
+        layout: info.layout,
         pixels,
     })
 }
 
+/// Read and validate a single disk entry, streaming pixel bytes
+/// through a caller-supplied callback.  The callback receives the
+/// parsed header and a reader positioned at the pixel payload; it
+/// must consume exactly `info.expected_pixel_bytes` (typically via
+/// `read_exact` into its own buffer).
+fn read_entry_into<F>(path: &Path, fill: F) -> Result<DiskHeaderInfo, DiskReadError>
+where
+    F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> io::Result<()>,
+{
+    let (mut f, info) = open_and_parse_header(path)?;
+    fill(&info, &mut f).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => DiskReadError::PixelsTruncated {
+            expected: info.expected_pixel_bytes,
+            got: 0,
+        },
+        _ => DiskReadError::Io(e),
+    })?;
+    Ok(info)
+}
+
 /// Write an entry atomically: temp file in the same directory, then
 /// rename into place.  POSIX rename is atomic across same-fs boundaries.
+///
+/// Cleans up the temp file on any error path — `write_all` /
+/// `sync_all` / `rename` failures all unlink the temp before
+/// propagating the error.  Without this, an `ENOSPC` mid-write
+/// would leave a `<name>.tmp.<pid>.<tid>` file behind permanently.
 fn write_entry(
     final_path: &Path,
     width: u32,
@@ -397,6 +527,18 @@ fn write_entry(
     layout: ImageLayout,
     pixels: &[u8],
 ) -> io::Result<()> {
+    // Reject Mask before opening any file — there's no defined
+    // components value for it in the on-disk format.
+    let components: u8 = match layout {
+        ImageLayout::Gray => 1,
+        ImageLayout::Rgb => 3,
+        ImageLayout::Mask => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mask layout cannot be cached on disk (no defined components value)",
+            ));
+        }
+    };
     let parent = final_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -415,40 +557,39 @@ fn write_entry(
     );
     let tmp_path = parent.join(tmp_name);
 
-    {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    header[4..8].copy_from_slice(&VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&width.to_le_bytes());
+    header[12..16].copy_from_slice(&height.to_le_bytes());
+    header[16] = components;
+    header[17] = FORMAT_RAW;
+    // header[18..24] stays zero (Reserved bytes).
+
+    // All steps that touch `tmp_path` after `create_new` must unlink
+    // it on failure.  Wrap them so the cleanup runs uniformly.
+    let result = (|| -> io::Result<()> {
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp_path)?;
-        let components: u8 = match layout {
-            ImageLayout::Gray => 1,
-            ImageLayout::Rgb => 3,
-            ImageLayout::Mask => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Mask layout cannot be cached on disk (no defined components value)",
-                ));
-            }
-        };
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        header[4..8].copy_from_slice(&VERSION.to_le_bytes());
-        header[8..12].copy_from_slice(&width.to_le_bytes());
-        header[12..16].copy_from_slice(&height.to_le_bytes());
-        header[16] = components;
-        header[17] = FORMAT_RAW;
-        // header[18..24] stays zero (Reserved).
         f.write_all(&header)?;
         f.write_all(pixels)?;
         f.sync_all()?;
-    }
-    // Atomic rename.  If a same-name file exists (concurrent writer
-    // committed the same hash first), rename overwrites it on POSIX
-    // — both files have the same bytes anyway, so this is fine.
-    fs::rename(&tmp_path, final_path).inspect_err(|_| {
-        // Clean up our temp file on failure so we don't leak.
+        drop(f);
+        // Atomic rename.  If a same-name file exists (concurrent writer
+        // committed the same hash first), rename overwrites it on POSIX —
+        // both files have the same bytes anyway.
+        fs::rename(&tmp_path, final_path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // Cleanup is best-effort: a simultaneous successful rename by
+        // another writer may have moved the file out from under us, so
+        // remove_file's NotFound is fine.
         let _ = fs::remove_file(&tmp_path);
-    })?;
+        return Err(e);
+    }
     Ok(())
 }
 

@@ -30,7 +30,7 @@ mod disk_tier;
 mod host_tier;
 mod page_buffer;
 
-pub use disk_tier::{DiskEntry, DiskTier};
+pub use disk_tier::DiskTier;
 pub use host_tier::HostBudget;
 pub(crate) use host_tier::{HostEntry, HostTier};
 pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
@@ -487,45 +487,46 @@ impl DeviceImageCache {
     }
 
     /// Lift a disk-tier entry back into VRAM.  Reads the file via
-    /// `posix_fadvise(WILLNEED)` + `read_exact`, copies into a fresh
-    /// pinned host slab, uploads to VRAM, and installs in the primary
-    /// index.  The host tier is also populated as a side effect so a
-    /// later same-session lookup that misses VRAM hits host RAM
-    /// instead of going back to disk.
+    /// `posix_fadvise(WILLNEED)` + `read_exact` directly into a
+    /// fresh pinned host slab (no transient `Vec`), uploads to
+    /// VRAM, and installs in the primary index.  The host tier is
+    /// also populated as a side effect so a later same-session
+    /// lookup that misses VRAM hits host RAM instead of going back
+    /// to disk.
     ///
     /// Returns `None` on disk miss, malformed file, allocation
     /// failure, or upload error — caller treats as a cache miss and
     /// re-decodes the source bytes.
     fn promote_from_disk(&self, doc: DocId, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
         let disk = self.disk.as_ref()?;
-        let entry = disk.lookup(doc, hash)?;
+        // Allocate the pinned slab outside the lookup callback so we
+        // keep ownership after the disk read is done.  The callback
+        // borrows a `&mut [u8]` view of the slab and fills it via
+        // `read_exact`, eliminating the transient `Vec<u8>` we used
+        // to copy through.
+        let mut pinned: Option<cudarc::driver::PinnedHostSlice<u8>> = None;
+        let info = disk.lookup_into(doc, hash, |info, reader| {
+            let mut slab = HostTier::alloc_pinned(self.stream.context(), info.expected_pixel_bytes)
+                .map_err(|e| std::io::Error::other(format!("alloc_pinned failed: {e}")))?;
+            let dst = slab
+                .as_mut_slice()
+                .map_err(|e| std::io::Error::other(format!("pinned slab access failed: {e}")))?;
+            reader.read_exact(dst)?;
+            pinned = Some(slab);
+            Ok(())
+        })?;
+        let pinned = pinned?;
         log::debug!(
             "disk-tier: hit for ({doc:?}, {hash:?}) {}×{} {:?}",
-            entry.width,
-            entry.height,
-            entry.layout
+            info.width,
+            info.height,
+            info.layout,
         );
-        // Allocate a pinned host slab and copy the disk bytes in.
-        // The host tier owns the `Arc<HostEntry>` after this so a
-        // future same-session lookup that misses VRAM finds it in
-        // host RAM without going back to disk.
-        let mut pinned = match HostTier::alloc_pinned(self.stream.context(), entry.pixels.len()) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("promote_from_disk: alloc_pinned failed: {e}");
-                return None;
-            }
-        };
-        match pinned.as_mut_slice() {
-            Ok(slab) => slab.copy_from_slice(&entry.pixels),
-            Err(e) => {
-                log::warn!("promote_from_disk: pinned slab access failed: {e}");
-                return None;
-            }
-        }
-        let host_entry = HostEntry::new(pinned, entry.width, entry.height, entry.layout);
+        let host_entry = HostEntry::new(pinned, info.width, info.height, info.layout);
         let _arc = self.host.insert(*hash, host_entry, self.next_tick());
-        // Re-bind alias and promote up to VRAM via the existing path.
+        // Promote up to VRAM via the existing host→VRAM path.  The
+        // `_arc` keeps the host entry alive across this call; it
+        // drops at function exit, leaving only the host tier's Arc.
         self.promote_from_host(hash)
     }
 
