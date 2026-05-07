@@ -121,11 +121,8 @@ preflight() {
   elif [[ ! -e "$CUDA_LIB/libcudart.so" || ! -e "$CUDA_LIB/libnvjpeg.so" ]]; then
     warn "CUDA libs missing under $CUDA_LIB; modes D/DC/DCP will be skipped"
     SKIP_NVJPEG=1
-  elif [[ ! -e "$NVJPEG2K_LIB/libnvjpeg2k.so" ]]; then
-    warn "libnvjpeg2k.so missing under $NVJPEG2K_LIB; modes D/DC/DCP will be skipped"
-    SKIP_NVJPEG=1
   else
-    log "  nvidia: /dev/nvidia0 + cudart + nvjpeg + nvjpeg2k present"
+    log "  nvidia: /dev/nvidia0 + cudart + nvjpeg present (nvjpeg2k optional)"
   fi
 
   mkdir -p "$OUT_DIR"
