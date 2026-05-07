@@ -523,6 +523,7 @@ dependencies = [
  "cudarc",
  "dashmap",
  "log",
+ "tempfile",
 ]
 
 [[package]]

@@ -47,6 +47,10 @@ bytemuck = { workspace = true }
 blake3   = { workspace = true, optional = true }
 dashmap  = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Disk-tier tests want isolated cache dirs.
+tempfile = { workspace = true }
+
 # unsafe_code must be "allow" here because cudarc requires unsafe blocks.
 # We do not inherit workspace lints so we can override unsafe_code.
 [lints.rust]

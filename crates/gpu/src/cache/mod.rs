@@ -1,9 +1,14 @@
-//! Phase 9 device-resident image cache — VRAM and host RAM tiers.
+//! Phase 9 device-resident image cache — three tiers.
 //!
 //! See `docs/superpowers/specs/2026-05-07-phase-9-device-resident-image-cache.md`
-//! for the full architecture.  This module ships the in-process VRAM
-//! tier (Task 2) and the pinned host RAM demotion target (Task 3).
-//! The disk persistence tier lands in Task 5.
+//! for the full architecture.  This module ships:
+//!
+//! - VRAM tier (Task 2): primary `DashMap<ContentHash, Arc<...>>` +
+//!   `(DocId, ObjId)` alias index, refcount-pinned LRU eviction.
+//! - Host RAM tier (Task 3): pinned-memory demote-on-evict /
+//!   promote-on-hit; in-process only.
+//! - Disk tier (Task 5): `<root>/<doc>/<hash>.bin` sidecar files for
+//!   cross-process persistence; opt-in via [`DeviceImageCache::with_disk`].
 //!
 //! # Concurrency model
 //!
@@ -21,11 +26,13 @@
 //! until the last consumer drops its `Arc` — that's the desired behaviour:
 //! pulling memory from under an in-flight kernel would corrupt the page.
 
+mod disk_tier;
 mod host_tier;
 mod page_buffer;
 
+pub use disk_tier::{DiskEntry, DiskTier};
 pub use host_tier::HostBudget;
-pub(crate) use host_tier::HostTier;
+pub(crate) use host_tier::{HostEntry, HostTier};
 pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
 
 use std::sync::Arc;
@@ -287,6 +294,10 @@ pub struct DeviceImageCache {
     /// reclaims a VRAM slab; consulted by [`Self::lookup_by_hash`] on
     /// a primary miss.
     host: HostTier,
+    /// Phase 9 disk tier — sidecar cache directory keyed by
+    /// `(DocId, ContentHash)`.  `None` disables disk persistence
+    /// (fully in-process cache).  Wired in via [`Self::with_disk`].
+    disk: Option<DiskTier>,
     budget: VramBudget,
     /// Monotonic LRU clock.  Incremented on every observable cache
     /// event in either tier.
@@ -332,18 +343,35 @@ pub struct InsertRequest<'a> {
 
 impl DeviceImageCache {
     /// Build an empty cache bound to a CUDA stream, a VRAM budget, and
-    /// a host-RAM demotion budget.
+    /// a host-RAM demotion budget.  The disk tier is off by default;
+    /// enable it via [`Self::with_disk`].
     #[must_use]
     pub fn new(stream: Arc<CudaStream>, vram: VramBudget, host: HostBudget) -> Self {
         Self {
             primary: DashMap::new(),
             by_doc_obj: DashMap::new(),
             host: HostTier::new(host),
+            disk: None,
             budget: vram,
             tick: AtomicU64::new(0),
             used_bytes: AtomicU64::new(0),
             stream,
         }
+    }
+
+    /// Attach a disk tier for cross-process persistence.
+    ///
+    /// On a VRAM + host-RAM miss, a disk hit avoids the CPU re-decode
+    /// pass: `NVMe` at roughly 1 GB/s sustained beats `zune-jpeg`'s
+    /// per-image throughput because disk reads run in parallel with
+    /// the CPU-busy decode workers.  Editing the source PDF
+    /// invalidates the disk cache automatically because the doc-id
+    /// is content-hashed (callers should derive `DocId` from PDF
+    /// bytes, not the file path).
+    #[must_use]
+    pub fn with_disk(mut self, disk: DiskTier) -> Self {
+        self.disk = Some(disk);
+        self
     }
 
     /// Compute the BLAKE3 content hash of an encoded byte stream.  Exposed
@@ -384,7 +412,14 @@ impl DeviceImageCache {
     #[must_use]
     pub fn lookup_by_id(&self, doc: DocId, obj: ObjId) -> Option<Arc<CachedDeviceImage>> {
         let hash = *self.by_doc_obj.get(&(doc, obj))?;
-        self.lookup_by_hash(&hash)
+        // Try the in-process tiers first; on miss, fall through to the
+        // disk tier which is keyed by `(doc, hash)` (cross-document
+        // dedup is in-process only — the disk format scopes entries
+        // to the doc-id directory for clean eviction granularity).
+        if let Some(entry) = self.lookup_by_hash(&hash) {
+            return Some(entry);
+        }
+        self.promote_from_disk(doc, &hash)
     }
 
     /// Probe the cache by content hash.  On a VRAM hit, returns the
@@ -392,6 +427,10 @@ impl DeviceImageCache {
     /// through to the host tier and promotes back to VRAM (one `PCIe`
     /// upload).  Returns `None` only if the hash is in neither tier or
     /// the promotion upload fails.
+    ///
+    /// Does NOT probe the disk tier — that's keyed by `(doc, hash)`
+    /// and only [`Self::lookup_by_id`] has the doc-id needed for the
+    /// lookup.
     #[must_use]
     pub fn lookup_by_hash(&self, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
         if let Some(entry) = self.primary.get(hash) {
@@ -445,6 +484,49 @@ impl DeviceImageCache {
                 Some(new_entry)
             }
         }
+    }
+
+    /// Lift a disk-tier entry back into VRAM.  Reads the file via
+    /// `posix_fadvise(WILLNEED)` + `read_exact`, copies into a fresh
+    /// pinned host slab, uploads to VRAM, and installs in the primary
+    /// index.  The host tier is also populated as a side effect so a
+    /// later same-session lookup that misses VRAM hits host RAM
+    /// instead of going back to disk.
+    ///
+    /// Returns `None` on disk miss, malformed file, allocation
+    /// failure, or upload error — caller treats as a cache miss and
+    /// re-decodes the source bytes.
+    fn promote_from_disk(&self, doc: DocId, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
+        let disk = self.disk.as_ref()?;
+        let entry = disk.lookup(doc, hash)?;
+        log::debug!(
+            "disk-tier: hit for ({doc:?}, {hash:?}) {}×{} {:?}",
+            entry.width,
+            entry.height,
+            entry.layout
+        );
+        // Allocate a pinned host slab and copy the disk bytes in.
+        // The host tier owns the `Arc<HostEntry>` after this so a
+        // future same-session lookup that misses VRAM finds it in
+        // host RAM without going back to disk.
+        let mut pinned = match HostTier::alloc_pinned(self.stream.context(), entry.pixels.len()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("promote_from_disk: alloc_pinned failed: {e}");
+                return None;
+            }
+        };
+        match pinned.as_mut_slice() {
+            Ok(slab) => slab.copy_from_slice(&entry.pixels),
+            Err(e) => {
+                log::warn!("promote_from_disk: pinned slab access failed: {e}");
+                return None;
+            }
+        }
+        let host_entry = HostEntry::new(pinned, entry.width, entry.height, entry.layout);
+        let _arc = self.host.insert(*hash, host_entry, self.next_tick());
+        // Re-bind alias and promote up to VRAM via the existing path.
+        self.promote_from_host(hash)
     }
 
     /// Bind an existing primary entry to a `(DocId, ObjId)` alias.  Used
@@ -565,6 +647,13 @@ impl DeviceImageCache {
                     .fetch_add(new_entry.vram_bytes(), Ordering::Relaxed);
                 let _ = vac.insert(new_entry.clone());
                 self.alias(doc, obj, hash);
+                // Persist to disk for cross-process / cross-session
+                // reuse.  Best-effort: write errors are logged inside
+                // `disk.insert` and don't fail the in-memory insert
+                // — the renderer always gets a valid `Arc<...>`.
+                if let Some(disk) = self.disk.as_ref() {
+                    disk.insert(doc, hash, width, height, layout, pixels);
+                }
                 Ok(new_entry)
             }
         }

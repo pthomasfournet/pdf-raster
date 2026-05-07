@@ -229,25 +229,45 @@ pub fn open_session(
     // failed init produces `image_cache = None`.
     #[cfg(feature = "cache")]
     let image_cache = gpu_ctx.as_ref().map(|ctx| {
-        Arc::new(gpu::cache::DeviceImageCache::new(
+        let mut cache = gpu::cache::DeviceImageCache::new(
             std::sync::Arc::clone(ctx.stream()),
             // Auto-detect would need a running CUDA stream; for v0.7.0
             // we use the spec defaults so a session always boots.
             // Future work: expose a SessionConfig::cache_budget knob.
             gpu::cache::VramBudget::DEFAULT,
             gpu::cache::HostBudget::DEFAULT,
-        ))
+        );
+        // Enable disk persistence when the cache root resolves
+        // (HOME / XDG_CACHE_HOME / PDF_RASTER_CACHE_DIR set).  No
+        // disk tier in sandboxed environments where none of those
+        // env vars are present — the cache stays in-process only.
+        if let Some(disk) = gpu::cache::DiskTier::try_new() {
+            cache = cache.with_disk(disk);
+        }
+        Arc::new(cache)
     });
 
-    // DocId: hash the file path bytes via the cache's BLAKE3 helper
-    // (avoids a direct blake3 dep on this crate).  Stable per file,
-    // cheap.  When the disk tier (Task 5) lands, this should switch
-    // to BLAKE3 of the PDF bytes for cross-process invalidation on
-    // edit, but the path-hash is fine for in-process dedup.
+    // DocId: BLAKE3 of the PDF bytes.  Stable per content; editing
+    // the PDF naturally invalidates the disk tier (Task 5) because
+    // the hash changes.  Costs one full BLAKE3 hash at session open
+    // (~250 MB/s; ~40ms for a 10MB PDF) — paid once per session, not
+    // per page.  Path-hashing was an earlier expedient that didn't
+    // detect content changes.
+    //
+    // If the file becomes unreadable between `pdf_interp::open` (which
+    // succeeded above) and now, fall back to a path-hash so the cache
+    // still functions in-process — disk-tier invalidation is sacrificed
+    // but in-process dedup keeps working.
     #[cfg(feature = "cache")]
     let doc_id = {
-        let path_bytes = path.as_os_str().as_encoded_bytes();
-        let hash = gpu::cache::DeviceImageCache::hash_bytes(path_bytes);
+        let bytes_for_hash = std::fs::read(path).unwrap_or_else(|e| {
+            log::warn!(
+                "open_session: re-read of PDF for DocId hashing failed ({e}); \
+                 falling back to path-hash — disk cache invalidation by content edit will not work"
+            );
+            path.as_os_str().as_encoded_bytes().to_vec()
+        });
+        let hash = gpu::cache::DeviceImageCache::hash_bytes(&bytes_for_hash);
         gpu::cache::DocId(hash.0)
     };
 
