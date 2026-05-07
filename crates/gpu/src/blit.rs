@@ -159,13 +159,20 @@ impl GpuCtx {
         );
         #[expect(
             clippy::cast_precision_loss,
-            reason = "debug_assert: dst.height up to ~64K at 600 DPI fits losslessly in f32"
+            reason = "debug_assert: dst.height up to 2^24 fits losslessly in f32; PDF pages are far smaller"
         )]
         let height_f = dst.height as f32;
+        // Exact equality: callers should pass `page_h = dst.height
+        // as f32`.  Any non-zero discrepancy corrupts the kernel's
+        // y-flip math (`page_h - dy`) on every sample.
+        #[expect(
+            clippy::float_cmp,
+            reason = "page_h is f32-cast of dst.height (u32); equality is exact for u32 ≤ 2^24"
+        )]
+        let page_h_matches = page_h == height_f;
         debug_assert!(
-            (page_h - height_f).abs() < 0.5,
-            "page_h ({page_h}) must match dst.height ({})",
-            dst.height,
+            page_h_matches,
+            "page_h ({page_h}) must equal dst.height as f32 ({height_f})",
         );
 
         let layout_code: i32 = match src.layout {
