@@ -28,9 +28,36 @@ set -euo pipefail
 # ─── Configuration ────────────────────────────────────────────────────────────
 OUT_DIR="bench/v070"
 BENCH="tests/bench_corpus.sh"
-NVJPEG2K_LIB="/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12"
-CUDA_LIB="/usr/local/cuda-12.8/lib64"
 MIN_FREE_GB=20
+
+# CUDA + nvjpeg2k library locations differ across machines.  Override via
+# env if your install lives elsewhere (e.g. on the i7-8700K testbench
+# CUDA libs ship under /usr/lib/x86_64-linux-gnu and nvjpeg2k is absent).
+# Probe candidates in order; first hit wins.  The `:-` defaults preserve
+# any caller override.
+probe_path() {
+  local var="$1"; shift
+  if [[ -n "${!var:-}" ]]; then return; fi
+  for cand in "$@"; do
+    if [[ -e "$cand" ]]; then
+      eval "$var=\"\$cand\""
+      return
+    fi
+  done
+}
+probe_path CUDA_LIB \
+  "/usr/local/cuda-12.8/lib64" \
+  "/usr/local/cuda/lib64" \
+  "/usr/lib/x86_64-linux-gnu"
+probe_path NVJPEG2K_LIB \
+  "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12" \
+  "/usr/local/cuda-12.8/lib64" \
+  "/usr/local/cuda/lib64"
+CUDA_LIB="${CUDA_LIB:-/usr/local/cuda-12.8/lib64}"
+NVJPEG2K_LIB="${NVJPEG2K_LIB:-/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12}"
+
+HAVE_NVJPEG2K=0
+[[ -e "$NVJPEG2K_LIB/libnvjpeg2k.so" ]] && HAVE_NVJPEG2K=1
 
 # Mode → (binary suffix, --backend value, extra args).
 MODES=(A D DC DCP)
@@ -49,10 +76,12 @@ declare -A MODE_LABEL=(
   [DC]="Full GPU + cache"
   [DCP]="Full GPU + cache + prefetch"
 )
+# Feature lists are filled in `builds()` after probing — nvjpeg2k is
+# optional and not present on every machine.
 declare -A BIN_FEATURES=(
-  [nvjpeg]="nvjpeg,nvjpeg2k"
-  [full-nocache]="nvjpeg,nvjpeg2k,gpu-aa,gpu-icc"
-  [full-cache]="nvjpeg,nvjpeg2k,gpu-aa,gpu-icc,cache"
+  [nvjpeg]=""
+  [full-nocache]=""
+  [full-cache]=""
 )
 
 FORCE=0
@@ -122,9 +151,23 @@ build_binary() {
 
 builds() {
   log "Build phase"
+
+  # Compose feature lists based on what's actually installed.
+  local jpeg2k_feat=""
+  if [[ $HAVE_NVJPEG2K -eq 1 ]]; then
+    jpeg2k_feat=",nvjpeg2k"
+    log "  features: nvjpeg2k present"
+  else
+    warn "  features: nvjpeg2k absent (no $NVJPEG2K_LIB/libnvjpeg2k.so) — building without it"
+  fi
+
   if [[ $SKIP_NVJPEG -eq 1 ]]; then
     BIN_FEATURES[nvjpeg]=""
     warn "nvjpeg binary will be built without CUDA features (CUDA unavailable)"
+  else
+    BIN_FEATURES[nvjpeg]="nvjpeg${jpeg2k_feat}"
+    BIN_FEATURES[full-nocache]="nvjpeg${jpeg2k_feat},gpu-aa,gpu-icc"
+    BIN_FEATURES[full-cache]="nvjpeg${jpeg2k_feat},gpu-aa,gpu-icc,cache"
   fi
   build_binary nvjpeg
 
