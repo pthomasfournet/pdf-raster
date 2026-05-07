@@ -31,7 +31,6 @@ CORPORA = [
 
 MODES = [
     ("A", "A. CPU-only"),
-    ("B", "B. VA-API"),
     ("C", "C. nvJPEG"),
     ("D", "D. Full GPU"),
 ]

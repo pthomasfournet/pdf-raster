@@ -20,28 +20,28 @@ NVJPEG2K_LIB="/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12"
 CUDA_LIB="/usr/local/cuda-12.8/lib64"
 MIN_FREE_GB=20
 
-# Mode → (binary suffix, --backend value, cargo features)
-# The same nvjpeg binary is used for modes A, B, C; full is used for D.
-MODES=(A B C D)
+# Mode → (binary suffix, --backend value).
+# VA-API is intentionally absent: this machine has no DRM render node
+# bound to a VA-API driver. See project_vaapi_on_hold.md memory.
+MODES=(A C D)
 declare -A MODE_BIN=(
-  [A]=nvjpeg [B]=nvjpeg [C]=nvjpeg [D]=full
+  [A]=nvjpeg [C]=nvjpeg [D]=full
 )
 declare -A MODE_BACKEND=(
-  [A]=cpu [B]=vaapi [C]=cuda [D]=cuda
+  [A]=cpu [C]=cuda [D]=cuda
 )
 declare -A MODE_LABEL=(
-  [A]="CPU-only" [B]="VA-API" [C]="nvJPEG only" [D]="Full GPU"
+  [A]="CPU-only" [C]="nvJPEG only" [D]="Full GPU"
 )
 declare -A BIN_FEATURES=(
-  [nvjpeg]="nvjpeg,nvjpeg2k,vaapi"
-  [full]="nvjpeg,nvjpeg2k,vaapi,gpu-aa,gpu-icc"
+  [nvjpeg]="nvjpeg,nvjpeg2k"
+  [full]="nvjpeg,nvjpeg2k,gpu-aa,gpu-icc"
 )
 
 FORCE=0
 if [[ ${1:-} == "--force" ]]; then FORCE=1; fi
 
 SKIP_NVJPEG=0
-SKIP_VAAPI=0
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -79,16 +79,6 @@ preflight() {
     SKIP_NVJPEG=1
   else
     log "  nvidia: /dev/nvidia0 + cudart + nvjpeg + nvjpeg2k present"
-  fi
-
-  if [[ ! -e /dev/dri/renderD128 ]]; then
-    warn "/dev/dri/renderD128 missing; mode B will be skipped"
-    SKIP_VAAPI=1
-  elif [[ ! -e /usr/lib/x86_64-linux-gnu/libva.so.2 ]]; then
-    warn "libva.so.2 missing; mode B will be skipped"
-    SKIP_VAAPI=1
-  else
-    log "  vaapi: /dev/dri/renderD128 + libva.so.2 present"
   fi
 
   mkdir -p "$OUT_DIR"
@@ -152,10 +142,6 @@ bench_mode() {
     return 0
   fi
 
-  if [[ "$backend" == "vaapi" && $SKIP_VAAPI -eq 1 ]]; then
-    log "bench[$mode/$label]: SKIP (VA-API unavailable)"
-    return 0
-  fi
   if [[ "$backend" == "cuda" && $SKIP_NVJPEG -eq 1 ]]; then
     log "bench[$mode/$label]: SKIP (CUDA unavailable)"
     return 0
