@@ -26,7 +26,7 @@ mod page_buffer;
 
 pub use host_tier::HostBudget;
 pub(crate) use host_tier::HostTier;
-pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
+pub use page_buffer::DevicePageBuffer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

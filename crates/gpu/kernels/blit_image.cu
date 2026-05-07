@@ -73,7 +73,12 @@ extern "C" __global__ void blit_image(
 ) {
     int dx = bx0 + (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int dy = by0 + (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (dx >= bx1 || dy >= by1 || dx >= dst_w || dy >= dst_h) {
+    // Reject pixels outside the bbox AND outside the page.  The page
+    // bounds (`>= 0` and `>= dst_w/dst_h`) are load-bearing for
+    // memory safety: a rotated image partially off the page can have
+    // bbox.x0 < 0 or bbox.x1 > dst_w; without these checks the
+    // dst_off index below would underflow / overflow into OOB memory.
+    if (dx < 0 || dy < 0 || dx >= bx1 || dy >= by1 || dx >= dst_w || dy >= dst_h) {
         return;
     }
 
@@ -96,11 +101,15 @@ extern "C" __global__ void blit_image(
     }
 
     // Nearest-neighbour: floor(u * src_w), with the (1-v) flip for v.
-    // `min(..., src_w - 1)` clamps the rare case where u rounds up
-    // past the last pixel due to f32 imprecision near u==1.0.
+    // Clamp on both sides: with --use_fast_math, FMA contraction can
+    // produce small negative `(1.0f - v)` values for v very close to
+    // 1.0, which would cast to a huge positive int and read OOB.
+    // Symmetric clamps are cheap and remove the failure mode.
     int ix = (int)(u * (float)src_w);
+    if (ix < 0) ix = 0;
     if (ix >= src_w) ix = src_w - 1;
     int iy = (int)((1.0f - v) * (float)src_h);
+    if (iy < 0) iy = 0;
     if (iy >= src_h) iy = src_h - 1;
 
     int dst_off = (dy * dst_w + dx) * 4;

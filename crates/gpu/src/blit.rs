@@ -50,6 +50,17 @@ pub struct InverseCtm {
     pub ty: f32,
 }
 
+/// Narrow f64 to f32 for the kernel's per-pixel arithmetic.  The
+/// kernel uses f32 for one-FMA-per-pixel performance; PDF-realistic
+/// CTM scales are bounded enough that the truncation is sub-pixel.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "intentional f64→f32 narrowing — see fn doc"
+)]
+const fn narrow(x: f64) -> f32 {
+    x as f32
+}
+
 impl InverseCtm {
     /// Build from a PDF CTM `[a, b, c, d, e, f]`.  Returns `None` when
     /// the matrix is singular (det ≈ 0); the caller should fall back
@@ -67,21 +78,12 @@ impl InverseCtm {
         }
         let inv_det = 1.0 / det;
         Some(Self {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "f64→f32 narrowing is intentional; the kernel uses f32 for one-FMA-per-pixel performance and the precision is sub-pixel at PDF-realistic scales"
-            )]
-            u_dx: (d * inv_det) as f32,
-            #[expect(clippy::cast_possible_truncation, reason = "see u_dx")]
-            u_dy: (-c * inv_det) as f32,
-            #[expect(clippy::cast_possible_truncation, reason = "see u_dx")]
-            v_dx: (-b * inv_det) as f32,
-            #[expect(clippy::cast_possible_truncation, reason = "see u_dx")]
-            v_dy: (a * inv_det) as f32,
-            #[expect(clippy::cast_possible_truncation, reason = "see u_dx")]
-            tx: e as f32,
-            #[expect(clippy::cast_possible_truncation, reason = "see u_dx")]
-            ty: f as f32,
+            u_dx: narrow(d * inv_det),
+            u_dy: narrow(-c * inv_det),
+            v_dx: narrow(-b * inv_det),
+            v_dy: narrow(a * inv_det),
+            tx: narrow(e),
+            ty: narrow(f),
         })
     }
 
@@ -107,11 +109,14 @@ pub struct BlitBbox {
 }
 
 impl BlitBbox {
+    /// Width in pixels, saturating to 0 for an inverted or zero-area
+    /// bbox.  `saturating_sub` rules out the i32-overflow case that
+    /// `(x1 - x0).max(0)` could panic on for adversarial inputs.
     fn width(self) -> u32 {
-        u32::try_from((self.x1 - self.x0).max(0)).unwrap_or(0)
+        u32::try_from(self.x1.saturating_sub(self.x0)).unwrap_or(0)
     }
     fn height(self) -> u32 {
-        u32::try_from((self.y1 - self.y0).max(0)).unwrap_or(0)
+        u32::try_from(self.y1.saturating_sub(self.y0)).unwrap_or(0)
     }
 }
 
@@ -140,6 +145,29 @@ impl GpuCtx {
         // in any modern SM's register budget for this kernel.
         const TILE: u32 = 16;
 
+        // Caller contract: bbox is non-inverted.  An inverted bbox
+        // would silently render zero pixels (BlitBbox::width returns
+        // 0 via saturating_sub), masking a programming error.  The
+        // page_h must match dst.height for the kernel's y-flip math.
+        debug_assert!(
+            bbox.x0 <= bbox.x1 && bbox.y0 <= bbox.y1,
+            "blit bbox is inverted: ({}..{}, {}..{})",
+            bbox.x0,
+            bbox.x1,
+            bbox.y0,
+            bbox.y1,
+        );
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "debug_assert: dst.height up to ~64K at 600 DPI fits losslessly in f32"
+        )]
+        let height_f = dst.height as f32;
+        debug_assert!(
+            (page_h - height_f).abs() < 0.5,
+            "page_h ({page_h}) must match dst.height ({})",
+            dst.height,
+        );
+
         let layout_code: i32 = match src.layout {
             ImageLayout::Rgb => 0,
             ImageLayout::Gray => 1,
@@ -148,7 +176,6 @@ impl GpuCtx {
         let bw = bbox.width();
         let bh = bbox.height();
         if bw == 0 || bh == 0 {
-            // Empty bbox — nothing to do, success.
             return Ok(());
         }
 
