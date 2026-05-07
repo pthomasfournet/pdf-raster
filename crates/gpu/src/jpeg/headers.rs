@@ -27,6 +27,17 @@
 use std::error::Error;
 use std::fmt;
 
+// ── JPEG marker bytes ─────────────────────────────────────────────────────────
+//
+// Spec names from ISO/IEC 10918-1 Annex B, kept as module-level consts so
+// match arms and error variants don't require a 0xC0 → "SOF0" mental lookup.
+
+const MARKER_SOF0: u8 = 0xC0;
+const MARKER_DHT: u8 = 0xC4;
+const MARKER_DQT: u8 = 0xDB;
+const MARKER_SOS: u8 = 0xDA;
+const MARKER_DRI: u8 = 0xDD;
+
 /// A successfully parsed set of JPEG headers.
 ///
 /// Lifetime is tied to the input slice: `scan_data` is a borrow of the
@@ -43,10 +54,9 @@ pub struct JpegHeaders<'a> {
     pub components: u8,
     /// Per-component metadata (only the first `components` entries are valid).
     pub frame_components: [JpegFrameComponent; 4],
-    /// Quantisation tables, indexed by table ID 0..=3. Only `quant_present` slots are valid.
-    pub quant_tables: [JpegQuantTable; 4],
-    /// Bitmap: `quant_present[i] == true` iff `quant_tables[i]` was loaded from a DQT segment.
-    pub quant_present: [bool; 4],
+    /// Quantisation tables, indexed by table ID 0..=3.  `None` slots were
+    /// never loaded from a DQT segment.
+    pub quant_tables: [Option<JpegQuantTable>; 4],
     /// All Huffman tables seen in DHT segments. Index by `(class, table_id)` via [`Self::huffman`].
     pub huffman_tables: Vec<JpegHuffmanTable>,
     /// SOS scan header.
@@ -80,12 +90,6 @@ pub struct JpegQuantTable {
     pub values: [u8; 64],
 }
 
-impl Default for JpegQuantTable {
-    fn default() -> Self {
-        Self { values: [0; 64] }
-    }
-}
-
 /// Class of a Huffman table — DC differentials or AC run/size pairs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DhtClass {
@@ -93,6 +97,23 @@ pub enum DhtClass {
     Dc,
     /// AC run/size codes (`values` encode `(run << 4) | size`, max 162 distinct codes).
     Ac,
+}
+
+impl DhtClass {
+    /// Short human name used by error messages: `"DC"` or `"AC"`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Dc => "DC",
+            Self::Ac => "AC",
+        }
+    }
+}
+
+impl fmt::Display for DhtClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// One Huffman table parsed from a DHT segment, in JPEG wire form.
@@ -153,6 +174,11 @@ pub enum JpegHeaderError {
     },
     /// SOF0 was not encountered before SOS, or `width`/`height`/`components` are zero.
     MissingSof0,
+    /// Stream is not baseline DCT — typically progressive JPEG (SOF2) or
+    /// lossless (SOF3).  Detected up-front via [`crate::jpeg_sof::jpeg_sof_type`]
+    /// so the caller can route to a different decoder cleanly instead of
+    /// receiving a less-actionable [`Self::MissingSof0`].
+    NotBaseline,
     /// SOF0 specified an unsupported precision (we only handle 8-bit baseline).
     UnsupportedPrecision {
         /// Precision in bits as declared in the SOF0 segment.
@@ -229,6 +255,10 @@ impl fmt::Display for JpegHeaderError {
                 write!(f, "segment 0x{marker:02X} length < 2 bytes")
             }
             Self::MissingSof0 => write!(f, "SOF0 baseline frame header not found before SOS"),
+            Self::NotBaseline => write!(
+                f,
+                "JPEG is not baseline DCT (progressive or lossless variants are routed to a different decoder)",
+            ),
             Self::UnsupportedPrecision { precision } => {
                 write!(
                     f,
@@ -265,11 +295,7 @@ impl fmt::Display for JpegHeaderError {
                 "SOS header malformed or component table overruns segment"
             ),
             Self::BadSosTableSelector { class, selector } => {
-                let kind = match class {
-                    DhtClass::Dc => "DC",
-                    DhtClass::Ac => "AC",
-                };
-                write!(f, "SOS {kind} table selector {selector} not in {{0, 1}}")
+                write!(f, "SOS {class} table selector {selector} not in {{0, 1}}")
             }
             Self::Truncated => write!(f, "JPEG stream truncated before SOS"),
             Self::Overflow => write!(f, "integer overflow during JPEG header parse"),
@@ -301,12 +327,24 @@ impl<'a> JpegHeaders<'a> {
             return Err(JpegHeaderError::MissingSoi);
         }
 
+        // Fail fast on streams whose SOF marker explicitly flags a non-
+        // baseline variant (SOF2/SOF10 = progressive, etc.) so the caller
+        // gets a precise routing signal rather than the eventual
+        // MissingSof0 / Truncated. We only reject when the SOF byte is
+        // unambiguous; truncated-before-SOF or non-JPEG inputs fall through
+        // to the regular error paths.
+        if matches!(
+            crate::jpeg_sof::jpeg_sof_type(data),
+            Some(crate::jpeg_sof::JpegVariant::Progressive)
+        ) {
+            return Err(JpegHeaderError::NotBaseline);
+        }
+
         let mut width: u16 = 0;
         let mut height: u16 = 0;
         let mut components: u8 = 0;
         let mut frame_components = [JpegFrameComponent::default(); 4];
-        let mut quant_tables = [JpegQuantTable::default(); 4];
-        let mut quant_present = [false; 4];
+        let mut quant_tables: [Option<JpegQuantTable>; 4] = [None; 4];
         let mut huffman_tables: Vec<JpegHuffmanTable> = Vec::with_capacity(4);
         let mut scan = JpegScanHeader::default();
         let mut restart_interval: u16 = 0;
@@ -331,7 +369,7 @@ impl<'a> JpegHeaders<'a> {
                 0xD0..=0xD8 => {}
 
                 // SOF0 — baseline DCT 8-bit.
-                0xC0 => {
+                MARKER_SOF0 => {
                     let body = read_segment(&mut cursor, marker)?;
                     parse_sof0(
                         body,
@@ -343,19 +381,19 @@ impl<'a> JpegHeaders<'a> {
                 }
 
                 // DQT — quantisation tables.
-                0xDB => {
+                MARKER_DQT => {
                     let body = read_segment(&mut cursor, marker)?;
-                    parse_dqt(body, &mut quant_tables, &mut quant_present)?;
+                    parse_dqt(body, &mut quant_tables)?;
                 }
 
                 // DHT — Huffman tables.
-                0xC4 => {
+                MARKER_DHT => {
                     let body = read_segment(&mut cursor, marker)?;
                     parse_dht(body, &mut huffman_tables)?;
                 }
 
                 // DRI — define restart interval.
-                0xDD => {
+                MARKER_DRI => {
                     let body = read_segment(&mut cursor, marker)?;
                     if body.len() != 2 {
                         return Err(JpegHeaderError::BadDriLength {
@@ -366,7 +404,7 @@ impl<'a> JpegHeaders<'a> {
                 }
 
                 // SOS — start of scan: last header we need.
-                0xDA => {
+                MARKER_SOS => {
                     let body = read_segment(&mut cursor, marker)?;
                     parse_sos(body, &mut scan)?;
                     scan_data_offset = cursor.position();
@@ -375,10 +413,9 @@ impl<'a> JpegHeaders<'a> {
                     break;
                 }
 
-                // APP0–APP15, COM, etc. (0xE0–0xFE except already-handled): length-prefixed; skip.
-                // We only need read_segment's side-effect of advancing the cursor.
+                // APP0–APP15, COM, etc. — length-prefixed; advance past the body.
                 0xE0..=0xFE => {
-                    let _skipped_segment_body = read_segment(&mut cursor, marker)?;
+                    let _ = read_segment(&mut cursor, marker)?;
                 }
 
                 // EOI or any unrecognised marker — stop parsing.
@@ -401,7 +438,6 @@ impl<'a> JpegHeaders<'a> {
             components,
             frame_components,
             quant_tables,
-            quant_present,
             huffman_tables,
             scan,
             restart_interval,
@@ -423,18 +459,39 @@ impl<'a> JpegHeaders<'a> {
     /// `components`, `width`/`height`, and the per-component sampling factors.
     #[must_use]
     pub fn num_mcus(&self) -> u32 {
-        if self.components == 0 {
-            return 0;
-        }
-        let comps = &self.frame_components[..self.components as usize];
-        let max_h = comps.iter().map(|c| c.h_sampling).max().unwrap_or(1).max(1);
-        let max_v = comps.iter().map(|c| c.v_sampling).max().unwrap_or(1).max(1);
-        let mcu_w = u32::from(max_h) * 8;
-        let mcu_h = u32::from(max_v) * 8;
-        let w = u32::from(self.width);
-        let h = u32::from(self.height);
-        w.div_ceil(mcu_w) * h.div_ceil(mcu_h)
+        mcu_count(
+            self.width,
+            self.height,
+            &self.frame_components[..self.components as usize],
+        )
     }
+}
+
+/// Compute the MCU count from raw frame parameters.  Shared between
+/// [`JpegHeaders::num_mcus`] and [`super::CpuPrepassOutput::num_mcus`] so
+/// the formula lives in exactly one place.
+#[must_use]
+pub fn mcu_count(width: u16, height: u16, frame_components: &[JpegFrameComponent]) -> u32 {
+    if frame_components.is_empty() {
+        return 0;
+    }
+    let max_h = frame_components
+        .iter()
+        .map(|c| c.h_sampling)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_v = frame_components
+        .iter()
+        .map(|c| c.v_sampling)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mcu_w = u32::from(max_h) * 8;
+    let mcu_h = u32::from(max_v) * 8;
+    let w = u32::from(width);
+    let h = u32::from(height);
+    w.div_ceil(mcu_w) * h.div_ceil(mcu_h)
 }
 
 // ── Cursor + segment helpers ──────────────────────────────────────────────────
@@ -503,7 +560,9 @@ fn parse_sof0(
     frame_components: &mut [JpegFrameComponent; 4],
 ) -> Result<(), JpegHeaderError> {
     if body.len() < 6 {
-        return Err(JpegHeaderError::SegmentTooShort { marker: 0xC0 });
+        return Err(JpegHeaderError::SegmentTooShort {
+            marker: MARKER_SOF0,
+        });
     }
     if body[0] != 8 {
         return Err(JpegHeaderError::UnsupportedPrecision { precision: body[0] });
@@ -515,7 +574,9 @@ fn parse_sof0(
         return Err(JpegHeaderError::TooManyComponents { count: nf });
     }
     if (nf as usize) * 3 + 6 > body.len() {
-        return Err(JpegHeaderError::SegmentOverrun { marker: 0xC0 });
+        return Err(JpegHeaderError::SegmentOverrun {
+            marker: MARKER_SOF0,
+        });
     }
     *components = nf;
     let component_records = body[6..6 + usize::from(nf) * 3].chunks_exact(3);
@@ -526,7 +587,7 @@ fn parse_sof0(
         let quant_selector = record[2];
         if quant_selector >= 4 {
             return Err(JpegHeaderError::BadTableId {
-                marker: 0xC0,
+                marker: MARKER_SOF0,
                 table_id: quant_selector,
             });
         }
@@ -552,8 +613,7 @@ fn parse_sof0(
 
 fn parse_dqt(
     body: &[u8],
-    quant_tables: &mut [JpegQuantTable; 4],
-    quant_present: &mut [bool; 4],
+    quant_tables: &mut [Option<JpegQuantTable>; 4],
 ) -> Result<(), JpegHeaderError> {
     let mut off = 0usize;
     while off < body.len() {
@@ -563,33 +623,32 @@ fn parse_dqt(
         let table_id_u8 = id_prec & 0x0F;
         if table_id_u8 >= 4 {
             return Err(JpegHeaderError::BadTableId {
-                marker: 0xDB,
+                marker: MARKER_DQT,
                 table_id: table_id_u8,
             });
         }
         let table_id = table_id_u8 as usize;
+        let mut values = [0u8; 64];
         if prec == 0 {
             if off + 64 > body.len() {
-                return Err(JpegHeaderError::SegmentOverrun { marker: 0xDB });
+                return Err(JpegHeaderError::SegmentOverrun { marker: MARKER_DQT });
             }
-            quant_tables[table_id]
-                .values
-                .copy_from_slice(&body[off..off + 64]);
+            values.copy_from_slice(&body[off..off + 64]);
             off += 64;
         } else {
             // 16-bit quantisers — clamp each big-endian u16 to u8 for downstream
             // consumers that only support 8-bit. Documented widening contract.
             if off + 128 > body.len() {
-                return Err(JpegHeaderError::SegmentOverrun { marker: 0xDB });
+                return Err(JpegHeaderError::SegmentOverrun { marker: MARKER_DQT });
             }
             for k in 0..64 {
                 let val = u16::from_be_bytes([body[off + k * 2], body[off + k * 2 + 1]]);
                 // val.min(255) constrains to u8 range; cast is lossless.
-                quant_tables[table_id].values[k] = val.min(255) as u8;
+                values[k] = val.min(255) as u8;
             }
             off += 128;
         }
-        quant_present[table_id] = true;
+        quant_tables[table_id] = Some(JpegQuantTable { values });
     }
     Ok(())
 }
@@ -601,7 +660,7 @@ fn parse_dht(
     let mut off = 0usize;
     while off < body.len() {
         if off + 17 > body.len() {
-            return Err(JpegHeaderError::SegmentOverrun { marker: 0xC4 });
+            return Err(JpegHeaderError::SegmentOverrun { marker: MARKER_DHT });
         }
         let tc_th = body[off];
         off += 1;
@@ -614,7 +673,7 @@ fn parse_dht(
         };
         if th >= 4 {
             return Err(JpegHeaderError::BadTableId {
-                marker: 0xC4,
+                marker: MARKER_DHT,
                 table_id: th,
             });
         }
@@ -634,7 +693,7 @@ fn parse_dht(
             _ => {}
         }
         if off + total > body.len() {
-            return Err(JpegHeaderError::SegmentOverrun { marker: 0xC4 });
+            return Err(JpegHeaderError::SegmentOverrun { marker: MARKER_DHT });
         }
 
         let mut values = Vec::with_capacity(total);
@@ -735,7 +794,7 @@ mod tests {
         assert_eq!(h.width, 16);
         assert_eq!(h.height, 16);
         assert_eq!(h.components, 1);
-        assert!(h.quant_present[0]);
+        assert!(h.quant_tables[0].is_some());
         assert_eq!(h.scan.component_count, 1);
         assert_eq!(h.scan.components[0].id, 1);
         assert!(!h.scan_data.is_empty());
@@ -762,10 +821,11 @@ mod tests {
     #[test]
     fn parse_extracts_quant_table() {
         let h = JpegHeaders::parse(GRAY_16X16_JPEG).expect("parse failed");
+        let qt = h.quant_tables[0].as_ref().expect("DQT 0 missing");
         // First three zigzag values from the DQT in the fixture.
-        assert_eq!(h.quant_tables[0].values[0], 0x06);
-        assert_eq!(h.quant_tables[0].values[1], 0x04);
-        assert_eq!(h.quant_tables[0].values[2], 0x05);
+        assert_eq!(qt.values[0], 0x06);
+        assert_eq!(qt.values[1], 0x04);
+        assert_eq!(qt.values[2], 0x05);
     }
 
     #[test]
@@ -787,16 +847,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_progressive_minimal_returns_missing_sof0() {
-        // SOF2 (progressive) instead of SOF0 — parser must not parse it as a
-        // frame header. The whole-stream walk eventually hits truncation
-        // because no SOS appears with valid framing; either result is
-        // acceptable, but it must NOT silently succeed.
+    fn parse_progressive_minimal_returns_not_baseline() {
+        // The up-front jpeg_sof_type gate must catch progressive (SOF2) so
+        // the caller routes to a different decoder rather than receiving the
+        // less-actionable MissingSof0/Truncated.
         let err = JpegHeaders::parse(PROGRESSIVE_MINIMAL).expect_err("must fail");
-        assert!(matches!(
-            err,
-            JpegHeaderError::MissingSof0 | JpegHeaderError::Truncated,
-        ));
+        assert_eq!(err, JpegHeaderError::NotBaseline);
     }
 
     #[test]

@@ -78,8 +78,12 @@ impl JpegHeaders {
         }
 
         let mut quant_tables = [[0u8; 64]; 4];
-        for (i, qt) in shared.quant_tables.iter().enumerate() {
-            quant_tables[i] = qt.values;
+        let mut quant_present = [false; 4];
+        for (i, slot) in shared.quant_tables.iter().enumerate() {
+            if let Some(qt) = slot {
+                quant_tables[i] = qt.values;
+                quant_present[i] = true;
+            }
         }
 
         let huffman_entries = pack_huffman_entries(&shared.huffman_tables);
@@ -102,7 +106,7 @@ impl JpegHeaders {
             v_samp,
             quant_sel,
             quant_tables,
-            quant_present: shared.quant_present,
+            quant_present,
             huffman_entries,
             scan_comp_ids,
             scan_dc_table,
@@ -206,14 +210,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_does_not_reject_sof2_directly() {
-        // The shared parser fails non-SOF0 streams via MissingSof0/Truncated;
-        // either error is fine, but the message must NOT mention "progressive"
-        // — that's the upstream router's responsibility (jpeg_sof_type).
+    fn parse_rejects_sof2_with_routable_error() {
+        // The shared parser's NotBaseline gate catches SOF2 up-front; the
+        // VA-API adapter forwards it as VapiError::BadJpeg with the
+        // descriptive message intact so the caller's error log explains
+        // why the image was skipped.
         match JpegHeaders::parse(PROGRESSIVE_MINIMAL) {
             Err(VapiError::BadJpeg(msg)) => assert!(
-                !msg.contains("progressive"),
-                "VA-API parser should not reject progressive JPEG itself; got: {msg}",
+                msg.contains("baseline"),
+                "expected NotBaseline message; got: {msg}",
             ),
             Err(other) => panic!("unexpected error variant: {other:?}"),
             Ok(_) => panic!("SOF2-only stream must not parse successfully"),

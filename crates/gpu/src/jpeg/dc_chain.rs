@@ -149,16 +149,10 @@ impl std::fmt::Display for DcChainError {
                 f,
                 "DC chain pre-pass: AC run/size pair overflows block at MCU {mcu_index}",
             ),
-            Self::MissingHuffmanTable { class, selector } => {
-                let kind = match class {
-                    DhtClass::Dc => "DC",
-                    DhtClass::Ac => "AC",
-                };
-                write!(
-                    f,
-                    "DC chain pre-pass: scan references {kind} table {selector} but no codebook was provided",
-                )
-            }
+            Self::MissingHuffmanTable { class, selector } => write!(
+                f,
+                "DC chain pre-pass: scan references {class} table {selector} but no codebook was provided",
+            ),
             Self::UnsupportedScanShape => write!(f, "DC chain pre-pass: unsupported scan shape"),
             Self::TooManyMcus { requested } => write!(
                 f,
@@ -205,7 +199,7 @@ fn blocks_per_mcu(scan_components: usize, h_sampling: u8, v_sampling: u8) -> usi
 /// Caller must pre-build the canonical Huffman codebooks for every (class,
 /// selector) the scan references and pass them in via `dc_codebooks` and
 /// `ac_codebooks` indexed by selector (0..=3).  This avoids rebuilding the
-/// 256 KB-per-table lookup arrays inside `resolve_dc_chain` when the caller
+/// 128 KB-per-table lookup arrays inside `resolve_dc_chain` when the caller
 /// already has them — the on-GPU pipeline keeps the AC codebooks alive for
 /// Phase 1 and would otherwise duplicate construction.
 ///
@@ -308,18 +302,19 @@ pub fn resolve_dc_chain(
 
     let n_mcus_u32 = u32::try_from(n_mcus).expect("MAX_SAFE_MCUS guarantees fit in u32");
     for mcu_idx in 0..n_mcus_u32 {
-        // If the bit reader has crossed (or is at) the next RST boundary,
-        // realign to a byte boundary and reset every DC predictor before
-        // decoding this MCU.  RST boundaries are byte-aligned in the
-        // unstuffed stream.
-        while let Some(&&rst) = rst_iter.peek() {
-            if bits.byte_position() >= rst.byte_offset_in_dst {
-                bits.realign_to_byte_at(rst.byte_offset_in_dst);
-                dc_predictor = [0i32; 4];
-                let _ = rst_iter.next();
-            } else {
-                break;
-            }
+        // Consume every RST boundary the bit reader has crossed (or reached)
+        // before decoding this MCU.  At each crossing the DC predictor resets
+        // to zero and the bit reader realigns to a byte boundary, per
+        // JPEG § F.1.1.5.
+        while rst_iter
+            .peek()
+            .is_some_and(|&&r| bits.byte_position() >= r.byte_offset_in_dst)
+        {
+            let rst = rst_iter
+                .next()
+                .expect("peek returned Some immediately above");
+            bits.realign_to_byte_at(rst.byte_offset_in_dst);
+            dc_predictor = [0i32; 4];
         }
 
         for step in steps.iter().take(scan_components) {

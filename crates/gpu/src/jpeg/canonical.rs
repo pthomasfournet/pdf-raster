@@ -4,22 +4,14 @@
 //! `(num_codes[16], values)`, where `num_codes[i]` is the number of `i+1`-bit
 //! codewords and `values` is the list of decoded symbols in canonical order.
 //! This module builds the canonical code values per JPEG ISO/IEC 10918-1
-//! Annex C and produces a fast direct-indexed lookup table suitable for
-//! both CPU bit-walkers and the GPU parallel-Huffman kernel.
+//! Annex C and produces a 65 536-entry direct-indexed lookup table.
 //!
 //! # Lookup table format
 //!
-//! The table is keyed by the next 16 bits of the entropy stream, MSB-first,
-//! padded with zeros if fewer than 16 bits remain.  Each entry stores the
-//! number of bits the codeword consumes (1..=16) and the symbol value.
-//! Replication: a 10-bit codeword `c` occupies all 64 entries from `c << 6`
-//! through `(c << 6) | 63`.  This mirrors the layout used by `gpuhd`'s
-//! `CUHDCodetableItemSingle` (which we read for reference) and by GPUJPEG's
-//! `quick + full` two-tier scheme; the GPU pipeline will later split this
-//! flat table into a small shared-memory tier for short codes plus a global
-//! fallback for long codes, but the construction logic is identical.
-//!
-//! Lookups: given the next 16 bits as a `u16`, the entry is `table[u16]`.
+//! Keyed by the next 16 bits of the entropy stream, MSB-first, zero-padded
+//! if fewer than 16 bits remain.  Each entry stores the number of bits the
+//! codeword consumes (1..=16) and the symbol value.  Replication: a 10-bit
+//! codeword `c` occupies all 64 entries from `c << 6` through `(c << 6) | 63`.
 //! Decoder advances by `entry.num_bits` and emits `entry.symbol`.
 
 use super::headers::JpegHuffmanTable;
@@ -50,7 +42,7 @@ impl CanonicalEntry {
 /// A canonical Huffman codebook ready for direct-indexed lookup.
 ///
 /// Construction is allocation-aware: the 65 536-entry table is heap-allocated
-/// once per codebook, since stack-allocating 256 KB would blow most thread
+/// once per codebook, since stack-allocating 128 KB would blow most thread
 /// stacks.  `CanonicalCodebook` owns the table.
 pub struct CanonicalCodebook {
     /// 1 << 16 entries, indexed by the next 16 bits of the bitstream MSB-first.
@@ -121,7 +113,7 @@ impl CanonicalCodebook {
     ///
     /// # Panics
     ///
-    /// Panics only on heap-allocation failure of the 256 KB lookup slab,
+    /// Panics only on heap-allocation failure of the 128 KB lookup slab,
     /// which is the standard "allocator OOM" panic Rust emits and not a
     /// recoverable error from the caller's perspective.
     pub fn build(table: &JpegHuffmanTable) -> Result<Self, CanonicalCodebookError> {
@@ -136,7 +128,7 @@ impl CanonicalCodebook {
             });
         }
 
-        // Allocate the 256 KB lookup table directly on the heap; constructing
+        // Allocate the 128 KB lookup table directly on the heap; constructing
         // it on the stack first would risk overflowing typical thread stacks.
         let mut entries: Box<[CanonicalEntry; 65_536]> = vec![CanonicalEntry::EMPTY; 65_536]
             .into_boxed_slice()

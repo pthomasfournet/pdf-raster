@@ -42,16 +42,16 @@ pub struct CpuPrepassOutput {
     pub components: u8,
     /// Per-component frame metadata (only the first `components` entries valid).
     pub frame_components: [super::headers::JpegFrameComponent; 4],
-    /// Quantisation tables.  `quant_present[i]` says which slots are valid.
-    pub quant_tables: [super::headers::JpegQuantTable; 4],
-    /// Bitmap of valid quantiser slots.
-    pub quant_present: [bool; 4],
+    /// Quantisation tables, indexed by table ID 0..=3.  `None` slots were
+    /// never loaded from a DQT segment.
+    pub quant_tables: [Option<super::headers::JpegQuantTable>; 4],
     /// Canonical Huffman lookup tables for AC decoding.  Indexed by `table_id`
     /// (0..=1 in baseline JPEG); only entries referenced by the scan are present.
     pub ac_codebooks: [Option<CanonicalCodebook>; 4],
     /// Scan header (which components, which Huffman selectors).
     pub scan: super::headers::JpegScanHeader,
-    /// Restart interval in MCUs (0 = none).
+    /// Restart interval in MCUs (0 = none).  When > 0, [`Self::rst_positions`]
+    /// is non-empty.
     pub restart_interval: u16,
     /// Flat entropy-coded bitstream, byte-stuffing already removed.
     pub unstuffed: Vec<u8>,
@@ -60,8 +60,6 @@ pub struct CpuPrepassOutput {
     pub rst_positions: Vec<RstPosition>,
     /// Per-component absolute DC values resolved on the CPU.
     pub dc_values: DcValues,
-    /// Total MCU count, redundantly cached so callers don't re-derive it.
-    pub num_mcus: u32,
 }
 
 impl CpuPrepassOutput {
@@ -69,6 +67,19 @@ impl CpuPrepassOutput {
     #[must_use]
     pub fn pixel_count(&self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
+    }
+
+    /// Active per-component frame metadata (slice of length `self.components`).
+    #[must_use]
+    pub fn active_frame_components(&self) -> &[super::headers::JpegFrameComponent] {
+        &self.frame_components[..usize::from(self.components)]
+    }
+
+    /// Number of MCUs in the image.  Computed from `width`/`height`/sampling
+    /// factors on demand — cheap and cache-line-friendly.
+    #[must_use]
+    pub fn num_mcus(&self) -> u32 {
+        super::headers::mcu_count(self.width, self.height, self.active_frame_components())
     }
 }
 
@@ -113,26 +124,14 @@ impl std::fmt::Display for CpuPrepassError {
                 class,
                 selector,
                 source,
-            } => {
-                let kind = match class {
-                    DhtClass::Dc => "DC",
-                    DhtClass::Ac => "AC",
-                };
-                write!(
-                    f,
-                    "build {kind} Huffman codebook (selector {selector}): {source}",
-                )
-            }
-            Self::MissingHuffmanTable { class, selector } => {
-                let kind = match class {
-                    DhtClass::Dc => "DC",
-                    DhtClass::Ac => "AC",
-                };
-                write!(
-                    f,
-                    "scan references {kind} Huffman table {selector} but no DHT declared it",
-                )
-            }
+            } => write!(
+                f,
+                "build {class} Huffman codebook (selector {selector}): {source}",
+            ),
+            Self::MissingHuffmanTable { class, selector } => write!(
+                f,
+                "scan references {class} Huffman table {selector} but no DHT declared it",
+            ),
             Self::DcChain(e) => write!(f, "DC chain pre-pass: {e}"),
         }
     }
@@ -179,16 +178,13 @@ impl From<DcChainError> for CpuPrepassError {
 pub fn run_cpu_prepass(data: &[u8]) -> Result<CpuPrepassOutput, CpuPrepassError> {
     let headers = JpegHeaders::parse(data)?;
 
-    // Strip 0xFF 0x00 byte-stuffing and capture every RST marker so the
-    // DC-chain walker can reset its predictor at the right boundaries.
     let mut unstuffed = Vec::with_capacity(headers.scan_data.len());
     let mut rst_positions = Vec::new();
     unstuff::unstuff_into(headers.scan_data, &mut unstuffed, &mut rst_positions)?;
 
-    // Build every Huffman codebook the scan references.  Both DC and AC
-    // tables are constructed once and consumed by the DC-chain walker (DC
-    // tables) and (in a later phase) the parallel-Huffman GPU kernel (AC
-    // tables).
+    // Build codebooks once, hand both DC and AC sets to the DC-chain walker.
+    // AC codebooks live in CpuPrepassOutput so the parallel-Huffman kernel
+    // can reuse them without rebuilding.
     let (dc_codebooks, ac_codebooks) = build_scan_codebooks(&headers)?;
 
     let dc_values = dc_chain::resolve_dc_chain(
@@ -198,7 +194,6 @@ pub fn run_cpu_prepass(data: &[u8]) -> Result<CpuPrepassOutput, CpuPrepassError>
         &dc_codebooks,
         &ac_codebooks,
     )?;
-    let num_mcus = headers.num_mcus();
 
     Ok(CpuPrepassOutput {
         width: headers.width,
@@ -206,14 +201,12 @@ pub fn run_cpu_prepass(data: &[u8]) -> Result<CpuPrepassOutput, CpuPrepassError>
         components: headers.components,
         frame_components: headers.frame_components,
         quant_tables: headers.quant_tables,
-        quant_present: headers.quant_present,
         ac_codebooks,
         scan: headers.scan,
         restart_interval: headers.restart_interval,
         unstuffed,
         rst_positions,
         dc_values,
-        num_mcus,
     })
 }
 
@@ -278,7 +271,7 @@ mod tests {
         assert_eq!(out.width, 16);
         assert_eq!(out.height, 16);
         assert_eq!(out.components, 1);
-        assert_eq!(out.num_mcus, 4);
+        assert_eq!(out.num_mcus(), 4);
         // 4 MCUs × 1 block each = 4 DC values for the single component.
         assert_eq!(out.dc_values.per_component.len(), 1);
         assert_eq!(out.dc_values.per_component[0].len(), 4);
