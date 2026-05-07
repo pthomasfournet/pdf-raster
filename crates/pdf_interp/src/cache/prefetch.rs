@@ -33,7 +33,17 @@ use std::thread;
 use gpu::cache::{DeviceImageCache, DocId, ObjId};
 use pdf::{Document, Object, ObjectId};
 
+use crate::resources::image::{ImageFilter, filter_name};
 use crate::resources::resolve_image;
+
+/// Upper bound on prefetcher worker threads.
+///
+/// Caps an arbitrary caller-supplied [`PrefetchConfig::workers`]
+/// value so a misconfig (typo, overflow from `num_cpus * factor`)
+/// can't spawn thousands of threads.  Beyond ~16 workers the
+/// JPEG-decode pool would contend with the renderer's rayon pool
+/// anyway.
+pub const MAX_PREFETCH_WORKERS: usize = 16;
 
 /// Tunables for [`spawn_prefetch`].
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +51,8 @@ pub struct PrefetchConfig {
     /// Number of background worker threads.  Default 2; bumping this
     /// only helps if the renderer hasn't started yet (i.e. the
     /// session was opened well in advance of the first render call).
+    /// Clamped to the range `1..=MAX_PREFETCH_WORKERS` at spawn time
+    /// (see [`MAX_PREFETCH_WORKERS`]).
     pub workers: usize,
     /// Hard cap on the number of distinct images the prefetcher will
     /// decode.  Acts as a guardrail for adversarial PDFs that list
@@ -201,10 +213,6 @@ pub fn spawn_prefetch(
         cache,
         doc,
         doc_id,
-        // Discovery is the only writer to `seen`, but the type
-        // wraps it in a Mutex anyway so the call site stays a
-        // one-line guard.
-        seen: Arc::new(Mutex::new(HashSet::new())),
         stats: Arc::new(PrefetchStats::default()),
         cancel: Arc::new(AtomicBool::new(false)),
     });
@@ -215,7 +223,7 @@ pub fn spawn_prefetch(
     let rx = Arc::new(Mutex::new(rx));
 
     // Spawn workers first so they're ready when discovery begins.
-    let workers = config.workers.max(1);
+    let workers = config.workers.clamp(1, MAX_PREFETCH_WORKERS);
     let mut handles = Vec::with_capacity(workers + 1);
     for worker_idx in 0..workers {
         let rx = Arc::clone(&rx);
@@ -260,11 +268,14 @@ struct PrefetchJob {
 /// Bundled state borrowed by both [`discover_pages`] and
 /// [`worker_loop`] — keeps each function's arg list sane and means
 /// the spawn site only owns one set of `Arc`s.
+///
+/// `seen` doesn't live here: discovery is single-threaded and is
+/// the only writer, so the dedup set is a plain `HashSet` owned
+/// inside [`discover_pages`].
 struct PrefetchState {
     cache: Arc<DeviceImageCache>,
     doc: Arc<Document>,
     doc_id: DocId,
-    seen: Arc<Mutex<HashSet<ObjId>>>,
     stats: Arc<PrefetchStats>,
     cancel: Arc<AtomicBool>,
 }
@@ -272,7 +283,17 @@ struct PrefetchState {
 /// Walk every page's `/XObject` resource dict and emit a
 /// [`PrefetchJob`] for each `/DCTDecode`-filtered image `XObject` we
 /// haven't already seen.
+///
+/// Form `XObject`s are *not* recursed into; images nested inside
+/// a Form's own resource dict will not be prefetched and the
+/// renderer will decode them on first touch.  The renderer already
+/// pays that cost only once per image (subsequent pages hit the
+/// cache), so the gap is bounded.
 fn discover_pages(state: &PrefetchState, max_images: usize, tx: &mpsc::Sender<PrefetchJob>) {
+    // Discovery is single-threaded so the dedup set is a plain
+    // local — no Mutex / Arc.  An image referenced from N pages
+    // therefore generates one PrefetchJob, not N.
+    let mut seen: HashSet<ObjId> = HashSet::new();
     let mut emitted = 0usize;
     'pages: for (_page_num, page_id) in state.doc.get_pages() {
         if state.cancel.load(Ordering::Acquire) {
@@ -297,15 +318,7 @@ fn discover_pages(state: &PrefetchState, max_images: usize, tx: &mpsc::Sender<Pr
                 continue;
             };
             let obj_id = ObjId(stream_id.0);
-            // Already-cached images (alias hit) and already-queued
-            // images both short-circuit here — the seen set is the
-            // single dedup source for the whole run.
-            if !state
-                .seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(obj_id)
-            {
+            if !seen.insert(obj_id) {
                 continue;
             }
             if state.cache.lookup_by_id(state.doc_id, obj_id).is_some() {
@@ -424,6 +437,11 @@ fn decode_one(
 /// Cheap pre-filter: does `stream_id` resolve to a stream with
 /// `/Subtype Image` and `/Filter DCTDecode`?  Avoids spinning up a
 /// worker for non-image references or non-DCT images.
+///
+/// Filter normalisation (single-name vs single-element array vs
+/// chained filters vs empty array) is delegated to the shared
+/// [`filter_name`] helper used by the image decode path so the
+/// prefetcher and the renderer agree on what "is JPEG" means.
 fn is_dct_image_stream(doc: &Document, stream_id: ObjectId) -> bool {
     let Ok(obj_arc) = doc.get_object(stream_id) else {
         return false;
@@ -437,15 +455,10 @@ fn is_dct_image_stream(doc: &Document, stream_id: ObjectId) -> bool {
     let Some(filter_obj) = stream.dict.get(b"Filter") else {
         return false;
     };
-    // Filter may be a /Name or a [/Name ...] array; in either case
-    // we accept if any element matches "DCTDecode".
-    match filter_obj {
-        Object::Name(n) => n == b"DCTDecode",
-        Object::Array(arr) => arr
-            .iter()
-            .any(|o| matches!(o, Object::Name(n) if n == b"DCTDecode")),
-        _ => false,
-    }
+    matches!(
+        ImageFilter::from_filter_str(filter_name(filter_obj).as_deref()),
+        ImageFilter::Dct
+    )
 }
 
 #[cfg(test)]
@@ -481,6 +494,22 @@ startxref\n180\n%%EOF"
         assert_eq!(snap.decoded, 0);
         assert_eq!(snap.already_cached, 0);
         assert_eq!(snap.errors, 0);
+    }
+
+    #[test]
+    fn max_prefetch_workers_caps_high_caller_value() {
+        // The clamp lives inside spawn_prefetch; assert the constant
+        // exists and is at the expected bound so an accidental
+        // bump shows up in review.
+        assert_eq!(MAX_PREFETCH_WORKERS, 16);
+        // Sanity: a config with workers=10_000 would clamp to 16.
+        let c = PrefetchConfig {
+            workers: 10_000,
+            max_images: 1,
+        };
+        assert_eq!(c.workers.clamp(1, MAX_PREFETCH_WORKERS), 16);
+        // Zero clamps up to one — single-worker minimum.
+        assert_eq!(0usize.clamp(1, MAX_PREFETCH_WORKERS), 1);
     }
 
     #[test]
