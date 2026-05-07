@@ -24,6 +24,11 @@ gpu-validation = []
 # Enable VA-API hardware JPEG decoding for AMD/Intel iGPU and discrete GPU on Linux.
 # Requires libva.so.2 and libva-drm.so.2 (Mesa / intel-media-driver).
 vaapi = []
+# Enable the custom on-GPU JPEG pipeline (Weißenberger 2018 self-synchronizing
+# parallel Huffman + GPU IDCT/colour). Currently CPU-only Phase 0; GPU phases
+# land incrementally. Disabled by default until the bench gate in
+# docs/superpowers/specs/2026-05-06-gpu-jpeg-pipeline.md passes.
+nvjpeg-gpu = []
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }

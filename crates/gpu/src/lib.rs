@@ -29,6 +29,7 @@ pub(crate) mod cuda;
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub mod decode_queue;
 mod fill;
+pub mod jpeg;
 pub mod jpeg_sof;
 pub mod traits;
 

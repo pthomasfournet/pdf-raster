@@ -1,16 +1,26 @@
-//! Minimal JPEG header parser for VA-API parameter buffer construction.
+//! VA-API adapter over the shared JPEG header parser.
 //!
-//! Extracts exactly what the driver needs — SOF0 (dimensions/components),
-//! DQT (quantisation tables), DHT (Huffman tables), DRI (restart interval),
-//! and SOS (scan header + data offset).  No allocations are performed; all
-//! output fields are fixed-size arrays.
+//! The actual marker walker lives in [`crate::jpeg::headers`] and is feature-
+//! flag-free.  This module re-exposes those headers in the shape VA-API
+//! consumers expect (4-slot DC/AC `VaHuffmanEntry` layout, fixed-size arrays
+//! sized for the FFI buffers).
+//!
+//! Wire-format parsing logic is **not** duplicated — it lives in one place.
 
 #![cfg(feature = "vaapi")]
 
 use super::error::{Result, VapiError};
 use super::ffi::VaHuffmanEntry;
+use crate::jpeg::headers::{
+    DhtClass, JpegHeaderError, JpegHeaders as SharedHeaders, JpegHuffmanTable,
+};
 
-/// Extracted JPEG headers needed to fill VA-API parameter buffers.
+/// Extracted JPEG headers in the shape VA-API parameter buffers expect.
+///
+/// This is an adapter around [`SharedHeaders`] that flattens the parsed data
+/// into the fixed-size layouts VA-API's FFI structures need.  All wire-format
+/// validation (segment lengths, table sizes, marker correctness) happens in
+/// the shared parser before we get here.
 pub(super) struct JpegHeaders {
     pub(super) width: u16,
     pub(super) height: u16,
@@ -22,7 +32,7 @@ pub(super) struct JpegHeaders {
     /// Up to 4 quantisation tables (zigzag order, 64 bytes each).
     pub(super) quant_tables: [[u8; 64]; 4],
     pub(super) quant_present: [bool; 4],
-    /// Huffman tables: [0]=luma DC, [1]=luma AC, [2]=chroma DC, [3]=chroma AC.
+    /// Huffman tables packed for VA-API: `[luma_DC=0, luma_AC=1, chroma_DC=2, chroma_AC=3]`.
     pub(super) huffman_entries: [Option<VaHuffmanEntry>; 4],
     /// SOS scan component selectors.
     pub(super) scan_comp_ids: [u8; 4],
@@ -37,325 +47,60 @@ pub(super) struct JpegHeaders {
 }
 
 impl JpegHeaders {
-    /// Parse a JPEG bitstream, extracting all headers needed by VA-API.
+    /// Parse a JPEG bitstream and translate into the VA-API-shaped layout.
     ///
     /// # Errors
     ///
-    /// Returns [`VapiError::BadJpeg`] on any parse error: missing SOI, truncated
-    /// segments, unknown segment structure, or missing SOF0/SOS markers.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "single-function JPEG header parser — the state machine naturally spans many lines; splitting mid-loop would reduce clarity"
-    )]
-    #[expect(
-        clippy::similar_names,
-        reason = "scan_dc_table and scan_ac_table mirror the JPEG spec field names; renaming would obscure the mapping to the standard"
-    )]
+    /// Returns [`VapiError::BadJpeg`] for any header parse failure, with the
+    /// underlying [`JpegHeaderError`] message as the cause.
     pub(super) fn parse(data: &[u8]) -> Result<Self> {
-        let err = |msg: &str| VapiError::BadJpeg(msg.to_string());
+        let shared = SharedHeaders::parse(data).map_err(jpeg_header_to_vapi)?;
 
-        let mut pos = 0usize;
-
-        macro_rules! read_bytes {
-            ($n:expr) => {{
-                let end = pos.checked_add($n).ok_or_else(|| err("integer overflow"))?;
-                if end > data.len() {
-                    return Err(err("unexpected end of JPEG data"));
-                }
-                let slice = &data[pos..end];
-                pos = end;
-                slice
-            }};
-        }
-
-        macro_rules! read_u16 {
-            () => {{
-                let b = read_bytes!(2);
-                u16::from_be_bytes([b[0], b[1]])
-            }};
-        }
-
-        // SOI check.
-        if read_bytes!(2) != [0xFF, 0xD8] {
-            return Err(err("missing JPEG SOI marker"));
-        }
-
-        let mut width: u16 = 0;
-        let mut height: u16 = 0;
-        let mut components: u8 = 0;
         let mut comp_ids = [0u8; 4];
         let mut h_samp = [0u8; 4];
         let mut v_samp = [0u8; 4];
         let mut quant_sel = [0u8; 4];
+        for (i, fc) in shared.frame_components.iter().enumerate() {
+            comp_ids[i] = fc.id;
+            h_samp[i] = fc.h_sampling;
+            v_samp[i] = fc.v_sampling;
+            quant_sel[i] = fc.quant_selector;
+        }
+
         let mut quant_tables = [[0u8; 64]; 4];
-        let mut quant_present = [false; 4];
-        let mut huffman_entries: [Option<VaHuffmanEntry>; 4] = [None, None, None, None];
+        for (i, qt) in shared.quant_tables.iter().enumerate() {
+            quant_tables[i] = qt.values;
+        }
+
+        let huffman_entries = pack_huffman_entries(&shared.huffman_tables);
+
         let mut scan_comp_ids = [0u8; 4];
         let mut scan_dc_table = [0u8; 4];
         let mut scan_ac_table = [0u8; 4];
-        let mut scan_components: u8 = 0;
-        let mut restart_interval: u16 = 0;
-        let mut scan_data_offset: usize = 0;
-        let mut scan_data_size: usize = 0;
-        let mut truncated = false;
-
-        loop {
-            if pos + 2 > data.len() {
-                truncated = true;
-                break;
-            }
-            if data[pos] != 0xFF {
-                return Err(err("expected JPEG marker 0xFF"));
-            }
-            let marker = data[pos + 1];
-            pos += 2;
-
-            match marker {
-                // SOI (re-encountered) or RST0–RST7 — no payload, continue.
-                0xD0..=0xD8 => {}
-
-                // SOF0 — baseline DCT frame header.
-                0xC0 => {
-                    let seg_len = read_u16!() as usize;
-                    if seg_len < 2 {
-                        return Err(err("SOF0 segment too short"));
-                    }
-                    let body = read_bytes!(seg_len - 2);
-                    if body.len() < 6 {
-                        return Err(err("SOF0 body too short"));
-                    }
-                    if body[0] != 8 {
-                        return Err(err("SOF0: unsupported sample precision (expected 8-bit)"));
-                    }
-                    height = u16::from_be_bytes([body[1], body[2]]);
-                    width = u16::from_be_bytes([body[3], body[4]]);
-                    components = body[5];
-                    if (components as usize) * 3 + 6 > body.len() {
-                        return Err(err("SOF0 component table overruns segment"));
-                    }
-                    for i in 0..components.min(4) as usize {
-                        let b = 6 + i * 3;
-                        comp_ids[i] = body[b];
-                        h_samp[i] = body[b + 1] >> 4;
-                        v_samp[i] = body[b + 1] & 0x0F;
-                        quant_sel[i] = body[b + 2];
-                        if body[b + 2] > 3 {
-                            return Err(err("SOF0: quantiser table selector out of range"));
-                        }
-                    }
-                }
-
-                // DQT — define quantisation table(s).
-                0xDB => {
-                    let seg_len = read_u16!() as usize;
-                    if seg_len < 2 {
-                        return Err(err("DQT segment too short"));
-                    }
-                    let body = read_bytes!(seg_len - 2);
-                    let mut off = 0usize;
-                    while off < body.len() {
-                        let id_prec = body[off];
-                        off += 1;
-                        let prec = id_prec >> 4;
-                        let table_id = (id_prec & 0x0F) as usize;
-                        if table_id >= 4 {
-                            return Err(err("DQT: table ID >= 4"));
-                        }
-                        if prec == 0 {
-                            if off + 64 > body.len() {
-                                return Err(err("DQT: 8-bit table overruns segment"));
-                            }
-                            quant_tables[table_id].copy_from_slice(&body[off..off + 64]);
-                            off += 64;
-                        } else {
-                            // 16-bit table: clamp to u8 for VA-API (big-endian u16, high byte first).
-                            if off + 128 > body.len() {
-                                return Err(err("DQT: 16-bit table overruns segment"));
-                            }
-                            for k in 0..64 {
-                                let val =
-                                    u16::from_be_bytes([body[off + k * 2], body[off + k * 2 + 1]]);
-                                quant_tables[table_id][k] = val.min(255) as u8;
-                            }
-                            off += 128;
-                        }
-                        quant_present[table_id] = true;
-                    }
-                }
-
-                // DHT — define Huffman table.
-                0xC4 => {
-                    let seg_len = read_u16!() as usize;
-                    if seg_len < 2 {
-                        return Err(err("DHT segment too short"));
-                    }
-                    let body = read_bytes!(seg_len - 2);
-                    let mut off = 0usize;
-                    while off < body.len() {
-                        if off + 17 > body.len() {
-                            return Err(err("DHT: segment truncated"));
-                        }
-                        let tc_th = body[off];
-                        off += 1;
-                        let tc = (tc_th >> 4) & 0x1; // 0=DC, 1=AC
-                        let th = (tc_th & 0x0F) as usize; // 0 or 1
-                        if th >= 2 {
-                            return Err(err("DHT: table index >= 2"));
-                        }
-
-                        let mut num_codes = [0u8; 16];
-                        num_codes.copy_from_slice(&body[off..off + 16]);
-                        off += 16;
-                        let total_codes: usize = num_codes.iter().map(|&n| n as usize).sum();
-
-                        // huffman_entries: [luma_DC=0, luma_AC=1, chroma_DC=2, chroma_AC=3].
-                        // th=0 → luma (slots 0,1); th=1 → chroma (slots 2,3).
-                        // tc=0 → DC (even slots); tc=1 → AC (odd slots).
-                        let slot = th * 2 + tc as usize;
-                        debug_assert!(
-                            slot < 4,
-                            "DHT slot invariant: tc∈{{0,1}}, th<2 ⟹ slot∈[0,3]"
-                        );
-
-                        let mut entry = VaHuffmanEntry {
-                            num_dc_codes: [0; 16],
-                            dc_values: [0; 12],
-                            num_ac_codes: [0; 16],
-                            ac_values: [0; 162],
-                            _pad: [0; 2],
-                        };
-
-                        if tc == 0 {
-                            if total_codes > 12 {
-                                return Err(err("DHT: DC table has > 12 codes"));
-                            }
-                            if off + total_codes > body.len() {
-                                return Err(err("DHT: DC values overrun segment"));
-                            }
-                            entry.num_dc_codes.copy_from_slice(&num_codes);
-                            entry.dc_values[..total_codes]
-                                .copy_from_slice(&body[off..off + total_codes]);
-                        } else {
-                            if total_codes > 162 {
-                                return Err(err("DHT: AC table has > 162 codes"));
-                            }
-                            if off + total_codes > body.len() {
-                                return Err(err("DHT: AC values overrun segment"));
-                            }
-                            entry.num_ac_codes.copy_from_slice(&num_codes);
-                            entry.ac_values[..total_codes]
-                                .copy_from_slice(&body[off..off + total_codes]);
-                        }
-                        off += total_codes;
-                        huffman_entries[slot] = Some(entry);
-                    }
-                }
-
-                // DRI — define restart interval.
-                0xDD => {
-                    let seg_len = read_u16!() as usize;
-                    if seg_len < 2 {
-                        return Err(err("DRI segment too short"));
-                    }
-                    if seg_len != 4 {
-                        return Err(err("DRI: segment must be exactly 4 bytes"));
-                    }
-                    let body = read_bytes!(seg_len - 2);
-                    restart_interval = u16::from_be_bytes([body[0], body[1]]);
-                }
-
-                // SOS — start of scan: last header we need.
-                0xDA => {
-                    let seg_len = read_u16!() as usize;
-                    if seg_len < 2 {
-                        return Err(err("SOS segment too short"));
-                    }
-                    let body = read_bytes!(seg_len - 2);
-                    if body.is_empty() {
-                        return Err(err("SOS header empty"));
-                    }
-                    scan_components = body[0];
-                    if scan_components > 4 {
-                        return Err(err("SOS: scan_components > 4"));
-                    }
-                    if (scan_components as usize) * 2 + 4 > body.len() {
-                        return Err(err("SOS component table overruns header"));
-                    }
-                    for i in 0..scan_components.min(4) as usize {
-                        scan_comp_ids[i] = body[1 + i * 2];
-                        scan_dc_table[i] = body[2 + i * 2] >> 4;
-                        scan_ac_table[i] = body[2 + i * 2] & 0x0F;
-                        if scan_dc_table[i] > 1 || scan_ac_table[i] > 1 {
-                            return Err(err("SOS: Huffman table index out of range"));
-                        }
-                    }
-                    scan_data_offset = pos;
-                    // Scan data runs from here to the EOI marker (last 0xFF 0xD9).
-                    let eoi_pos = data[pos..]
-                        .windows(2)
-                        .rposition(|w| w == [0xFF, 0xD9])
-                        .map(|i| pos + i);
-                    if eoi_pos.is_none() {
-                        log::warn!(
-                            "VA-API JPEG parser: no EOI marker found — stream may be truncated"
-                        );
-                    }
-                    let eoi = eoi_pos.unwrap_or(data.len());
-                    scan_data_size = eoi - pos;
-                    break;
-                }
-
-                // APP0–APP15 (0xE0–0xEF), APP-style / COM (0xF0–0xFE) — length-prefixed; skip.
-                0xE0..=0xFE => {
-                    let seg_len = read_u16!() as usize;
-                    if seg_len < 2 {
-                        return Err(err("marker segment length < 2"));
-                    }
-                    let skip = seg_len - 2;
-                    pos = pos
-                        .checked_add(skip)
-                        .ok_or_else(|| err("integer overflow in segment skip"))?;
-                    if pos > data.len() {
-                        return Err(err("segment body overruns JPEG data"));
-                    }
-                }
-
-                // EOI or any unrecognised marker — stop parsing.
-                _ => break,
-            }
-        }
-
-        if truncated {
-            return Err(err("JPEG stream truncated before SOF0/SOS"));
-        }
-        if width == 0 || height == 0 {
-            return Err(err("JPEG SOF0 not found or zero dimensions"));
-        }
-        if components == 0 {
-            return Err(err("JPEG has 0 components"));
-        }
-        if scan_data_size == 0 {
-            return Err(err("JPEG SOS not found or empty scan data"));
+        for (i, sc) in shared.scan.components.iter().enumerate() {
+            scan_comp_ids[i] = sc.id;
+            scan_dc_table[i] = sc.dc_table;
+            scan_ac_table[i] = sc.ac_table;
         }
 
         Ok(Self {
-            width,
-            height,
-            components,
+            width: shared.width,
+            height: shared.height,
+            components: shared.components,
             comp_ids,
             h_samp,
             v_samp,
             quant_sel,
             quant_tables,
-            quant_present,
+            quant_present: shared.quant_present,
             huffman_entries,
             scan_comp_ids,
             scan_dc_table,
             scan_ac_table,
-            scan_components,
-            restart_interval,
-            scan_data_offset,
-            scan_data_size,
+            scan_components: shared.scan.component_count,
+            restart_interval: shared.restart_interval,
+            scan_data_offset: shared.scan_data_offset,
+            scan_data_size: shared.scan_data.len(),
         })
     }
 
@@ -384,13 +129,58 @@ impl JpegHeaders {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+/// Map shared parser error → VA-API error, preserving the message.
+fn jpeg_header_to_vapi(e: JpegHeaderError) -> VapiError {
+    VapiError::BadJpeg(e.to_string())
+}
+
+/// Pack the shared parser's `Vec<JpegHuffmanTable>` into VA-API's 4-slot
+/// `[luma_DC=0, luma_AC=1, chroma_DC=2, chroma_AC=3]` layout.
+///
+/// VA-API only accepts table_id 0 (luma) and 1 (chroma) in baseline JPEG; the
+/// shared parser permits 0..=3, but a baseline-conforming stream will only
+/// reference 0 and 1.  Out-of-range tables are silently dropped here — the
+/// caller's SOS-table-selector validation already catches the spec violation.
+fn pack_huffman_entries(tables: &[JpegHuffmanTable]) -> [Option<VaHuffmanEntry>; 4] {
+    let mut entries: [Option<VaHuffmanEntry>; 4] = [None, None, None, None];
+    for t in tables {
+        if t.table_id >= 2 {
+            continue;
+        }
+        let slot = (t.table_id as usize) * 2
+            + match t.class {
+                DhtClass::Dc => 0,
+                DhtClass::Ac => 1,
+            };
+        let mut entry = entries[slot].take().unwrap_or(VaHuffmanEntry {
+            num_dc_codes: [0; 16],
+            dc_values: [0; 12],
+            num_ac_codes: [0; 16],
+            ac_values: [0; 162],
+            _pad: [0; 2],
+        });
+        match t.class {
+            DhtClass::Dc => {
+                entry.num_dc_codes = t.num_codes;
+                let n = t.values.len().min(12);
+                entry.dc_values[..n].copy_from_slice(&t.values[..n]);
+            }
+            DhtClass::Ac => {
+                entry.num_ac_codes = t.num_codes;
+                let n = t.values.len().min(162);
+                entry.ac_values[..n].copy_from_slice(&t.values[..n]);
+            }
+        }
+        entries[slot] = Some(entry);
+    }
+    entries
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 16×16 grayscale JPEG — SOF0 should parse to w=16, h=16, components=1.
+    /// Same 16×16 grayscale fixture used elsewhere in this crate's tests.
     const GRAY_16X16_JPEG: &[u8] = &[
         0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x06, 0x04, 0x05, 0x06, 0x05,
@@ -413,6 +203,9 @@ mod tests {
         assert_eq!(h.components, 1);
         assert!(h.quant_present[0], "quant table 0 must be present");
         assert!(h.scan_data_size > 0, "scan data must be non-empty");
+        // Slot 0 = luma DC, slot 1 = luma AC: both present in this fixture.
+        assert!(h.huffman_entries[0].is_some(), "luma DC entry missing");
+        assert!(h.huffman_entries[1].is_some(), "luma AC entry missing");
     }
 
     #[test]
@@ -433,33 +226,20 @@ mod tests {
 
     #[test]
     fn parse_does_not_reject_sof2_directly() {
-        // The parser only handles SOF0 (baseline); a SOF2 stream still fails
-        // because no SOF0 is found.  The error must not mention "progressive" —
-        // progressive detection and routing is the caller's responsibility
-        // (see `decode_sync` / `jpeg_sof_type`).
+        // The shared parser fails non-SOF0 streams via MissingSof0/Truncated;
+        // either error is fine, but the message must NOT mention "progressive"
+        // — that's the upstream router's responsibility (jpeg_sof_type).
         let minimal_sof2: &[u8] = &[
-            0xFF, 0xD8, // SOI
-            0xFF, 0xC2, // SOF2
-            0x00, 0x11, // length = 17
-            0x08, // precision
-            0x00, 0x10, 0x00, 0x10, // height=16, width=16
-            0x03, // components
-            0x01, 0x11, 0x00, // comp 1
-            0x02, 0x11, 0x01, // comp 2
-            0x03, 0x11, 0x01, // comp 3
-            0xFF, 0xD9, // EOI
+            0xFF, 0xD8, 0xFF, 0xC2, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11,
+            0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
         ];
-        let err = JpegHeaders::parse(minimal_sof2)
-            .err()
-            .expect("SOF2-only stream must fail");
-        let msg = format!("{err}");
-        assert!(
-            !msg.contains("progressive"),
-            "parser should not reject progressive JPEG; got: {msg}"
-        );
-        assert!(
-            msg.contains("SOF0"),
-            "expected SOF0-not-found error; got: {msg}"
-        );
+        match JpegHeaders::parse(minimal_sof2) {
+            Err(VapiError::BadJpeg(msg)) => assert!(
+                !msg.contains("progressive"),
+                "VA-API parser should not reject progressive JPEG itself; got: {msg}",
+            ),
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+            Ok(_) => panic!("SOF2-only stream must not parse successfully"),
+        }
     }
 }
