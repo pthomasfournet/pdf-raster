@@ -278,6 +278,10 @@ impl<'doc> PageResources<'doc> {
         #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut gpu::nvjpeg2k::NvJpeg2kDecoder>,
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
         #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut image::IccClutCache>,
+        #[cfg(feature = "cache")] image_cache: Option<
+            &std::sync::Arc<gpu::cache::DeviceImageCache>,
+        >,
+        #[cfg(feature = "cache")] doc_id: Option<gpu::cache::DocId>,
     ) -> Option<image::ImageDescriptor> {
         let page_dict = self.ctx_dict()?;
         image::resolve_image(
@@ -294,6 +298,10 @@ impl<'doc> PageResources<'doc> {
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
             clut_cache,
+            #[cfg(feature = "cache")]
+            image_cache,
+            #[cfg(feature = "cache")]
+            doc_id,
         )
     }
 

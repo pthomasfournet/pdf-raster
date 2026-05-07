@@ -229,20 +229,34 @@ pub const IMAGE_FILTER_COUNT: usize = 6;
 
 /// Backing storage for decoded image pixels.
 ///
-/// Today the only producer is CPU-side decode and the only consumer is the
-/// CPU blit path; both use [`ImageData::Cpu`].  Phase 9 will add a `Gpu`
-/// variant for cache-managed VRAM allocations.  The enum is
-/// [`#[non_exhaustive]`] so adding that variant is non-breaking.
+/// Two variants depending on whether the `cache` feature is on:
+///
+/// - [`ImageData::Cpu`] always available; produced by every CPU
+///   decode path (CCITT, JBIG2, raw, JPEG fallback).
+/// - [`ImageData::Gpu`] (feature `cache`) — `Arc<CachedDeviceImage>`
+///   handed back from the Phase 9 device image cache.  Produced by
+///   `decode_dct` when a cache is wired in; consumed by the GPU
+///   blit kernel which writes transformed pixels into the page's
+///   `DevicePageBuffer` without a `PCIe` round-trip.
+///
+/// The enum is [`#[non_exhaustive]`] so future variants (e.g. an
+/// `Arc<[u8]>` shared-host variant) can be added without breaking
+/// downstream `match` consumers.
 ///
 /// Hot-path access goes through [`Self::as_cpu`] which returns
-/// `Option<&[u8]>` — `Some(&[..])` for the CPU variant, `None` for any
-/// future GPU variant where the bytes don't live in host memory.
+/// `Option<&[u8]>` — `Some(&[..])` for the CPU variant, `None` for the
+/// GPU variant.  GPU consumers must match on the variant explicitly to
+/// reach the device pointer.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ImageData {
     /// Host-resident pixel bytes — layout defined by [`ImageColorSpace`].
-    /// All decoders today produce this variant.
     Cpu(Vec<u8>),
+    /// Device-resident image, owned by the Phase 9 cache.  The `Arc`
+    /// keeps the slab alive past in-flight kernel reads even if the
+    /// cache evicts; see `gpu::cache::CachedDeviceImage` docs.
+    #[cfg(feature = "cache")]
+    Gpu(std::sync::Arc<gpu::cache::CachedDeviceImage>),
 }
 
 impl ImageData {
@@ -252,21 +266,36 @@ impl ImageData {
     pub const fn as_cpu(&self) -> Option<&[u8]> {
         match self {
             Self::Cpu(bytes) => Some(bytes.as_slice()),
+            #[cfg(feature = "cache")]
+            Self::Gpu(_) => None,
         }
     }
 
     /// Length in bytes of the underlying pixel storage.  Cheap for either
-    /// variant — no host memory access required for a future GPU variant.
+    /// variant — no host memory access required for the GPU variant.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    #[cfg_attr(
+        not(feature = "cache"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "the cache-feature path calls a non-const cudarc method; keep one signature"
+        )
+    )]
+    pub fn len(&self) -> usize {
         match self {
             Self::Cpu(bytes) => bytes.len(),
+            #[cfg(feature = "cache")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "vram_bytes returns u64 for forward-compat; 32-bit hosts will OOM long before this matters in practice"
+            )]
+            Self::Gpu(cached) => cached.vram_bytes() as usize,
         }
     }
 
     /// Whether the underlying pixel storage is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
@@ -305,6 +334,10 @@ pub struct ImageDescriptor {
 /// - the filter is unsupported (a warning is logged), or
 /// - any decoding error occurs.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "filter dispatch table; splitting per-filter would scatter the dispatch logic"
+)]
 pub fn resolve_image(
     doc: &Document,
     page_dict: &Dictionary,
@@ -314,6 +347,8 @@ pub fn resolve_image(
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
+    #[cfg(feature = "cache")] image_cache: Option<&std::sync::Arc<gpu::cache::DeviceImageCache>>,
+    #[cfg(feature = "cache")] doc_id: Option<gpu::cache::DocId>,
 ) -> Option<ImageDescriptor> {
     use codecs::{decode_ccitt, decode_dct, decode_jbig2, decode_jpx};
     use raw::decode_raw;
@@ -377,19 +412,32 @@ pub fn resolve_image(
             let parms = stream.dict.get(b"DecodeParms");
             decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
         }
-        Some("DCTDecode") => decode_dct(
-            stream.content.as_slice(),
-            w,
-            h,
-            #[cfg(feature = "nvjpeg")]
-            gpu,
-            #[cfg(feature = "vaapi")]
-            vaapi,
-            #[cfg(feature = "gpu-icc")]
-            gpu_ctx,
-            #[cfg(feature = "gpu-icc")]
-            clut_cache,
-        ),
+        Some("DCTDecode") => {
+            #[cfg(feature = "cache")]
+            let cache_ctx = match (image_cache, doc_id) {
+                (Some(cache), Some(doc_id)) => Some(codecs::DctCacheCtx {
+                    cache,
+                    doc_id,
+                    obj_id: gpu::cache::ObjId(stream_id.0),
+                }),
+                _ => None,
+            };
+            decode_dct(
+                stream.content.as_slice(),
+                w,
+                h,
+                #[cfg(feature = "nvjpeg")]
+                gpu,
+                #[cfg(feature = "vaapi")]
+                vaapi,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
+                #[cfg(feature = "cache")]
+                cache_ctx.as_ref(),
+            )
+        }
         Some("JPXDecode") => {
             #[cfg(feature = "nvjpeg2k")]
             {

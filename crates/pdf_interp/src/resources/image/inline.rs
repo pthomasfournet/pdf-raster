@@ -51,6 +51,10 @@ use super::ImageColorSpace;
 /// Returns `None` if the parameter block is unparseable, dimensions are
 /// degenerate, or the filter is unsupported.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "filter dispatch table; splitting per-filter would scatter the dispatch logic"
+)]
 pub fn decode_inline_image(
     doc: &Document,
     params: &[u8],
@@ -118,6 +122,9 @@ pub fn decode_inline_image(
         Some("DCTDecode") => {
             // GPU dispatch is threshold-gated inside decode_dct (same threshold as
             // resolve_image). Most inline images are small and will use the CPU path.
+            // Inline images have no stable ObjectId so we never cache them — the
+            // cross-document content-hash dedup wouldn't pay off either since
+            // inline JPEGs are usually tiny (icons / glyph fallbacks).
             decode_dct(
                 data,
                 w,
@@ -130,6 +137,8 @@ pub fn decode_inline_image(
                 gpu_ctx,
                 #[cfg(feature = "gpu-icc")]
                 clut_cache,
+                #[cfg(feature = "cache")]
+                None::<&super::codecs::DctCacheCtx<'_>>,
             )
         }
         Some("JPXDecode") => {

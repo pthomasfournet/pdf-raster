@@ -170,6 +170,18 @@ impl GpuCtx {
         })
     }
 
+    /// The CUDA stream this context binds all kernel launches and
+    /// device allocations to.
+    ///
+    /// Exposed so callers (e.g. the Phase 9 image cache) can share
+    /// the same stream for upload + dispatch + download — single-
+    /// stream serialisation eliminates the need for explicit
+    /// cross-stream synchronisation.
+    #[must_use]
+    pub const fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// Porter-Duff source-over compositing on RGBA8 pixel pairs.
     ///
     /// `src` and `dst` must have the same length (4 × `n_pixels` bytes).

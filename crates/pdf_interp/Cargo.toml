@@ -31,6 +31,11 @@ gpu-aa  = ["dep:gpu"]
 # Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU subtractive complement
 # when no GPU context is set or the image is below the dispatch threshold.
 gpu-icc = ["dep:gpu"]
+# Phase 9 device-resident image cache.  Adds the `ImageData::Gpu` variant
+# (Arc<CachedDeviceImage>) and the `decode_dct` cache lookup-or-decode path.
+# Requires CUDA 12 and a NVIDIA GPU.  When off, the renderer compiles with
+# the CPU-only `ImageData::Cpu` arm and the cache module is excluded.
+cache = ["dep:gpu", "gpu/cache"]
 # Build FreeType from source (cross-compilation, static builds).
 bundled = ["font/bundled"]
 

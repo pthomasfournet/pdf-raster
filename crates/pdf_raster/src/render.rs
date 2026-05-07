@@ -1,6 +1,11 @@
 //! Core render pipeline: PDF page → pixel buffer.
 
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "vaapi"))]
+#[cfg(any(
+    feature = "gpu-aa",
+    feature = "gpu-icc",
+    feature = "vaapi",
+    feature = "cache"
+))]
 use std::sync::Arc;
 
 use color::{Gray8, Rgb8};
@@ -133,7 +138,7 @@ pub struct RasterSession {
         reason = "stored but not read back; retained for SessionConfig symmetry"
     )]
     pub(crate) vaapi_device: String,
-    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     pub(crate) gpu_ctx: Option<Arc<gpu::GpuCtx>>,
     /// Single-threaded VA-API JPEG decode queue.  One worker thread owns the
     /// `VapiJpegDecoder`; all Rayon page-render threads share handles to it.
@@ -141,6 +146,17 @@ pub struct RasterSession {
     /// `ForceCuda`, or VA-API initialisation failed (soft failure on `Auto`).
     #[cfg(feature = "vaapi")]
     pub(crate) vaapi_queue: Option<Arc<gpu::DecodeQueue<gpu::vaapi::VapiJpegDecoder>>>,
+    /// Phase 9 device-resident image cache.  `Some` when the `cache`
+    /// feature is enabled and a CUDA device is available; `None`
+    /// otherwise (CPU-only fallback).  Shared across all pages so
+    /// content-hash dedup spans the whole render.
+    #[cfg(feature = "cache")]
+    pub(crate) image_cache: Option<Arc<gpu::cache::DeviceImageCache>>,
+    /// Stable document identifier used as the cache's secondary alias
+    /// key.  Today derived from the file path or a per-session UUID;
+    /// any 32-byte content-addressable identifier works.
+    #[cfg(feature = "cache")]
+    pub(crate) doc_id: gpu::cache::DocId,
 }
 
 impl RasterSession {
@@ -197,7 +213,7 @@ pub fn open_session(
         ))
     })?;
 
-    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     let gpu_ctx = init_gpu_ctx(config.policy)?;
 
     let vaapi_device = config.vaapi_device.clone();
@@ -207,6 +223,34 @@ pub fn open_session(
         .map_err(RasterError::BackendUnavailable)?
         .map(Arc::new);
 
+    // Phase 9 image cache: one per session, shared across all pages.
+    // Construction needs a CUDA stream from the GpuCtx, so the cache
+    // is gated on gpu_ctx availability — a CpuOnly session or a
+    // failed init produces `image_cache = None`.
+    #[cfg(feature = "cache")]
+    let image_cache = gpu_ctx.as_ref().map(|ctx| {
+        Arc::new(gpu::cache::DeviceImageCache::new(
+            std::sync::Arc::clone(ctx.stream()),
+            // Auto-detect would need a running CUDA stream; for v0.7.0
+            // we use the spec defaults so a session always boots.
+            // Future work: expose a SessionConfig::cache_budget knob.
+            gpu::cache::VramBudget::DEFAULT,
+            gpu::cache::HostBudget::DEFAULT,
+        ))
+    });
+
+    // DocId: hash the file path bytes via the cache's BLAKE3 helper
+    // (avoids a direct blake3 dep on this crate).  Stable per file,
+    // cheap.  When the disk tier (Task 5) lands, this should switch
+    // to BLAKE3 of the PDF bytes for cross-process invalidation on
+    // edit, but the path-hash is fine for in-process dedup.
+    #[cfg(feature = "cache")]
+    let doc_id = {
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        let hash = gpu::cache::DeviceImageCache::hash_bytes(path_bytes);
+        gpu::cache::DocId(hash.0)
+    };
+
     Ok(RasterSession {
         doc,
         pages,
@@ -214,10 +258,14 @@ pub fn open_session(
         policy: config.policy,
         #[cfg(not(feature = "vaapi"))]
         vaapi_device,
-        #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+        #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
         gpu_ctx,
         #[cfg(feature = "vaapi")]
         vaapi_queue,
+        #[cfg(feature = "cache")]
+        image_cache,
+        #[cfg(feature = "cache")]
+        doc_id,
     })
 }
 
@@ -225,7 +273,7 @@ pub fn open_session(
 ///
 /// Returns `None` on `CpuOnly`; errors loudly on `ForceCuda` if init fails;
 /// logs a warning and returns `None` on `Auto`/`ForceVaapi` if init fails.
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
 fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
     if matches!(policy, BackendPolicy::CpuOnly) {
         return Ok(None);
@@ -369,8 +417,11 @@ fn render_page_rgb_with_geom(
         page_id,
     )?;
 
-    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     renderer.set_gpu_ctx(session.gpu_ctx.as_ref().map(Arc::clone));
+
+    #[cfg(feature = "cache")]
+    renderer.set_image_cache(session.image_cache.as_ref().map(Arc::clone), session.doc_id);
 
     lend_decoders(session, &mut renderer, effective_policy)?;
     renderer.execute(&ops);

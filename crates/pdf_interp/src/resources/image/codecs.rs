@@ -12,6 +12,14 @@ use pdf::{Document, Object};
 use super::{ImageColorSpace, ImageData, ImageDescriptor, ImageFilter};
 use crate::resources::dict_ext::DictExt;
 
+#[cfg(feature = "cache")]
+use gpu::cache::{
+    CachedDeviceImage, DeviceImageCache, DocId, ImageLayout as CacheImageLayout, InsertRequest,
+    ObjId,
+};
+#[cfg(feature = "cache")]
+use std::sync::Arc;
+
 // ── GPU JPEG acceleration (nvJPEG and/or VA-API) ──────────────────────────────
 
 #[cfg(feature = "nvjpeg")]
@@ -418,11 +426,22 @@ pub(super) fn decode_dct(
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
+    #[cfg(feature = "cache")] cache_ctx: Option<&DctCacheCtx<'_>>,
 ) -> Option<ImageDescriptor> {
     use zune_core::bytestream::ZCursor;
     use zune_core::colorspace::ColorSpace as ZColorSpace;
     use zune_core::options::DecoderOptions;
     use zune_jpeg::JpegDecoder;
+
+    // Phase 9 cache fast path: if a cache is wired in and the encoded
+    // bytes are already cached (cross-document content-hash dedup),
+    // return the device-resident handle with zero CPU decode work.
+    #[cfg(feature = "cache")]
+    if let Some(ctx) = cache_ctx
+        && let Some(img) = try_decode_dct_cached_lookup(data, pdf_w, pdf_h, ctx)
+    {
+        return Some(img);
+    }
 
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
     let area = pdf_w.saturating_mul(pdf_h);
@@ -539,23 +558,23 @@ pub(super) fn decode_dct(
         );
     }
 
-    match out_cs {
-        ZColorSpace::Luma => Some(ImageDescriptor {
+    let cpu_desc = match out_cs {
+        ZColorSpace::Luma => ImageDescriptor {
             width: jw,
             height: jh,
             color_space: ImageColorSpace::Gray,
             data: ImageData::Cpu(pixels),
             smask: None,
             filter: ImageFilter::Raw,
-        }),
-        ZColorSpace::RGB => Some(ImageDescriptor {
+        },
+        ZColorSpace::RGB => ImageDescriptor {
             width: jw,
             height: jh,
             color_space: ImageColorSpace::Rgb,
             data: ImageData::Cpu(pixels),
             smask: None,
             filter: ImageFilter::Raw,
-        }),
+        },
         ZColorSpace::CMYK => {
             // JPEG CMYK stores inverted ink densities (0 = full ink, 255 = no ink).
             // Pass inverted=true so cmyk_raw_to_rgb complements on-the-fly without
@@ -571,17 +590,142 @@ pub(super) fn decode_dct(
                 #[cfg(feature = "gpu-icc")]
                 clut_cache,
             )?;
-            Some(ImageDescriptor {
+            ImageDescriptor {
                 width: jw,
                 height: jh,
                 color_space: ImageColorSpace::Rgb,
                 data: ImageData::Cpu(rgb),
                 smask: None,
                 filter: ImageFilter::Raw,
-            })
+            }
         }
         // out_cs is always Luma, RGB, or CMYK — set from the components match above.
         _ => unreachable!("DCTDecode: unexpected out_cs variant"),
+    };
+
+    // Phase 9: insert into the cache so the next render of this PDF
+    // (or a different PDF with the same image content) hits the
+    // device-resident fast path instead of decoding again.
+    #[cfg(feature = "cache")]
+    if let Some(ctx) = cache_ctx {
+        return Some(try_decode_dct_cached_insert(cpu_desc, data, ctx));
+    }
+    Some(cpu_desc)
+}
+
+/// Phase 9 cache plumbing for `decode_dct`.  When set, [`decode_dct`]
+/// (a) probes the cache by content hash before any decode work and,
+/// on a miss, (b) inserts the decoded bytes after the CPU decode
+/// completes so the next render hits the cache.
+#[cfg(feature = "cache")]
+pub(super) struct DctCacheCtx<'a> {
+    /// Phase 9 device image cache.  Borrowed; the cache outlives the
+    /// renderer for the duration of a `raster_pdf` call.
+    pub cache: &'a Arc<DeviceImageCache>,
+    /// Stable identifier for the source PDF.
+    pub doc_id: DocId,
+    /// Per-image PDF object id (the `XObject`'s stream object number).
+    pub obj_id: ObjId,
+}
+
+/// Probe the cache by content hash before any CPU decode work.
+/// Returns the device-resident `ImageDescriptor` on hit, `None` on
+/// miss (caller falls through to decode + insert).
+#[cfg(feature = "cache")]
+fn try_decode_dct_cached_lookup(
+    data: &[u8],
+    pdf_w: u32,
+    pdf_h: u32,
+    ctx: &DctCacheCtx<'_>,
+) -> Option<ImageDescriptor> {
+    // Same-document fast path: alias by (DocId, ObjId) skips BLAKE3 hashing.
+    if let Some(cached) = ctx.cache.lookup_by_id(ctx.doc_id, ctx.obj_id) {
+        log::debug!(
+            "decode_dct: cache hit by alias for ({:?}, {:?})",
+            ctx.doc_id,
+            ctx.obj_id,
+        );
+        return Some(image_descriptor_from_cached(cached, pdf_w, pdf_h));
+    }
+    // Cross-document content-hash probe.
+    let hash = DeviceImageCache::hash_bytes(data);
+    if let Some(cached) = ctx.cache.lookup_by_hash(&hash) {
+        // Bind the alias for next time.
+        ctx.cache.alias(ctx.doc_id, ctx.obj_id, hash);
+        log::debug!("decode_dct: cache hit by content hash; alias rebound");
+        return Some(image_descriptor_from_cached(cached, pdf_w, pdf_h));
+    }
+    None
+}
+
+/// Wrap a freshly-decoded JPEG into the cache, returning a
+/// device-resident `ImageDescriptor`.  Skipped (returns the
+/// caller's CPU descriptor) on insert error so the renderer
+/// still gets pixels — typically a budget violation; not fatal.
+#[cfg(feature = "cache")]
+fn try_decode_dct_cached_insert(
+    cpu_desc: ImageDescriptor,
+    data: &[u8],
+    ctx: &DctCacheCtx<'_>,
+) -> ImageDescriptor {
+    // Only cache RGB / Gray output (the layouts the blit kernel
+    // can sample).  Mask images are rare in JPEG and stay on CPU.
+    let layout = match cpu_desc.color_space {
+        ImageColorSpace::Rgb => CacheImageLayout::Rgb,
+        ImageColorSpace::Gray => CacheImageLayout::Gray,
+        ImageColorSpace::Mask => return cpu_desc,
+    };
+    let Some(pixels) = cpu_desc.data.as_cpu() else {
+        return cpu_desc;
+    };
+    let hash = DeviceImageCache::hash_bytes(data);
+    let req = InsertRequest {
+        doc: ctx.doc_id,
+        obj: ctx.obj_id,
+        hash,
+        width: cpu_desc.width,
+        height: cpu_desc.height,
+        layout,
+        pixels,
+    };
+    match ctx.cache.insert(req) {
+        Ok(cached) => image_descriptor_from_cached(cached, cpu_desc.width, cpu_desc.height),
+        Err(e) => {
+            log::warn!(
+                "decode_dct: cache insert failed ({e}); returning CPU descriptor — image will use CPU blit path"
+            );
+            cpu_desc
+        }
+    }
+}
+
+#[cfg(feature = "cache")]
+fn image_descriptor_from_cached(
+    cached: Arc<CachedDeviceImage>,
+    pdf_w: u32,
+    pdf_h: u32,
+) -> ImageDescriptor {
+    let color_space = match cached.layout {
+        CacheImageLayout::Rgb => ImageColorSpace::Rgb,
+        CacheImageLayout::Gray => ImageColorSpace::Gray,
+        CacheImageLayout::Mask => ImageColorSpace::Mask,
+    };
+    // Prefer the cached entry's actual dimensions over the PDF
+    // dict's claim — the dict can lie; the decoded image can't.
+    let width = cached.width;
+    let height = cached.height;
+    if (width, height) != (pdf_w, pdf_h) {
+        log::debug!(
+            "decode_dct: cache hit dimensions {width}×{height} differ from PDF dict {pdf_w}×{pdf_h}; using cache",
+        );
+    }
+    ImageDescriptor {
+        width,
+        height,
+        color_space,
+        data: ImageData::Gpu(cached),
+        smask: None,
+        filter: ImageFilter::Dct,
     }
 }
 

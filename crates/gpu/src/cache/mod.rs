@@ -26,7 +26,7 @@ mod page_buffer;
 
 pub use host_tier::HostBudget;
 pub(crate) use host_tier::HostTier;
-pub use page_buffer::DevicePageBuffer;
+pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,6 +151,9 @@ impl CachedDeviceImage {
     /// Bytes in VRAM occupied by this entry.  Used for budget accounting.
     #[must_use]
     pub fn vram_bytes(&self) -> u64 {
+        // CudaSlice::len is not yet const in cudarc 0.19; can't make
+        // this const fn until it is.  Caller perf is fine — this is
+        // only used in `evict_to_fit` and diagnostic accessors.
         self.device_ptr.len() as u64
     }
 
@@ -573,6 +576,15 @@ impl DeviceImageCache {
     /// `cache.stream().synchronize()` (or wire a `cudaStreamWaitEvent`).
     #[must_use]
     pub fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
+    /// The cache's CUDA stream as an `Arc`, for callers that need to
+    /// own a shared reference (e.g. constructing a [`DevicePageBuffer`]
+    /// bound to the same stream so its `download()` synchronises
+    /// against blits the cache enqueues).
+    #[must_use]
+    pub const fn stream_arc(&self) -> &Arc<CudaStream> {
         &self.stream
     }
 

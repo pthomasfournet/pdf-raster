@@ -26,11 +26,11 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DriverError};
 
-/// Bytes per pixel for the RGBA layout.  `page_buffer` is a private
-/// module so this is module-local; not re-exported because external
-/// consumers (the renderer compositor in Task 27) get the byte count
-/// via [`DevicePageBuffer::byte_len`] rather than reading the
-/// constant directly.
+/// Bytes per pixel for the RGBA layout.
+///
+/// Re-exported from `gpu::cache` so the renderer compositor knows
+/// how many bytes per pixel to read when alpha-compositing the
+/// downloaded buffer onto the host bitmap.
 pub const RGBA_BPP: usize = 4;
 
 /// Device-side composition target for one rendered page.

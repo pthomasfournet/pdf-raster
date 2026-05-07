@@ -75,15 +75,17 @@ use super::gstate::{GStateStack, ctm_multiply, ctm_transform};
 use crate::InterpError;
 use crate::content::Operator;
 use crate::resources::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageResources};
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
 use gpu::GpuCtx;
 #[cfg(feature = "vaapi")]
 use gpu::JpegQueueHandle;
+#[cfg(feature = "cache")]
+use gpu::cache::{DeviceImageCache, DevicePageBuffer, DocId};
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
 use std::sync::Arc;
 
 const _: () = assert!(
@@ -225,13 +227,29 @@ pub struct PageRenderer<'doc> {
     nvjpeg2k: Option<NvJpeg2kDecoder>,
     /// Shared GPU context for AA fill dispatch and ICC CMYK→RGB colour conversion.
     /// Present when `gpu-aa` or `gpu-icc` features are enabled.
-    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     gpu_ctx: Option<Arc<GpuCtx>>,
     /// Per-page cache of baked ICC CMYK→RGB CLUT tables.  Keyed by a hash of the
     /// raw ICC profile bytes so that repeated images sharing the same profile (the
     /// common case in press PDFs) only pay the bake cost once per page.
     #[cfg(feature = "gpu-icc")]
     icc_clut_cache: crate::resources::image::IccClutCache,
+    /// Phase 9 device-resident image cache.  When `Some`, JPEG decode
+    /// goes through the cache and produces `ImageData::Gpu` handles
+    /// the renderer dispatches to the GPU blit kernel; when `None`,
+    /// the renderer is fully CPU-resident.
+    #[cfg(feature = "cache")]
+    image_cache: Option<Arc<DeviceImageCache>>,
+    /// Stable identifier for the source PDF — combined with the
+    /// per-image PDF object id, forms the cache's `(DocId, ObjId)`
+    /// alias key for fast same-document lookups.
+    #[cfg(feature = "cache")]
+    doc_id: DocId,
+    /// Lazy-allocated device-resident page buffer.  `None` until the
+    /// first GPU image blit allocates it; non-None pages download +
+    /// alpha-composite onto `bitmap` at [`Self::finish`].
+    #[cfg(feature = "cache")]
+    device_page_buffer: Option<DevicePageBuffer>,
 }
 
 impl<'doc> PageRenderer<'doc> {
@@ -325,10 +343,16 @@ impl<'doc> PageRenderer<'doc> {
             vaapi_jpeg_queue: None,
             #[cfg(feature = "nvjpeg2k")]
             nvjpeg2k: None,
-            #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+            #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
             gpu_ctx: None,
             #[cfg(feature = "gpu-icc")]
             icc_clut_cache: crate::resources::image::IccClutCache::new(),
+            #[cfg(feature = "cache")]
+            image_cache: None,
+            #[cfg(feature = "cache")]
+            doc_id: DocId([0u8; 32]),
+            #[cfg(feature = "cache")]
+            device_page_buffer: None,
         })
     }
 
@@ -399,9 +423,34 @@ impl<'doc> PageRenderer<'doc> {
     /// jittered warp-ballot kernel instead of the CPU 4× scanline AA path.
     ///
     /// Call with `None` to revert to CPU-only AA.
-    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc"))]
+    #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     pub fn set_gpu_ctx(&mut self, ctx: Option<Arc<GpuCtx>>) {
         self.gpu_ctx = ctx;
+    }
+
+    /// Attach a Phase 9 device-resident image cache.
+    ///
+    /// When set, JPEG image decode goes through the cache: a content-
+    /// hash hit returns an `Arc<CachedDeviceImage>` with no decode
+    /// work; a miss decodes on CPU, uploads to VRAM, caches, and
+    /// returns the same handle.  The renderer dispatches `Gpu`-variant
+    /// images to a CUDA blit kernel that writes into a per-page
+    /// `DevicePageBuffer`; CPU-rasterised vector content stays on
+    /// `bitmap`, and the two are alpha-composited at [`Self::finish`].
+    ///
+    /// `doc_id` should be a stable identifier for the source PDF
+    /// (typically `BLAKE3(pdf_bytes)` or similar).  It's combined
+    /// with the per-image PDF object number to form the cache's
+    /// secondary alias key for fast same-document lookups.
+    ///
+    /// Call with `None` to revert to CPU-only image decode.
+    #[cfg(feature = "cache")]
+    pub fn set_image_cache(&mut self, cache: Option<Arc<DeviceImageCache>>, doc_id: DocId) {
+        self.image_cache = cache;
+        self.doc_id = doc_id;
+        // Reset the per-page buffer if a new cache is wired in
+        // mid-page; the next GPU image blit will lazy-allocate.
+        self.device_page_buffer = None;
     }
 
     /// Consume the renderer and return the finished bitmap and page diagnostics.
@@ -424,7 +473,60 @@ impl<'doc> PageRenderer<'doc> {
             .filter(|(count, _)| **count > 0)
             .max_by_key(|(count, _)| *count)
             .map(|(_, filter)| *filter);
+
+        // Phase 9: download the device-resident image-blit buffer (if
+        // any GPU image-blit ran on this page) and source-over
+        // composite it onto the host bitmap.  Pixels the kernel
+        // didn't write read back as alpha=0 → no-op for the
+        // composite, leaving the CPU-rasterised content untouched.
+        #[cfg(feature = "cache")]
+        if let Some(buf) = self.device_page_buffer.take() {
+            self.composite_device_page_buffer(&buf);
+        }
+
         (self.bitmap, self.diag)
+    }
+
+    /// Download the device page buffer and alpha-composite it onto
+    /// `self.bitmap`.  Source-over: written GPU pixels (alpha=255)
+    /// replace; unwritten pixels (alpha=0) leave the bitmap intact.
+    /// This is the moment where the blit kernel's writes become
+    /// visible on host.
+    #[cfg(feature = "cache")]
+    fn composite_device_page_buffer(&mut self, buf: &DevicePageBuffer) {
+        use gpu::cache::RGBA_BPP;
+
+        let host_rgba = match buf.download() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!(
+                    "finish: device page buffer download failed: {e} — GPU images will be missing"
+                );
+                return;
+            }
+        };
+        let dst = self.bitmap.data_mut();
+        let dst_stride = self.width as usize * 3;
+        let src_stride = self.width as usize * RGBA_BPP;
+        debug_assert_eq!(host_rgba.len(), src_stride * self.height as usize);
+        for y in 0..self.height as usize {
+            let src_row = &host_rgba[y * src_stride..(y + 1) * src_stride];
+            let dst_row = &mut dst[y * dst_stride..(y + 1) * dst_stride];
+            for x in 0..self.width as usize {
+                let s = &src_row[x * RGBA_BPP..x * RGBA_BPP + 4];
+                if s[3] == 0 {
+                    continue;
+                }
+                // Source-over with src.a == 255 in the kernel's
+                // current implementation; opaque copy.  When/if
+                // the kernel grows partial-alpha output, switch to
+                // a full Porter-Duff compositor here.
+                let d = &mut dst_row[x * 3..x * 3 + 3];
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+            }
+        }
     }
 
     /// Execute a slice of decoded operators in order.
@@ -741,6 +843,10 @@ impl<'doc> PageRenderer<'doc> {
             self.gpu_ctx.as_deref(),
             #[cfg(feature = "gpu-icc")]
             Some(&mut self.icc_clut_cache),
+            #[cfg(feature = "cache")]
+            self.image_cache.as_ref(),
+            #[cfg(feature = "cache")]
+            Some(self.doc_id),
         );
         if let Some(img) = img {
             self.blit_image(&img);
@@ -1069,11 +1175,32 @@ impl<'doc> PageRenderer<'doc> {
         let img_w = f64::from(img.width);
         let img_h = f64::from(img.height);
         let img_width_usize = img.width as usize;
-        // Future-proof for the Phase 9 GPU variant: degrade gracefully rather
-        // than panicking if a device-resident image reaches this CPU blit path.
+
+        // Phase 9 GPU image-blit fast path: device-resident pixels +
+        // CUDA kernel transform writing into a per-page DevicePageBuffer.
+        // Returns true if the GPU path handled the image; false to fall
+        // through to the CPU sampler below.
+        #[cfg(feature = "cache")]
+        if let crate::resources::image::ImageData::Gpu(cached) = &img.data {
+            if self.try_gpu_blit_image(cached, &ctm, page_h) {
+                return;
+            }
+            // Promotion or kernel dispatch failed; we don't have host
+            // bytes either, so log and skip the image rather than CPU
+            // sampling something that isn't there.
+            log::warn!(
+                "blit_image: GPU image-blit failed (no fallback bytes available — image will be missing from output)"
+            );
+            return;
+        }
+
+        // CPU path: needs host-resident pixels.  The graceful skip
+        // below also covers the cache-feature-on, ImageData::Gpu
+        // case if `try_gpu_blit_image` somehow falls through (it
+        // currently doesn't, but the explicit None check is cheap).
         let Some(img_bytes) = img.data.as_cpu() else {
             log::warn!(
-                "blit_image: image data not host-resident — skipping (Phase 9 device-resident path is not yet wired through this renderer)"
+                "blit_image: image data not host-resident and GPU dispatch unavailable — skipping"
             );
             return;
         };
@@ -1262,6 +1389,123 @@ impl<'doc> PageRenderer<'doc> {
                 }
             }
         }
+    }
+
+    /// Phase 9 GPU image blit dispatcher.
+    ///
+    /// Lazy-allocates `device_page_buffer` on first call, builds the
+    /// inverse-CTM coefficients, computes the destination AABB, and
+    /// launches the CUDA blit kernel.  Returns `true` on success;
+    /// `false` if any prerequisite is missing (no `GpuCtx`, singular
+    /// CTM, page-buffer alloc fails, kernel dispatch errors).
+    ///
+    /// Designed to be cheap to call: per-call cost is one bbox
+    /// computation + one ~10 µs kernel launch.  No host-side pixel
+    /// touch.
+    #[cfg(feature = "cache")]
+    #[expect(
+        clippy::similar_names,
+        reason = "page_w_i / page_h_i are paired width/height constants — renaming would obscure the symmetry"
+    )]
+    fn try_gpu_blit_image(
+        &mut self,
+        cached: &Arc<gpu::cache::CachedDeviceImage>,
+        ctm: &[f64; 6],
+        page_h: f64,
+    ) -> bool {
+        use gpu::blit::{BlitBbox, InverseCtm};
+
+        let Some(gpu_ctx) = self.gpu_ctx.as_deref() else {
+            log::debug!("blit_image: GPU image blit skipped — no GpuCtx attached");
+            return false;
+        };
+        let Some(image_cache) = self.image_cache.as_ref() else {
+            // Shouldn't happen: ImageData::Gpu only originates from a
+            // wired-in cache.  Defensive check; cheap.
+            return false;
+        };
+        let Some(inv_ctm) = InverseCtm::from_ctm(*ctm) else {
+            log::debug!("blit_image: GPU image blit skipped — singular CTM");
+            return false;
+        };
+
+        // Compute the destination AABB (page pixels).  Must clamp at
+        // launch time because rotated images can spill off the page;
+        // the kernel itself also guards against negative coords for
+        // defence-in-depth.
+        let (x00, y00) = ctm_transform(ctm, 0.0, 0.0);
+        let (x10, y10) = ctm_transform(ctm, 1.0, 0.0);
+        let (x01, y01) = ctm_transform(ctm, 0.0, 1.0);
+        let (x11, y11) = ctm_transform(ctm, 1.0, 1.0);
+        if ![x00, y00, x10, y10, x01, y01, x11, y11]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return false;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "device pixel coords floor/ceil to i32 cleanly within page bounds (max ~64K at 600 DPI)"
+        )]
+        let dx0 = x00.min(x10).min(x01).min(x11).floor() as i32;
+        #[expect(clippy::cast_possible_truncation, reason = "see dx0")]
+        let dx1 = x00.max(x10).max(x01).max(x11).ceil() as i32;
+        let dy_pdf_min = (page_h - y00)
+            .min(page_h - y10)
+            .min(page_h - y01)
+            .min(page_h - y11);
+        let dy_pdf_max = (page_h - y00)
+            .max(page_h - y10)
+            .max(page_h - y01)
+            .max(page_h - y11);
+        #[expect(clippy::cast_possible_truncation, reason = "see dx0")]
+        let dy0 = dy_pdf_min.floor() as i32;
+        #[expect(clippy::cast_possible_truncation, reason = "see dx0")]
+        let dy1 = dy_pdf_max.ceil() as i32;
+
+        // Clamp to page bounds for kernel efficiency (the kernel
+        // also guards each thread, but skipping out-of-page tiles is
+        // cheaper than launching them).
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "self.width/height are PDF page dims well below i32::MAX"
+        )]
+        let page_w_i = self.width as i32;
+        #[expect(clippy::cast_possible_wrap, reason = "see page_w_i")]
+        let page_h_i = self.height as i32;
+        let bbox = BlitBbox {
+            x0: dx0.max(0),
+            y0: dy0.max(0),
+            x1: dx1.min(page_w_i),
+            y1: dy1.min(page_h_i),
+        };
+
+        // Lazy-allocate the per-page device buffer on first GPU
+        // image; subsequent images on the same page reuse it.
+        if self.device_page_buffer.is_none() {
+            let stream = Arc::clone(image_cache.stream_arc());
+            match DevicePageBuffer::new(stream, self.width, self.height) {
+                Ok(buf) => self.device_page_buffer = Some(buf),
+                Err(e) => {
+                    log::warn!("blit_image: DevicePageBuffer alloc failed: {e}");
+                    return false;
+                }
+            }
+        }
+        let Some(buf) = self.device_page_buffer.as_mut() else {
+            return false;
+        };
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "page_h is u32 page height; lossless f32 for u32 ≤ 2^24, vastly larger than any PDF page"
+        )]
+        let page_h_f = self.height as f32;
+        if let Err(e) = gpu_ctx.blit_image_to_buffer(cached, buf, inv_ctm, bbox, page_h_f) {
+            log::warn!("blit_image: GPU kernel dispatch failed: {e}");
+            return false;
+        }
+        true
     }
 }
 
