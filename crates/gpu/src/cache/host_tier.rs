@@ -9,17 +9,20 @@
 //! # Invariants
 //!
 //! - Indexed only by [`super::ContentHash`] (the cache's primary key).
-//!   The `(DocId, ObjId)` alias lives in the VRAM tier; on a host
-//!   promotion we re-establish that alias via the existing
-//!   [`super::DeviceImageCache::alias`] call.
+//!   The `(DocId, ObjId)` alias lives in the VRAM tier; an alias is
+//!   wired only at `insert` time, so a promote-after-eviction lookup
+//!   that reaches us by content hash will not auto-bind a new alias —
+//!   that's fine because hash lookups are themselves O(1) once the
+//!   caller already has the hash.
 //! - Each entry stores its bytes in a [`PinnedHostSlice<u8>`] allocated
 //!   with `cuMemAllocHost(CU_MEMHOSTALLOC_WRITECOMBINED)`.  Write-
 //!   combined memory is fast for upload-on-promote and fast to fill on
 //!   demote, but slow for general CPU reads — the cache writes to it
 //!   from a `cudaMemcpyAsync(D2H)` and reads from it via
 //!   `cudaMemcpyAsync(H2D)`.  The CPU never inspects the bytes.
-//! - LRU clock and used-bytes accounting are independent of the VRAM
-//!   tier's so each tier evicts on its own pressure.
+//! - The LRU clock is shared with the VRAM tier (callers pass it in)
+//!   so cross-tier freshness is comparable.  Used-bytes accounting is
+//!   per-tier; each tier evicts on its own pressure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +52,11 @@ impl HostBudget {
 }
 
 /// One host-resident copy of a previously-decoded image.
+///
+/// `host_tier` is a private module so `pub` here means visible only
+/// to the parent `cache` module, which re-exports as `pub(crate)`.
+/// External callers never see this type — they only see
+/// `Arc<CachedDeviceImage>` returned from cache lookups.
 pub struct HostEntry {
     /// Pinned host memory holding the decoded bytes.  Allocated with
     /// `CU_MEMHOSTALLOC_WRITECOMBINED` for fast DMA in both directions.
@@ -66,6 +74,25 @@ pub struct HostEntry {
 }
 
 impl HostEntry {
+    /// Build a new entry from a populated pinned slab.  `last_used` is
+    /// initialised to zero and is bumped to the current tick by the
+    /// host tier on insert.
+    #[must_use]
+    pub const fn new(
+        pinned: PinnedHostSlice<u8>,
+        width: u32,
+        height: u32,
+        layout: ImageLayout,
+    ) -> Self {
+        Self {
+            pinned,
+            width,
+            height,
+            layout,
+            last_used: AtomicU64::new(0),
+        }
+    }
+
     /// Bytes occupied in pinned host memory by this entry.
     #[must_use]
     pub fn host_bytes(&self) -> u64 {
@@ -93,6 +120,10 @@ impl std::fmt::Debug for HostEntry {
 }
 
 /// Concurrent host RAM tier.  All methods take `&self`.
+///
+/// Re-exported from the parent module as `pub(crate)`; external
+/// callers never see this type — the host tier is an implementation
+/// detail of [`super::DeviceImageCache`].
 pub struct HostTier {
     entries: DashMap<ContentHash, Arc<HostEntry>>,
     used_bytes: AtomicU64,
@@ -110,19 +141,24 @@ impl HostTier {
         }
     }
 
-    /// Live entry count — diagnostics only.
+    /// Live entry count — diagnostics / tests only.  Gated on `cfg(test)`
+    /// because production code never inspects the tier directly; an
+    /// operator who wants this can toggle the gate.
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the tier currently holds zero entries.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Live host RAM usage in bytes — diagnostics only.
+    /// Live host RAM usage in bytes — diagnostics / tests only.
+    #[cfg(test)]
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes.load(Ordering::Relaxed)
@@ -155,10 +191,11 @@ impl HostTier {
     /// # Safety note
     /// The returned slice is uninitialised; the caller MUST overwrite
     /// every byte (e.g. via [`CudaStream::memcpy_dtoh`]) before another
-    /// reader observes it.  This crate's only caller is
-    /// [`super::DeviceImageCache::evict_to_fit`], which immediately
-    /// fills the slab from a `D2H` copy and synchronises the stream
-    /// before publishing the entry.
+    /// reader observes it.  In production the only caller is
+    /// [`Self::build_from_device`], which immediately fills the slab
+    /// from a `D2H` copy and synchronises the stream before returning
+    /// the populated entry.  The `gpu-validation` test fixtures call
+    /// it directly and fill the buffer before any read.
     pub fn alloc_pinned(
         ctx: &Arc<cudarc::driver::CudaContext>,
         bytes: usize,
@@ -175,6 +212,18 @@ impl HostTier {
     ///
     /// Returns the strong `Arc` for symmetry with the VRAM tier; most
     /// callers ignore it.
+    ///
+    /// # Accounting semantics
+    ///
+    /// `used_bytes` tracks **bytes managed by this tier's index**, not
+    /// bytes physically allocated as pinned memory.  When this method
+    /// removes a prior same-hash entry whose `Arc` has `strong_count >
+    /// 1` (a concurrent lookup-holder is still reading it), the
+    /// `PinnedHostSlice` stays allocated until the holder drops, but
+    /// `used_bytes` is decremented immediately.  The transient
+    /// undercount is bounded by the number of in-flight lookups and
+    /// resolves the moment those `Arc`s drop.  This matches the VRAM
+    /// tier's contract; both tiers charge bytes to the index.
     pub fn insert(&self, hash: ContentHash, entry: HostEntry, tick: u64) -> Arc<HostEntry> {
         entry.touch(tick);
         let bytes = entry.host_bytes();
@@ -267,13 +316,7 @@ impl HostTier {
         // caller can drop the source device slab safely afterwards.
         stream.memcpy_dtoh(device, pinned.as_mut_slice()?)?;
         stream.synchronize()?;
-        Ok(HostEntry {
-            pinned,
-            width,
-            height,
-            layout,
-            last_used: AtomicU64::new(0),
-        })
+        Ok(HostEntry::new(pinned, width, height, layout))
     }
 }
 
@@ -318,13 +361,7 @@ mod tests {
             *b = u8::try_from(i & 0xFF).expect("low byte fits u8");
         }
         let hash = ContentHash([0x11; 32]);
-        let entry = HostEntry {
-            pinned,
-            width: 16,
-            height: 16,
-            layout: ImageLayout::Gray,
-            last_used: AtomicU64::new(0),
-        };
+        let entry = HostEntry::new(pinned, 16, 16, ImageLayout::Gray);
         let _ = tier.insert(hash, entry, /* tick */ 0);
 
         let hit = tier.lookup(&hash, /* tick */ 1).expect("hit");
@@ -347,13 +384,7 @@ mod tests {
             for b in pinned.as_mut_slice().expect("as_mut_slice").iter_mut() {
                 *b = fill;
             }
-            HostEntry {
-                pinned,
-                width: 16,
-                height: 16,
-                layout: ImageLayout::Gray,
-                last_used: AtomicU64::new(0),
-            }
+            HostEntry::new(pinned, 16, 16, ImageLayout::Gray)
         };
 
         let h_a = ContentHash([0xAA; 32]);

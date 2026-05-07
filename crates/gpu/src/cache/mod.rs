@@ -23,12 +23,13 @@
 
 mod host_tier;
 
-pub use host_tier::{HostBudget, HostEntry, HostTier};
+pub use host_tier::HostBudget;
+pub(crate) use host_tier::HostTier;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DeviceRepr};
+use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
@@ -280,11 +281,9 @@ pub struct DeviceImageCache {
     used_bytes: AtomicU64,
     /// Owned CUDA stream for upload work.  Held by `Arc` so per-call
     /// upload paths can clone cheaply, and so the host tier's D2H copy
-    /// can synchronise on it before publishing a demoted entry.
+    /// can synchronise on it before publishing a demoted entry.  The
+    /// CUDA context is reachable as `self.stream.context()`.
     stream: Arc<CudaStream>,
-    /// CUDA context — needed for `alloc_pinned` during demotion and
-    /// rebuilding `CudaSlice<u8>` during promotion.
-    ctx: Arc<CudaContext>,
 }
 
 /// Bundled arguments for [`DeviceImageCache::insert`].
@@ -321,7 +320,6 @@ impl DeviceImageCache {
     /// a host-RAM demotion budget.
     #[must_use]
     pub fn new(stream: Arc<CudaStream>, vram: VramBudget, host: HostBudget) -> Self {
-        let ctx = Arc::clone(stream.context());
         Self {
             primary: DashMap::new(),
             by_doc_obj: DashMap::new(),
@@ -330,7 +328,6 @@ impl DeviceImageCache {
             tick: AtomicU64::new(0),
             used_bytes: AtomicU64::new(0),
             stream,
-            ctx,
         }
     }
 
@@ -395,19 +392,22 @@ impl DeviceImageCache {
     /// or the upload fails (treated as a cache miss; caller re-decodes).
     fn promote_from_host(&self, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
         let host_entry = self.host.lookup(hash, self.next_tick())?;
-        // Upload from the pinned host slice straight to VRAM.  Pinned
-        // memory means the DMA bypasses the kernel page-cache copy.
-        let pixels = host_entry.pinned.as_slice().ok()?;
-        let bytes = pixels.len() as u64;
+        let bytes = host_entry.pinned.num_bytes() as u64;
         // Make room in the VRAM tier.  If we can't (every entry pinned
         // by in-flight kernels), fall back to a cache miss; the host
         // entry stays in place for a future retry.
         if self.evict_to_fit(bytes).is_err() {
             return None;
         }
+        // Pass the `PinnedHostSlice` directly so cudarc's `HostSlice`
+        // impl records the H→D copy against the slice's internal event
+        // — without that, dropping `host_entry` while the DMA is still
+        // in flight would let `PinnedHostSlice::Drop` free the source
+        // buffer mid-copy.  Calling `as_slice()` first would route
+        // through the plain `[u8]` impl whose `SyncOnDrop` is a no-op.
         let device_ptr = self
             .stream
-            .clone_htod(pixels)
+            .clone_htod(&host_entry.pinned)
             .map_err(|e| log::warn!("host-tier promotion upload failed: {e}"))
             .ok()?;
         let new_entry = Arc::new(CachedDeviceImage {
@@ -580,7 +580,7 @@ impl DeviceImageCache {
             return;
         }
         match HostTier::build_from_device(
-            &self.ctx,
+            self.stream.context(),
             &self.stream,
             &evicted.device_ptr,
             evicted.width,
@@ -1004,7 +1004,6 @@ mod tests {
         let entry_a = cache
             .insert(req(1, h_a, ImageLayout::Rgb, &pixels_a))
             .expect("insert a");
-        let device_ptr_before = Arc::as_ptr(&entry_a);
         drop(entry_a);
 
         // Insert B — must evict A and demote it to the host tier.
@@ -1026,13 +1025,11 @@ mod tests {
         drop(entry_b);
 
         // Look up A — promotion from host should succeed and the
-        // returned bytes must match the original pixels exactly.
+        // returned bytes must match the original pixels exactly.  The
+        // bit-for-bit readback below is the load-bearing assertion;
+        // checking Arc-pointer identity isn't (the heap may reuse a
+        // slot under load and produce false negatives).
         let entry_a_promoted = cache.lookup_by_hash(&h_a).expect("promote hit");
-        let device_ptr_after = Arc::as_ptr(&entry_a_promoted);
-        assert_ne!(
-            device_ptr_before, device_ptr_after,
-            "promotion should produce a fresh CachedDeviceImage Arc",
-        );
         let mut readback = vec![0u8; pixels_a.len()];
         stream
             .memcpy_dtoh(&entry_a_promoted.device_ptr, &mut readback)
