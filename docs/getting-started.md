@@ -234,9 +234,12 @@ pdf-raster refuses to open PDFs that contain JavaScript entry points and returns
 cargo build --release -p pdf-raster
 
 # With all GPU features
+# Default CUDA_ARCH is sm_80 (Ampere); override to match your card.
 CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
-  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew"
+  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew,pdf_raster/cache"
 ```
+
+`CUDA_ARCH` must match your GPU's Compute Capability (e.g. `sm_75` for RTX 20-series, `sm_86` for RTX 30-series, `sm_89` for RTX 40-series, `sm_120` for RTX 50-series). Look yours up at [developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus). See the [README's GPU matrix](../README.md#picking-cuda_arch-for-your-gpu) for the common-case table and the [feature-flag list](../README.md#feature-flags).
 
 ### A note on output destination (v0.6.0+)
 

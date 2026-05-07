@@ -67,10 +67,40 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 # CPU-only (no CUDA)
 cargo build --release -p cli
 
-# With all GPU features (CUDA 12, RTX/NVIDIA GPU required)
+# With all GPU features (CUDA 12, NVIDIA GPU required)
+# Default CUDA_ARCH is sm_80 (Ampere); override for older or newer GPUs.
 CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
-  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew"
+  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew,pdf_raster/cache"
 ```
+
+### Picking `CUDA_ARCH` for your GPU
+
+The `CUDA_ARCH` environment variable controls which Compute Capability the PTX kernels target. Mismatched arch flags produce kernels the GPU can't load at runtime. Set it to your card's CC (e.g. `sm_75`, `sm_86`, `sm_120`).
+
+| GPU generation | Architecture | `CUDA_ARCH` |
+|---|---|---|
+| GTX 10-series | Pascal | `sm_61` |
+| RTX 20-series, Quadro RTX | Turing | `sm_75` |
+| RTX 30-series, A100 | Ampere | `sm_80` / `sm_86` |
+| RTX 40-series | Ada Lovelace | `sm_89` |
+| H100 / Hopper | Hopper | `sm_90` |
+| RTX 50-series | Blackwell | `sm_120` |
+
+Look up your card's exact Compute Capability at [developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus). The build defaults to `sm_80` if `CUDA_ARCH` is unset; that's a reasonable fallback for any Ampere-or-later card thanks to PTX forward-compatibility, but matching your hardware exactly produces better-optimised code.
+
+### Feature flags
+
+| Flag | What it enables | Required runtime |
+|---|---|---|
+| `nvjpeg` | GPU JPEG decode for `DCTDecode` | `libnvjpeg.so` (ships with CUDA 12) |
+| `nvjpeg2k` | GPU JPEG-2000 decode for `JPXDecode` | `libnvjpeg2k.so` |
+| `gpu-aa` | GPU supersampled anti-aliased fill | CUDA |
+| `gpu-icc` | GPU CMYK→RGB ICC transform | CUDA |
+| `gpu-deskew` | GPU deskew rotation via NPP | CUDA + NPP |
+| `cache` | Device-resident image cache (3-tier VRAM/host/disk) | CUDA |
+| `vaapi` | Linux iGPU/dGPU JPEG decode (AMD/Intel) | `libva.so.2` + DRM render node |
+
+All GPU features fall back to CPU automatically when the runtime requirement is missing, except `--policy ForceCuda` / `--policy ForceVaapi` which fail loudly.
 
 ## Testing
 
