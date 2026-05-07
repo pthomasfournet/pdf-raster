@@ -121,25 +121,11 @@ pub struct DiskTier {
     /// (filesystem mtimes drive eviction; the counter avoids a
     /// directory scan on every insert).
     budget: u64,
-    /// Bytes written by *this process* since startup — **not** a
-    /// global view of the on-disk cache.  Two consequences:
-    ///
-    /// 1. A fresh process starts at zero even if `<root>/` already
-    ///    holds gigabytes from prior runs.  The first `insert` that
-    ///    pushes the counter past `budget` triggers `evict_to_fit`,
-    ///    which scans the directory and reconciles the counter
-    ///    against actual size.  Until then, the counter understates
-    ///    real usage.
-    /// 2. Multiple concurrent processes sharing the same `<root>/`
-    ///    each run their own counter; budget enforcement is
-    ///    eventual rather than strict.  In practice eviction is
-    ///    triggered by whichever process exceeds *its own* budget
-    ///    first, which is fine for a single-user dev box but worth
-    ///    knowing for shared-cache deployments.
-    ///
-    /// Strict enforcement would require a directory scan on every
-    /// insert (too expensive) or a cross-process lock file (added
-    /// complexity for marginal benefit).
+    /// Bytes written by *this process* since startup — not a global
+    /// view of the on-disk cache.  Starts at zero on a fresh process
+    /// even when `<root>/` already holds prior data; reconciled by
+    /// `evict_to_fit` on the first budget-exceeding insert.  Across
+    /// concurrent processes, budget enforcement is eventual.
     used_estimate: AtomicU64,
 }
 
@@ -178,14 +164,8 @@ impl DiskTier {
         self.budget
     }
 
-    /// Probe the disk tier for `(doc, hash)`.  On hit, returns the
-    /// decoded image with pixels owned in a fresh `Vec<u8>`.  Caller
-    /// builds a `HostEntry` and promotes through the upper tiers.
-    /// Returns `None` on miss, malformed file, or any I/O error.
-    ///
-    /// Prefer [`Self::lookup_into`] when the caller can supply a
-    /// pre-allocated pinned-host slab to read directly into — that
-    /// avoids the transient `Vec` + memcpy.
+    /// Test helper: read + validate, allocating pixels into a `Vec`.
+    /// Production uses [`Self::lookup_into`] + a pinned slab.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn lookup(&self, doc: DocId, hash: &ContentHash) -> Option<DiskEntry> {
@@ -203,28 +183,28 @@ impl DiskTier {
     /// Probe the disk tier for `(doc, hash)` and stream the pixel
     /// payload through a caller-supplied callback.  On hit, opens
     /// the file, validates the header, then calls `fill` with the
-    /// parsed [`DiskHeaderInfo`] and a `&mut dyn Read` positioned at
-    /// the pixel bytes.  The callback is responsible for reading
-    /// exactly `header.expected_pixel_bytes` bytes — typically via
-    /// `read_exact` into its own pinned-host slab.
+    /// parsed [`DiskHeaderInfo`] and a reader positioned at the
+    /// pixel bytes.  The callback reads exactly
+    /// `header.expected_pixel_bytes` (typically via `read_exact`
+    /// into a pinned-host slab) and tags failures with
+    /// [`LookupCallbackError::Read`] for file-side problems or
+    /// [`LookupCallbackError::Resource`] for caller-side problems.
     ///
-    /// This avoids the transient `Vec<u8>` that the test-only
-    /// `lookup` helper allocates: the disk pixels land straight in
-    /// the caller's destination buffer.
-    ///
-    /// Returns `Some(header)` on success, `None` on miss or any
-    /// validation/I/O failure (the bad entry is removed so a future
-    /// write can replace it).  Errors raised by the callback
-    /// propagate via the [`io::Result`] return and surface here as
-    /// `None` after `report_bad_entry`.
+    /// Returns `Some(header)` on success, `None` on miss, validation
+    /// failure, file-side I/O error (entry is removed), or
+    /// caller-side resource failure (entry is left intact — a
+    /// transient pinned-alloc failure must not nuke a valid entry).
     pub fn lookup_into<F>(&self, doc: DocId, hash: &ContentHash, fill: F) -> Option<DiskHeaderInfo>
     where
-        F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> io::Result<()>,
+        F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> Result<(), LookupCallbackError>,
     {
         let path = entry_path(&self.root, doc, *hash);
         match read_entry_into(&path, fill) {
             Ok(header) => Some(header),
-            Err(DiskReadError::Missing) => None,
+            // Missing or callback-failed: the file is fine (or absent),
+            // so don't delete it.  A transient pinned-alloc failure must
+            // not nuke a valid cache entry.
+            Err(DiskReadError::Missing | DiskReadError::CallbackFailed(_)) => None,
             Err(e) => {
                 report_bad_entry(&path, &e);
                 None
@@ -235,15 +215,10 @@ impl DiskTier {
     /// Write an entry to disk.  Idempotent: a same-content rewrite
     /// overwrites with bit-identical bytes via the atomic-rename
     /// pattern.  Errors are logged and swallowed (caller's render
-    /// path always sees `()`), but the call itself is **synchronous**:
-    /// `write_all` + `sync_all` + `rename` block the calling thread
-    /// for ~1–5 ms on `NVMe` and ~10–50 ms on a slow HDD per image.
-    /// On a 1000-image render that's seconds added to first-render
-    /// time.  A future revision should dispatch the write to a
-    /// background thread (small bounded mpsc + dedicated worker) so
-    /// the renderer is genuinely never blocked; the spec calls out
-    /// this expectation but v0.7.0 ships sync to keep the patch
-    /// surface small.
+    /// path always sees `()`).  **Synchronous**: `write_all` +
+    /// `sync_all` + `rename` block the calling thread for ~1–5 ms
+    /// on `NVMe` / ~10–50 ms on HDD per image.  Background-writer
+    /// dispatch is roadmap work — see ROADMAP.md.
     pub fn insert(
         &self,
         doc: DocId,
@@ -334,11 +309,7 @@ impl std::fmt::Debug for DiskTier {
     }
 }
 
-/// Decoded contents of a disk cache hit (allocating variant).
-///
-/// Retained for the in-crate tests of [`DiskTier::lookup`].  The
-/// production hot path uses [`DiskTier::lookup_into`] + a pinned slab
-/// to avoid the transient `Vec`.
+/// Test-only allocating variant of a disk cache hit.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct DiskEntry {
@@ -378,8 +349,18 @@ enum DiskReadError {
     UnsupportedFormat(u8),
     UnsupportedComponents(u8),
     HeaderTruncated,
-    PixelsTruncated { expected: usize, got: usize },
+    PixelsTruncated {
+        expected: usize,
+        got: usize,
+    },
     DimensionOverflow,
+    /// The `read_entry_into` callback failed for a reason unrelated
+    /// to the file's contents (e.g. pinned-host alloc failure, CUDA
+    /// driver hiccup).  Distinct so `lookup_into` can treat it as a
+    /// transient miss rather than corruption — deleting a valid disk
+    /// entry under transient pinned-memory pressure would silently
+    /// trash the cache.
+    CallbackFailed(io::Error),
 }
 
 impl std::fmt::Display for DiskReadError {
@@ -396,6 +377,7 @@ impl std::fmt::Display for DiskReadError {
                 write!(f, "pixels truncated: expected {expected} bytes, got {got}")
             }
             Self::DimensionOverflow => write!(f, "width × height × bpp overflows usize"),
+            Self::CallbackFailed(e) => write!(f, "lookup callback failed: {e}"),
         }
     }
 }
@@ -411,9 +393,6 @@ impl From<io::Error> for DiskReadError {
 }
 
 /// Log + delete a bad disk entry so a future write can replace it.
-/// Free function (no `&self`) because it touches only the path; the
-/// `DiskTier::used_estimate` counter is reconciled by the next
-/// `evict_to_fit` pass and doesn't need a per-removal touch here.
 fn report_bad_entry(path: &Path, e: &DiskReadError) {
     log::warn!(
         "disk-tier: bad cache entry at {}: {e}; removing",
@@ -478,13 +457,8 @@ fn open_and_parse_header(path: &Path) -> Result<(File, DiskHeaderInfo), DiskRead
 fn read_entry(path: &Path) -> Result<DiskEntry, DiskReadError> {
     let (mut f, info) = open_and_parse_header(path)?;
     let mut pixels = vec![0u8; info.expected_pixel_bytes];
-    f.read_exact(&mut pixels).map_err(|e| match e.kind() {
-        io::ErrorKind::UnexpectedEof => DiskReadError::PixelsTruncated {
-            expected: info.expected_pixel_bytes,
-            got: pixels.len(),
-        },
-        _ => DiskReadError::Io(e),
-    })?;
+    f.read_exact(&mut pixels)
+        .map_err(|e| map_pixel_io_err(&info, e))?;
     Ok(DiskEntry {
         width: info.width,
         height: info.height,
@@ -498,20 +472,65 @@ fn read_entry(path: &Path) -> Result<DiskEntry, DiskReadError> {
 /// parsed header and a reader positioned at the pixel payload; it
 /// must consume exactly `info.expected_pixel_bytes` (typically via
 /// `read_exact` into its own buffer).
+///
+/// The callback distinguishes file-side failures
+/// ([`LookupCallbackError::Read`] — propagated as `Io` /
+/// `PixelsTruncated`, which trigger entry deletion) from caller-side
+/// failures ([`LookupCallbackError::Resource`] — propagated as
+/// `CallbackFailed`, which `lookup_into` treats as a transient miss
+/// without touching the file).
 fn read_entry_into<F>(path: &Path, fill: F) -> Result<DiskHeaderInfo, DiskReadError>
 where
-    F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> io::Result<()>,
+    F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> Result<(), LookupCallbackError>,
 {
     let (mut f, info) = open_and_parse_header(path)?;
-    fill(&info, &mut f).map_err(|e| match e.kind() {
+    fill(&info, &mut f).map_err(|e| match e {
+        LookupCallbackError::Read(e) => map_pixel_io_err(&info, e),
+        LookupCallbackError::Resource(e) => DiskReadError::CallbackFailed(e),
+    })?;
+    Ok(info)
+}
+
+/// Map an `io::Error` from a pixel-payload read into the appropriate
+/// `DiskReadError` variant.  Shared by [`read_entry`] and
+/// [`read_entry_into`] so the truncation reporting stays consistent.
+fn map_pixel_io_err(info: &DiskHeaderInfo, e: io::Error) -> DiskReadError {
+    match e.kind() {
         io::ErrorKind::UnexpectedEof => DiskReadError::PixelsTruncated {
             expected: info.expected_pixel_bytes,
             got: 0,
         },
         _ => DiskReadError::Io(e),
-    })?;
-    Ok(info)
+    }
 }
+
+/// Reasons the [`DiskTier::lookup_into`] callback can fail.
+///
+/// Splits "the file gave us bad data" from "my side broke" so the
+/// disk tier doesn't delete a perfectly good cache entry under
+/// transient resource pressure (pinned-host pool exhausted, CUDA
+/// context hiccup, etc.).
+#[derive(Debug)]
+pub enum LookupCallbackError {
+    /// The file-side read failed — typically `read_exact` returning
+    /// `UnexpectedEof` because the payload was truncated.  Treated as
+    /// corruption; the entry is removed.
+    Read(io::Error),
+    /// A caller-side resource failed (alloc, driver, etc.).  The
+    /// file is fine; the lookup surfaces as a miss without removal.
+    Resource(io::Error),
+}
+
+impl std::fmt::Display for LookupCallbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "read: {e}"),
+            Self::Resource(e) => write!(f, "resource: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LookupCallbackError {}
 
 /// Write an entry atomically: temp file in the same directory, then
 /// rename into place.  POSIX rename is atomic across same-fs boundaries.
@@ -564,7 +583,6 @@ fn write_entry(
     header[12..16].copy_from_slice(&height.to_le_bytes());
     header[16] = components;
     header[17] = FORMAT_RAW;
-    // header[18..24] stays zero (Reserved bytes).
 
     // All steps that touch `tmp_path` after `create_new` must unlink
     // it on failure.  Wrap them so the cleanup runs uniformly.
@@ -742,6 +760,55 @@ mod tests {
         fs::write(&path, header).unwrap();
         assert!(tier.lookup(doc, &hash).is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn lookup_into_resource_failure_keeps_file() {
+        // Resource-side failures from the callback (e.g. pinned-host
+        // alloc OOM, CUDA hiccup) must NOT delete the disk entry —
+        // that would silently nuke a perfectly good cache file under
+        // transient pressure.
+        let dir = tempdir().expect("tempdir");
+        let tier = mk_tier(dir.path(), 0);
+        let doc = DocId([0x77; 32]);
+        let hash = ContentHash([0x88; 32]);
+        let pixels = vec![0xABu8; 8 * 8 * 3];
+        tier.insert(doc, hash, 8, 8, ImageLayout::Rgb, &pixels);
+        let path = entry_path(&tier.root, doc, hash);
+        assert!(path.exists());
+
+        let result = tier.lookup_into(doc, &hash, |_info, _reader| {
+            Err(LookupCallbackError::Resource(io::Error::other(
+                "simulated alloc failure",
+            )))
+        });
+        assert!(result.is_none(), "Resource failure surfaces as miss");
+        assert!(
+            path.exists(),
+            "Resource failure must NOT delete the disk entry"
+        );
+    }
+
+    #[test]
+    fn lookup_into_read_failure_removes_file() {
+        // Read-side failures from the callback (e.g. truncated
+        // payload) DO delete the entry — the file is unusable.
+        let dir = tempdir().expect("tempdir");
+        let tier = mk_tier(dir.path(), 0);
+        let doc = DocId([0x99; 32]);
+        let hash = ContentHash([0xAA; 32]);
+        let pixels = vec![0xCDu8; 8 * 8 * 3];
+        tier.insert(doc, hash, 8, 8, ImageLayout::Rgb, &pixels);
+        let path = entry_path(&tier.root, doc, hash);
+
+        let result = tier.lookup_into(doc, &hash, |_info, _reader| {
+            Err(LookupCallbackError::Read(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "simulated truncation",
+            )))
+        });
+        assert!(result.is_none());
+        assert!(!path.exists(), "Read failure removes the disk entry");
     }
 
     #[test]

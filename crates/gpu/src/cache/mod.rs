@@ -30,7 +30,7 @@ mod disk_tier;
 mod host_tier;
 mod page_buffer;
 
-pub use disk_tier::DiskTier;
+pub use disk_tier::{DiskTier, LookupCallbackError};
 pub use host_tier::HostBudget;
 pub(crate) use host_tier::{HostEntry, HostTier};
 pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
@@ -499,19 +499,26 @@ impl DeviceImageCache {
     /// re-decodes the source bytes.
     fn promote_from_disk(&self, doc: DocId, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
         let disk = self.disk.as_ref()?;
-        // Allocate the pinned slab outside the lookup callback so we
-        // keep ownership after the disk read is done.  The callback
-        // borrows a `&mut [u8]` view of the slab and fills it via
-        // `read_exact`, eliminating the transient `Vec<u8>` we used
-        // to copy through.
+        // Slab outlives the callback; the closure fills it via
+        // `read_exact` and hands ownership back via `pinned`.
         let mut pinned: Option<cudarc::driver::PinnedHostSlice<u8>> = None;
         let info = disk.lookup_into(doc, hash, |info, reader| {
+            // Pinned alloc and slab-access failures are caller-side
+            // — tag them `Resource` so a transient pinned-pool
+            // exhaustion doesn't delete the (perfectly fine) disk
+            // entry.
             let mut slab = HostTier::alloc_pinned(self.stream.context(), info.expected_pixel_bytes)
-                .map_err(|e| std::io::Error::other(format!("alloc_pinned failed: {e}")))?;
-            let dst = slab
-                .as_mut_slice()
-                .map_err(|e| std::io::Error::other(format!("pinned slab access failed: {e}")))?;
-            reader.read_exact(dst)?;
+                .map_err(|e| {
+                    LookupCallbackError::Resource(std::io::Error::other(format!(
+                        "alloc_pinned failed: {e}"
+                    )))
+                })?;
+            let dst = slab.as_mut_slice().map_err(|e| {
+                LookupCallbackError::Resource(std::io::Error::other(format!(
+                    "pinned slab access failed: {e}"
+                )))
+            })?;
+            reader.read_exact(dst).map_err(LookupCallbackError::Read)?;
             pinned = Some(slab);
             Ok(())
         })?;
@@ -524,9 +531,6 @@ impl DeviceImageCache {
         );
         let host_entry = HostEntry::new(pinned, info.width, info.height, info.layout);
         let _arc = self.host.insert(*hash, host_entry, self.next_tick());
-        // Promote up to VRAM via the existing host→VRAM path.  The
-        // `_arc` keeps the host entry alive across this call; it
-        // drops at function exit, leaving only the host tier's Arc.
         self.promote_from_host(hash)
     }
 
