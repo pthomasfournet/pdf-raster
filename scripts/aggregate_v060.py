@@ -31,8 +31,9 @@ CORPORA = [
 
 MODES = [
     ("A", "A. CPU-only"),
-    ("C", "C. nvJPEG"),
+    ("C", "C. nvJPEG (GPU_HYBRID)"),
     ("D", "D. Full GPU"),
+    ("E", "E. nvJPEG (HARDWARE)"),
 ]
 
 # bench_corpus.sh format:

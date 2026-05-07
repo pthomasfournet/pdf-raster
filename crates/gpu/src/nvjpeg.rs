@@ -117,11 +117,15 @@ const NVJPEG_BACKEND_DEFAULT: nvjpegBackend_t = 0;
 const NVJPEG_BACKEND_GPU_HYBRID: nvjpegBackend_t = 2;
 /// Fixed-function hardware JPEG engine.  Supported on Ampere (A100/A30), Hopper,
 /// Ada, Blackwell, and Jetson Thor — **not Turing** (despite marketing).  Serialises
-/// all concurrent callers through the engine; slower than `GPU_HYBRID` for
-/// multi-threaded workloads.  Not used; retained for documentation only.
-#[expect(
-    dead_code,
-    reason = "documents the HARDWARE backend value; not used — see module doc"
+/// all concurrent callers through the engine; documented as slower than
+/// `GPU_HYBRID` for multi-threaded workloads.  Off by default; enable via
+/// the `nvjpeg-hardware` cargo feature to measure on a specific machine.
+#[cfg_attr(
+    not(feature = "nvjpeg-hardware"),
+    expect(
+        dead_code,
+        reason = "documents the HARDWARE backend value; only used when nvjpeg-hardware feature is on"
+    )
 )]
 const NVJPEG_BACKEND_HARDWARE: nvjpegBackend_t = 3;
 
@@ -507,8 +511,30 @@ impl NvJpeg {
         Ok(Self { handle, state })
     }
 
-    /// Try `GPU_HYBRID` first; fall back to `DEFAULT`.
+    /// Pick the nvJPEG backend.
+    ///
+    /// Default: `GPU_HYBRID` (CPU Huffman + GPU IDCT) with `DEFAULT` fallback.
+    /// With the `nvjpeg-hardware` feature flag: try the fixed-function
+    /// `HARDWARE` engine first, then `GPU_HYBRID`, then `DEFAULT`.  The flag
+    /// exists for empirical comparison — datacenter parts (A100/H100/Ada)
+    /// have multi-engine `HARDWARE` and should win on it; consumer Blackwell
+    /// has a single engine and was assumed to lose.  Use the bench matrix to
+    /// confirm rather than infer.
     fn create_handle() -> Result<nvjpegHandle_t> {
+        #[cfg(feature = "nvjpeg-hardware")]
+        {
+            match Self::try_backend(NVJPEG_BACKEND_HARDWARE) {
+                Ok(h) => {
+                    log::debug!("nvJPEG: using HARDWARE backend (nvjpeg-hardware feature on)");
+                    return Ok(h);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "nvJPEG HARDWARE backend unavailable ({e}); falling back to GPU_HYBRID"
+                    );
+                }
+            }
+        }
         Self::try_backend(NVJPEG_BACKEND_GPU_HYBRID).or_else(|e| {
             log::debug!("nvJPEG GPU_HYBRID backend unavailable ({e}), falling back to DEFAULT");
             Self::try_backend(NVJPEG_BACKEND_DEFAULT)

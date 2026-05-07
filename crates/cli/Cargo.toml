@@ -20,6 +20,8 @@ path = "src/main.rs"
 gpu-aa   = ["pdf_raster/gpu-aa"]
 # Enable GPU-accelerated JPEG decoding via nvJPEG.
 nvjpeg   = ["pdf_raster/nvjpeg"]
+# Probe NVJPEG_BACKEND_HARDWARE instead of GPU_HYBRID.  Empirical-only.
+nvjpeg-hardware = ["pdf_raster/nvjpeg-hardware"]
 # Enable GPU-accelerated JPEG 2000 decoding via nvJPEG2000.
 nvjpeg2k = ["pdf_raster/nvjpeg2k"]
 # Enable GPU ICC CMYK→RGB transform.

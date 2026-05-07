@@ -23,19 +23,24 @@ MIN_FREE_GB=20
 # Mode → (binary suffix, --backend value).
 # VA-API is intentionally absent: this machine has no DRM render node
 # bound to a VA-API driver. See project_vaapi_on_hold.md memory.
-MODES=(A C D)
+#
+# Mode E added 2026-05-07 to measure NVJPEG_BACKEND_HARDWARE on consumer
+# Blackwell — the v0.6.0 baseline ran GPU_HYBRID only and the HARDWARE
+# inference was never directly tested.
+MODES=(A C D E)
 declare -A MODE_BIN=(
-  [A]=nvjpeg [C]=nvjpeg [D]=full
+  [A]=nvjpeg [C]=nvjpeg [D]=full [E]=hardware
 )
 declare -A MODE_BACKEND=(
-  [A]=cpu [C]=cuda [D]=cuda
+  [A]=cpu [C]=cuda [D]=cuda [E]=cuda
 )
 declare -A MODE_LABEL=(
-  [A]="CPU-only" [C]="nvJPEG only" [D]="Full GPU"
+  [A]="CPU-only" [C]="nvJPEG GPU_HYBRID" [D]="Full GPU" [E]="nvJPEG HARDWARE"
 )
 declare -A BIN_FEATURES=(
   [nvjpeg]="nvjpeg,nvjpeg2k"
   [full]="nvjpeg,nvjpeg2k,gpu-aa,gpu-icc"
+  [hardware]="nvjpeg,nvjpeg2k,nvjpeg-hardware"
 )
 
 FORCE=0
@@ -153,7 +158,7 @@ bench_mode() {
   # loader needs LD_LIBRARY_PATH set whenever the binary has those
   # dependencies, not only when --backend cuda is used.
   local ld_path=""
-  if [[ "$bin_suffix" == "nvjpeg" || "$bin_suffix" == "full" ]]; then
+  if [[ "$bin_suffix" == "nvjpeg" || "$bin_suffix" == "full" || "$bin_suffix" == "hardware" ]]; then
     ld_path="LD_LIBRARY_PATH=$NVJPEG2K_LIB:$CUDA_LIB:${LD_LIBRARY_PATH:-}"
   fi
 

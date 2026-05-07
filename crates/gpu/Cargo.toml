@@ -29,6 +29,11 @@ vaapi = []
 # land incrementally. Disabled by default until the bench gate in
 # docs/superpowers/specs/2026-05-06-gpu-jpeg-pipeline.md passes.
 nvjpeg-gpu = []
+# Probe `NVJPEG_BACKEND_HARDWARE` (fixed-function NVJPG engine) instead of
+# `NVJPEG_BACKEND_GPU_HYBRID`. Default (off) reflects the v0.6.0 baseline
+# claim that consumer Blackwell's single NVJPG engine serialises 24-thread
+# workloads. This flag exists so we can measure rather than assume.
+nvjpeg-hardware = ["nvjpeg"]
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }

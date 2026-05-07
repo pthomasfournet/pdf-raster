@@ -662,62 +662,115 @@ Currently every progressive JPEG incurs a full VA-API header parse + `BadJpeg` e
 - [x] Serial prescan loop removed from CLI render path — all pages default to `RoutingHint::Unclassified`; `routing_hint_from_diag` retained as extension point for future affinity dispatch; recovered 15-20% throughput regression
 - [x] Affinity dispatch: prescan all pages sequentially before pool start; `CpuOnly` hint → `BackendPolicy::CpuOnly` override in `render_page_rgb_hinted` → `lend_decoders` skips `ensure_nvjpeg` and `DECODER_INIT_LOCK` acquisition; `GpuJpegCandidate` uses session policy unchanged; single rayon pool (soft affinity)
 - [x] Benchmark: full v0.6.0 matrix on 9900X3D + RTX 5070 (`bench/v060/results.md`) and i7-8700K + RTX 2080 SUPER testbench (`bench/v060/results-testbench-i7-8700K-rtx2080super.md`).  Target corpus 08/09 GPU speedup ≥ 5× **was not met** — nvJPEG-via-`GPU_HYBRID` is 5–13× *slower* than 24-thread zune-jpeg on every DCT-heavy corpus on both machines.  Root cause and fix scoped under Phase 8.
+- [ ] Re-bench with `nvjpeg-hardware` feature flag enabled — fifth matrix column (mode E, `NVJPEG_BACKEND_HARDWARE`) added 2026-05-07 to measure rather than infer.  The original v0.6.0 matrix only ran `GPU_HYBRID`; the inference that `HARDWARE` would also lose on consumer Blackwell was never directly tested.  If `HARDWARE` wins, Phase 8 changes shape.
 
 ---
 
-## Phase 8 — Custom on-GPU JPEG decoder
+## Hard blocker: NVJPG silicon access on consumer NVIDIA
 
-**Goal:** replace nvJPEG in the dispatch path with a parallel-Huffman + GPU IDCT pipeline based on the Weißenberger 2018 self-synchronizing algorithm and the Wei et al. 2024 JPEG-specific extension, producing device-resident pixels that compose with the existing GPU AA / GPU ICC / tile fill / composite kernels.
+Documented here once, then referred to elsewhere.
 
-### Motivation
+The fixed-function NVJPG hardware engine is **closed to consumer GeForce SKUs** in three independent ways:
 
-Two v0.6.0 baseline matrices (24-thread 9900X3D + RTX 5070; 12-thread 8700K + RTX 2080 SUPER) confirmed nvJPEG **always loses** to multi-threaded CPU JPEG decode on consumer hardware as the codebase currently dispatches it.  The mechanism, per nvJPEG documentation: `GPU_HYBRID` only puts decode on GPU when batch size ≥ 50–100; for our single-image-per-call workload it falls back to CPU work behind a CUDA stream-sync wrapper.  We pay GPU API overhead for a CPU decode that's slower than calling zune-jpeg directly.  `HARDWARE` backend would help on datacenter GPUs (multiple NVJPG engines) but not on consumer Blackwell (one engine) or Turing (no engine at all).
+1. **The user-space library `libnvjpeg.so` rejects `NVJPEG_BACKEND_HARDWARE` at handle creation** on consumer cards (verified on RTX 5070; the `nvjpeg-hardware` cargo feature added 2026-05-07 confirms this empirically).
+2. **The open kernel module (`open-gpu-kernel-modules`) exposes NVJPG class IDs** for current architectures (`NVCDD1`, `NVCFD1`) but **deliberately does not publish the command-buffer methods**, the PRI register definitions, or the firmware that drives the engine. ~220 lines of NVJPG-related kernel code in the open repo, all of it context lifecycle / capability-table reading; zero of it is the actual decode submission path.
+3. **No Vulkan extension exposes JPEG decode.** `VK_KHR_video_decode_*` covers H.264/H.265/AV1/VP9 only; Khronos has not standardised JPEG video, NVIDIA has not proposed a vendor extension. Vulkan-on-NVIDIA on consumer Blackwell exposes H.264/H.265 decode operations on the queue family, nothing else.
 
-The threshold workaround `GPU_JPEG_THRESHOLD_PX = u32::MAX` (committed `dd3ed21`) disables nvJPEG dispatch as the floor.  Phase 8 builds the path that actually wins on consumer hardware.
+Reverse-engineering desktop NVJPG would take a multi-month research project (cf. Asahi Linux's GPU work for analogous scope), wouldn't transfer across architecture generations, and would land in a legally murky zone (Falcon firmware signatures). No academic or community project is publicly working on this; the ROI doesn't exist for the open-source ecosystem either.
 
-### Design overview
+**What this means for pdf-raster:** the only open path to GPU acceleration of JPEG-related work is the SM array via custom CUDA or Vulkan compute shaders. The fixed-function engine is unreachable from any open code path. This is the load-bearing constraint behind Phase 9's design (CPU decode + device-resident pipeline) and Phase 8's deferral.
 
-Six phases, with the bench gate at the end deciding ship vs. shelve:
+---
 
-```
-Phase 0 (CPU): parse headers, build canonical Huffman tables, resolve DC chain, strip byte-stuffing
-Phase 1 (GPU): intra-sequence Huffman sync (gpuhd 4-phase algorithm, AC stream)
-Phase 2 (GPU): inter-sequence sync across thread-block seams, bounded retries
-Phase 3 (GPU): thrust::exclusive_scan over per-subsequence symbol counts
-Phase 4 (GPU): re-run decode with offsets, write coefficients
-Phase 5 (GPU): zig-zag inverse + dequantize + IDCT + colour convert → device-resident pixels
-```
+## Phase 8 — Custom on-GPU parallel Huffman decoder (DEFERRED)
 
-The serial DC differential chain is resolved on CPU during Phase 0 (~1% of total decode bits) so Phase 1 gets a fully-parallelisable AC-only stream.  The 51× over libjpeg-turbo / 8× over nvJPEG figures from Wei et al. 2024 are the upper bound on A100; consumer hardware will see something more modest but still positive.
+**Status:** Phase 0 (CPU pre-pass) shipped 2026-05-06/07. Phases 1+ deferred indefinitely as a research project, not a performance work item.
 
-The architectural payoff isn't just "faster JPEG decode" — it's that Phase 5 produces **device-resident pixels**, which lets the existing GPU AA / GPU ICC / tile fill / composite kernels stop paying PCIe round trips per kernel invocation.  Four already-shipped GPU features become useful at the same time.
+**Why deferred:**
 
-### Reference reading
+Phase 8 was originally scoped under the assumption that we needed a GPU-resident JPEG decoder to enable device-resident pixels. That assumption was wrong: CPU decode + one strategic upload achieves the same architectural property (Phase 9) with dramatically less work.
 
-Algorithmic logic was studied (read-only) from:
-- `weissenberger/gpuhd` (LGPL-3.0) — generic 4-phase parallel Huffman, ~500 lines CUDA.  Reimplemented clean in Rust + CUDA.
-- `CESNET/GPUJPEG` (BSD-2-Clause) — JPEG-specific GPU IDCT + colour kernel.  Adaptable with attribution if needed; their parallelism strategy (RST-marker boundaries) doesn't fit our PDF inputs but the per-block kernel logic does.
-- Wei et al. 2024 ([arXiv 2111.09219](https://arxiv.org/abs/2111.09219)) — full-on-GPU JPEG with self-synchronizing parallel Huffman; algorithm-only, no source.
+The v0.6.0 baseline matrices on both 9900X3D + RTX 5070 and 8700K + RTX 2080 SUPER, plus the consumer-Blackwell NVJPG investigation, established that:
 
-### Work items
+- Multi-thread CPU JPEG decode (zune-jpeg, AVX-512 IDCT) at 24 threads delivers ~5 GB/s aggregate. This is the path Phase 9 keeps.
+- A custom parallel-Huffman GPU decoder, even built ideally per Wei et al. 2024, would *match or marginally beat* per-image latency but **lose on aggregate throughput** to 24-thread CPU. The 51× speedup over libjpeg-turbo in the paper is on A100 datacenter hardware against a single-thread CPU baseline; consumer Blackwell + 24-thread CPU is a different comparison.
+- The architectural payoff (device-resident pixels enabling GPU AA / ICC / tile fill / composite) is achievable via Phase 9 without Phase 8.
 
-- [x] **Phase 0 (CPU pre-pass)** — `crates/gpu/src/jpeg/`: shared header parser (`headers.rs`), canonical Huffman lookup-table builder (`canonical.rs`), byte-unstuffing with RST position recording (`unstuff.rs`), DC differential chain resolution (`dc_chain.rs`), end-to-end orchestrator (`prepass.rs`).  `tests/bench_corpus.sh` wiring not yet there; module is feature-gated behind `nvjpeg-gpu` (off by default).  84 unit tests across 6 modules; 100% of the existing VA-API path consumes the new shared parser through a thin adapter.  Hardening pass found a critical RST DC-predictor reset bug + 3 high-severity issues, all fixed and pinned with regression tests.  Simplifier sweep applied 11 quality wins (Option-typed quant tables, shared MCU formula, marker constants, `Display for DhtClass`, fail-fast on progressive JPEG, doc hygiene).
-- [ ] **Phase 1 (parallel Huffman, in isolation)** — port gpuhd's 4-phase decoder to CUDA, with our own canonical-codebook layout.  MVP: synthetic Huffman streams from a known table, byte-identical recovery; malicious-stream-doesn't-self-sync handling; subsequence-size sweep (default 128 bits per Klein & Wiseman 2003).  Decision point: does the algorithm work?  ~1 week focused.
-- [ ] **Phase 2–4 (JPEG framing on top)** — extend the parallel-Huffman kernel with JPEG-specific consumption: (run, size) pair handling for AC, EOB / ZRL recognition, output coefficient layout.  Inputs: `CpuPrepassOutput` from Phase 0; outputs: `[i16; 64] × num_blocks` device buffer in zig-zag scan order.
-- [ ] **Phase 5 (IDCT + colour)** — adapt GPUJPEG's IDCT kernel (BSD-2-Clause) for our coefficient layout; per-block dequant from `JpegQuantTable.values`; YCbCr → RGB conversion; output device-resident pixels.
-- [ ] **Bench gate** — re-run `bench/v060/` matrix with `nvjpeg-gpu` feature on.  Strict ship criterion: at least one DCT-heavy corpus (06/07/08/09) must show mode C ≤ 0.7× mode A on the 9900X3D primary baseline.  If gate fails, the code stays behind the feature flag, the threshold workaround stays, and the next architectural move is device-resident image lifetime independent of the JPEG decoder change.
-- [ ] **Phase D (post-gate, only if Phase 1–5 pass the gate)** — make the renderer page bitmap a `DeviceImage`; existing GPU AA / GPU ICC / tile fill / composite kernels read/write the device-resident page buffer with no intermediate PCIe round trips; final D→H once at `PageRenderer::finish`.  Single biggest payoff in the whole roadmap if it lands.
+**What stays in the codebase:**
 
-### What this kills
+The Phase 0 work (`crates/gpu/src/jpeg/`) shipped clean across three commits and 84 passing unit tests. It stays as scaffolding for a future hobbyist port and as well-tested JPEG metadata utilities that any future work might want.
 
-- The "use nvJPEG batched API" plan (deleted; was a workaround for the same root cause this addresses architecturally).
-- The "switch to `NVJPEG_BACKEND_HARDWARE`" experiment (no NVJPG engine on Turing; one engine on consumer Blackwell — would serialise 24 worker threads).
-- Any expectation of a real GPU JPEG win on consumer hardware without writing custom CUDA.
+**Why Phase 8 stays in the roadmap at all:**
 
-### What this does not change
+The Weißenberger 2018 self-synchronizing parallel Huffman algorithm is genuinely beautiful CUDA work. Implementing it produces an open, redistributable artifact that demonstrates a non-obvious algorithm. If pdf-raster ever wants to run on a workload where 24 CPU threads aren't available (embedded, single-core, etc.) the GPU decoder becomes relevant. The work has long-term value as a learning project; it's just not the path to faster pdf-raster.
 
-- nvJPEG2000 (`JPXDecode` path) — the only existing GPU-decode win on this codebase (corpus 10, 1.7× over CPU).  Stays on the nvJPEG2K library; not affected by this work.
-- VA-API — orthogonal; remains on hold (no DRM render node bound to a VA-API driver on this machine).
+See `docs/superpowers/specs/2026-05-06-gpu-jpeg-pipeline.md` for the full original spec, kept on the local-only `docs/superpowers/` side because it's a research artifact, not an active spec.
+
+---
+
+## Phase 9 — Device-resident image cache and GPU page buffer (ACTIVE)
+
+**Spec:** `docs/superpowers/specs/2026-05-07-phase-9-device-resident-image-cache.md`
+
+**Goal:** decoded image pixels and the page being rendered both live in VRAM for the lifetime of a render session, so the rendering hot path performs zero PCIe round-trips per image and zero decode work on cache hits.
+
+**Why this is the right phase now:**
+
+Three load-bearing facts from the v0.6.0 baseline + consumer-Blackwell NVJPG investigation:
+
+1. Multi-thread CPU JPEG decode is faster than any GPU JPEG path we can ship on consumer hardware.
+2. The 4 already-shipped GPU kernels (AA fill, ICC CLUT, tile fill, composite) don't carry their weight today because every kernel pays a PCIe round-trip per invocation.
+3. The OCR pipeline pattern renders the same PDF multiple times; today every pass re-decodes every JPEG.
+
+Phase 9 addresses all three at the same time: the cache makes (3) free after the first render, the device-resident page buffer makes (2) finally pay off, and (1) is no longer a problem because we're not trying to beat CPU JPEG decode — we're keeping its output in VRAM.
+
+**Architecture (one-liner):** three-tier cache (VRAM → host RAM → disk) with content-hash dedup (BLAKE3) keying across documents, plus a device-resident page bitmap that the existing GPU kernels read and write in place.
+
+**Work items:**
+
+- [ ] **Task 1 — `ImageData` enum + `Gpu` variant** (~150 LoC). Type plumbing only; no behaviour change. Lets subsequent tasks switch decoders to produce `ImageData::Gpu(...)`.
+- [ ] **Task 2 — VRAM tier in-process** (~400 LoC). Content-hash keyed cache, LRU eviction, refcount-based reclaim, DashMap concurrent access, decode-or-wait dedup on simultaneous miss. **First measurable speedup ships here.**
+- [ ] **Task 3 — Host RAM tier** (~250 LoC). Pinned memory pool; demote-on-evict from VRAM; promote-on-hit. Enables corpus 09 (~1900 pages) without OOM under default budgets.
+- [ ] **Task 4 — Device page buffer + GPU blit kernel** (~600 LoC, includes `crates/gpu/kernels/blit_image.cu`). The architectural win: AA fill / ICC / tile fill / composite all operate on a `CudaSlice<u8>` page buffer, never round-trip pixels through PCIe. Mode D should finally beat mode A on DCT-heavy corpora.
+- [ ] **Task 5 — Disk tier** (~300 LoC). Sidecar cache directory, atomic writes, document-keyed eviction. Cross-process persistence; OCR pipeline second-pass becomes I/O-bound at NVMe speed.
+- [ ] **Task 6 — Pre-fetcher** (~150 LoC). Walk PDF object table at session start, async decode + upload to budget. Optional, off by default.
+
+**Bench gate:** Phase 9 ships if and only if (1) cache hit rate ≥ 95% on logo-heavy multi-page renders; (2) second-render time ≤ 30% of first-render time; (3) mode A doesn't regress; (4) no OOM on corpus 09 with default budgets; (5) **mode D beats mode A on at least 3 of corpora 04-08** — this is the architectural win the whole project has been chasing.
+
+**Total scope:** ~1850 LoC new Rust + ~150 LoC new CUDA + ~400 LoC modified existing. Tasks 1+2 ship in ~5-7 days; full pipeline ~3 weeks elapsed.
+
+---
+
+## Phase 10 — Vulkan compute backend (PLANNED)
+
+**Spec:** `docs/superpowers/specs/2026-05-07-phase-10-vulkan-compute-backend.md`
+
+**Goal:** replace the CUDA-specific kernel launch and device-memory layer with a backend-abstracted layer that has both CUDA and Vulkan compute implementations, so the same algorithmic kernels run on NVIDIA, AMD, Intel, and Apple GPUs from one source tree.
+
+**Why now (and why not before):**
+
+Vulkan compute on the dev machine (RTX 5070, driver 580.142) was confirmed 2026-05-07 to expose Vulkan 1.4.312, conformance 1.4.1.3, full subgroup operations (the equivalent of CUDA warp intrinsics), tensor cores via `VK_KHR_cooperative_matrix`, and the same SM array CUDA uses. Cross-vendor portability is the real reason — the same SPIR-V kernel runs on AMD (RADV), Intel (ANV), Apple (MoltenVK→Metal), and Mesa lavapipe (CPU debug).
+
+What was missing before Phase 9 was *the abstraction layer to even consider a backend swap*. Phase 9 introduces backend-agnostic shapes (`ImageData::Gpu`, `CachedDeviceImage`, `DevicePageBuffer`); Phase 10 swaps the *implementation* behind those shapes from CUDA-specific to backend-trait-driven, with concrete CUDA and Vulkan backends.
+
+**Approach:**
+
+- Single kernel source-of-truth in **Slang** (Khronos-supported shading language). One `.slang` file per algorithm; `slangc` compiles to PTX for CUDA backend and SPIR-V for Vulkan backend.
+- `GpuBackend` trait abstracting device-memory, kernel launch, host↔device transfer, synchronisation. Two implementations: `CudaBackend` (current, refactored) and `VulkanBackend` (new, via `ash`).
+- `BackendPreference` enum on `RasterOptions`: `Auto` (CUDA on NVIDIA, Vulkan elsewhere), `ForceCuda`, `ForceVulkan`, `CpuOnly`.
+- The Phase 9 cache and page buffer become generic over `B: GpuBackend`.
+
+**Work items:**
+
+- [ ] **Task 1 — Backend trait + CUDA refactor** (~600 new + ~400 modified LoC). Extract `CudaBackend` from existing code; refactor Phase 9 cache + page buffer to be generic. Bench parity required.
+- [ ] **Task 2 — Slang port of all kernels** (~1000 LoC). Translate 5 existing `.cu` files + Phase 9's `blit_image.cu` to `.slang`. nvcc compiles Slang→PTX for CUDA; SPIR-V backend used in task 3. **Riskiest task in Phase 10**; rollback plan is to keep `.cu` files alongside `.slang` until bench parity confirmed.
+- [ ] **Task 3 — Vulkan backend implementation** (~1500 LoC). `VulkanBackend` impl via `ash`; pipeline cache; descriptor set management; synchronisation; integrates behind the trait. Cross-vendor smoke test on at least one AMD or Intel GPU.
+
+**Bench gate:** Phase 10 ships if (1) CUDA path performance unchanged within ±5%; (2) Vulkan path functional on RTX 5070 with pixel-diff ≤ 1 LSB vs CUDA; (3) Vulkan timing within 15% of CUDA on RTX 5070; (4) cross-vendor proof of life on AMD or Intel.
+
+**Total scope:** ~3100 LoC new Rust + ~1000 LoC Slang + ~400 LoC modified. Estimated ~6-8 weeks elapsed (3-4 weeks tasks 1+2; 3-4 weeks task 3).
+
+**Sequencing:** Phase 9 must ship first. Phase 10 task 1 generifies Phase 9's cache; doing them in parallel would mean fighting merge conflicts.
 
 ---
 

@@ -16,6 +16,9 @@ categories  = ["multimedia::images", "rendering", "parser-implementations"]
 gpu-aa  = ["dep:gpu", "pdf_interp/gpu-aa"]
 # GPU-accelerated JPEG decoding via nvJPEG.
 nvjpeg  = ["dep:gpu", "pdf_interp/nvjpeg"]
+# Probe NVJPEG_BACKEND_HARDWARE instead of GPU_HYBRID.  Empirical-only;
+# benched alongside the default `nvjpeg` feature to compare backends.
+nvjpeg-hardware = ["nvjpeg", "gpu/nvjpeg-hardware"]
 # VA-API JPEG decoding (AMD/Intel iGPU fallback; no CUDA required).
 vaapi   = ["dep:gpu", "pdf_interp/vaapi"]
 # GPU-accelerated JPEG 2000 decoding via nvJPEG2000.
