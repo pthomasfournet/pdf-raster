@@ -186,6 +186,16 @@ pub struct SessionConfig {
     /// Only relevant when the `vaapi` feature is enabled and `policy` is not
     /// [`CpuOnly`](BackendPolicy::CpuOnly) or [`ForceCuda`](BackendPolicy::ForceCuda).
     pub vaapi_device: String,
+    /// Whether to spawn the image-cache prefetcher at session open.
+    /// Default `false` — opt-in because the prefetcher reads every
+    /// page's resource dict eagerly, which is wasted work for short
+    /// single-page renders.  Long renders, multi-pass renders (OCR
+    /// pipelines), and re-renders of the same PDF benefit.
+    ///
+    /// No effect when the `cache` feature is disabled or when GPU
+    /// initialisation fails (no cache → nowhere to prefetch into).
+    #[cfg(feature = "cache")]
+    pub prefetch: bool,
 }
 
 impl Default for SessionConfig {
@@ -193,6 +203,8 @@ impl Default for SessionConfig {
         Self {
             policy: BackendPolicy::Auto,
             vaapi_device: DEFAULT_VAAPI_DEVICE.to_owned(),
+            #[cfg(feature = "cache")]
+            prefetch: false,
         }
     }
 }

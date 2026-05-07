@@ -11,6 +11,8 @@
 //! The [`renderer`] module rasterises operators to a pixel bitmap.
 //! The [`prescan`] module classifies pages cheaply before rendering.
 
+#[cfg(feature = "cache")]
+pub mod cache;
 pub mod content;
 pub mod prescan;
 pub mod renderer;

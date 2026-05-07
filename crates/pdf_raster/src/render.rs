@@ -1,11 +1,5 @@
 //! Core render pipeline: PDF page → pixel buffer.
 
-#[cfg(any(
-    feature = "gpu-aa",
-    feature = "gpu-icc",
-    feature = "vaapi",
-    feature = "cache"
-))]
 use std::sync::Arc;
 
 use color::{Gray8, Rgb8};
@@ -124,7 +118,7 @@ impl From<pdf_interp::InterpError> for RasterError {
 /// is `Arc`-wrapped, and the VA-API decode queue is `Arc`-wrapped (its inner
 /// `mpsc::Sender` is `Send + Sync`).
 pub struct RasterSession {
-    pub(crate) doc: pdf::Document,
+    pub(crate) doc: Arc<pdf::Document>,
     /// Page-number → object-ID map, built once at construction.
     pub(crate) pages: std::collections::BTreeMap<u32, pdf::ObjectId>,
     pub(crate) total_pages: u32,
@@ -146,7 +140,7 @@ pub struct RasterSession {
     /// `ForceCuda`, or VA-API initialisation failed (soft failure on `Auto`).
     #[cfg(feature = "vaapi")]
     pub(crate) vaapi_queue: Option<Arc<gpu::DecodeQueue<gpu::vaapi::VapiJpegDecoder>>>,
-    /// Phase 9 device-resident image cache.  `Some` when the `cache`
+    /// Device-resident image cache.  `Some` when the `cache`
     /// feature is enabled and a CUDA device is available; `None`
     /// otherwise (CPU-only fallback).  Shared across all pages so
     /// content-hash dedup spans the whole render.
@@ -157,6 +151,18 @@ pub struct RasterSession {
     /// any 32-byte content-addressable identifier works.
     #[cfg(feature = "cache")]
     pub(crate) doc_id: gpu::cache::DocId,
+    /// Image-cache prefetcher handle — kept alive for the session's
+    /// lifetime so the discovery + worker threads can drain.
+    /// `None` when the cache is disabled or the user opted out via
+    /// [`crate::SessionConfig::prefetch`].  Drop semantics: cancels
+    /// in-flight prefetch and joins workers; safe to drop mid-render.
+    #[cfg(feature = "cache")]
+    #[expect(
+        dead_code,
+        reason = "held for Drop side-effect (cancels + joins prefetcher); \
+                  callers don't read it but session lifetime owns it"
+    )]
+    pub(crate) prefetch: Option<pdf_interp::cache::PrefetchHandle>,
 }
 
 impl RasterSession {
@@ -169,7 +175,7 @@ impl RasterSession {
     /// Borrow the underlying [`pdf::Document`] for read-only operations such as
     /// the [`pdf_raster::prescan_page`] pre-scan pass.
     #[must_use]
-    pub const fn doc(&self) -> &pdf::Document {
+    pub fn doc(&self) -> &pdf::Document {
         &self.doc
     }
 
@@ -204,7 +210,7 @@ pub fn open_session(
     path: &std::path::Path,
     config: &SessionConfig,
 ) -> Result<RasterSession, RasterError> {
-    let doc = pdf_interp::open(path).map_err(RasterError::from)?;
+    let doc = Arc::new(pdf_interp::open(path).map_err(RasterError::from)?);
     let pages: std::collections::BTreeMap<u32, pdf::ObjectId> = doc.get_pages().collect();
     let total_pages = u32::try_from(pages.len()).map_err(|_| {
         RasterError::InvalidPageGeometry(format!(
@@ -223,7 +229,7 @@ pub fn open_session(
         .map_err(RasterError::BackendUnavailable)?
         .map(Arc::new);
 
-    // Phase 9 image cache: one per session, shared across all pages.
+    // Image cache: one per session, shared across all pages.
     // Construction needs a CUDA stream from the GpuCtx, so the cache
     // is gated on gpu_ctx availability — a CpuOnly session or a
     // failed init produces `image_cache = None`.
@@ -231,9 +237,9 @@ pub fn open_session(
     let image_cache = gpu_ctx.as_ref().map(|ctx| {
         let mut cache = gpu::cache::DeviceImageCache::new(
             std::sync::Arc::clone(ctx.stream()),
-            // Auto-detect would need a running CUDA stream; for v0.7.0
-            // we use the spec defaults so a session always boots.
-            // Future work: expose a SessionConfig::cache_budget knob.
+            // Auto-detect would need a running CUDA stream; we use
+            // the spec defaults so a session always boots.  Future
+            // work: expose a SessionConfig::cache_budget knob.
             gpu::cache::VramBudget::DEFAULT,
             gpu::cache::HostBudget::DEFAULT,
         );
@@ -279,6 +285,23 @@ pub fn open_session(
         gpu::cache::DocId(hash.0)
     };
 
+    // Spawn the prefetcher last (after the cache + doc_id are
+    // resolved).  Skipped when the user didn't opt in or when no
+    // cache exists to prefetch into.
+    #[cfg(feature = "cache")]
+    let prefetch = if config.prefetch
+        && let Some(cache) = image_cache.as_ref()
+    {
+        Some(pdf_interp::cache::spawn_prefetch(
+            Arc::clone(&doc),
+            Arc::clone(cache),
+            doc_id,
+            pdf_interp::cache::PrefetchConfig::default(),
+        ))
+    } else {
+        None
+    };
+
     Ok(RasterSession {
         doc,
         pages,
@@ -294,6 +317,8 @@ pub fn open_session(
         image_cache,
         #[cfg(feature = "cache")]
         doc_id,
+        #[cfg(feature = "cache")]
+        prefetch,
     })
 }
 
