@@ -38,7 +38,13 @@ Phase 5 is complete. The API exists and is integrated.
 - **JPEG scaffolding cleanup.** Collapsed the double SOF scan in `JpegHeaders::parse` (non-baseline detection inline in the marker loop, no separate `jpeg_sof_type` pre-pass). `BitReader::refill` grew an 8-byte `u64::from_be_bytes` fast path on the common cap-zero case (~2× Huffman codeword throughput per textbooks). `canonical::fill_table` switched to `slice::fill`. VA-API adapter no longer caches `num_mcus` — derives from a shared `mcu_count_from_max_sampling` helper.
 - **Documentation.** README gains a "Picking CUDA_ARCH for your GPU" subsection mapping consumer GPU generations (Pascal → Blackwell, A100, H100) to the right `sm_NN` flag, plus a feature-flag table covering `nvjpeg`, `nvjpeg2k`, `gpu-aa`, `gpu-icc`, `gpu-deskew`, `cache`, `vaapi`. Build script default of `sm_80` is documented inline.
 
-**Bench gate (pending):** the device-resident-image-cache spec defines five acceptance criteria (cache hit rate ≥ 95% on logo-heavy multi-page renders, second-render time ≤ 30% of first-render, mode A no regression, no OOM on corpus 09 with default budgets, mode D beats mode A on at least 3 of corpora 04–08). v0.7.0 ships the implementation; the bench gate has not yet been run, so the architectural payoff is structurally complete but not yet validated end-to-end.
+**Bench gate (FAIL — see `bench/v070/results.md` and `bench/v070-testbench/results.md`):**
+
+Bench gate ran on both 9900X3D + RTX 5070 (sm_120) and i7-8700K + RTX 2080 SUPER (sm_75).  Criterion 5 (mode DCP beats mode A on ≥ 3 of corpora 04–08) failed 0/5 on both machines.  The cache makes DCT-heavy renders **3–14× slower**, not faster.  Diagnosis confirmed by re-running corpus 07 with the disk tier disabled (`HOME=/nonexistent`): mode DC drops from 9975 ± 8948 ms to 842 ± 23 ms, a 12× speedup — the entire regression is the per-image synchronous disk-tier write (`write_all + sync_all + rename`, ~1–5 ms NVMe / 10–50 ms HDD per image; with hundreds of JPEG XObjects per render, that's seconds added).  This was already documented in `disk_tier.rs` as deferred async-writer work; the bench result confirms that deferral was the wrong call for v0.7.0.
+
+The in-process tiers (VRAM + host RAM) are not the problem: corpus 07 with disk tier off matches mode D no-cache within noise.  Criterion 3 (mode A no regression) is borderline — testbench shows -15% to +2% (within noise), local shows +1% to +16% with two corpora outside noise (02 +15.8%, 08 +10.9%).  No OOMs on corpus 09 (criterion 4 ✓).
+
+Next step: dispatch disk-tier writes to a background worker thread (small bounded mpsc + dedicated writer) so the renderer is genuinely never blocked, then re-bench.  Until that lands, the cache is best left off via `--no-default-features` or by not enabling the `cache` feature flag on user builds.
 
 ### v0.6.0 (May 2026)
 
@@ -721,7 +727,7 @@ See `docs/superpowers/specs/2026-05-06-gpu-jpeg-pipeline.md` for the full origin
 
 ---
 
-## Phase 9 — Device-resident image cache and GPU page buffer (COMPLETE — bench gate pending)
+## Phase 9 — Device-resident image cache and GPU page buffer (IMPLEMENTATION COMPLETE — bench gate FAILED)
 
 **Spec:** `docs/superpowers/specs/2026-05-07-phase-9-device-resident-image-cache.md`
 
@@ -748,7 +754,11 @@ Phase 9 addresses all three at the same time: the cache makes (3) free after the
 - [x] **Task 5 — Disk tier**. `crates/gpu/src/cache/disk_tier.rs` — `<root>/<doc-hex>/<hash-hex>.bin` sidecar files with PDRF magic + version + dimensions header.  Atomic write via temp+rename; `posix_fadvise(WILLNEED)` on Linux for read-ahead; document-mtime eviction.  Env-var overrides: `PDF_RASTER_CACHE_DIR`, `PDF_RASTER_CACHE_BYTES`.  `open_session` switched to BLAKE3-of-PDF-bytes for the `DocId` so editing a PDF naturally invalidates the disk cache.  7 unit tests under `cache` feature (no GPU needed).
 - [x] **Task 6 — Pre-fetcher** (commits `013219b` + `a2e81d9` hardening pass). `crates/pdf_interp/src/cache/prefetch.rs` — `spawn_prefetch(doc, cache, doc_id, config)` walks every page's `/XObject` resource dict, dedupes by `ObjId`, decodes `/DCTDecode` images on a small `std::thread` worker pool (default 2, capped at `MAX_PREFETCH_WORKERS = 16`).  Discovery is single-threaded; `seen` is a plain local `HashSet<ObjId>`.  Decoder panics caught per-image so one bad XObject doesn't kill the run.  Opt-in via `SessionConfig::prefetch`; `RasterSession.doc` upgraded to `Arc<Document>` so the prefetcher can hold its own clone.  Form-XObject contents are not recursed into; renderer decodes them on first touch.  4 unit tests under the `cache` feature (no GPU needed).
 
-**Bench gate (pending measurement):** Phase 9 ships end-to-end if and only if (1) cache hit rate ≥ 95% on logo-heavy multi-page renders; (2) second-render time ≤ 30% of first-render time; (3) mode A doesn't regress vs the v0.6.0 baseline; (4) no OOM on corpus 09 (~1900 pages) with default budgets; (5) **mode D beats mode A on at least 3 of corpora 04–08** — this is the architectural win the whole project has been chasing.  All six implementation tasks are complete; the bench has not yet been run, so the phase is structurally done but not yet validated against the gate.
+**Bench gate (FAILED, ran 2026-05-07 on both reference machines):** all six implementation tasks landed, but the matrix in `bench/v070/results.md` (9900X3D + RTX 5070, sm_120) and `bench/v070-testbench/results.md` (i7-8700K + RTX 2080 SUPER, sm_75) shows criterion 5 failing 0/5 on both: mode DCP (cache + prefetch) is **3–14× slower** than mode A on DCT-heavy corpora 04–08.  Reproduced deterministically on the testbench (σ ~3 s on a 30-s mean) — not a flake.
+
+Root cause confirmed: the per-image synchronous disk-tier write (`write_all + sync_all + rename`) costs ~1–5 ms NVMe / 10–50 ms HDD per image, and DCT-heavy corpora ship hundreds of JPEG XObjects per render.  With the disk tier disabled (`HOME=/nonexistent`), corpus 07 mode DC drops 12× back to mode D no-cache speed — the in-process tiers (VRAM + host RAM) are correct.
+
+**To unblock the gate:** dispatch disk writes to a background worker thread (small bounded mpsc + dedicated writer) so the renderer thread is genuinely never blocked.  This was already noted in `disk_tier.rs` as deferred work; the bench shows the deferral was the wrong call.  Re-bench after the async writer lands.  Until then, the `cache` feature flag should be considered experimental and not enabled in production builds.
 
 **Total scope:** ~1850 LoC new Rust + ~150 LoC new CUDA + ~400 LoC modified existing. Tasks 1+2 ship in ~5-7 days; full pipeline ~3 weeks elapsed.
 

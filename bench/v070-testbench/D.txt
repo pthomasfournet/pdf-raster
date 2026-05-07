@@ -1,0 +1,22 @@
+
+System: load=12.07  cores=12  perf_paranoid=4
+Binary: target/release/pdf-raster-full-nocache  backend=cuda
+Runs:   5 (warmup 1) — hyperfine mean±σ + mpstat/iostat
+
+corpus                                    mean ± σ   cpu avg  cpu peak  disk MB/s  flags
+------                                      --------   -------  --------  ---------
+01-native-text-small                    546ms ±   60ms       12%       12%         0 MB/s  
+02-native-vector-text                   529ms ±   36ms        7%        7%         0 MB/s  
+03-native-text-dense                   1077ms ±   94ms       35%       35%         0 MB/s  
+04-ebook-mixed                         1484ms ±   68ms       46%       53%         0 MB/s  
+05-academic-book                       4029ms ±   96ms       65%       96%         0 MB/s  
+06-modern-layout-dct                  12044ms ± 1151ms       61%       91%         0 MB/s  
+07-journal-dct-heavy                   1528ms ±   69ms       52%       69%         0 MB/s  
+08-scan-dct-1927                       5225ms ±  282ms       42%       99%         0 MB/s  
+09-scan-dct-1836                       6361ms ±  206ms       74%      100%         0 MB/s  
+10-scan-jbig2-jpx                     60690ms ± 5386ms       96%      100%         0 MB/s  
+
+Flags:
+  [high-σ N%]    stddev > 15% of mean — background interference likely
+  [low-cpu N%]   avg CPU < 30% on multi-page corpus — contention or I/O bound
+  [cold=Nms>>mean] cold-cache single run >> hyperfine mean — scheduling outlier
