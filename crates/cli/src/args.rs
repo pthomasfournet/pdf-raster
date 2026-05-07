@@ -244,6 +244,15 @@ pub struct Args {
         default_value = DEFAULT_VAAPI_DEVICE
     )]
     pub vaapi_device: String,
+
+    /// Prefetch image `XObject`s into the device-resident image cache at
+    /// session open.  Only meaningful when the binary was built with the
+    /// `cache` feature; ignored otherwise.  Off by default — the prefetch
+    /// walk is wasted work for short single-page renders, but a clear win
+    /// on multi-page or multi-pass workloads (OCR pipelines).
+    #[cfg(feature = "cache")]
+    #[arg(long = "prefetch")]
+    pub prefetch: bool,
 }
 
 /// Yes/no flag for anti-aliasing options.
@@ -414,6 +423,8 @@ impl Args {
         Ok(SessionConfig {
             policy,
             vaapi_device: self.vaapi_device.clone(),
+            #[cfg(feature = "cache")]
+            prefetch: self.prefetch,
         })
     }
 

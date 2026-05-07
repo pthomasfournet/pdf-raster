@@ -149,6 +149,12 @@ EOF
 # ── Argument list for pdf-raster ─────────────────────────────────────────────
 PDF_RASTER_ARGS=(--backend "$BACKEND" -r 150 --ram)
 [[ "$BACKEND" == "vaapi" ]] && PDF_RASTER_ARGS+=(--vaapi-device "$VAAPI_DEVICE")
+# Caller-supplied extras (driver scripts use this for things like --prefetch).
+if [[ -n "${PDF_RASTER_EXTRA_ARGS:-}" ]]; then
+  # Word-split deliberately: the caller controls this string.
+  read -r -a EXTRA <<<"$PDF_RASTER_EXTRA_ARGS"
+  PDF_RASTER_ARGS+=("${EXTRA[@]}")
+fi
 
 # ── Corpus list ───────────────────────────────────────────────────────────────
 corpora=(
