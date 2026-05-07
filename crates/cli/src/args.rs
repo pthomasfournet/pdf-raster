@@ -194,23 +194,29 @@ pub struct Args {
     pub timings: bool,
 
     // ── RAM-backed output ─────────────────────────────────────────────────────
-    /// Write output to a freshly-created tmpfs directory under `/dev/shm`
-    /// instead of the path given by `OUTPUT_PREFIX`.
+    /// Force RAM-backed output even when `OUTPUT_PREFIX` looks like a path.
     ///
-    /// The chosen directory is printed on stderr at startup and on stdout at
-    /// the end of the run (so callers can pipe it into a follow-on tool).
-    /// The directory is removed when the process exits cleanly; on crash it
-    /// is left behind but `/dev/shm` is tmpfs and clears on reboot.
+    /// By default the program already redirects bare-stem prefixes (e.g.
+    /// `pdf-raster doc.pdf out`) to a freshly-created tmpfs directory under
+    /// `/dev/shm`, because writing to disk is 10–20× slower than RAM and
+    /// dominates wall time. Path-like prefixes (anything with `/` or
+    /// starting with `.`) opt out of that redirect and write to disk.
     ///
-    /// The basename of `OUTPUT_PREFIX` is reused as the file stem inside the
-    /// tmpfs dir so naming stays stable for downstream consumers — e.g.
-    /// `pdf-raster --ram doc.pdf out` writes `/dev/shm/pdf-raster-<pid>-<rand>/out-NNN.ppm`.
-    #[arg(long = "ram")]
+    /// Use `--ram` to override the heuristic: redirect to tmpfs even when
+    /// the user-supplied prefix would otherwise be treated as a real path.
+    /// Mutually exclusive with `--no-ram`.
+    #[arg(long = "ram", conflicts_with = "no_ram")]
     pub ram: bool,
 
-    /// Override the tmpfs directory used by `--ram` (default: a fresh dir
-    /// under `/dev/shm`). Has no effect without `--ram`.
-    #[arg(long = "ram-path", value_name = "PATH")]
+    /// Force on-disk output. Disables the default tmpfs redirect for bare
+    /// stems and writes pages exactly at `OUTPUT_PREFIX`.
+    /// Mutually exclusive with `--ram`.
+    #[arg(long = "no-ram", conflicts_with = "ram")]
+    pub no_ram: bool,
+
+    /// Override the tmpfs directory used by RAM-backed output. Implies the
+    /// RAM redirect. Default is a fresh `/dev/shm/pdf-raster-<pid>-<nanos>/`.
+    #[arg(long = "ram-path", value_name = "PATH", conflicts_with = "no_ram")]
     pub ram_path: Option<String>,
 
     // ── Backend selection ─────────────────────────────────────────────────────

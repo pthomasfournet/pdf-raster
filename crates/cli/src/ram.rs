@@ -1,19 +1,31 @@
-//! `--ram` mode: redirect render output to a fresh tmpfs directory, with a
-//! dynamic spill-to-disk fallback when free memory drops below a safety margin.
+//! RAM-backed render output (default) with dynamic spill-to-disk when free
+//! memory drops below a safety margin.
 //!
-//! When `--ram` is set, this module:
-//! 1. Creates `/dev/shm/pdf-raster-<pid>-<nanos>/` (or honours `--ram-path`)
-//!    and rewrites `args.output_prefix` to live inside it. The basename of
-//!    the user's original prefix is preserved as the file stem so downstream
-//!    tooling that consumes `out-NNN.ppm` keeps working unchanged.
-//! 2. Returns a [`RamDirGuard`] that removes the directory on drop.
-//! 3. Returns a [`SpillPolicy`] that the per-page writer queries to decide
-//!    where each page goes — RAM by default, disk when memory tightens.
+//! # Default behaviour
 //!
-//! The chosen path is printed:
-//! - on stderr at startup (so a `tee` or human watcher can see it)
-//! - on stdout at the end (so a follow-on tool can capture it via shell
-//!   substitution: `out=$(pdf-raster --ram doc.pdf p)`)
+//! By default this module redirects per-page writes to a fresh tmpfs dir
+//! (`/dev/shm/pdf-raster-<pid>-<nanos>/`) because writing to disk costs
+//! 10–20× more wall time than writing to RAM and dominates render latency.
+//! The user's `OUTPUT_PREFIX` becomes the file stem inside that dir, so
+//! downstream consumers that read `out-NNN.ppm` keep working unchanged.
+//!
+//! The redirect is suppressed when `OUTPUT_PREFIX` looks like a path
+//! (contains `/`, starts with `.`) — those are taken literally as the user
+//! asking for a real disk location. See [`should_use_ram`] for the rule.
+//!
+//! Flags:
+//! - `--no-ram` forces disk regardless of prefix shape
+//! - `--ram` forces RAM regardless of prefix shape
+//! - `--ram-path <PATH>` overrides the default tmpfs location and implies RAM
+//!
+//! # What this module returns
+//!
+//! 1. A [`RamDirGuard`] that removes the tmpfs dir on drop (no-op when on disk).
+//! 2. A [`SpillPolicy`] queried per-page: returns the RAM prefix while free
+//!    memory is comfortable, the disk prefix once it tightens.
+//!
+//! The chosen path is printed on stderr at startup and on stdout at the end
+//! so callers can capture it via `out=$(pdf-raster doc.pdf p)`.
 //!
 //! # Why dynamic instead of pre-flight?
 //!
@@ -119,7 +131,7 @@ impl SpillPolicy {
         } else {
             if !self.spill_announced.swap(true, Ordering::Relaxed) {
                 eprintln!(
-                    "pdf-raster: --ram: free memory dropped below safety margin; \
+                    "pdf-raster: free memory dropped below safety margin; \
                      spilling subsequent pages to disk at {disk_prefix}-NNN.*"
                 );
             }
@@ -188,19 +200,55 @@ fn read_mem_available() -> Option<u64> {
     None
 }
 
-/// Inspect `args.ram` and, if set, create a tmpfs directory and rewrite
-/// `args.output_prefix` to live inside it. Always returns a [`SpillPolicy`]
-/// even when `--ram` is off (in which case the policy is a no-op).
+/// Decide whether the renderer should redirect output to a tmpfs directory.
+///
+/// Precedence (highest first):
+/// 1. `--no-ram` → always disk
+/// 2. `--ram` or `--ram-path` → always RAM
+/// 3. Heuristic on `output_prefix`:
+///    - bare stem (e.g. `out`, `p`) → RAM (default)
+///    - path-like (`./out`, `dir/p`, `/abs/path`) → disk
+///
+/// Path-like means the prefix contains a path separator or starts with `.`
+/// (covers `./out`, `../out`, and absolute paths). The intent: a user who
+/// types `pdf-raster doc.pdf out` gets the fast path; a user who types
+/// `pdf-raster doc.pdf ./out` or `pdf-raster doc.pdf /data/x` gets the
+/// path they asked for.
+fn should_use_ram(args: &Args) -> bool {
+    use_ram_for(
+        args.no_ram,
+        args.ram,
+        args.ram_path.is_some(),
+        &args.output_prefix,
+    )
+}
+
+/// Pure-function form of [`should_use_ram`] for unit testing without an
+/// `Args` value. The four inputs map 1:1 to the policy precedence.
+fn use_ram_for(no_ram: bool, ram: bool, has_ram_path: bool, prefix: &str) -> bool {
+    if no_ram {
+        return false;
+    }
+    if ram || has_ram_path {
+        return true;
+    }
+    // Bare stem: non-empty, doesn't start with '.', no path separators.
+    !prefix.is_empty()
+        && !prefix.starts_with('.')
+        && !prefix.contains(std::path::MAIN_SEPARATOR)
+        && !prefix.contains('/')
+}
+
+/// Apply the RAM/disk policy: when [`should_use_ram`] returns true, create a
+/// tmpfs directory and rewrite `args.output_prefix` to live inside it.
+/// Always returns a [`SpillPolicy`] — when on disk it's a passthrough.
 ///
 /// # Errors
 /// - directory creation failed (permissions, ENOSPC on /dev/shm at startup).
 pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPolicy)> {
     let original_prefix = args.output_prefix.clone();
 
-    if !args.ram {
-        if args.ram_path.is_some() {
-            eprintln!("pdf-raster: warning: --ram-path has no effect without --ram");
-        }
+    if !should_use_ram(args) {
         return Ok((
             RamDirGuard { dir: None },
             SpillPolicy::passthrough(original_prefix),
@@ -244,7 +292,7 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
     let ram_prefix = ram_prefix_pb.to_string_lossy().into_owned();
 
     eprintln!(
-        "pdf-raster: --ram → writing to {} (auto-removed on exit)",
+        "pdf-raster: writing to RAM at {} (auto-removed on exit; use --no-ram to write to disk)",
         dir.display()
     );
     println!("{}", dir.display());
@@ -311,5 +359,49 @@ mod tests {
     fn passthrough_policy_returns_original_prefix() {
         let p = SpillPolicy::passthrough("/foo/bar".into());
         assert_eq!(p.next_prefix(), "/foo/bar");
+    }
+
+    #[test]
+    fn heuristic_bare_stem_uses_ram() {
+        assert!(use_ram_for(false, false, false, "out"));
+        assert!(use_ram_for(false, false, false, "p"));
+        assert!(use_ram_for(false, false, false, "page"));
+    }
+
+    #[test]
+    fn heuristic_path_like_prefix_uses_disk() {
+        assert!(!use_ram_for(false, false, false, "./out"));
+        assert!(!use_ram_for(false, false, false, "../out"));
+        assert!(!use_ram_for(false, false, false, "/tmp/out"));
+        assert!(!use_ram_for(false, false, false, "dir/p"));
+        assert!(!use_ram_for(false, false, false, ".hidden"));
+    }
+
+    #[test]
+    fn heuristic_empty_prefix_uses_disk() {
+        // Defensive: an empty prefix could match the bare-stem rule by
+        // accident, but every-page write would land at "-NNN.ppm" in the
+        // cwd which is bizarre. Better to fall through to disk and let
+        // the user see the obvious-broken behaviour.
+        assert!(!use_ram_for(false, false, false, ""));
+    }
+
+    #[test]
+    fn explicit_ram_flag_overrides_path_heuristic() {
+        // User typed --ram with a path-like prefix: respect the flag.
+        assert!(use_ram_for(false, true, false, "./out"));
+        assert!(use_ram_for(false, true, false, "/abs/p"));
+    }
+
+    #[test]
+    fn explicit_no_ram_flag_overrides_bare_stem() {
+        // User typed --no-ram with a bare stem: respect the flag.
+        assert!(!use_ram_for(true, false, false, "out"));
+    }
+
+    #[test]
+    fn ram_path_implies_ram() {
+        // --ram-path on its own (without --ram) is enough to opt in.
+        assert!(use_ram_for(false, false, true, "./out"));
     }
 }

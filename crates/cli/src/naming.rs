@@ -89,6 +89,7 @@ mod tests {
             backend: BackendArg::Auto,
             vaapi_device: "/dev/dri/renderD128".into(),
             ram: false,
+            no_ram: false,
             ram_path: None,
         }
     }
