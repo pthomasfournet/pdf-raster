@@ -147,7 +147,7 @@ EOF
 }
 
 # ── Argument list for pdf-raster ─────────────────────────────────────────────
-PDF_RASTER_ARGS=(--backend "$BACKEND" -r 150)
+PDF_RASTER_ARGS=(--backend "$BACKEND" -r 150 --ram)
 [[ "$BACKEND" == "vaapi" ]] && PDF_RASTER_ARGS+=(--vaapi-device "$VAAPI_DEVICE")
 
 # ── Corpus list ───────────────────────────────────────────────────────────────

@@ -389,9 +389,25 @@ impl Iterator for PageIter<'_> {
                 return Some((self.page_num, node_id));
             }
 
-            // Pages node: iterate /Kids.
+            // Pages node: iterate /Kids. The spec allows /Kids to be either
+            // a direct array or an indirect reference to an array; resolve
+            // the reference case so we don't silently treat valid PDFs as
+            // empty (corpus-04 hit this).
             let kids = match dict.get(b"Kids") {
                 Some(Object::Array(a)) => a.clone(),
+                Some(Object::Reference(rid)) => match self.doc.get_object(*rid) {
+                    Ok(o) => match o.as_ref() {
+                        Object::Array(a) => a.clone(),
+                        _ => {
+                            self.pop();
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        self.pop();
+                        continue;
+                    }
+                },
                 _ => {
                     self.pop();
                     continue;
@@ -456,5 +472,32 @@ startxref\n180\n%%EOF"
         let pages: Vec<_> = doc.get_pages().collect();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].0, 1);
+    }
+
+    /// Regression: a Pages node whose `/Kids` is an indirect reference to an
+    /// array (rather than an inline array) used to bail and report 0 pages.
+    /// Real PDFs in the wild ship this layout (e.g. corpus-04).
+    #[test]
+    fn get_pages_handles_kids_as_reference() {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        // Kids points to obj 4, which is an array containing obj 3 (the page).
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids 4 0 R /Count 1>>\nendobj\n";
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n";
+        let obj4 = "4 0 obj\n[3 0 R]\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        let off4 = off3 + obj3.len();
+        let xref_start = off4 + obj4.len();
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n{off2:010} 00000 n\r\n\
+             {off3:010} 00000 n\r\n{off4:010} 00000 n\r\n"
+        );
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes = format!("{header}{obj1}{obj2}{obj3}{obj4}{xref}{trailer}").into_bytes();
+        let doc = Document::from_bytes_owned(bytes).expect("indirect-Kids PDF");
+        assert_eq!(doc.page_count(), 1, "expected 1 page through indirect Kids");
     }
 }
