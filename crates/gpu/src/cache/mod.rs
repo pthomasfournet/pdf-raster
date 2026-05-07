@@ -36,9 +36,18 @@ use dashmap::mapref::entry::Entry;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DocId(pub [u8; 32]);
 
-/// Stable identifier for an image within a PDF document.  This is the
-/// PDF object number; combined with [`DocId`] it forms the secondary key
-/// for fast same-document lookup that bypasses content hashing.
+/// Stable identifier for an image within a PDF document.
+///
+/// Combined with [`DocId`] it forms the secondary alias key for fast
+/// same-document lookup that bypasses content hashing.
+///
+/// **Note:** PDF's authoritative object identifier is `(number, generation)`
+/// (see `pdf::ObjectId`).  This newtype intentionally drops the generation
+/// because image `XObjects` are written once and never bumped in any PDF
+/// produced by tools we encounter.  If a workflow ever rewrites image
+/// objects with new generations, callers must construct distinct `ObjId`s
+/// (e.g. by hashing `(number, generation)` into the u32) to keep the alias
+/// index from returning stale content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjId(pub u32);
 
@@ -401,7 +410,7 @@ impl DeviceImageCache {
     /// - [`CacheError::Cuda`] — the upload itself failed.
     #[expect(
         clippy::needless_pass_by_value,
-        reason = "by-value conveys 'caller hands over a fully built request'; every field is Copy so this is the same code as &-borrow"
+        reason = "all fields are trivially movable (Copy newtypes plus a `&[u8]` slice header); by-value conveys ownership transfer at the call site without changing codegen vs `&InsertRequest`"
     )]
     pub fn insert(&self, req: InsertRequest<'_>) -> Result<Arc<CachedDeviceImage>, CacheError> {
         let InsertRequest {
@@ -434,16 +443,12 @@ impl DeviceImageCache {
                 budget: self.budget.vram_bytes,
             });
         }
-        // Fast path: same-content already cached.  Skip the upload and
-        // the eviction scan entirely; just refresh LRU and rebind the
-        // alias so a future same-(doc, obj) lookup is one DashMap probe.
         if let Some(existing) = self.lookup_by_hash(&hash) {
             self.alias(doc, obj, hash);
             return Ok(existing);
         }
-        // Miss path: make room, upload, install via a single Entry
-        // transition so concurrent inserts of the same hash can't
-        // both fetch_add `used_bytes`.
+        // Single Entry transition below so concurrent inserts of the same
+        // hash can't both fetch_add `used_bytes` after their Vacant probe.
         self.evict_to_fit(needed)?;
         let device_ptr = self.stream.clone_htod(pixels).map_err(CacheError::cuda)?;
         let new_entry = Arc::new(CachedDeviceImage {
@@ -477,9 +482,10 @@ impl DeviceImageCache {
 
     /// The CUDA stream on which the cache enqueues uploads.  Exposed so
     /// callers using a different stream can synchronise before reading
-    /// from a freshly inserted [`CachedDeviceImage::device_ptr`].
+    /// from a freshly inserted [`CachedDeviceImage::device_ptr`] — call
+    /// `cache.stream().synchronize()` (or wire a `cudaStreamWaitEvent`).
     #[must_use]
-    pub const fn stream(&self) -> &Arc<CudaStream> {
+    pub fn stream(&self) -> &CudaStream {
         &self.stream
     }
 
@@ -604,6 +610,17 @@ mod tests {
         }
     }
 
+    /// Build a fresh cache on CUDA device 0 with the given VRAM budget.
+    /// Returns `(stream, cache)` so tests that need the stream after the
+    /// cache is built (e.g. for a readback) can use it directly.
+    #[cfg(feature = "gpu-validation")]
+    fn mk_cache(vram_bytes: u64) -> (Arc<CudaStream>, DeviceImageCache) {
+        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.default_stream();
+        let cache = DeviceImageCache::new(Arc::clone(&stream), VramBudget { vram_bytes });
+        (stream, cache)
+    }
+
     /// Smoke test: basic API shape sanity that does not require a CUDA
     /// device.  Verifies that newtype keys and the budget struct
     /// round-trip and have the documented properties.
@@ -660,13 +677,7 @@ mod tests {
     #[cfg(feature = "gpu-validation")]
     #[test]
     fn round_trip_rgb_image() {
-        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.default_stream();
-        let budget = VramBudget {
-            vram_bytes: 1 << 20,
-        };
-        // Clone so we can read back through the original stream below.
-        let cache = DeviceImageCache::new(Arc::clone(&stream), budget);
+        let (stream, cache) = mk_cache(1 << 20);
 
         // 16×16×3 = 768; (i % 256) always fits u8, hence the unwrap.
         let pixels: Vec<u8> = (0_i32..16 * 16 * 3)
@@ -700,11 +711,8 @@ mod tests {
     #[cfg(feature = "gpu-validation")]
     #[test]
     fn lru_evicts_oldest_unpinned_entry() {
-        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.default_stream();
-        // Budget large enough for two 256-byte entries but not three.
-        let budget = VramBudget { vram_bytes: 600 };
-        let cache = DeviceImageCache::new(stream, budget);
+        // Budget for two 256-byte entries but not three.
+        let (_stream, cache) = mk_cache(600);
 
         let make_pixels = |fill: u8| -> Vec<u8> { vec![fill; 256] };
 
@@ -744,11 +752,8 @@ mod tests {
     #[cfg(feature = "gpu-validation")]
     #[test]
     fn pinned_entries_block_eviction() {
-        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.default_stream();
         // Budget for one 256-byte entry.
-        let budget = VramBudget { vram_bytes: 300 };
-        let cache = DeviceImageCache::new(stream, budget);
+        let (_stream, cache) = mk_cache(300);
 
         let h_a = ContentHash([0xAA; 32]);
         let h_b = ContentHash([0xBB; 32]);
@@ -793,14 +798,10 @@ mod tests {
         const UNIQUE_HASHES: u8 = 8;
         const PIXEL_BYTES: usize = 256;
 
-        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA device 0");
-        let stream = ctx.default_stream();
         // Generous budget so eviction doesn't enter the picture; the
         // test is only about dedup accounting.
-        let budget = VramBudget {
-            vram_bytes: u64::from(UNIQUE_HASHES) * (PIXEL_BYTES as u64) * 2,
-        };
-        let cache = Arc::new(DeviceImageCache::new(stream, budget));
+        let (_stream, cache) = mk_cache(u64::from(UNIQUE_HASHES) * (PIXEL_BYTES as u64) * 2);
+        let cache = Arc::new(cache);
 
         // Each thread inserts PER_THREAD requests cycling through the
         // same UNIQUE_HASHES values, so threads heavily collide on each
