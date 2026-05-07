@@ -924,8 +924,7 @@ impl<'doc> PageRenderer<'doc> {
         if let Some(mut g) = group {
             std::mem::swap(&mut self.bitmap, &mut g.bitmap);
             let pipe = Self::make_pipe(parent_fill_alpha, parent_blend_mode);
-            // paint_group returns the residual Clip; not needed here since we're
-            // restoring the parent gstate immediately below.
+            // Residual Clip is unused — parent gstate is restored immediately below.
             let _ = paint_group(&mut self.bitmap, g, &pipe);
         }
 
@@ -1080,12 +1079,11 @@ impl<'doc> PageRenderer<'doc> {
         };
         // Decoder contract: bytes.len() == width × height × bpp.  A truncated
         // buffer would silently invite the unsafe `get_unchecked` arms below
-        // to read out of bounds; assert in debug builds.
+        // to read out of bounds; assert in debug builds.  Plain `*` is correct:
+        // a debug-mode overflow panic on absurd metadata is the desired failure.
         debug_assert_eq!(
             img_bytes.len(),
-            img_width_usize
-                .saturating_mul(img.height as usize)
-                .saturating_mul(img.color_space.bytes_per_pixel()),
+            img_width_usize * img.height as usize * img.color_space.bytes_per_pixel(),
             "img_bytes length does not match width × height × bpp; decoder produced a truncated buffer",
         );
 

@@ -178,7 +178,6 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                         parse_value(tokens.get(i + 1).copied()),
                     ) {
                         let code = bytes_to_u32(&code_bytes_v);
-                        // Last-write-wins for duplicate codes; the prior value (if any) is unused.
                         let _ = map.insert(code, val);
                         i += 2;
                     } else {
@@ -221,7 +220,6 @@ pub fn parse_cmap(stream: &[u8]) -> Option<CMap> {
                         // entries per block; 0x10000 is a generous ceiling).
                         if hi >= lo && hi - lo < 0x1_0000 {
                             for offset in 0u32..=(hi - lo) {
-                                // Last-write-wins; prior value (if any) is unused.
                                 let _ = map.insert(lo + offset, base.saturating_add(offset));
                             }
                         } else {

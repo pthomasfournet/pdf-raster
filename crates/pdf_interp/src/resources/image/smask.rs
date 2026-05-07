@@ -6,7 +6,7 @@
 
 use pdf::{Document, ObjectId};
 
-use super::ImageDescriptor;
+use super::ImageData;
 use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp};
 use super::codecs::{decode_ccitt, decode_jbig2};
 use super::filter_name;
@@ -18,11 +18,16 @@ use super::validated_dims;
 /// emit Mask-space bytes (paint = 0x00, skip = 0xFF) that must be flipped to
 /// alpha-space (transparent = 0x00, opaque = 0xFF) before composition.
 ///
-/// Returns `None` when the descriptor's pixel storage is not host-resident —
-/// today this never happens (CCITT and JBIG2 always decode to CPU), but the
-/// graceful skip future-proofs against the Phase 9 GPU variant landing.
-fn invert_bitonal_alpha(desc: &ImageDescriptor) -> Option<Vec<u8>> {
-    let bytes = desc.data.as_cpu()?;
+/// Implemented as a zero-test rather than bitwise NOT: the decoders are
+/// documented to emit only `0x00` / `0xFF`, but a corrupt or out-of-spec
+/// stream that produces e.g. `0x80` must still collapse to `0x00`, not
+/// `0x7F` — so we cannot use `!v`.
+///
+/// Returns `None` when the storage is not host-resident — today never the
+/// case (CCITT/JBIG2 always decode to CPU), but the graceful skip future-
+/// proofs against the Phase 9 GPU variant.
+fn invert_bitonal_alpha(data: &ImageData) -> Option<Vec<u8>> {
+    let bytes = data.as_cpu()?;
     Some(
         bytes
             .iter()
@@ -78,7 +83,7 @@ pub(super) fn decode_smask(
             let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, true, parms)?;
             let actual_w = sm_desc.width;
             let actual_h = sm_desc.height;
-            let inverted: Vec<u8> = invert_bitonal_alpha(&sm_desc)?;
+            let inverted: Vec<u8> = invert_bitonal_alpha(&sm_desc.data)?;
             return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
         }
         Some("JBIG2Decode") => {
@@ -86,7 +91,7 @@ pub(super) fn decode_smask(
             let sm_desc = decode_jbig2(doc, stream.content.as_slice(), sm_w, sm_h, true, parms)?;
             let actual_w = sm_desc.width;
             let actual_h = sm_desc.height;
-            let inverted: Vec<u8> = invert_bitonal_alpha(&sm_desc)?;
+            let inverted: Vec<u8> = invert_bitonal_alpha(&sm_desc.data)?;
             return Some(scale_smask(inverted, actual_w, actual_h, img_w, img_h));
         }
         Some("FlateDecode") => {
