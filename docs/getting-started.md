@@ -67,7 +67,7 @@ Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0" }
 ```
 
 For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
@@ -75,10 +75,10 @@ For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
 ```toml
 [dependencies]
 # CUDA GPU features (NVIDIA only):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
 
 # VA-API (AMD/Intel iGPU on Linux — libva required):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1", features = ["vaapi"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0", features = ["vaapi"] }
 ```
 
 To track the latest commit on `master` instead of a pinned tag:
@@ -237,5 +237,9 @@ cargo build --release -p pdf-raster
 CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
   --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew"
 ```
+
+### A note on output destination (v0.6.0+)
+
+The CLI defaults to writing rendered pages into a fresh `/dev/shm/pdf-raster-<pid>-<nanos>/` tmpfs directory whenever `OUTPUT_PREFIX` looks like a bare stem (e.g. `out`, `p`). Disk writes were dominating wall time on JPEG-heavy workloads — ext4 `auto_da_alloc` rename serialisation parked all 24 render threads in `do_renameat2`. Path-like prefixes (anything containing `/` or starting with `.`) opt out and write where you asked. Pass `--no-ram` to force on-disk output even for bare stems, or `--ram-path <DIR>` to override the tmpfs location. A built-in spill policy automatically falls through to disk when MemAvailable drops below 1 GiB.
 
 See [cli-reference.md](cli-reference.md) for CLI usage.

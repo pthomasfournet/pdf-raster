@@ -27,6 +27,14 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.6.0 (May 2026)
+
+**New since v0.5.1:**
+
+- **lopdf rip-out — in-tree `pdf` crate.** Replaced lopdf 0.40 with `crates/pdf/`: a lazy mmap-based parser that reads only the xref table and trailer at `Document::open` and resolves objects on demand via byte-offset seek. Per-object `Arc` cache + mutex; ObjStm decompression cached once across worker threads. API surface (`Object`, `Dictionary` newtype, `Stream`, `ObjectId`, `PdfError`) mirrors the lopdf names previously used so the migration was mechanical. DOS-hardened: caps on xref entries (10M), `/N` (1M), PNG predictor output (256 MiB); `checked_add` throughout. `pdf_interp` (17 files) and `pdf_raster` swapped over file-by-file; lopdf is gone from the entire workspace. Motivation: lopdf's `load_objects_raw` had been burning ~20% of corpus-07 cycles in `nom_locate`'s `memchr` on the main thread before render workers could start, capping CPU utilisation at ~1.6 of 24 cores. Cold-cache corpus-07 went from 757 ms → 689 ms.
+- **RAM-backed output by default.** Disk I/O was hiding actual CPU work — the previous temp-file + atomic-rename pattern triggered ext4 `auto_da_alloc` on every page, parking 24 workers in `do_renameat2`. Two changes: dropped the temp-rename dance (write directly to the final path, delete on encode failure); defaulted per-page output to `/dev/shm/pdf-raster-<pid>-<nanos>/` for bare-stem prefixes. New CLI flags: `--ram`, `--no-ram`, `--ram-path <PATH>`. Heuristic: bare stem (`out`, `p`) → RAM; path-like (`./out`, `/tmp/p`) → disk literally. `SpillPolicy` queries `/proc/meminfo` MemAvailable every 100 ms; subsequent pages spill to disk automatically when free RAM drops below 1 GiB, with a one-shot stderr warning.
+- **`PageIter` handles indirect `/Kids`.** The PDF spec allows `/Kids` to be either an inline array or an indirect Reference to one. `PageIter` only handled the inline case, silently reporting `page_count=0` for files using the reference form. Now resolves the reference one level. Regression test added in `pdf/src/document.rs`. Discovered while benchmarking corpus-04.
+
 ### v0.5.1 (May 2026)
 
 **New since v0.5.0:**

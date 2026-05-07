@@ -8,7 +8,7 @@ All benchmarks render all pages of each corpus PDF at **150 DPI** (the default) 
 
 | Tool | Version |
 |---|---|
-| pdf-raster | v0.5.1, built with `-C target-cpu=native` |
+| pdf-raster | v0.6.0, built with `-C target-cpu=native` |
 | pdftoppm (Poppler) | 24.02.0 (Ryzen), 25.03.0 (Intel) |
 
 **Corpus:** 10 real-world PDFs spanning the common workload categories. Files are not distributed with the repository (see `.gitignore`); the corpus used internally matches the 10 fixture files in `tests/fixtures/corpus-*.pdf`.
@@ -153,18 +153,22 @@ All five minor versions benchmarked on the Ryzen 9 9900X3D, CPU-only backend, 15
 
 Built with `RUSTFLAGS="-C target-cpu=native"` at each tagged commit. v0.1.0–v0.3.0 use `glibc malloc`; v0.4.0+ use `mimalloc`.
 
-| Corpus | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.1 |
-|---|---|---|---|---|---|
-| 01 native text, small | 45 ms | 50 ms | 41 ms | 47 ms | 48 ms |
-| 02 native vector + text | 129 ms | 138 ms | 126 ms | 138 ms | 145 ms |
-| 03 native text, dense | 598 ms | 622 ms | 591 ms | 599 ms | 595 ms |
-| 04 ebook, mixed | 1 784 ms | 1 944 ms | 1 824 ms | 1 836 ms | 1 916 ms |
-| 05 academic book | 743 ms | 763 ms | 751 ms | 760 ms | 785 ms |
-| 06 modern layout, DCT | 2 663 ms | 2 718 ms | 2 658 ms | 2 698 ms | 2 662 ms |
-| 07 journal, DCT-heavy | 768 ms | 776 ms | 761 ms | 760 ms | 757 ms |
-| 08 1927 scan, DCT | 11 431 ms | 12 882 ms | 12 616 ms | 13 711 ms | 12 601 ms |
-| **09 1836 scan, DCT** | **35 502 ms** | **77 132 ms** | **58 232 ms** | **60 137 ms** | **36 661 ms** |
-| 10 scan, JBIG2+JPX | 18 703 ms | 18 405 ms | 18 350 ms | 18 492 ms | 18 069 ms |
+| Corpus | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | v0.5.1 | v0.6.0 † |
+|---|---|---|---|---|---|---|
+| 01 native text, small | 45 ms | 50 ms | 41 ms | 47 ms | 48 ms | 51 ms ± 1 ms |
+| 02 native vector + text | 129 ms | 138 ms | 126 ms | 138 ms | 145 ms | 22 ms ± 3 ms ‡ |
+| 03 native text, dense | 598 ms | 622 ms | 591 ms | 599 ms | 595 ms | 254 ms ± 3 ms |
+| 04 ebook, mixed | 1 784 ms | 1 944 ms | 1 824 ms | 1 836 ms | 1 916 ms | 382 ms ± 4 ms |
+| 05 academic book | 743 ms | 763 ms | 751 ms | 760 ms | 785 ms | 935 ms ± 19 ms ‡ |
+| 06 modern layout, DCT | 2 663 ms | 2 718 ms | 2 658 ms | 2 698 ms | 2 662 ms | 2 660 ms ± 33 ms ‡ |
+| 07 journal, DCT-heavy | 768 ms | 776 ms | 761 ms | 760 ms | 757 ms | **689 ms ± 7 ms** |
+| 08 1927 scan, DCT | 11 431 ms | 12 882 ms | 12 616 ms | 13 711 ms | 12 601 ms | 2 210 ms ± 291 ms ‡ |
+| **09 1836 scan, DCT** | **35 502 ms** | **77 132 ms** | **58 232 ms** | **60 137 ms** | **36 661 ms** | **2 540 ms ± 5 ms** |
+| 10 scan, JBIG2+JPX | 18 703 ms | 18 405 ms | 18 350 ms | 18 492 ms | 18 069 ms | 18 220 ms ± 55 ms |
+
+† v0.6.0 measured with `--backend cpu --ram` (RAM-backed output is the new default; previous releases all wrote PPM to a tmpfs path explicitly). hyperfine 5 runs warmup 1.
+
+‡ Page-count drift in this column: corpora 02, 05, 06, 08 reflect a different page subset than the v0.1.0–v0.5.1 columns (02 1 page vs 16, 05 ~50 vs 601, 06 ~30 vs 160, 08 150 vs 390) — wall-time drops on those four rows are dominated by the smaller render set and are not directly comparable. Corpora 01, 03, 04, 07, 09, 10 retain their original page counts and *are* directly comparable across all columns.
 
 ### What the numbers show
 
@@ -172,9 +176,29 @@ Built with `RUSTFLAGS="-C target-cpu=native"` at each tagged commit. v0.1.0–v0
 
 **Corpus 08 (baseline JPEG, 390 pages)** shows mild drift: +1–2 s added over v0.1.0 baseline. The renderer adds overhead with each release — more dispatch layers, more feature flag branches, more plumbing through the call stack — and it accumulates. At ~12 s total the regression is ~10% over five versions. Not catastrophic but real.
 
-**Corpus 09 (progressive JPEG, 490 pages) is the headline.** v0.1.0 ran in 35 s. v0.2.0 blew up to 77 s — a 2.2× regression. v0.3.0 partially recovered (58 s), v0.4.0 remained slow (60 s), and v0.5.1 recovered to 36 s, nearly back to v0.1.0.
+**Corpus 09 (progressive JPEG, 490 pages) is the headline.** v0.1.0 ran in 35 s. v0.2.0 blew up to 77 s — a 2.2× regression. v0.3.0 partially recovered (58 s), v0.4.0 remained slow (60 s), v0.5.1 recovered to 36 s (nearly back to v0.1.0), and v0.6.0 dropped to **2.54 s** — a 14× win over the previous best.
 
 The cause: v0.2.0 introduced VA-API JPEG dispatch (`feat(gpu/interp): GPU decoder traits + inline image GPU dispatch`). Even on a CPU-only build, every progressive JPEG frame attempted VA-API decode first, failed (VA-API is baseline-only), and fell through to zune-jpeg — paying parse overhead for every single frame in a 490-page progressive-JPEG corpus. v0.5.1 fixed this with SOF-aware routing (`feat(pdf_interp): content-aware JPEG dispatch`) that short-circuits progressive JPEG directly to zune-jpeg without touching VA-API.
+
+### What v0.6.0 changed
+
+Two things broke open the workloads that had been stuck:
+
+- **lopdf rip-out.** lopdf 0.40 was replaced by an in-tree `pdf` crate (lazy mmap-based parser, threadsafe per-object cache, ObjStm cached once across workers, DOS-hardened). lopdf's `load_objects_raw` had been burning ~20% of corpus-07 cycles in `nom_locate`'s `memchr` on the main thread before any render worker could start, capping effective parallelism at ~1.6 of 24 cores. Corpus-07 went from 757 ms (v0.5.1) to **689 ms cold cache**, with the prior hot-cache best (~2.2 s) now beaten cold.
+- **RAM-backed output by default.** The previous temp-file + atomic-rename pattern triggered ext4 `auto_da_alloc` on every page, parking 24 workers in `do_renameat2`. v0.6.0 writes pages directly to `/dev/shm/pdf-raster-<pid>-<nanos>/` for bare-stem prefixes; a `SpillPolicy` polls `/proc/meminfo` every 100 ms and falls subsequent pages through to disk when MemAvailable drops below 1 GiB. This is the dominant factor in the corpus-09 result and a non-trivial contributor on every JPEG-heavy corpus.
+
+CPU utilisation (sampled with `mpstat`) on the v0.6.0 cold runs:
+
+| Corpus | Pages | CPU avg | CPU peak |
+|---|---|---|---|
+| 05 academic-book | ~50 | 71% | 71% |
+| 06 modern-layout-dct | ~30 | 82% | 99% |
+| 07 journal-dct-heavy | 162 | 48% | 48% |
+| 08 scan-dct-1927 | 150 | 73% | 94% |
+| 09 scan-dct-1836 | 490 | 65% | 100% |
+| 10 scan-jbig2-jpx | 576 | 96% | 99% |
+
+Corpora 01–04 finished faster than `mpstat`'s 1 s sampling window — CPU% is unmeasured for those rows. The remaining headroom (corpus-07 sitting at 48% average) is the next thing to chase: with the parser unblocked the bottleneck has moved further down the pipeline.
 
 ### Lessons
 

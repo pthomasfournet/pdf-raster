@@ -304,10 +304,12 @@ Direct use of `pdf_interp` is not required for most consumers. Use it when build
 ### `open`
 
 ```rust
-pub fn open(path: impl AsRef<Path>) -> Result<lopdf::Document, InterpError>
+pub fn open(path: impl AsRef<Path>) -> Result<pdf::Document, InterpError>
 ```
 
 Opens and validates a PDF. Returns `InterpError::JavaScript` immediately if any JS entry point is detected (checked locations: `/OpenAction`, `/AA`, `/Names/JavaScript`, `/AcroForm/AA`). No JS is parsed or evaluated.
+
+The returned `pdf::Document` comes from the in-tree `pdf` crate (replaced lopdf 0.40 in v0.6.0). It is a lazy, mmap-backed reader: opening the file parses only the xref table and trailer; individual objects resolve on demand via byte-offset seek with a per-object `Arc` cache shared safely across worker threads. Object stream (`ObjStm`) decompression is cached once and reused. The API mirrors the lopdf method names previously used here.
 
 ### `page_count`
 
@@ -354,7 +356,7 @@ To get pixel dimensions: `(width_pts × dpi / 72.0).round()`.
 
 ```rust
 pub enum InterpError {
-    Pdf(lopdf::Error),
+    Pdf(pdf::PdfError),
     PageOutOfRange { page: u32, total: u32 },
     MissingResource(String),
     JavaScript { location: &'static str },
@@ -362,7 +364,7 @@ pub enum InterpError {
 }
 ```
 
-Implements `std::error::Error`. `InterpError::Pdf(e)` chains to `lopdf::Error`.
+Implements `std::error::Error`. `InterpError::Pdf(e)` chains to `pdf::PdfError`.
 
 ---
 

@@ -109,6 +109,23 @@ DPI values must be positive finite numbers; non-positive values are rejected at 
 | `--sep CHAR` | `-` | Separator between prefix and page number (`out-1.ppm`, `out_1.ppm`, etc.). |
 | `--forcenum N` | — | Zero-pad page numbers to at least N digits (`001`, `002`, …). |
 | `-P` / `--progress` | off | Print per-page progress (page done, elapsed, ETA) to stderr. |
+| `--timings` | off | Print per-page wall time and thread index to stderr for profiling. |
+
+---
+
+## Output destination (RAM-backed by default)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ram` | (heuristic) | Force RAM-backed output even when `OUTPUT_PREFIX` looks like a path. Mutually exclusive with `--no-ram`. |
+| `--no-ram` | (heuristic) | Force on-disk output. Disables the default tmpfs redirect for bare stems and writes pages exactly at `OUTPUT_PREFIX`. Mutually exclusive with `--ram`. |
+| `--ram-path PATH` | `/dev/shm/pdf-raster-<pid>-<nanos>/` | Override the tmpfs directory used by RAM-backed output. Implies `--ram`. |
+
+By default `pdf-raster` redirects rendered pages to a freshly-created tmpfs directory under `/dev/shm` whenever the output prefix is a bare stem, because writing to disk is 10–20× slower than RAM and dominates wall time on JPEG-heavy workloads.
+
+**Bare stem vs path heuristic:** prefixes containing `/` or starting with `.` (e.g. `./out`, `/tmp/p`, `out/dir/p`) are treated as path-like and write to disk literally. Bare stems (e.g. `out`, `p`, `cover`) are redirected to tmpfs. `--ram` overrides the heuristic to redirect anyway; `--no-ram` overrides it to write to disk anyway.
+
+A built-in spill policy polls `/proc/meminfo` every 100 ms and falls subsequent pages through to disk when MemAvailable drops below 1 GiB, with a one-shot warning printed to stderr.
 
 ---
 

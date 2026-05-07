@@ -6,8 +6,13 @@ Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tes
 
 ```toml
 # Cargo.toml
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.5.1" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0" }
 ```
+
+## What's new in v0.6.0
+
+- **lopdf rip-out.** The lopdf 0.40 dependency is gone; replaced by an in-tree `pdf` crate (lazy mmap-based parser, threadsafe per-object cache, DOS-hardened limits). lopdf's `load_objects_raw` previously burned ~20% of corpus-07 cycles in `nom_locate` on the main thread before render workers could start, capping CPU utilisation at ~1.6/24 cores. With the new parser the same corpus is now cold-cache 689 ms.
+- **RAM-backed output by default.** Bare-stem prefixes (e.g. `pdf-raster doc.pdf out`) now write pages to `/dev/shm/pdf-raster-<pid>-<nanos>/` rather than disk, avoiding ext4 `auto_da_alloc` rename serialisation that was parking 24 workers in `do_renameat2`. A `SpillPolicy` polls `/proc/meminfo` every 100 ms and spills subsequent pages to disk when MemAvailable drops below 1 GiB. New flags: `--ram`, `--no-ram`, `--ram-path`. Path-like prefixes (anything with `/` or starting with `.`) opt out and write where the user asked.
 
 ```rust
 use pdf_raster::{RasterOptions, raster_pdf};
@@ -82,16 +87,19 @@ tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 
 Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full methodology, hardware details, and AVX2 vs AVX-512 comparison in **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-**CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512:**
+**CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512, v0.6.0, RAM-backed output, cold cache, hyperfine 5 runs:**
 
-| Document | Pages | pdf-raster | pdftoppm | Speedup |
-|---|---|---|---|---|
-| Native text, small | 16 | 48 ms | 154 ms | 3.2× |
-| Native text, dense | 254 | 592 ms | 3 853 ms | **6.5×** |
-| Journal, DCT-heavy | 162 | 813 ms | 5 273 ms | **6.5×** |
-| 1927 scan, DCT | 390 | 19 s | 388 s | **20×** |
-| 1836 scan, DCT | 490 | 58 s | 390 s | 6.7× |
-| Scan, JBIG2+JPX | 576 | 22 s | 151 s | 7.0× |
+| Document | Pages | pdf-raster |
+|---|---|---|
+| Native text, small | 16 | 51 ms ± 1 ms |
+| Native text, dense | 254 | 254 ms ± 3 ms |
+| Ebook, mixed | 358 | 382 ms ± 4 ms |
+| Journal, DCT-heavy | 162 | 689 ms ± 7 ms |
+| 1927 scan, DCT | 150 | 2.21 s ± 291 ms |
+| 1836 scan, DCT | 490 | 2.54 s ± 5 ms |
+| Scan, JBIG2+JPX | 576 | 18.22 s ± 55 ms |
+
+Per-version regression history and the full pdftoppm comparison are in **[docs/benchmarks.md](docs/benchmarks.md)** — corpus-09 dropped from 36 s (v0.5.1) to 2.54 s (v0.6.0), a 14× win driven by the lopdf rip-out and RAM-backed output default.
 
 **GPU-accelerated (nvJPEG + nvJPEG2000), same machine + RTX 5070:**
 
