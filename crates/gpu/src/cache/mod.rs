@@ -68,21 +68,31 @@ pub struct VramBudget {
 }
 
 impl VramBudget {
-    /// Auto-tune from `cudaMemGetInfo`.  Returns `min(75% of free, 6 GiB)`,
-    /// matching the spec's "default min(75% of free VRAM, 6 GB)" rule.
+    /// Spec-mandated VRAM hard cap: 6 GiB.  Caps `auto_detect` so we
+    /// don't claim every byte on a workstation GPU shared with a
+    /// desktop compositor, and serves as the value of [`Self::DEFAULT`]
+    /// for tests and callers who can't probe the device.
+    pub const HARD_CAP_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+    /// Conservative default for tests and non-GPU contexts.  Production
+    /// code should prefer [`Self::auto_detect`] when a stream is on hand.
+    pub const DEFAULT: Self = Self {
+        vram_bytes: Self::HARD_CAP_BYTES,
+    };
+
+    /// Auto-tune from `cudaMemGetInfo`.  Returns `min(75% of free,
+    /// HARD_CAP_BYTES)`, matching the spec's "default min(75% of free
+    /// VRAM, 6 GB)" rule.
     ///
     /// # Errors
     /// Returns an error if `cudaMemGetInfo` fails (e.g. no CUDA device).
     pub fn auto_detect(stream: &CudaStream) -> Result<Self, CacheError> {
-        // Hard ceiling so we don't claim every byte on a workstation GPU
-        // shared with a desktop compositor; matches the spec.
-        const HARD_CAP: u64 = 6 * 1024 * 1024 * 1024;
         let ctx = stream.context();
         let (free, _total) = ctx.mem_get_info().map_err(CacheError::cuda)?;
         // Saturating mul guards against absurd `free` values from a buggy driver.
         let three_quarters = (free as u64).saturating_mul(3) / 4;
         Ok(Self {
-            vram_bytes: three_quarters.min(HARD_CAP),
+            vram_bytes: three_quarters.min(Self::HARD_CAP_BYTES),
         })
     }
 }

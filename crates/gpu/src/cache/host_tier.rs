@@ -53,10 +53,8 @@ impl HostBudget {
 
 /// One host-resident copy of a previously-decoded image.
 ///
-/// `host_tier` is a private module so `pub` here means visible only
-/// to the parent `cache` module, which re-exports as `pub(crate)`.
-/// External callers never see this type — they only see
-/// `Arc<CachedDeviceImage>` returned from cache lookups.
+/// Implementation detail of [`HostTier`]; re-exported as `pub(crate)`
+/// from the parent module.
 pub struct HostEntry {
     /// Pinned host memory holding the decoded bytes.  Allocated with
     /// `CU_MEMHOSTALLOC_WRITECOMBINED` for fast DMA in both directions.
@@ -121,9 +119,8 @@ impl std::fmt::Debug for HostEntry {
 
 /// Concurrent host RAM tier.  All methods take `&self`.
 ///
-/// Re-exported from the parent module as `pub(crate)`; external
-/// callers never see this type — the host tier is an implementation
-/// detail of [`super::DeviceImageCache`].
+/// Implementation detail of [`super::DeviceImageCache`]; re-exported
+/// as `pub(crate)` from the parent module.
 pub struct HostTier {
     entries: DashMap<ContentHash, Arc<HostEntry>>,
     used_bytes: AtomicU64,
@@ -142,8 +139,7 @@ impl HostTier {
     }
 
     /// Live entry count — diagnostics / tests only.  Gated on `cfg(test)`
-    /// because production code never inspects the tier directly; an
-    /// operator who wants this can toggle the gate.
+    /// because production code never inspects the tier directly.
     #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
