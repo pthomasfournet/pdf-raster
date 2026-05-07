@@ -34,27 +34,51 @@
 //! semantic (run/size pairs).  We **skip** AC during the DC pre-pass — we
 //! only need to advance the bit position past the 63 AC coefficients of each
 //! block.  This module does not produce AC outputs; that's Phase 1's job.
+//!
+//! ## Restart markers
+//!
+//! When [`super::unstuff::unstuff_into`] strips a `0xFF 0xDn` marker it
+//! records the resulting byte position in the unstuffed stream.  At each
+//! such position the DC predictor is reset to zero for every component
+//! (JPEG § F.1.1.5) and the bit reader's mid-byte phase is realigned to a
+//! byte boundary.  Skipping these resets is a silent correctness bug — for
+//! any JPEG with `restart_interval > 0` the DC values after the first
+//! restart would accumulate the wrong predictor.
 
 use super::canonical::{CanonicalCodebook, CanonicalEntry};
 use super::headers::{DhtClass, JpegHeaders};
+use super::unstuff::RstPosition;
 
-/// Per-component absolute DC values, one per MCU, in scan order.
+/// Per-component absolute DC values, one per block, in scan order.
 ///
-/// `values[c]` is a `Vec<i32>` of length [`JpegHeaders::num_mcus`] for
+/// `per_component[c]` is a `Vec<i32>` of length `n_mcus × blocks_per_mcu` for
 /// component `c`.  Allocated up front so the GPU upload is a single
 /// `cudaMemcpyAsync` per component.
 #[derive(Debug, Clone)]
 pub struct DcValues {
-    /// Per-component scan-order DC values.  Outer index matches
-    /// `JpegHeaders::frame_components`.
+    /// Per-component scan-order DC values.  Outer index matches scan order
+    /// (`headers.scan.components[i]`), not frame order.
     pub per_component: Vec<Vec<i32>>,
 }
+
+/// Bounded number of MCUs we will accept from a single image.
+///
+/// 65535 px / 8 px-per-MCU ≈ 8192 MCUs per axis even at 1×1 sampling, so
+/// 8192² caps a worst-case JPEG that the SOF0 width/height fields can express.
+/// Anything beyond this means the SOF0 dimensions or sampling factors are
+/// adversarial; we refuse rather than honour the resulting allocation.
+pub(crate) const MAX_SAFE_MCUS: usize = 8192 * 8192;
 
 /// Errors emitted by [`resolve_dc_chain`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DcChainError {
     /// Bitstream ended before all expected DC values were decoded.
-    UnexpectedEnd,
+    UnexpectedEnd {
+        /// MCU index where the truncation was observed.
+        mcu_index: u32,
+        /// Component index within the MCU.
+        component_index: u8,
+    },
     /// A Huffman lookup landed on an unassigned slot — bitstream is corrupt
     /// or the wrong table was used.
     InvalidCode {
@@ -73,7 +97,8 @@ pub enum DcChainError {
         /// MCU index where AC ran past coefficient 63.
         mcu_index: u32,
     },
-    /// SOS scan referenced a Huffman table that wasn't declared in any DHT.
+    /// SOS scan referenced a Huffman table that wasn't pre-built or wasn't
+    /// declared in any DHT.
     MissingHuffmanTable {
         /// Class (DC or AC).
         class: DhtClass,
@@ -81,14 +106,32 @@ pub enum DcChainError {
         selector: u8,
     },
     /// SOF declared a quantiser/sampling combination we don't support yet
-    /// (e.g. interleaved scan with > 4 components, or v_sampling > 4).
+    /// (e.g. interleaved scan with > 4 components, or `v_sampling` > 4).
     UnsupportedScanShape,
+    /// Image dimensions × sampling factors yield more MCUs than [`MAX_SAFE_MCUS`].
+    /// Refuses the image rather than allocating an adversarial output buffer.
+    TooManyMcus {
+        /// MCU count requested.
+        requested: u64,
+    },
+    /// A scan-component referenced a frame-component ID that does not appear
+    /// in the SOF0 component list.
+    UnknownScanComponent {
+        /// The unknown component identifier.
+        component_id: u8,
+    },
 }
 
 impl std::fmt::Display for DcChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnexpectedEnd => write!(f, "DC chain pre-pass: bitstream ended unexpectedly"),
+            Self::UnexpectedEnd {
+                mcu_index,
+                component_index,
+            } => write!(
+                f,
+                "DC chain pre-pass: bitstream ended unexpectedly at MCU {mcu_index}, component {component_index}",
+            ),
             Self::InvalidCode {
                 mcu_index,
                 component_index,
@@ -113,82 +156,180 @@ impl std::fmt::Display for DcChainError {
                 };
                 write!(
                     f,
-                    "DC chain pre-pass: scan references {kind} table {selector} but no DHT declared it",
+                    "DC chain pre-pass: scan references {kind} table {selector} but no codebook was provided",
                 )
             }
             Self::UnsupportedScanShape => write!(f, "DC chain pre-pass: unsupported scan shape"),
+            Self::TooManyMcus { requested } => write!(
+                f,
+                "DC chain pre-pass: image declares {requested} MCUs which exceeds the safety cap of {MAX_SAFE_MCUS}",
+            ),
+            Self::UnknownScanComponent { component_id } => write!(
+                f,
+                "DC chain pre-pass: scan references component id {component_id} not declared in SOF0",
+            ),
         }
     }
 }
 
 impl std::error::Error for DcChainError {}
 
+/// One block-emission step in the DC walk.  Carries enough metadata to
+/// produce a precise error if anything fails.
+#[derive(Debug, Clone, Copy)]
+struct ScanStep<'a> {
+    sc_idx: u8,
+    sc_idx_usize: usize,
+    blocks_per_mcu: usize,
+    dc_cb: &'a CanonicalCodebook,
+    ac_cb: &'a CanonicalCodebook,
+}
+
+/// Number of 8×8 blocks emitted per MCU per scan-component.
+///
+/// Per JPEG ISO/IEC 10918-1 § A.2.3: a non-interleaved scan (one component)
+/// always emits one block per MCU regardless of that component's sampling
+/// factors.  Interleaved scans emit `h_sampling × v_sampling` blocks per
+/// component per MCU.
+fn blocks_per_mcu(scan_components: usize, h_sampling: u8, v_sampling: u8) -> usize {
+    if scan_components == 1 {
+        1
+    } else {
+        usize::from(h_sampling) * usize::from(v_sampling)
+    }
+}
+
 /// Walk the unstuffed entropy-coded segment, decoding only enough bits to
 /// extract every DC coefficient's absolute value.  AC bits are skipped.
 ///
-/// `unstuffed` is the entropy-coded data after [`super::unstuff::unstuff_into`]
-/// has been applied.  `headers` provides the SOS scan metadata; this function
-/// looks up the right DC and AC Huffman tables via `headers.huffman()`.
+/// Caller must pre-build the canonical Huffman codebooks for every (class,
+/// selector) the scan references and pass them in via `dc_codebooks` and
+/// `ac_codebooks` indexed by selector (0..=3).  This avoids rebuilding the
+/// 256 KB-per-table lookup arrays inside `resolve_dc_chain` when the caller
+/// already has them — the on-GPU pipeline keeps the AC codebooks alive for
+/// Phase 1 and would otherwise duplicate construction.
+///
+/// `rst_positions` carries every restart marker encountered by
+/// [`super::unstuff::unstuff_into`].  At each marker the DC predictor is
+/// reset to zero for every component and the bit reader is realigned to the
+/// next byte boundary, per JPEG § F.1.1.5.
 ///
 /// # Errors
 ///
 /// Returns [`DcChainError`] on malformed or unsupported input.  All errors
 /// are non-fatal at the caller level — the caller can fall back to a CPU
 /// decoder for this image.
+///
+/// # Panics
+///
+/// Panics only on heap-allocation failure (the standard Rust OOM panic) when
+/// pre-allocating the per-component DC value vectors.  The total allocation
+/// is bounded by `MAX_SAFE_MCUS × 16 × sizeof(i32)` ≈ 4 GiB across all
+/// components in the worst case, but is gated by the [`DcChainError::TooManyMcus`]
+/// check before any allocation happens, so adversarial input gets a clean
+/// error rather than a panic.
 pub fn resolve_dc_chain(
     headers: &JpegHeaders<'_>,
     unstuffed: &[u8],
+    rst_positions: &[RstPosition],
+    dc_codebooks: &[Option<CanonicalCodebook>; 4],
+    ac_codebooks: &[Option<CanonicalCodebook>; 4],
 ) -> Result<DcValues, DcChainError> {
-    if headers.scan.component_count == 0 {
+    let scan_components = usize::from(headers.scan.component_count);
+    if scan_components == 0 || scan_components > 4 {
         return Err(DcChainError::UnsupportedScanShape);
     }
-    let scan_components = headers.scan.component_count as usize;
 
-    let (dc_codebooks, ac_codebooks) = build_scan_codebooks(headers)?;
     let scan_to_frame = map_scan_to_frame(headers)?;
-    let n_mcus = headers.num_mcus();
-    let frame_components = &headers.frame_components[..headers.components as usize];
-    let mut per_component = allocate_dc_output(headers, n_mcus, &scan_to_frame);
+    let n_mcus = u64::from(headers.num_mcus());
+    let frame_components = &headers.frame_components[..usize::from(headers.components)];
 
-    // Per-component running DC predictor; reset to 0 at start.  RST-marker
-    // handling is the caller's responsibility — we resolve a contiguous
-    // segment here.
+    // Resolve the per-step metadata up front.  This both validates every
+    // codebook reference and gives us a fixed-size array to index inside the
+    // hot loop without re-doing scan-to-frame mapping or codebook lookup.
+    let mut steps: [Option<ScanStep<'_>>; 4] = [None, None, None, None];
+    let mut total_blocks_per_mcu: u64 = 0;
+    for (sc_idx, sc) in headers.scan.components[..scan_components]
+        .iter()
+        .enumerate()
+    {
+        let fc = &frame_components[scan_to_frame[sc_idx]];
+        let bpm = blocks_per_mcu(scan_components, fc.h_sampling, fc.v_sampling);
+        if bpm == 0 {
+            return Err(DcChainError::UnsupportedScanShape);
+        }
+        let dc_cb = dc_codebooks[usize::from(sc.dc_table)].as_ref().ok_or(
+            DcChainError::MissingHuffmanTable {
+                class: DhtClass::Dc,
+                selector: sc.dc_table,
+            },
+        )?;
+        let ac_cb = ac_codebooks[usize::from(sc.ac_table)].as_ref().ok_or(
+            DcChainError::MissingHuffmanTable {
+                class: DhtClass::Ac,
+                selector: sc.ac_table,
+            },
+        )?;
+        let sc_idx_u8 = u8::try_from(sc_idx).expect("scan_components ≤ 4 guarantees fit in u8");
+        steps[sc_idx] = Some(ScanStep {
+            sc_idx: sc_idx_u8,
+            sc_idx_usize: sc_idx,
+            blocks_per_mcu: bpm,
+            dc_cb,
+            ac_cb,
+        });
+        total_blocks_per_mcu = total_blocks_per_mcu.saturating_add(bpm as u64);
+    }
+
+    // Cap the output allocation before we honour an adversarial SOF0.
+    // Compare in u64 throughout — MAX_SAFE_MCUS fits in usize on every
+    // target we ship to, but on a 32-bit host casting `u64 as usize`
+    // would silently truncate before the comparison.
+    let total_blocks = n_mcus.saturating_mul(total_blocks_per_mcu);
+    let max_safe_mcus_u64 = MAX_SAFE_MCUS as u64;
+    let max_safe_blocks_u64 = max_safe_mcus_u64.saturating_mul(16);
+    if total_blocks > max_safe_blocks_u64 {
+        return Err(DcChainError::TooManyMcus {
+            requested: total_blocks,
+        });
+    }
+    if n_mcus > max_safe_mcus_u64 {
+        return Err(DcChainError::TooManyMcus { requested: n_mcus });
+    }
+
+    let mut per_component = allocate_dc_output(scan_components, n_mcus, &steps);
+
+    // Per-component running DC predictor; reset to 0 at start and at every
+    // RST boundary.  RST positions are sorted in ascending byte order by
+    // construction (unstuff_into emits them as it walks the input).
     let mut dc_predictor = [0i32; 4];
     let mut bits = BitReader::new(unstuffed);
+    let mut rst_iter = rst_positions.iter().peekable();
 
-    for mcu_idx in 0..n_mcus {
-        for (sc_idx, sc) in headers.scan.components[..scan_components]
-            .iter()
-            .enumerate()
-        {
-            let frame_idx = scan_to_frame[sc_idx];
-            let fc = &frame_components[frame_idx];
-            let blocks_per_mcu = if scan_components == 1 {
-                1
+    let n_mcus_u32 = u32::try_from(n_mcus).expect("MAX_SAFE_MCUS guarantees fit in u32");
+    for mcu_idx in 0..n_mcus_u32 {
+        // If the bit reader has crossed (or is at) the next RST boundary,
+        // realign to a byte boundary and reset every DC predictor before
+        // decoding this MCU.  RST boundaries are byte-aligned in the
+        // unstuffed stream.
+        while let Some(&&rst) = rst_iter.peek() {
+            if bits.byte_position() >= rst.byte_offset_in_dst {
+                bits.realign_to_byte_at(rst.byte_offset_in_dst);
+                dc_predictor = [0i32; 4];
+                let _ = rst_iter.next();
             } else {
-                usize::from(fc.h_sampling) * usize::from(fc.v_sampling)
-            };
+                break;
+            }
+        }
 
-            let dc_cb = dc_codebooks[sc.dc_table as usize].as_ref().ok_or(
-                DcChainError::MissingHuffmanTable {
-                    class: DhtClass::Dc,
-                    selector: sc.dc_table,
-                },
-            )?;
-            let ac_cb = ac_codebooks[sc.ac_table as usize].as_ref().ok_or(
-                DcChainError::MissingHuffmanTable {
-                    class: DhtClass::Ac,
-                    selector: sc.ac_table,
-                },
-            )?;
-
-            let comp_index_u8 = u8::try_from(sc_idx).unwrap_or(u8::MAX);
-
-            for _block in 0..blocks_per_mcu {
-                let delta = decode_dc_delta(&mut bits, dc_cb, mcu_idx, comp_index_u8)?;
-                dc_predictor[sc_idx] = dc_predictor[sc_idx].wrapping_add(delta);
-                per_component[sc_idx].push(dc_predictor[sc_idx]);
-                skip_ac_coefficients(&mut bits, ac_cb, mcu_idx, comp_index_u8)?;
+        for step in steps.iter().take(scan_components) {
+            let step = step.expect("steps[..scan_components] populated above");
+            for _block in 0..step.blocks_per_mcu {
+                let delta = decode_dc_delta(&mut bits, step.dc_cb, mcu_idx, step.sc_idx)?;
+                dc_predictor[step.sc_idx_usize] =
+                    dc_predictor[step.sc_idx_usize].wrapping_add(delta);
+                per_component[step.sc_idx_usize].push(dc_predictor[step.sc_idx_usize]);
+                skip_ac_coefficients(&mut bits, step.ac_cb, mcu_idx, step.sc_idx)?;
             }
         }
     }
@@ -196,53 +337,10 @@ pub fn resolve_dc_chain(
     Ok(DcValues { per_component })
 }
 
-/// Build canonical Huffman lookup tables for every (class, selector) the
-/// scan header references.  Returns parallel arrays indexed by selector
-/// (0..=3); only the slots referenced by the scan are populated.
-fn build_scan_codebooks(
-    headers: &JpegHeaders<'_>,
-) -> Result<
-    (
-        [Option<CanonicalCodebook>; 4],
-        [Option<CanonicalCodebook>; 4],
-    ),
-    DcChainError,
-> {
-    let scan_components = headers.scan.component_count as usize;
-    let mut dc_codebooks: [Option<CanonicalCodebook>; 4] = [None, None, None, None];
-    let mut ac_codebooks: [Option<CanonicalCodebook>; 4] = [None, None, None, None];
-
-    for sc in &headers.scan.components[..scan_components] {
-        if dc_codebooks[sc.dc_table as usize].is_none() {
-            dc_codebooks[sc.dc_table as usize] =
-                Some(load_codebook(headers, DhtClass::Dc, sc.dc_table)?);
-        }
-        if ac_codebooks[sc.ac_table as usize].is_none() {
-            ac_codebooks[sc.ac_table as usize] =
-                Some(load_codebook(headers, DhtClass::Ac, sc.ac_table)?);
-        }
-    }
-    Ok((dc_codebooks, ac_codebooks))
-}
-
-fn load_codebook(
-    headers: &JpegHeaders<'_>,
-    class: DhtClass,
-    selector: u8,
-) -> Result<CanonicalCodebook, DcChainError> {
-    let table = headers
-        .huffman(class, selector)
-        .ok_or(DcChainError::MissingHuffmanTable { class, selector })?;
-    CanonicalCodebook::build(table).map_err(|_| DcChainError::InvalidCode {
-        mcu_index: 0,
-        component_index: 0,
-    })
-}
-
 /// Map each scan component (by index) to its frame-component index.
 fn map_scan_to_frame(headers: &JpegHeaders<'_>) -> Result<[usize; 4], DcChainError> {
-    let scan_components = headers.scan.component_count as usize;
-    let frame_components = &headers.frame_components[..headers.components as usize];
+    let scan_components = usize::from(headers.scan.component_count);
+    let frame_components = &headers.frame_components[..usize::from(headers.components)];
     let mut scan_to_frame = [0usize; 4];
     for (i, sc) in headers.scan.components[..scan_components]
         .iter()
@@ -251,29 +349,27 @@ fn map_scan_to_frame(headers: &JpegHeaders<'_>) -> Result<[usize; 4], DcChainErr
         scan_to_frame[i] = frame_components
             .iter()
             .position(|fc| fc.id == sc.id)
-            .ok_or(DcChainError::UnsupportedScanShape)?;
+            .ok_or(DcChainError::UnknownScanComponent {
+                component_id: sc.id,
+            })?;
     }
     Ok(scan_to_frame)
 }
 
 /// Pre-size the per-component output `Vec`s so the entropy walk does no
-/// reallocation.
+/// reallocation.  Caller has already capped `n_mcus × bpm` to ≤
+/// `MAX_SAFE_MCUS × 16`, which fits in `usize` on every supported target,
+/// so the cast at the end is provably lossless.
 fn allocate_dc_output(
-    headers: &JpegHeaders<'_>,
-    n_mcus: u32,
-    scan_to_frame: &[usize; 4],
+    scan_components: usize,
+    n_mcus: u64,
+    steps: &[Option<ScanStep<'_>>; 4],
 ) -> Vec<Vec<i32>> {
-    let scan_components = headers.scan.component_count as usize;
-    let frame_components = &headers.frame_components[..headers.components as usize];
     (0..scan_components)
         .map(|i| {
-            let fc = &frame_components[scan_to_frame[i]];
-            let blocks_per_mcu = usize::from(fc.h_sampling) * usize::from(fc.v_sampling);
-            let count = if scan_components == 1 {
-                n_mcus as usize
-            } else {
-                (n_mcus as usize) * blocks_per_mcu
-            };
+            let bpm = steps[i].as_ref().map_or(1u64, |s| s.blocks_per_mcu as u64);
+            let total = n_mcus.saturating_mul(bpm);
+            let count = usize::try_from(total).unwrap_or(usize::MAX);
             Vec::with_capacity(count)
         })
         .collect()
@@ -286,10 +382,7 @@ fn decode_dc_delta(
     mcu_idx: u32,
     comp_index: u8,
 ) -> Result<i32, DcChainError> {
-    let dc_entry = decode_one(bits, dc_cb).ok_or(DcChainError::InvalidCode {
-        mcu_index: mcu_idx,
-        component_index: comp_index,
-    })?;
+    let dc_entry = decode_one(bits, dc_cb, mcu_idx, comp_index)?;
     let category = dc_entry.symbol;
     if category > 11 {
         return Err(DcChainError::BadDcCategory { category });
@@ -298,7 +391,10 @@ fn decode_dc_delta(
         0i32
     } else {
         bits.read_bits(category as usize)
-            .ok_or(DcChainError::UnexpectedEnd)?
+            .ok_or(DcChainError::UnexpectedEnd {
+                mcu_index: mcu_idx,
+                component_index: comp_index,
+            })?
     };
     Ok(extend(raw, category))
 }
@@ -313,10 +409,7 @@ fn skip_ac_coefficients(
 ) -> Result<(), DcChainError> {
     let mut ac_pos = 1;
     while ac_pos < 64 {
-        let ac_entry = decode_one(bits, ac_cb).ok_or(DcChainError::InvalidCode {
-            mcu_index: mcu_idx,
-            component_index: comp_index,
-        })?;
+        let ac_entry = decode_one(bits, ac_cb, mcu_idx, comp_index)?;
         if ac_entry.symbol == 0x00 {
             // EOB: rest of block is zero.
             break;
@@ -336,14 +429,20 @@ fn skip_ac_coefficients(
             return Err(DcChainError::AcOverflow { mcu_index: mcu_idx });
         }
         // Skip the value bits without interpreting them.
-        let _ = bits.read_bits(size).ok_or(DcChainError::UnexpectedEnd)?;
+        let _ = bits.read_bits(size).ok_or(DcChainError::UnexpectedEnd {
+            mcu_index: mcu_idx,
+            component_index: comp_index,
+        })?;
     }
     Ok(())
 }
 
 /// JPEG `EXTEND` operation (spec § F.1.2.1.1, Figure F.12).  Sign-extends an
 /// `nbits`-wide unsigned magnitude into a signed integer.
-fn extend(value: i32, nbits: u8) -> i32 {
+///
+/// `nbits` ≤ 11 in baseline JPEG (DC); the caller validates the cap before
+/// calling.  The implementation tolerates `nbits == 0` (returns 0).
+const fn extend(value: i32, nbits: u8) -> i32 {
     if nbits == 0 {
         return 0;
     }
@@ -355,16 +454,27 @@ fn extend(value: i32, nbits: u8) -> i32 {
     }
 }
 
-/// Decode the next codeword.  Returns `None` if the bit pattern doesn't
-/// resolve to a known symbol (stream corrupt or wrong table).
-fn decode_one(bits: &mut BitReader<'_>, cb: &CanonicalCodebook) -> Option<CanonicalEntry> {
-    let prefix = bits.peek_u16()?;
+/// Decode the next codeword.  Distinguishes end-of-stream from
+/// invalid-code-pattern so callers can return a precise error variant.
+fn decode_one(
+    bits: &mut BitReader<'_>,
+    cb: &CanonicalCodebook,
+    mcu_idx: u32,
+    comp_index: u8,
+) -> Result<CanonicalEntry, DcChainError> {
+    let prefix = bits.peek_u16().ok_or(DcChainError::UnexpectedEnd {
+        mcu_index: mcu_idx,
+        component_index: comp_index,
+    })?;
     let entry = cb.lookup(prefix);
     if entry.num_bits == 0 {
-        return None;
+        return Err(DcChainError::InvalidCode {
+            mcu_index: mcu_idx,
+            component_index: comp_index,
+        });
     }
-    bits.consume(entry.num_bits as usize);
-    Some(entry)
+    bits.consume(usize::from(entry.num_bits));
+    Ok(entry)
 }
 
 /// Bit reader over an unstuffed JPEG entropy-coded stream.  MSB-first.
@@ -380,7 +490,7 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(src: &'a [u8]) -> Self {
+    const fn new(src: &'a [u8]) -> Self {
         Self {
             src,
             byte_pos: 0,
@@ -462,6 +572,31 @@ impl<'a> BitReader<'a> {
         )]
         Some(bits as i32)
     }
+
+    /// Position of the next byte the reader will emit, measured in input
+    /// bytes.  Used to detect when the reader has crossed an RST boundary.
+    ///
+    /// `byte_pos` is "next byte to load into the buffer".  Bytes still in
+    /// `buf` are partly emitted: each fully-buffered byte (8 bits) hasn't
+    /// been emitted yet, while a fractional byte (`cap % 8 != 0`) means the
+    /// reader is mid-byte.  We use a ceiling division (`(cap + 7) / 8`) so
+    /// a mid-byte read still reports the byte index the reader is **inside**
+    /// rather than the next one.  This is the correct comparand for
+    /// `RstPosition::byte_offset_in_dst`, which by construction falls on a
+    /// byte boundary in the unstuffed stream.
+    const fn byte_position(&self) -> usize {
+        let bytes_unconsumed = (self.cap as usize).div_ceil(8);
+        self.byte_pos.saturating_sub(bytes_unconsumed)
+    }
+
+    /// Discard the buffer and seek to `byte_offset` on a byte boundary.
+    /// Used when crossing an RST marker — the entropy stream is byte-aligned
+    /// at every RST per JPEG § F.1.1.5, so we drop any in-flight bits.
+    fn realign_to_byte_at(&mut self, byte_offset: usize) {
+        self.buf = 0;
+        self.cap = 0;
+        self.byte_pos = byte_offset.min(self.src.len());
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +625,16 @@ mod tests {
         assert_eq!(extend(7, 3), 7);
         assert_eq!(extend(0, 3), -7);
         assert_eq!(extend(3, 3), -4);
+    }
+
+    #[test]
+    fn extend_max_baseline_dc_category() {
+        // Baseline DC category ≤ 11.  Confirm endpoints don't overflow.
+        // For nbits=11: range = -2047..=-1024 ∪ 1024..=2047.
+        assert_eq!(extend(0, 11), -2047);
+        assert_eq!(extend(1023, 11), -1024);
+        assert_eq!(extend(1024, 11), 1024);
+        assert_eq!(extend(2047, 11), 2047);
     }
 
     #[test]
@@ -527,5 +672,60 @@ mod tests {
         let src = [0xAB];
         let mut br = BitReader::new(&src);
         assert_eq!(br.peek_u16(), Some(0xAB00));
+    }
+
+    #[test]
+    fn bitreader_realign_clears_buffer_and_seeks() {
+        let src = [0xAA, 0xBB, 0xCC, 0xDD];
+        let mut br = BitReader::new(&src);
+        // Consume part of one byte.
+        let _ = br.read_bits(4);
+        br.realign_to_byte_at(2);
+        // Next read should now come from src[2] = 0xCC.
+        assert_eq!(br.read_bits(8), Some(0xCC));
+    }
+
+    #[test]
+    fn bitreader_realign_clamps_past_end() {
+        let src = [0xAA];
+        let mut br = BitReader::new(&src);
+        br.realign_to_byte_at(99);
+        assert_eq!(br.peek_u16(), None);
+    }
+
+    #[test]
+    fn bitreader_byte_position_tracks_mid_byte() {
+        // Pin down the byte_position contract: it must report the byte the
+        // reader is currently *inside*, not the next one.  This is the
+        // load-bearing invariant for RST-boundary detection.
+        let src = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22];
+        let mut br = BitReader::new(&src);
+        // Force a refill to a known state.
+        let _ = br.peek_u16();
+        assert_eq!(br.byte_position(), 0);
+        // Consume one full byte: position advances to byte 1.
+        let _ = br.read_bits(8);
+        assert_eq!(br.byte_position(), 1);
+        // Mid-byte: still inside byte 1.
+        let _ = br.read_bits(4);
+        assert_eq!(br.byte_position(), 1);
+        // Cross into byte 2.
+        let _ = br.read_bits(4);
+        assert_eq!(br.byte_position(), 2);
+    }
+
+    #[test]
+    fn blocks_per_mcu_non_interleaved_is_one() {
+        // Single-component scan: always 1 block per MCU regardless of
+        // sampling factors (JPEG § A.2.3).
+        assert_eq!(blocks_per_mcu(1, 2, 2), 1);
+        assert_eq!(blocks_per_mcu(1, 4, 4), 1);
+    }
+
+    #[test]
+    fn blocks_per_mcu_interleaved_is_h_times_v() {
+        assert_eq!(blocks_per_mcu(3, 1, 1), 1);
+        assert_eq!(blocks_per_mcu(3, 2, 2), 4);
+        assert_eq!(blocks_per_mcu(3, 2, 1), 2);
     }
 }

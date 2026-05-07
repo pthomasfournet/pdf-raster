@@ -26,10 +26,13 @@ pub mod headers;
 pub mod prepass;
 pub mod unstuff;
 
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 pub use canonical::{CanonicalCodebook, CanonicalCodebookError};
 pub use dc_chain::{DcChainError, DcValues};
 pub use headers::{
     DhtClass, JpegHeaderError, JpegHeaders, JpegHuffmanTable, JpegQuantTable, JpegScanComponent,
 };
 pub use prepass::{CpuPrepassError, CpuPrepassOutput, run_cpu_prepass};
-pub use unstuff::unstuff_into;
+pub use unstuff::{RstPosition, unstuff_into};

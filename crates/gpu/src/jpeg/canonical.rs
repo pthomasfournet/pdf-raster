@@ -75,7 +75,7 @@ pub enum CanonicalCodebookError {
     /// JPEG (every scan needs at least one symbol).
     Empty,
     /// `num_codes` declared more codewords than the JPEG spec allows for
-    /// this bit length.  Specifically, sum(num_codes[..=i]) <= (1 << (i+1))
+    /// this bit length.  Specifically, `sum(num_codes[..=i]) <= (1 << (i+1))`
     /// must hold for every length prefix; violation means the codes can't
     /// form a prefix code.
     OverflowAtLength {
@@ -118,6 +118,12 @@ impl CanonicalCodebook {
     /// Returns [`CanonicalCodebookError`] if `num_codes` is empty, declares
     /// more codes than fit in the prefix code space, or disagrees with the
     /// length of `values`.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on heap-allocation failure of the 256 KB lookup slab,
+    /// which is the standard "allocator OOM" panic Rust emits and not a
+    /// recoverable error from the caller's perspective.
     pub fn build(table: &JpegHuffmanTable) -> Result<Self, CanonicalCodebookError> {
         let total_codes: usize = table.num_codes.iter().map(|&n| n as usize).sum();
         if total_codes == 0 {

@@ -20,8 +20,8 @@
 //!   Canonical-code construction lives in [`super::canonical`].
 //! - SOS — scan header + offset/length of the entropy-coded data.
 //! - DRI — restart interval (0 if absent).
-//! - APPn / COM (0xE0–0xFE) — skipped via length prefix.
-//! - RSTn / SOI re-encounters (0xD0–0xD8) — silently consumed if encountered
+//! - `APPn` / COM (0xE0–0xFE) — skipped via length prefix.
+//! - `RSTn` / SOI re-encounters (0xD0–0xD8) — silently consumed if encountered
 //!   before SOS, treated as scan boundaries afterwards.
 
 use std::error::Error;
@@ -107,7 +107,7 @@ pub struct JpegHuffmanTable {
     pub table_id: u8,
     /// `num_codes[i]` = number of `i+1`-bit codewords (i in 0..16).
     pub num_codes: [u8; 16],
-    /// Symbol values in canonical order; length = sum(num_codes).
+    /// Symbol values in canonical order; length equals `sum(num_codes)`.
     pub values: Vec<u8>,
 }
 
@@ -162,6 +162,15 @@ pub enum JpegHeaderError {
     TooManyComponents {
         /// Component count from the SOF0 segment.
         count: u8,
+    },
+    /// SOF0 declared a sampling factor outside the JPEG baseline range 1..=4.
+    /// Catches `H=0` / `V=0` (which would produce a 0-block MCU geometry and
+    /// silently empty per-component output) and `H>4` / `V>4`.
+    BadSamplingFactor {
+        /// Horizontal sampling factor as declared.
+        h_sampling: u8,
+        /// Vertical sampling factor as declared.
+        v_sampling: u8,
     },
     /// DQT or DHT used a table ID outside the valid range.
     BadTableId {
@@ -229,8 +238,15 @@ impl fmt::Display for JpegHeaderError {
             Self::TooManyComponents { count } => {
                 write!(f, "SOF0 declares {count} components (max 4)")
             }
+            Self::BadSamplingFactor {
+                h_sampling,
+                v_sampling,
+            } => write!(
+                f,
+                "SOF0 sampling factor H={h_sampling} V={v_sampling} outside baseline range 1..=4",
+            ),
             Self::BadTableId { marker, table_id } => {
-                write!(f, "segment 0x{marker:02X} table_id {table_id} out of range",)
+                write!(f, "segment 0x{marker:02X} table_id {table_id} out of range")
             }
             Self::BadDhtClass { class } => {
                 write!(f, "DHT class {class} not in {{0=DC, 1=AC}}")
@@ -360,9 +376,9 @@ impl<'a> JpegHeaders<'a> {
                 }
 
                 // APP0–APP15, COM, etc. (0xE0–0xFE except already-handled): length-prefixed; skip.
+                // We only need read_segment's side-effect of advancing the cursor.
                 0xE0..=0xFE => {
-                    let body = read_segment(&mut cursor, marker)?;
-                    let _ = body;
+                    let _skipped_segment_body = read_segment(&mut cursor, marker)?;
                 }
 
                 // EOI or any unrecognised marker — stop parsing.
@@ -445,7 +461,7 @@ impl<'a> ByteCursor<'a> {
         self.data[self.pos + offset]
     }
 
-    fn advance(&mut self, n: usize) {
+    const fn advance(&mut self, n: usize) {
         self.pos += n;
     }
 
@@ -502,19 +518,32 @@ fn parse_sof0(
         return Err(JpegHeaderError::SegmentOverrun { marker: 0xC0 });
     }
     *components = nf;
-    for i in 0..nf as usize {
-        let off = 6 + i * 3;
-        let quant_selector = body[off + 2];
+    let component_records = body[6..6 + usize::from(nf) * 3].chunks_exact(3);
+    for (slot, record) in frame_components.iter_mut().zip(component_records) {
+        let id = record[0];
+        let h_sampling = record[1] >> 4;
+        let v_sampling = record[1] & 0x0F;
+        let quant_selector = record[2];
         if quant_selector >= 4 {
             return Err(JpegHeaderError::BadTableId {
                 marker: 0xC0,
                 table_id: quant_selector,
             });
         }
-        frame_components[i] = JpegFrameComponent {
-            id: body[off],
-            h_sampling: body[off + 1] >> 4,
-            v_sampling: body[off + 1] & 0x0F,
+        // JPEG ISO/IEC 10918-1 § B.2.2 requires 1 ≤ H,V ≤ 4 in baseline.
+        // Without this check, h=0 / v=0 silently yields blocks_per_mcu = 0
+        // and the DC-chain walker emits an empty per-component output for a
+        // component the GPU pipeline expected to populate.
+        if !(1..=4).contains(&h_sampling) || !(1..=4).contains(&v_sampling) {
+            return Err(JpegHeaderError::BadSamplingFactor {
+                h_sampling,
+                v_sampling,
+            });
+        }
+        *slot = JpegFrameComponent {
+            id,
+            h_sampling,
+            v_sampling,
             quant_selector,
         };
     }
@@ -697,23 +726,8 @@ fn locate_scan_end(data: &[u8], start: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_fixtures::{GRAY_16X16_JPEG, PROGRESSIVE_MINIMAL};
     use super::*;
-
-    /// 16×16 grayscale baseline JPEG — matches the fixture used by the
-    /// VA-API parser tests so we have a known-good input.
-    const GRAY_16X16_JPEG: &[u8] = &[
-        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x06, 0x04, 0x05, 0x06, 0x05,
-        0x04, 0x06, 0x06, 0x05, 0x06, 0x07, 0x07, 0x06, 0x08, 0x0a, 0x10, 0x0a, 0x0a, 0x09, 0x09,
-        0x0a, 0x14, 0x0e, 0x0f, 0x0c, 0x10, 0x17, 0x14, 0x18, 0x18, 0x17, 0x14, 0x16, 0x16, 0x1a,
-        0x1d, 0x25, 0x1f, 0x1a, 0x1b, 0x23, 0x1c, 0x16, 0x16, 0x20, 0x2c, 0x20, 0x23, 0x26, 0x27,
-        0x29, 0x2a, 0x29, 0x19, 0x1f, 0x2d, 0x30, 0x2d, 0x28, 0x30, 0x25, 0x28, 0x29, 0x28, 0xff,
-        0xc0, 0x00, 0x0b, 0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00,
-        0x15, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xda, 0x00,
-        0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x80, 0x3f, 0xff, 0xd9,
-    ];
 
     #[test]
     fn parse_gray_16x16_basic() {
@@ -778,22 +792,53 @@ mod tests {
         // frame header. The whole-stream walk eventually hits truncation
         // because no SOS appears with valid framing; either result is
         // acceptable, but it must NOT silently succeed.
-        let progressive: &[u8] = &[
-            0xFF, 0xD8, // SOI
-            0xFF, 0xC2, // SOF2 (progressive)
-            0x00, 0x11, // length 17
-            0x08, 0x00, 0x10, 0x00, 0x10, 0x03, // precision + dims + components
-            0x01, 0x11, 0x00, // comp 1
-            0x02, 0x11, 0x01, // comp 2
-            0x03, 0x11, 0x01, // comp 3
-            0xFF, 0xD9, // EOI
-        ];
-        let err = JpegHeaders::parse(progressive).expect_err("must fail");
-        // Most likely outcome: SOF0 was never seen, so SOS-or-truncation path
-        // hits MissingSof0 / Truncated.
+        let err = JpegHeaders::parse(PROGRESSIVE_MINIMAL).expect_err("must fail");
         assert!(matches!(
             err,
             JpegHeaderError::MissingSof0 | JpegHeaderError::Truncated,
+        ));
+    }
+
+    #[test]
+    fn parse_zero_sampling_factor_returns_bad_sampling_factor() {
+        // Construct a SOF0 with H=0, V=1 — the parser must catch this before
+        // downstream code reads `blocks_per_mcu = 0`.
+        let mut data = vec![0xFF, 0xD8];
+        // DQT first (so SOF0 has a valid quantiser to point at).
+        data.extend_from_slice(&[0xFF, 0xDB, 0x00, 67, 0]);
+        data.extend_from_slice(&[0u8; 64]);
+        // SOF0: 1 component, H=0 V=1.
+        data.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 11, 8, 0x00, 0x10, 0x00, 0x10, 1, 1, 0x01, 0x00,
+        ]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        let err = JpegHeaders::parse(&data).expect_err("H=0 must fail");
+        assert!(matches!(
+            err,
+            JpegHeaderError::BadSamplingFactor {
+                h_sampling: 0,
+                v_sampling: 1,
+            },
+        ));
+    }
+
+    #[test]
+    fn parse_oversize_sampling_factor_returns_bad_sampling_factor() {
+        let mut data = vec![0xFF, 0xD8];
+        data.extend_from_slice(&[0xFF, 0xDB, 0x00, 67, 0]);
+        data.extend_from_slice(&[0u8; 64]);
+        // SOF0: 1 component, H=5 V=1 (5 > 4 baseline limit).
+        data.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 11, 8, 0x00, 0x10, 0x00, 0x10, 1, 1, 0x51, 0x00,
+        ]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        let err = JpegHeaders::parse(&data).expect_err("H=5 must fail");
+        assert!(matches!(
+            err,
+            JpegHeaderError::BadSamplingFactor {
+                h_sampling: 5,
+                v_sampling: 1,
+            },
         ));
     }
 
