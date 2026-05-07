@@ -1,43 +1,40 @@
 #!/usr/bin/env bash
-# v0.6.0 GPU baseline benchmark driver.
+# v0.6.0 GPU baseline matrix — 10-corpus × 4-backend wrapper.
 #
-# Builds 4 binaries (CPU, VA-API, nvJPEG, full GPU) and runs hyperfine
-# against the 10-corpus fixture set. Output: bench/v060/<corpus>-<mode>.json
-# plus an aggregated bench/v060/results.md.
+# Builds two binaries (nvjpeg covers CPU/VA-API/CUDA-decode-only modes via
+# runtime --backend; full adds GPU AA + GPU ICC kernels) then drives the
+# existing tests/bench_corpus.sh four times to populate the matrix.
+#
+# Per-corpus measurement (hyperfine + mpstat + iostat + cache eviction)
+# lives in tests/bench_corpus.sh and is reused unchanged.
 #
 # Usage: scripts/bench_v060.sh [--force]
-#   --force   Re-run cells even if their JSON already exists.
+#   --force   Re-run modes even if their <mode>.txt already exists, and
+#             rebuild binaries even if already present.
 set -euo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-DPI=150
-WARMUP=3
-RUNS=8
 OUT_DIR="bench/v060"
-FIXTURES="tests/fixtures"
+BENCH="tests/bench_corpus.sh"
 NVJPEG2K_LIB="/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12"
 CUDA_LIB="/usr/local/cuda-12.8/lib64"
 MIN_FREE_GB=20
 
-CORPORA=(
-  corpus-01-native-text-small
-  corpus-02-native-vector-text
-  corpus-03-native-text-dense
-  corpus-04-ebook-mixed
-  corpus-05-academic-book
-  corpus-06-modern-layout-dct
-  corpus-07-journal-dct-heavy
-  corpus-08-scan-dct-1927
-  corpus-09-scan-dct-1836
-  corpus-10-scan-jbig2-jpx
+# Mode → (binary suffix, --backend value, cargo features)
+# The same nvjpeg binary is used for modes A, B, C; full is used for D.
+MODES=(A B C D)
+declare -A MODE_BIN=(
+  [A]=nvjpeg [B]=nvjpeg [C]=nvjpeg [D]=full
 )
-
-MODES=(cpu vaapi nvjpeg full)
-declare -A MODE_FEATURES=(
-  [cpu]=""
-  [vaapi]="vaapi"
-  [nvjpeg]="nvjpeg,nvjpeg2k"
-  [full]="nvjpeg,nvjpeg2k,gpu-aa,gpu-icc"
+declare -A MODE_BACKEND=(
+  [A]=cpu [B]=vaapi [C]=cuda [D]=cuda
+)
+declare -A MODE_LABEL=(
+  [A]="CPU-only" [B]="VA-API" [C]="nvJPEG only" [D]="Full GPU"
+)
+declare -A BIN_FEATURES=(
+  [nvjpeg]="nvjpeg,nvjpeg2k,vaapi"
+  [full]="nvjpeg,nvjpeg2k,vaapi,gpu-aa,gpu-icc"
 )
 
 FORCE=0
@@ -46,15 +43,15 @@ if [[ ${1:-} == "--force" ]]; then FORCE=1; fi
 SKIP_NVJPEG=0
 SKIP_VAAPI=0
 
-# ─── Pre-flight ───────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 fail() { printf '[%s] FAIL: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 warn() { printf '[%s] WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
+# ─── Pre-flight ───────────────────────────────────────────────────────────────
 preflight() {
-  log "Pre-flight checks"
+  log "Pre-flight"
 
-  # Disk
   local free_gb
   free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
   if (( free_gb < MIN_FREE_GB )); then
@@ -62,181 +59,146 @@ preflight() {
   fi
   log "  disk: ${free_gb}G free"
 
-  # Tools
-  command -v hyperfine >/dev/null || fail "hyperfine not in PATH"
-  command -v jq >/dev/null || fail "jq not in PATH"
-  command -v cargo >/dev/null || fail "cargo not in PATH"
-  log "  tools: hyperfine $(hyperfine --version | awk '{print $2}'), jq $(jq --version)"
-
-  # Fixtures
-  for c in "${CORPORA[@]}"; do
-    [[ -f "$FIXTURES/$c.pdf" ]] || fail "missing fixture: $FIXTURES/$c.pdf"
+  for cmd in cargo hyperfine mpstat iostat python3 awk; do
+    command -v "$cmd" >/dev/null || fail "$cmd not in PATH"
   done
-  log "  fixtures: 10/10 present"
+  log "  tools: cargo, hyperfine, mpstat, iostat, python3, awk all present"
 
-  # GPU detection (warning, not fatal — the script falls back to CPU-only).
-  # We probe the runtime requirements directly rather than relying on
-  # nvidia-smi (which may not be installed). nvJPEG needs:
-  #   - /dev/nvidia0 (kernel module + GPU device node)
-  #   - libcudart.so + libnvjpeg.so under $CUDA_LIB
-  #   - libnvjpeg2k.so under $NVJPEG2K_LIB
+  [[ -x "$BENCH" ]] || fail "$BENCH not executable"
+  log "  bench script: $BENCH"
+
+  # GPU detection — file/device probes (nvidia-smi may not be installed).
   if [[ ! -e /dev/nvidia0 ]]; then
-    warn "/dev/nvidia0 missing; nvjpeg/full modes will be skipped"
+    warn "/dev/nvidia0 missing; modes C and D will be skipped"
     SKIP_NVJPEG=1
   elif [[ ! -e "$CUDA_LIB/libcudart.so" || ! -e "$CUDA_LIB/libnvjpeg.so" ]]; then
-    warn "CUDA libs missing under $CUDA_LIB; nvjpeg/full modes will be skipped"
+    warn "CUDA libs missing under $CUDA_LIB; modes C and D will be skipped"
     SKIP_NVJPEG=1
   elif [[ ! -e "$NVJPEG2K_LIB/libnvjpeg2k.so" ]]; then
-    warn "libnvjpeg2k.so missing under $NVJPEG2K_LIB; nvjpeg/full modes will be skipped"
+    warn "libnvjpeg2k.so missing under $NVJPEG2K_LIB; modes C and D will be skipped"
     SKIP_NVJPEG=1
   else
     log "  nvidia: /dev/nvidia0 + cudart + nvjpeg + nvjpeg2k present"
   fi
 
-  # VA-API detection (warning, not fatal). We probe the runtime requirements
-  # directly rather than running vainfo (which is known to crash on some
-  # driver/kernel combos even when libva itself is healthy).
   if [[ ! -e /dev/dri/renderD128 ]]; then
-    warn "/dev/dri/renderD128 missing; vaapi mode will be skipped"
+    warn "/dev/dri/renderD128 missing; mode B will be skipped"
     SKIP_VAAPI=1
-  elif [[ ! -e /usr/lib/x86_64-linux-gnu/libva.so.2 || ! -e /usr/lib/x86_64-linux-gnu/libva-drm.so.2 ]]; then
-    warn "libva.so.2/libva-drm.so.2 missing; vaapi mode will be skipped"
+  elif [[ ! -e /usr/lib/x86_64-linux-gnu/libva.so.2 ]]; then
+    warn "libva.so.2 missing; mode B will be skipped"
     SKIP_VAAPI=1
   else
-    log "  vaapi: /dev/dri/renderD128 + libva.so.2 + libva-drm.so.2 present"
+    log "  vaapi: /dev/dri/renderD128 + libva.so.2 present"
   fi
-
-  # sudo cache for drop_caches. We require the cache to be primed before
-  # running the script (interactive prompting mid-run would stall the bench
-  # unpredictably). Once primed, a background keepalive loop refreshes the
-  # cache every 60 s for the duration of the run — needed because the full
-  # matrix takes longer than the default 15-minute sudo cache window.
-  if ! sudo -n true 2>/dev/null; then
-    fail "sudo credential cache not primed; run 'sudo -v' first, then re-run this script"
-  fi
-  log "  sudo: cached"
-  # Keepalive: refresh sudo every 60s in the background; killed via trap on exit.
-  ( while true; do sudo -n true 2>/dev/null || exit; sleep 60; done ) &
-  SUDO_KEEPALIVE_PID=$!
-  trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
-  log "  sudo: keepalive loop pid=$SUDO_KEEPALIVE_PID"
 
   mkdir -p "$OUT_DIR"
   log "Pre-flight OK"
 }
 
-# ─── Build phase ──────────────────────────────────────────────────────────────
-# For each mode, build pdf-raster with that mode's feature set and copy the
-# resulting binary to target/release/pdf-raster-<mode>. Skips a build if the
-# named binary already exists and --force was not passed.
-build_one() {
-  local mode="$1"
-  local features="${MODE_FEATURES[$mode]}"
-  local out="target/release/pdf-raster-$mode"
+# ─── Build ────────────────────────────────────────────────────────────────────
+build_binary() {
+  local suffix="$1"
+  local features="${BIN_FEATURES[$suffix]}"
+  local out="target/release/pdf-raster-$suffix"
 
   if [[ -x "$out" && $FORCE -eq 0 ]]; then
-    log "build[$mode]: $out already present (use --force to rebuild)"
+    log "build[$suffix]: $out already present"
     return 0
   fi
 
-  log "build[$mode]: features='$features'"
-  local cargo_args=(build --release -p pdf-raster)
-  if [[ -n "$features" ]]; then
-    cargo_args+=(--features "$features")
-  fi
-
-  RUSTFLAGS="-C target-cpu=native" cargo "${cargo_args[@]}"
+  log "build[$suffix]: features='$features'"
+  RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster --features "$features"
   cp -f target/release/pdf-raster "$out"
-  log "build[$mode]: copied to $out"
+  log "build[$suffix]: copied to $out"
 }
 
 builds() {
   log "Build phase"
-  for mode in "${MODES[@]}"; do
-    if [[ "$mode" == "vaapi" && $SKIP_VAAPI -eq 1 ]]; then
-      log "build[$mode]: SKIP (VA-API unavailable)"
-      continue
-    fi
-    if [[ ("$mode" == "nvjpeg" || "$mode" == "full") && $SKIP_NVJPEG -eq 1 ]]; then
-      log "build[$mode]: SKIP (NVIDIA GPU unavailable)"
-      continue
-    fi
-    build_one "$mode"
-  done
+  # Always need nvjpeg binary — covers CPU/VA-API even when CUDA absent
+  # because runtime --backend cpu and vaapi don't touch CUDA at runtime.
+  if [[ $SKIP_NVJPEG -eq 1 ]]; then
+    # Fall back to a vaapi-only binary if CUDA is unavailable. The features
+    # in MODE_FEATURES include nvjpeg, which links nvjpeg.so — that would
+    # fail at link time without CUDA. Strip it.
+    BIN_FEATURES[nvjpeg]="vaapi"
+    warn "nvjpeg binary will be built without CUDA features (CUDA unavailable)"
+  fi
+  build_binary nvjpeg
+
+  if [[ $SKIP_NVJPEG -eq 0 ]]; then
+    build_binary full
+  else
+    log "build[full]: SKIP (CUDA unavailable)"
+  fi
   log "Build phase OK"
 }
 
-# ─── Bench phase ──────────────────────────────────────────────────────────────
-# Drop kernel caches so the file read is genuinely cold. Hyperfine warmup
-# runs go on top of this — they'll be hot, which is the same protocol as v0.5.1.
-drop_caches() {
-  sync
-  sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-}
+# ─── Bench ────────────────────────────────────────────────────────────────────
+bench_mode() {
+  local mode="$1"
+  local bin_suffix="${MODE_BIN[$mode]}"
+  local backend="${MODE_BACKEND[$mode]}"
+  local label="${MODE_LABEL[$mode]}"
+  local bin="target/release/pdf-raster-$bin_suffix"
+  local out="$OUT_DIR/$mode.txt"
 
-# Run hyperfine for one (corpus, mode) cell. Idempotent: skips if the JSON
-# already exists and --force was not passed.
-bench_one() {
-  local corpus="$1"
-  local mode="$2"
-  local pdf="$FIXTURES/$corpus.pdf"
-  local bin="target/release/pdf-raster-$mode"
-  local json="$OUT_DIR/$corpus-$mode.json"
-
-  if [[ -f "$json" && $FORCE -eq 0 ]]; then
-    log "bench[$corpus/$mode]: SKIP (already done)"
+  if [[ -f "$out" && $FORCE -eq 0 ]]; then
+    log "bench[$mode/$label]: SKIP (already done — $out)"
     return 0
   fi
 
   if [[ ! -x "$bin" ]]; then
-    log "bench[$corpus/$mode]: SKIP (binary missing)"
+    log "bench[$mode/$label]: SKIP (binary $bin missing)"
     return 0
   fi
 
-  drop_caches
-  log "bench[$corpus/$mode]: starting"
-
-  # Bare-stem prefix routes pdf-raster output to /dev/shm (RAM) by default
-  # in v0.6.0, which is the protocol we want to measure.
-  local out_prefix="v060-out-$$-$corpus"
-
-  local extra_env=""
-  if [[ "$mode" == "nvjpeg" || "$mode" == "full" ]]; then
-    extra_env="LD_LIBRARY_PATH=$NVJPEG2K_LIB:$CUDA_LIB:\${LD_LIBRARY_PATH:-}"
+  if [[ "$backend" == "vaapi" && $SKIP_VAAPI -eq 1 ]]; then
+    log "bench[$mode/$label]: SKIP (VA-API unavailable)"
+    return 0
+  fi
+  if [[ "$backend" == "cuda" && $SKIP_NVJPEG -eq 1 ]]; then
+    log "bench[$mode/$label]: SKIP (CUDA unavailable)"
+    return 0
   fi
 
-  hyperfine \
-    --warmup "$WARMUP" \
-    --runs "$RUNS" \
-    --export-json "$json" \
-    --shell=bash \
-    "$extra_env $bin -r $DPI $pdf $out_prefix"
+  log "bench[$mode/$label]: starting (BIN=$bin --backend $backend)"
+  # nvjpeg2k library is in a non-standard location; preload it for cuda mode.
+  local ld_path=""
+  if [[ "$backend" == "cuda" ]]; then
+    ld_path="LD_LIBRARY_PATH=$NVJPEG2K_LIB:$CUDA_LIB:${LD_LIBRARY_PATH:-}"
+  fi
 
-  # Clean up the per-cell output directory in /dev/shm to keep RAM tidy.
-  # (pdf-raster routes bare-stem prefix to /dev/shm/pdf-raster-<pid>-<nanos>/.)
-  rm -rf "/dev/shm/pdf-raster-"* 2>/dev/null || true
-
-  log "bench[$corpus/$mode]: done — $(jq -r '.results[0].mean * 1000 | floor' "$json")ms mean"
+  # Run the existing bench_corpus.sh; capture stdout to <mode>.txt.
+  # ld_path is "LD_LIBRARY_PATH=..." or empty — env needs it as a separate
+  # KEY=VAL token, so deliberately unquoted (shellcheck disable=SC2086).
+  # shellcheck disable=SC2086
+  env $ld_path BIN="$bin" "$BENCH" --backend "$backend" \
+    | tee "$out"
+  log "bench[$mode/$label]: done — $out"
 }
 
 benches() {
-  log "Bench phase: 10 corpora × 4 modes = 40 cells"
-  for corpus in "${CORPORA[@]}"; do
-    for mode in "${MODES[@]}"; do
-      # Mode-skip gates mirror the build phase so we never try to bench a
-      # binary that wasn't built.
-      if [[ "$mode" == "vaapi" && $SKIP_VAAPI -eq 1 ]]; then continue; fi
-      if [[ ("$mode" == "nvjpeg" || "$mode" == "full") && $SKIP_NVJPEG -eq 1 ]]; then continue; fi
-      bench_one "$corpus" "$mode"
-    done
+  log "Bench phase"
+  for mode in "${MODES[@]}"; do
+    bench_mode "$mode"
   done
   log "Bench phase OK"
+}
+
+# ─── Aggregate ────────────────────────────────────────────────────────────────
+# Each mode's .txt has rows like:
+#   01-native-text-small             49ms ±    1ms       95%      99%        12 MB/s  [low-cpu...]
+# We pivot into:
+#   | corpus | A. CPU-only | B. VA-API | C. nvJPEG | D. Full GPU | flags |
+aggregate() {
+  log "Aggregating to $OUT_DIR/results.md"
+  python3 scripts/aggregate_v060.py "$OUT_DIR" > "$OUT_DIR/results.md"
+  log "Wrote $OUT_DIR/results.md"
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 preflight
 builds
 benches
-log "Aggregating results"
-./scripts/aggregate_v060.sh "$OUT_DIR" "$OUT_DIR/results.md"
-log "All done. Results: $OUT_DIR/results.md"
+aggregate
+log "All done. Matrix: $OUT_DIR/results.md"

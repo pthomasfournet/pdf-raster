@@ -59,7 +59,7 @@ tests/bench/bench-results.json
 tests/bench/bench-features-results.json
 
 # ── v0.6.0 GPU baseline raw output ────────────────────────────────────────────
-bench/v060/*.json
+bench/v060/*.txt
 
 # ── Stray compiled binaries at repo root ──────────────────────────────────────
 /test_*
