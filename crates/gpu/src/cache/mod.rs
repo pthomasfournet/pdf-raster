@@ -1,8 +1,9 @@
-//! Phase 9 device-resident image cache — VRAM tier.
+//! Phase 9 device-resident image cache — VRAM and host RAM tiers.
 //!
 //! See `docs/superpowers/specs/2026-05-07-phase-9-device-resident-image-cache.md`
-//! for the full architecture.  This module ships only the in-process VRAM
-//! tier (Task 2); the host RAM and disk tiers land in tasks 3 and 5.
+//! for the full architecture.  This module ships the in-process VRAM
+//! tier (Task 2) and the pinned host RAM demotion target (Task 3).
+//! The disk persistence tier lands in Task 5.
 //!
 //! # Concurrency model
 //!
@@ -20,10 +21,14 @@
 //! until the last consumer drops its `Arc` — that's the desired behaviour:
 //! pulling memory from under an in-flight kernel would corrupt the page.
 
+mod host_tier;
+
+pub use host_tier::{HostBudget, HostEntry, HostTier};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DeviceRepr};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
@@ -238,29 +243,48 @@ impl std::error::Error for CacheError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentHash(pub [u8; 32]);
 
-/// One in-process VRAM tier.  Indexed by content hash (primary, for
-/// cross-document dedup) and by `(DocId, ObjId)` (secondary, fast same-
-/// document lookup).
+/// Two-tier in-process image cache.
+///
+/// VRAM is the hot tier; pinned host RAM is the demotion target.
+///
+/// The VRAM tier is indexed by content hash (primary, for cross-
+/// document dedup) and by `(DocId, ObjId)` (secondary, fast same-
+/// document lookup).  The host tier is indexed only by content hash
+/// and is consulted on a VRAM miss before re-decoding.
 ///
 /// All methods take `&self` and are safe to call from many threads
 /// concurrently.  Eviction is read-then-CAS rather than locking the
 /// whole tier, so a hot path that touches a present entry never
 /// contends with eviction.
+///
+/// LRU clock (`tick`) is shared across tiers so a host-tier hit's
+/// "freshness" is comparable to a VRAM hit's; otherwise a freshly
+/// promoted slab would look like the oldest VRAM entry to the next
+/// eviction.
 pub struct DeviceImageCache {
     primary: DashMap<ContentHash, Arc<CachedDeviceImage>>,
     /// Maps `(DocId, ObjId)` to the content hash that resolves it.  An
     /// alias entry is cheap (40 bytes) and lets us skip BLAKE3 hashing
     /// on every same-document re-render.
     by_doc_obj: DashMap<(DocId, ObjId), ContentHash>,
+    /// Host RAM demotion target.  Populated when [`Self::evict_to_fit`]
+    /// reclaims a VRAM slab; consulted by [`Self::lookup_by_hash`] on
+    /// a primary miss.
+    host: HostTier,
     budget: VramBudget,
-    /// Monotonic LRU clock.  Incremented on every observable cache event.
+    /// Monotonic LRU clock.  Incremented on every observable cache
+    /// event in either tier.
     tick: AtomicU64,
     /// Sum of `vram_bytes()` over every entry currently held by the
     /// primary index.  Maintained on insert / evict.
     used_bytes: AtomicU64,
     /// Owned CUDA stream for upload work.  Held by `Arc` so per-call
-    /// upload paths can clone cheaply.
+    /// upload paths can clone cheaply, and so the host tier's D2H copy
+    /// can synchronise on it before publishing a demoted entry.
     stream: Arc<CudaStream>,
+    /// CUDA context — needed for `alloc_pinned` during demotion and
+    /// rebuilding `CudaSlice<u8>` during promotion.
+    ctx: Arc<CudaContext>,
 }
 
 /// Bundled arguments for [`DeviceImageCache::insert`].
@@ -293,16 +317,20 @@ pub struct InsertRequest<'a> {
 }
 
 impl DeviceImageCache {
-    /// Build an empty cache bound to a CUDA stream and a VRAM budget.
+    /// Build an empty cache bound to a CUDA stream, a VRAM budget, and
+    /// a host-RAM demotion budget.
     #[must_use]
-    pub fn new(stream: Arc<CudaStream>, budget: VramBudget) -> Self {
+    pub fn new(stream: Arc<CudaStream>, vram: VramBudget, host: HostBudget) -> Self {
+        let ctx = Arc::clone(stream.context());
         Self {
             primary: DashMap::new(),
             by_doc_obj: DashMap::new(),
-            budget,
+            host: HostTier::new(host),
+            budget: vram,
             tick: AtomicU64::new(0),
             used_bytes: AtomicU64::new(0),
             stream,
+            ctx,
         }
     }
 
@@ -337,24 +365,71 @@ impl DeviceImageCache {
         self.budget.vram_bytes
     }
 
-    /// Probe the cache by `(DocId, ObjId)`.  Returns `None` if the alias
-    /// is unknown or its content hash has been evicted from the primary.
-    /// Updates LRU on hit.
+    /// Probe the cache by `(DocId, ObjId)`.  Returns `None` if the
+    /// alias is unknown or its content hash is in neither tier; on a
+    /// host-tier hit, transparently promotes to VRAM (one `PCIe`
+    /// upload).  Updates LRU.
     #[must_use]
     pub fn lookup_by_id(&self, doc: DocId, obj: ObjId) -> Option<Arc<CachedDeviceImage>> {
         let hash = *self.by_doc_obj.get(&(doc, obj))?;
-        let entry = self.primary.get(&hash)?.clone();
-        entry.touch(self.next_tick());
-        Some(entry)
+        self.lookup_by_hash(&hash)
     }
 
-    /// Probe the cache by content hash.  Returns `None` if the entry has
-    /// been evicted.  Updates LRU on hit.
+    /// Probe the cache by content hash.  On a VRAM hit, returns the
+    /// device-resident handle and bumps LRU.  On a VRAM miss, falls
+    /// through to the host tier and promotes back to VRAM (one `PCIe`
+    /// upload).  Returns `None` only if the hash is in neither tier or
+    /// the promotion upload fails.
     #[must_use]
     pub fn lookup_by_hash(&self, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
-        let entry = self.primary.get(hash)?.clone();
-        entry.touch(self.next_tick());
-        Some(entry)
+        if let Some(entry) = self.primary.get(hash) {
+            let entry = entry.clone();
+            entry.touch(self.next_tick());
+            return Some(entry);
+        }
+        self.promote_from_host(hash)
+    }
+
+    /// Lift a host-tier entry back into VRAM and install it in the
+    /// primary index.  Returns `None` if the host tier doesn't have it
+    /// or the upload fails (treated as a cache miss; caller re-decodes).
+    fn promote_from_host(&self, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
+        let host_entry = self.host.lookup(hash, self.next_tick())?;
+        // Upload from the pinned host slice straight to VRAM.  Pinned
+        // memory means the DMA bypasses the kernel page-cache copy.
+        let pixels = host_entry.pinned.as_slice().ok()?;
+        let bytes = pixels.len() as u64;
+        // Make room in the VRAM tier.  If we can't (every entry pinned
+        // by in-flight kernels), fall back to a cache miss; the host
+        // entry stays in place for a future retry.
+        if self.evict_to_fit(bytes).is_err() {
+            return None;
+        }
+        let device_ptr = self
+            .stream
+            .clone_htod(pixels)
+            .map_err(|e| log::warn!("host-tier promotion upload failed: {e}"))
+            .ok()?;
+        let new_entry = Arc::new(CachedDeviceImage {
+            device_ptr,
+            width: host_entry.width,
+            height: host_entry.height,
+            layout: host_entry.layout,
+            last_used: AtomicU64::new(self.next_tick()),
+        });
+        match self.primary.entry(*hash) {
+            Entry::Occupied(occ) => {
+                // Another thread won the same race — return their entry.
+                Some(occ.get().clone())
+            }
+            Entry::Vacant(vac) => {
+                let _ = self
+                    .used_bytes
+                    .fetch_add(new_entry.vram_bytes(), Ordering::Relaxed);
+                let _ = vac.insert(new_entry.clone());
+                Some(new_entry)
+            }
+        }
     }
 
     /// Bind an existing primary entry to a `(DocId, ObjId)` alias.  Used
@@ -489,7 +564,49 @@ impl DeviceImageCache {
         &self.stream
     }
 
+    /// Copy the bytes of an evicted VRAM entry into pinned host memory
+    /// and install in the host tier so a future lookup avoids re-decode.
+    ///
+    /// Skipped when the host tier already holds this hash (re-demoting
+    /// would waste pinned RAM on identical bytes), or when the host
+    /// budget is zero (host tier disabled), or when the D2H copy fails
+    /// (logged; not propagated — demotion is a best-effort optimisation,
+    /// not a correctness requirement).
+    fn demote_to_host(&self, hash: ContentHash, evicted: &Arc<CachedDeviceImage>) {
+        if self.host.budget_bytes() == 0 {
+            return;
+        }
+        if self.host.lookup(&hash, self.next_tick()).is_some() {
+            return;
+        }
+        match HostTier::build_from_device(
+            &self.ctx,
+            &self.stream,
+            &evicted.device_ptr,
+            evicted.width,
+            evicted.height,
+            evicted.layout,
+        ) {
+            Ok(host_entry) => {
+                let _ = self.host.insert(hash, host_entry, self.next_tick());
+            }
+            Err(e) => {
+                log::warn!(
+                    "demotion D2H copy failed (hash={hash:?}, {}×{} {:?}): {e}",
+                    evicted.width,
+                    evicted.height,
+                    evicted.layout,
+                );
+            }
+        }
+    }
+
     /// Evict in LRU order until `needed` bytes of free budget exist.
+    ///
+    /// Each evicted entry is demoted to the host tier (best effort)
+    /// before its device memory is released, so a subsequent lookup
+    /// can DMA back from pinned host RAM rather than re-decode the
+    /// source bytes.
     ///
     /// Returns [`CacheError::OverBudget`] when nothing more is reclaimable
     /// (every entry is pinned by an outstanding `Arc`) or when an
@@ -547,6 +664,11 @@ impl DeviceImageCache {
                     self.used_bytes.load(Ordering::Relaxed),
                 );
                 let _ = self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                // Demote to host RAM if not already cached there.  The
+                // copy runs on `self.stream` and synchronises before
+                // returning, so when `removed` (and its `CudaSlice`)
+                // drops at end of scope the bytes are stable on host.
+                self.demote_to_host(key, &removed);
             }
             // Invite the OS scheduler if budget hasn't moved.  Cheap on x86.
             std::hint::spin_loop();
@@ -612,12 +734,24 @@ mod tests {
 
     /// Build a fresh cache on CUDA device 0 with the given VRAM budget.
     /// Returns `(stream, cache)` so tests that need the stream after the
-    /// cache is built (e.g. for a readback) can use it directly.
+    /// cache is built (e.g. for a readback) can use it directly.  The
+    /// host tier is configured large enough to never evict so each test
+    /// can isolate the behaviour under inspection; tests that exercise
+    /// the host tier explicitly use `mk_cache_with_host`.
     #[cfg(feature = "gpu-validation")]
     fn mk_cache(vram_bytes: u64) -> (Arc<CudaStream>, DeviceImageCache) {
+        mk_cache_with_host(vram_bytes, /* host */ 1 << 24)
+    }
+
+    #[cfg(feature = "gpu-validation")]
+    fn mk_cache_with_host(vram_bytes: u64, host_bytes: u64) -> (Arc<CudaStream>, DeviceImageCache) {
         let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA device 0");
         let stream = ctx.default_stream();
-        let cache = DeviceImageCache::new(Arc::clone(&stream), VramBudget { vram_bytes });
+        let cache = DeviceImageCache::new(
+            Arc::clone(&stream),
+            VramBudget { vram_bytes },
+            HostBudget { host_bytes },
+        );
         (stream, cache)
     }
 
@@ -711,8 +845,10 @@ mod tests {
     #[cfg(feature = "gpu-validation")]
     #[test]
     fn lru_evicts_oldest_unpinned_entry() {
-        // Budget for two 256-byte entries but not three.
-        let (_stream, cache) = mk_cache(600);
+        // Budget for two 256-byte entries but not three.  Host tier
+        // disabled so an evicted entry truly disappears (otherwise the
+        // demote-then-promote machinery would resurrect it on lookup).
+        let (_stream, cache) = mk_cache_with_host(600, /* host */ 0);
 
         let make_pixels = |fill: u8| -> Vec<u8> { vec![fill; 256] };
 
@@ -844,6 +980,67 @@ mod tests {
             (len as u64) * (PIXEL_BYTES as u64),
             "used_bytes drifted: {} B for {len} entries × {PIXEL_BYTES} B",
             cache.used_bytes(),
+        );
+    }
+
+    /// End-to-end host tier round trip: insert entry A, evict it by
+    /// inserting B, then look up A again — it must come back via the
+    /// host tier's promotion path with bit-identical bytes.
+    #[cfg(feature = "gpu-validation")]
+    #[test]
+    fn evicted_vram_entry_promotes_back_from_host() {
+        // Budget for exactly one 768-byte (16×16×3) RGB entry.  Host
+        // tier large enough to hold the demoted copy.
+        let (stream, cache) = mk_cache_with_host(/* vram */ 1000, /* host */ 1 << 20);
+
+        let pixels_a: Vec<u8> = (0_i32..16 * 16 * 3)
+            .map(|i| u8::try_from((i * 7) % 256).expect("fits u8"))
+            .collect();
+        let pixels_b = vec![0xCDu8; 16 * 16 * 3];
+        let h_a = DeviceImageCache::hash_bytes(&pixels_a);
+        let h_b = DeviceImageCache::hash_bytes(&pixels_b);
+
+        // Insert A and drop the local Arc so eviction can reclaim it.
+        let entry_a = cache
+            .insert(req(1, h_a, ImageLayout::Rgb, &pixels_a))
+            .expect("insert a");
+        let device_ptr_before = Arc::as_ptr(&entry_a);
+        drop(entry_a);
+
+        // Insert B — must evict A and demote it to the host tier.
+        let entry_b = cache
+            .insert(req(2, h_b, ImageLayout::Rgb, &pixels_b))
+            .expect("insert b");
+
+        // Host tier should now have A.
+        assert_eq!(
+            cache.host.len(),
+            1,
+            "host tier should hold the demoted A; got {} entries",
+            cache.host.len(),
+        );
+
+        // Drop B so the upcoming promote-of-A has room in VRAM (the
+        // budget is one-entry-wide; promoting A while B is pinned would
+        // legitimately fail with OverBudget).
+        drop(entry_b);
+
+        // Look up A — promotion from host should succeed and the
+        // returned bytes must match the original pixels exactly.
+        let entry_a_promoted = cache.lookup_by_hash(&h_a).expect("promote hit");
+        let device_ptr_after = Arc::as_ptr(&entry_a_promoted);
+        assert_ne!(
+            device_ptr_before, device_ptr_after,
+            "promotion should produce a fresh CachedDeviceImage Arc",
+        );
+        let mut readback = vec![0u8; pixels_a.len()];
+        stream
+            .memcpy_dtoh(&entry_a_promoted.device_ptr, &mut readback)
+            .expect("dtoh");
+        stream.synchronize().expect("sync");
+        assert_eq!(
+            readback, pixels_a,
+            "promoted bytes must match the originally inserted pixels",
         );
     }
 }
