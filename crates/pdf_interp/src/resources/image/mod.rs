@@ -414,14 +414,7 @@ pub fn resolve_image(
         }
         Some("DCTDecode") => {
             #[cfg(feature = "cache")]
-            let cache_ctx = match (image_cache, doc_id) {
-                (Some(cache), Some(doc_id)) => Some(codecs::DctCacheCtx {
-                    cache,
-                    doc_id,
-                    obj_id: gpu::cache::ObjId(stream_id.0),
-                }),
-                _ => None,
-            };
+            let cache_ctx = codecs::DctCacheCtx::from_resources(image_cache, doc_id, stream_id);
             decode_dct(
                 stream.content.as_slice(),
                 w,

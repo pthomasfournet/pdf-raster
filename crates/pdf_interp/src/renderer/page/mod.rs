@@ -234,22 +234,33 @@ pub struct PageRenderer<'doc> {
     /// common case in press PDFs) only pay the bake cost once per page.
     #[cfg(feature = "gpu-icc")]
     icc_clut_cache: crate::resources::image::IccClutCache,
-    /// Phase 9 device-resident image cache.  When `Some`, JPEG decode
-    /// goes through the cache and produces `ImageData::Gpu` handles
-    /// the renderer dispatches to the GPU blit kernel; when `None`,
-    /// the renderer is fully CPU-resident.
+    /// Phase 9 cache state.  `Some` only when the `cache` feature is
+    /// on AND a cache was wired in via [`Self::set_image_cache`];
+    /// `None` keeps the renderer fully CPU-resident.
     #[cfg(feature = "cache")]
-    image_cache: Option<Arc<DeviceImageCache>>,
+    cache_state: Option<CacheState>,
+}
+
+/// Phase 9 renderer-side state bundled together so the "cache wired
+/// in" condition is a single `Option<CacheState>` rather than three
+/// implicit invariants on separate fields.
+///
+/// Without this bundling, `doc_id: DocId` had to default to
+/// `DocId([0u8; 32])` — a valid hash that would collide with anyone
+/// using the all-zeros doc id, a sharp foot-gun.
+#[cfg(feature = "cache")]
+struct CacheState {
+    /// Phase 9 device-resident image cache.  Shared across pages so
+    /// content-hash dedup spans the whole render session.
+    cache: Arc<DeviceImageCache>,
     /// Stable identifier for the source PDF — combined with the
     /// per-image PDF object id, forms the cache's `(DocId, ObjId)`
     /// alias key for fast same-document lookups.
-    #[cfg(feature = "cache")]
     doc_id: DocId,
     /// Lazy-allocated device-resident page buffer.  `None` until the
     /// first GPU image blit allocates it; non-None pages download +
-    /// alpha-composite onto `bitmap` at [`Self::finish`].
-    #[cfg(feature = "cache")]
-    device_page_buffer: Option<DevicePageBuffer>,
+    /// alpha-composite onto `bitmap` at `PageRenderer::finish`.
+    page_buffer: Option<DevicePageBuffer>,
 }
 
 impl<'doc> PageRenderer<'doc> {
@@ -348,11 +359,7 @@ impl<'doc> PageRenderer<'doc> {
             #[cfg(feature = "gpu-icc")]
             icc_clut_cache: crate::resources::image::IccClutCache::new(),
             #[cfg(feature = "cache")]
-            image_cache: None,
-            #[cfg(feature = "cache")]
-            doc_id: DocId([0u8; 32]),
-            #[cfg(feature = "cache")]
-            device_page_buffer: None,
+            cache_state: None,
         })
     }
 
@@ -444,13 +451,19 @@ impl<'doc> PageRenderer<'doc> {
     /// secondary alias key for fast same-document lookups.
     ///
     /// Call with `None` to revert to CPU-only image decode.
+    ///
+    /// **Caller contract:** call before any rendering operators
+    /// execute on this renderer.  Wiring or unwiring a cache
+    /// mid-page would discard any GPU-blit pixels written so far
+    /// (the per-page `DevicePageBuffer` is dropped on reset);
+    /// today no caller does this.
     #[cfg(feature = "cache")]
     pub fn set_image_cache(&mut self, cache: Option<Arc<DeviceImageCache>>, doc_id: DocId) {
-        self.image_cache = cache;
-        self.doc_id = doc_id;
-        // Reset the per-page buffer if a new cache is wired in
-        // mid-page; the next GPU image blit will lazy-allocate.
-        self.device_page_buffer = None;
+        self.cache_state = cache.map(|cache| CacheState {
+            cache,
+            doc_id,
+            page_buffer: None,
+        });
     }
 
     /// Consume the renderer and return the finished bitmap and page diagnostics.
@@ -480,7 +493,11 @@ impl<'doc> PageRenderer<'doc> {
         // didn't write read back as alpha=0 → no-op for the
         // composite, leaving the CPU-rasterised content untouched.
         #[cfg(feature = "cache")]
-        if let Some(buf) = self.device_page_buffer.take() {
+        if let Some(buf) = self
+            .cache_state
+            .as_mut()
+            .and_then(|cs| cs.page_buffer.take())
+        {
             self.composite_device_page_buffer(&buf);
         }
 
@@ -505,10 +522,24 @@ impl<'doc> PageRenderer<'doc> {
                 return;
             }
         };
-        let dst = self.bitmap.data_mut();
         let dst_stride = self.width as usize * 3;
         let src_stride = self.width as usize * RGBA_BPP;
-        debug_assert_eq!(host_rgba.len(), src_stride * self.height as usize);
+        // Sanity: degrade gracefully on a dimension mismatch rather
+        // than panic-aborting on slice-out-of-bounds in release.
+        // Today only `try_gpu_blit_image` constructs `buf` (with
+        // `self.width` / `self.height`), so a mismatch indicates a
+        // future bug — log loudly and skip the composite.
+        let expected = src_stride * self.height as usize;
+        if host_rgba.len() != expected {
+            log::warn!(
+                "finish: device page buffer size {} != expected {expected} ({}×{}×{RGBA_BPP}); skipping composite",
+                host_rgba.len(),
+                self.width,
+                self.height,
+            );
+            return;
+        }
+        let dst = self.bitmap.data_mut();
         for y in 0..self.height as usize {
             let src_row = &host_rgba[y * src_stride..(y + 1) * src_stride];
             let dst_row = &mut dst[y * dst_stride..(y + 1) * dst_stride];
@@ -844,9 +875,9 @@ impl<'doc> PageRenderer<'doc> {
             #[cfg(feature = "gpu-icc")]
             Some(&mut self.icc_clut_cache),
             #[cfg(feature = "cache")]
-            self.image_cache.as_ref(),
+            self.cache_state.as_ref().map(|cs| &cs.cache),
             #[cfg(feature = "cache")]
-            Some(self.doc_id),
+            self.cache_state.as_ref().map(|cs| cs.doc_id),
         );
         if let Some(img) = img {
             self.blit_image(&img);
@@ -1407,6 +1438,14 @@ impl<'doc> PageRenderer<'doc> {
         clippy::similar_names,
         reason = "page_w_i / page_h_i are paired width/height constants — renaming would obscure the symmetry"
     )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "device pixel coords floor/ceil to i32 cleanly within page bounds (max ~64K at 600 DPI fits losslessly)"
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "self.width/height are PDF page dims well below i32::MAX"
+    )]
     fn try_gpu_blit_image(
         &mut self,
         cached: &Arc<gpu::cache::CachedDeviceImage>,
@@ -1419,11 +1458,26 @@ impl<'doc> PageRenderer<'doc> {
             log::debug!("blit_image: GPU image blit skipped — no GpuCtx attached");
             return false;
         };
-        let Some(image_cache) = self.image_cache.as_ref() else {
+        let Some(cache_state) = self.cache_state.as_mut() else {
             // Shouldn't happen: ImageData::Gpu only originates from a
             // wired-in cache.  Defensive check; cheap.
             return false;
         };
+        let image_cache = &cache_state.cache;
+        // Stream-identity invariant: the cache uploads `cached`'s
+        // device memory on its own stream; the blit kernel below
+        // launches on `gpu_ctx`'s stream; the page buffer's
+        // `download()` syncs the page buffer's stream.  All three
+        // must be the *same* stream — otherwise the kernel could
+        // read pre-DMA bytes or `download()` could miss writes.
+        // `open_session` constructs the cache from `gpu_ctx.stream()`
+        // so this holds today; the assert future-proofs against a
+        // refactor that introduces per-worker streams without
+        // updating the cache + page buffer plumbing.
+        debug_assert!(
+            Arc::ptr_eq(gpu_ctx.stream(), image_cache.stream_arc()),
+            "GpuCtx stream and DeviceImageCache stream diverged — cache upload, blit kernel, and page-buffer download must share one stream",
+        );
         let Some(inv_ctm) = InverseCtm::from_ctm(*ctm) else {
             log::debug!("blit_image: GPU image blit skipped — singular CTM");
             return false;
@@ -1443,12 +1497,7 @@ impl<'doc> PageRenderer<'doc> {
         {
             return false;
         }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "device pixel coords floor/ceil to i32 cleanly within page bounds (max ~64K at 600 DPI)"
-        )]
         let dx0 = x00.min(x10).min(x01).min(x11).floor() as i32;
-        #[expect(clippy::cast_possible_truncation, reason = "see dx0")]
         let dx1 = x00.max(x10).max(x01).max(x11).ceil() as i32;
         let dy_pdf_min = (page_h - y00)
             .min(page_h - y10)
@@ -1458,20 +1507,13 @@ impl<'doc> PageRenderer<'doc> {
             .max(page_h - y10)
             .max(page_h - y01)
             .max(page_h - y11);
-        #[expect(clippy::cast_possible_truncation, reason = "see dx0")]
         let dy0 = dy_pdf_min.floor() as i32;
-        #[expect(clippy::cast_possible_truncation, reason = "see dx0")]
         let dy1 = dy_pdf_max.ceil() as i32;
 
         // Clamp to page bounds for kernel efficiency (the kernel
         // also guards each thread, but skipping out-of-page tiles is
         // cheaper than launching them).
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "self.width/height are PDF page dims well below i32::MAX"
-        )]
         let page_w_i = self.width as i32;
-        #[expect(clippy::cast_possible_wrap, reason = "see page_w_i")]
         let page_h_i = self.height as i32;
         let bbox = BlitBbox {
             x0: dx0.max(0),
@@ -1482,17 +1524,17 @@ impl<'doc> PageRenderer<'doc> {
 
         // Lazy-allocate the per-page device buffer on first GPU
         // image; subsequent images on the same page reuse it.
-        if self.device_page_buffer.is_none() {
+        if cache_state.page_buffer.is_none() {
             let stream = Arc::clone(image_cache.stream_arc());
             match DevicePageBuffer::new(stream, self.width, self.height) {
-                Ok(buf) => self.device_page_buffer = Some(buf),
+                Ok(buf) => cache_state.page_buffer = Some(buf),
                 Err(e) => {
                     log::warn!("blit_image: DevicePageBuffer alloc failed: {e}");
                     return false;
                 }
             }
         }
-        let Some(buf) = self.device_page_buffer.as_mut() else {
+        let Some(buf) = cache_state.page_buffer.as_mut() else {
             return false;
         };
 

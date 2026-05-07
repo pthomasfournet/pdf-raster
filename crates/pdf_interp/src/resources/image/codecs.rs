@@ -14,8 +14,8 @@ use crate::resources::dict_ext::DictExt;
 
 #[cfg(feature = "cache")]
 use gpu::cache::{
-    CachedDeviceImage, DeviceImageCache, DocId, ImageLayout as CacheImageLayout, InsertRequest,
-    ObjId,
+    CachedDeviceImage, ContentHash, DeviceImageCache, DocId, ImageLayout as CacheImageLayout,
+    InsertRequest, ObjId,
 };
 #[cfg(feature = "cache")]
 use std::sync::Arc;
@@ -436,12 +436,18 @@ pub(super) fn decode_dct(
     // Phase 9 cache fast path: if a cache is wired in and the encoded
     // bytes are already cached (cross-document content-hash dedup),
     // return the device-resident handle with zero CPU decode work.
+    // On miss, retain the precomputed BLAKE3 hash so the post-decode
+    // insert at the bottom of this function doesn't re-hash the same
+    // bytes — that would double the per-image hashing cost on cold
+    // misses (~250 µs per 500 KB JPEG → ~250 ms per 1000-image render).
     #[cfg(feature = "cache")]
-    if let Some(ctx) = cache_ctx
-        && let Some(img) = try_decode_dct_cached_lookup(data, pdf_w, pdf_h, ctx)
-    {
-        return Some(img);
-    }
+    let cache_miss_hash: Option<ContentHash> = match cache_ctx {
+        Some(ctx) => match try_decode_dct_cached_lookup(data, pdf_w, pdf_h, ctx) {
+            Ok(img) => return Some(img),
+            Err(hash) => Some(hash),
+        },
+        None => None,
+    };
 
     #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
     let area = pdf_w.saturating_mul(pdf_h);
@@ -565,7 +571,7 @@ pub(super) fn decode_dct(
             color_space: ImageColorSpace::Gray,
             data: ImageData::Cpu(pixels),
             smask: None,
-            filter: ImageFilter::Raw,
+            filter: ImageFilter::Dct,
         },
         ZColorSpace::RGB => ImageDescriptor {
             width: jw,
@@ -573,7 +579,7 @@ pub(super) fn decode_dct(
             color_space: ImageColorSpace::Rgb,
             data: ImageData::Cpu(pixels),
             smask: None,
-            filter: ImageFilter::Raw,
+            filter: ImageFilter::Dct,
         },
         ZColorSpace::CMYK => {
             // JPEG CMYK stores inverted ink densities (0 = full ink, 255 = no ink).
@@ -596,7 +602,7 @@ pub(super) fn decode_dct(
                 color_space: ImageColorSpace::Rgb,
                 data: ImageData::Cpu(rgb),
                 smask: None,
-                filter: ImageFilter::Raw,
+                filter: ImageFilter::Dct,
             }
         }
         // out_cs is always Luma, RGB, or CMYK — set from the components match above.
@@ -605,10 +611,11 @@ pub(super) fn decode_dct(
 
     // Phase 9: insert into the cache so the next render of this PDF
     // (or a different PDF with the same image content) hits the
-    // device-resident fast path instead of decoding again.
+    // device-resident fast path instead of decoding again.  Reuse
+    // the hash from the lookup-miss path to skip a second BLAKE3.
     #[cfg(feature = "cache")]
-    if let Some(ctx) = cache_ctx {
-        return Some(try_decode_dct_cached_insert(cpu_desc, data, ctx));
+    if let (Some(ctx), Some(hash)) = (cache_ctx, cache_miss_hash) {
+        return Some(try_decode_dct_cached_insert(cpu_desc, hash, ctx));
     }
     Some(cpu_desc)
 }
@@ -628,16 +635,45 @@ pub(super) struct DctCacheCtx<'a> {
     pub obj_id: ObjId,
 }
 
-/// Probe the cache by content hash before any CPU decode work.
-/// Returns the device-resident `ImageDescriptor` on hit, `None` on
-/// miss (caller falls through to decode + insert).
+#[cfg(feature = "cache")]
+impl<'a> DctCacheCtx<'a> {
+    /// Build the cache context from the renderer's cache reference,
+    /// the document id, and the PDF object id of the image stream.
+    ///
+    /// Returns `None` when either the cache is absent or the `doc_id`
+    /// is absent — in that case `decode_dct` skips both the lookup
+    /// fast path and the post-decode insert.
+    ///
+    /// The `(u32, u16)` PDF `ObjectId` is mapped to `u32` by dropping
+    /// the generation.  See [`gpu::cache::ObjId`] for the lossy-
+    /// mapping rationale.
+    pub(super) fn from_resources(
+        cache: Option<&'a Arc<DeviceImageCache>>,
+        doc_id: Option<DocId>,
+        stream_id: pdf::ObjectId,
+    ) -> Option<Self> {
+        let cache = cache?;
+        let doc_id = doc_id?;
+        Some(Self {
+            cache,
+            doc_id,
+            obj_id: ObjId(stream_id.0),
+        })
+    }
+}
+
+/// Probe the cache.  On a hit returns the device-resident
+/// `ImageDescriptor`; on a miss returns `Err(ContentHash)` so the
+/// caller can pass the already-computed hash to
+/// [`try_decode_dct_cached_insert`] and avoid re-hashing the same
+/// bytes after CPU decode.
 #[cfg(feature = "cache")]
 fn try_decode_dct_cached_lookup(
     data: &[u8],
     pdf_w: u32,
     pdf_h: u32,
     ctx: &DctCacheCtx<'_>,
-) -> Option<ImageDescriptor> {
+) -> Result<ImageDescriptor, ContentHash> {
     // Same-document fast path: alias by (DocId, ObjId) skips BLAKE3 hashing.
     if let Some(cached) = ctx.cache.lookup_by_id(ctx.doc_id, ctx.obj_id) {
         log::debug!(
@@ -645,27 +681,30 @@ fn try_decode_dct_cached_lookup(
             ctx.doc_id,
             ctx.obj_id,
         );
-        return Some(image_descriptor_from_cached(cached, pdf_w, pdf_h));
+        return Ok(image_descriptor_from_cached(cached, pdf_w, pdf_h));
     }
-    // Cross-document content-hash probe.
+    // Cross-document content-hash probe.  Hash once; reuse on miss.
     let hash = DeviceImageCache::hash_bytes(data);
     if let Some(cached) = ctx.cache.lookup_by_hash(&hash) {
-        // Bind the alias for next time.
         ctx.cache.alias(ctx.doc_id, ctx.obj_id, hash);
         log::debug!("decode_dct: cache hit by content hash; alias rebound");
-        return Some(image_descriptor_from_cached(cached, pdf_w, pdf_h));
+        return Ok(image_descriptor_from_cached(cached, pdf_w, pdf_h));
     }
-    None
+    Err(hash)
 }
 
 /// Wrap a freshly-decoded JPEG into the cache, returning a
 /// device-resident `ImageDescriptor`.  Skipped (returns the
 /// caller's CPU descriptor) on insert error so the renderer
 /// still gets pixels — typically a budget violation; not fatal.
+///
+/// `hash` should be the value returned from
+/// [`try_decode_dct_cached_lookup`]'s `Err` arm; reusing it avoids
+/// hashing the same bytes a second time.
 #[cfg(feature = "cache")]
 fn try_decode_dct_cached_insert(
     cpu_desc: ImageDescriptor,
-    data: &[u8],
+    hash: ContentHash,
     ctx: &DctCacheCtx<'_>,
 ) -> ImageDescriptor {
     // Only cache RGB / Gray output (the layouts the blit kernel
@@ -678,7 +717,6 @@ fn try_decode_dct_cached_insert(
     let Some(pixels) = cpu_desc.data.as_cpu() else {
         return cpu_desc;
     };
-    let hash = DeviceImageCache::hash_bytes(data);
     let req = InsertRequest {
         doc: ctx.doc_id,
         obj: ctx.obj_id,
