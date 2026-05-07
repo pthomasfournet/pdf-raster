@@ -125,6 +125,48 @@ preflight() {
   log "Pre-flight OK"
 }
 
+# ─── Build phase ──────────────────────────────────────────────────────────────
+# For each mode, build pdf-raster with that mode's feature set and copy the
+# resulting binary to target/release/pdf-raster-<mode>. Skips a build if the
+# named binary already exists and --force was not passed.
+build_one() {
+  local mode="$1"
+  local features="${MODE_FEATURES[$mode]}"
+  local out="target/release/pdf-raster-$mode"
+
+  if [[ -x "$out" && $FORCE -eq 0 ]]; then
+    log "build[$mode]: $out already present (use --force to rebuild)"
+    return 0
+  fi
+
+  log "build[$mode]: features='$features'"
+  local cargo_args=(build --release -p pdf-raster)
+  if [[ -n "$features" ]]; then
+    cargo_args+=(--features "$features")
+  fi
+
+  RUSTFLAGS="-C target-cpu=native" cargo "${cargo_args[@]}"
+  cp -f target/release/pdf-raster "$out"
+  log "build[$mode]: copied to $out"
+}
+
+builds() {
+  log "Build phase"
+  for mode in "${MODES[@]}"; do
+    if [[ "$mode" == "vaapi" && $SKIP_VAAPI -eq 1 ]]; then
+      log "build[$mode]: SKIP (VA-API unavailable)"
+      continue
+    fi
+    if [[ ("$mode" == "nvjpeg" || "$mode" == "full") && $SKIP_NVJPEG -eq 1 ]]; then
+      log "build[$mode]: SKIP (NVIDIA GPU unavailable)"
+      continue
+    fi
+    build_one "$mode"
+  done
+  log "Build phase OK"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 preflight
-log "Pre-flight only mode (build/bench phases not yet implemented)"
+builds
+log "Build phase complete; bench phase not yet implemented"
