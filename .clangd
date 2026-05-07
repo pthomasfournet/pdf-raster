@@ -1,0 +1,43 @@
+# clangd configuration for the pdf-raster CUDA kernels.
+#
+# The kernels live in crates/gpu/kernels/*.cu and are compiled to PTX by
+# nvcc at build time (see crates/gpu/build.rs).  clangd uses the same
+# `compile_commands.json` clangd would normally consume from a CMake
+# project, manually written here because Cargo doesn't emit one.
+#
+# Reference: https://clangd.llvm.org/config
+
+CompileFlags:
+  # clangd's CUDA mode prints "missing __device__ qualifier" warnings on
+  # any host header included by a `.cu` file.  Suppress: we only edit the
+  # device-side kernels here; nvcc handles the host/device boundary.
+  Add:
+    - -Wno-unknown-cuda-version
+    - -Wno-unused-parameter
+    - -Wno-unused-variable
+  # Drop the -nocudalib/-nocudainc flags clangd doesn't understand cleanly;
+  # clangd derives the system include path from --cuda-path itself.
+  Remove:
+    - -nocudalib
+    - -nocudainc
+
+# Index everything under crates/gpu/kernels/ — small and infrequently changed.
+Index:
+  Background: Build
+
+# Diagnostics: surface CUDA-specific warnings as info, but don't promote
+# nvcc-specific syntax (which clangd's CUDA frontend parses as if it were
+# clang-CUDA) into errors.
+Diagnostics:
+  Suppress:
+    # "no matching function for call to '__shfl_sync'" etc. — clangd's view
+    # of warp-intrinsic signatures differs from nvcc's; both compile fine.
+    - no_matching_function
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - performance-*
+      - readability-braces-around-statements
+    Remove:
+      - bugprone-easily-swappable-parameters
+      - readability-magic-numbers

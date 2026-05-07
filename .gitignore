@@ -30,6 +30,12 @@ Thumbs.db
 *.pfx
 secrets/
 
+# ── clangd ────────────────────────────────────────────────────────────────────
+# .clangd is a tracked project config; compile_commands.json embeds absolute
+# paths from the local install (CUDA_PATH, etc.) so it stays per-machine.
+compile_commands.json
+.cache/
+
 # ── AI assistant / plugin files ────────────────────────────────────────────────
 .claude/
 .serena/
