@@ -500,8 +500,9 @@ mod tests {
         for w in recs.windows(2) {
             assert!(w[0].key <= w[1].key, "records must be sorted by key");
         }
-        let tile_01 = 0 * grid_w as usize + 1;
-        let tile_10 = 1 * grid_w as usize + 0;
+        let grid_w_us = grid_w as usize;
+        let tile_01 = 1; // (tile_y=0, tile_x=1)
+        let tile_10 = grid_w_us; // (tile_y=1, tile_x=0)
         assert_eq!(counts[tile_01], 1);
         assert_eq!(counts[tile_10], 1);
         let _ = starts;

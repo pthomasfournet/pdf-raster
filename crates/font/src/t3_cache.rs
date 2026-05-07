@@ -73,9 +73,10 @@ impl Type3Cache {
 
     /// Insert a bitmap into the cache for `(char_code, x_frac)`.
     ///
-    /// If the cache is full the LRU entry is evicted.  If an entry with the
-    /// same key already exists it is overwritten (the caller is responsible
-    /// for not inserting duplicates; use [`Self::get`] first).
+    /// If the cache is full the LRU entry is evicted.  The caller is
+    /// responsible for not inserting duplicate keys (call [`Self::get`]
+    /// first); inserting a duplicate while below capacity creates a second
+    /// entry rather than overwriting.
     pub fn insert(&mut self, char_code: u32, x_frac: u8, bitmap: GlyphBitmap) {
         self.counter = self.counter.wrapping_add(1);
         let slot = Slot {
@@ -88,7 +89,9 @@ impl Type3Cache {
         if self.slots.len() < CACHE_SIZE {
             self.slots.push(slot);
         } else {
-            // Evict the LRU entry (lowest mru counter).
+            // Evict the LRU entry (lowest mru counter).  `slots` is non-empty
+            // here (len == CACHE_SIZE > 0), so `min_by_key` returns `Some`;
+            // the `0` fallback is unreachable.
             let lru_idx = self
                 .slots
                 .iter()

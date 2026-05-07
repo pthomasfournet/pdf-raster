@@ -95,7 +95,7 @@ impl TransferLut {
     /// callers that want per-channel application must stride through the slice
     /// themselves.
     pub fn apply_row(&self, row: &mut [u8]) {
-        for b in row.iter_mut() {
+        for b in &mut *row {
             *b = self.apply(*b);
         }
     }
@@ -107,17 +107,12 @@ impl TransferLut {
     ///
     /// # Index safety
     ///
-    /// The enumeration index `i` comes from `0..256` (the length of the output
+    /// The closure index `i` comes from `0..256` (the length of the output
     /// array), so `255 - i` is always in `0..=255` — always a valid index into
     /// the 256-entry `self.0` array.
     #[must_use]
     pub fn invert_complement(&self) -> Self {
-        let mut out = [0u8; 256];
-        for (i, v) in out.iter_mut().enumerate() {
-            // i ∈ 0..=255  →  255 - i ∈ 0..=255: always a valid index.
-            *v = 255 - self.0[255 - i];
-        }
-        Self(out)
+        Self(std::array::from_fn(|i| 255 - self.0[255 - i]))
     }
 
     /// Return a reference to the raw 256-entry array.
@@ -157,12 +152,7 @@ impl TransferLut {
     /// ```
     #[must_use]
     pub fn compose(&self, other: &Self) -> Self {
-        let mut out = [0u8; 256];
-        for (i, v) in out.iter_mut().enumerate() {
-            // i ∈ 0..=255: safe index into self.0.
-            *v = other.apply(self.0[i]);
-        }
-        Self(out)
+        Self(std::array::from_fn(|i| other.apply(self.0[i])))
     }
 
     /// Compose a slice of LUTs left-to-right, starting from the identity.
@@ -172,11 +162,8 @@ impl TransferLut {
     /// [`IDENTITY`](Self::IDENTITY).
     #[must_use]
     pub fn compose_many(luts: &[&Self]) -> Self {
-        let mut acc = Self::IDENTITY;
-        for lut in luts {
-            acc = acc.compose(lut);
-        }
-        acc
+        luts.iter()
+            .fold(Self::IDENTITY, |acc, lut| acc.compose(lut))
     }
 }
 

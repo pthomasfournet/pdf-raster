@@ -390,7 +390,7 @@ fn render_page_rgb_with_geom(
 /// returned as `RasterError::BackendUnavailable` rather than silently falling back.
 #[cfg_attr(
     not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
-    allow(
+    expect(
         clippy::unnecessary_wraps,
         clippy::missing_const_for_fn,
         reason = "return type and body vary with GPU feature flags"
@@ -401,8 +401,7 @@ fn lend_decoders(
     renderer: &mut pdf_interp::renderer::PageRenderer,
     effective_policy: BackendPolicy,
 ) -> Result<(), RasterError> {
-    let policy = effective_policy;
-    if matches!(policy, BackendPolicy::CpuOnly) {
+    if matches!(effective_policy, BackendPolicy::CpuOnly) {
         return Ok(());
     }
     // `session` and `renderer` are used inside `#[cfg]`-gated blocks below;
@@ -413,8 +412,8 @@ fn lend_decoders(
     let _ = renderer;
 
     #[cfg(feature = "nvjpeg")]
-    if !matches!(policy, BackendPolicy::ForceVaapi) {
-        gpu_init::ensure_nvjpeg(policy).map_err(RasterError::BackendUnavailable)?;
+    if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
+        gpu_init::ensure_nvjpeg(effective_policy).map_err(RasterError::BackendUnavailable)?;
         gpu_init::NVJPEG_DEC.with(|cell| {
             if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
                 renderer.set_nvjpeg(slot.take());
@@ -423,8 +422,8 @@ fn lend_decoders(
     }
 
     #[cfg(feature = "nvjpeg2k")]
-    if !matches!(policy, BackendPolicy::ForceVaapi) {
-        gpu_init::ensure_nvjpeg2k(policy).map_err(RasterError::BackendUnavailable)?;
+    if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
+        gpu_init::ensure_nvjpeg2k(effective_policy).map_err(RasterError::BackendUnavailable)?;
         gpu_init::NVJPEG2K_DEC.with(|cell| {
             if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
                 renderer.set_nvjpeg2k(slot.take());
@@ -546,36 +545,32 @@ impl Iterator for PageIter {
     type Item = (u32, Result<RenderedPage, RasterError>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.state.as_mut()? {
-            Err(_) => {
-                let Err(e) = self.state.take()? else {
-                    unreachable!("matched Err arm above")
-                };
-                Some((1, Err(e)))
+        // Surface a deferred validation/open error exactly once, then close.
+        if self.state.as_ref()?.is_err() {
+            let err = self.state.take()?.err()?;
+            return Some((1, Err(err)));
+        }
+
+        let state = self.state.as_mut()?.as_mut().ok()?;
+        let window = page_window(&state.opts);
+        loop {
+            if state.current_page > *window.end() || state.current_page > state.session.total_pages
+            {
+                self.state = None;
+                return None;
             }
-            Ok(state) => {
-                let window = page_window(&state.opts);
-                loop {
-                    if state.current_page > *window.end()
-                        || state.current_page > state.session.total_pages
-                    {
-                        self.state = None;
-                        return None;
-                    }
 
-                    let page_num = state.current_page;
-                    // Saturate rather than wrap: u32::MAX is a legal page number
-                    // in a PageSet, so a plain `+= 1` would overflow to 0 and
-                    // loop forever on the next iteration.
-                    state.current_page = state.current_page.saturating_add(1);
+            let page_num = state.current_page;
+            // Saturate rather than wrap: u32::MAX is a legal page number
+            // in a PageSet, so a plain `+= 1` would overflow to 0 and
+            // loop forever on the next iteration.
+            state.current_page = state.current_page.saturating_add(1);
 
-                    if !should_render(&state.opts, page_num) {
-                        continue;
-                    }
-
-                    return Some((page_num, render_one(state, page_num)));
-                }
+            if !should_render(&state.opts, page_num) {
+                continue;
             }
+
+            return Some((page_num, render_one(state, page_num)));
         }
     }
 }
@@ -598,8 +593,8 @@ pub fn render_channel(
         return rx;
     }
 
-    let path_owned: std::path::PathBuf = path.to_owned();
-    let opts_owned: RasterOptions = opts.clone();
+    let path_owned = path.to_owned();
+    let opts_owned = opts.clone();
 
     rayon::spawn(move || {
         let session = match open_session(&path_owned, &SessionConfig::default()) {

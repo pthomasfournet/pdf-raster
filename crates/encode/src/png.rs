@@ -44,10 +44,8 @@ pub fn write_png<P: Pixel, W: Write>(bitmap: &Bitmap<P>, out: W) -> Result<(), E
     match P::MODE {
         PixelMode::Rgb8 => write_png_rgb(bitmap, out),
         PixelMode::Mono8 => write_png_gray(bitmap, out),
-        PixelMode::Xbgr8 => {
-            // Rgba8 is stored as Xbgr8 in the Pixel trait implementation.
-            write_png_rgba(bitmap, out)
-        }
+        // Rgba8 is stored as Xbgr8 in the Pixel trait implementation.
+        PixelMode::Xbgr8 => write_png_rgba(bitmap, out),
         PixelMode::Bgr8 | PixelMode::Cmyk8 | PixelMode::DeviceN8 | PixelMode::Mono1 => {
             Err(EncodeError::UnsupportedMode(
                 "unsupported mode for PNG: convert to Rgb8/Gray8/Rgba8 first",

@@ -1,8 +1,4 @@
 //! Per-thread GPU decoder lifecycle: init, lend-to-renderer, reclaim, release.
-// `pub(crate)` items inside a `pub(crate)` module trigger clippy::redundant_pub_crate
-// when nursery lints are enabled, but the explicitness aids readability in a module
-// that is only conditionally compiled and accessed from a single call site.
-#![allow(clippy::redundant_pub_crate)]
 //!
 //! nvJPEG and nvJPEG2000 decoders are held in per-thread `thread_local!` slots
 //! so each Rayon worker gets its own instance without locking on the hot path.

@@ -304,15 +304,7 @@ impl GraphicsState {
                 TransferLut::IDENTITY,
                 TransferLut::IDENTITY,
             ],
-            device_n_transfer: (0..SPOT_NCOMPS + 4)
-                .map(|_| {
-                    let mut lut = [0u8; 256];
-                    for (i, v) in lut.iter_mut().enumerate() {
-                        *v = u8::try_from(i).unwrap_or(255);
-                    }
-                    lut
-                })
-                .collect(),
+            device_n_transfer: vec![TransferLut::IDENTITY.0; SPOT_NCOMPS + 4],
             overprint_mask: 0xFFFF_FFFF,
             flags: StateFlags::default(),
         }
@@ -360,20 +352,18 @@ impl GraphicsState {
             cy[i] = 255 - self.rgb_transfer[2].0[255 - i]; // Y ← invert_complement(B)
             ck[i] = 255 - self.gray_transfer.0[255 - i]; // K ← invert_complement(gray)
         }
+        // DeviceN channels 0–3 mirror CMYK C/M/Y/K exactly — copy before the
+        // arrays are moved into the cmyk_transfer LUTs below.
+        self.device_n_transfer[0] = cc;
+        self.device_n_transfer[1] = cm;
+        self.device_n_transfer[2] = cy;
+        self.device_n_transfer[3] = ck;
         self.cmyk_transfer = [
             TransferLut(cc),
             TransferLut(cm),
             TransferLut(cy),
             TransferLut(ck),
         ];
-
-        // DeviceN channels 0–3 mirror CMYK C/M/Y/K exactly.
-        for i in 0usize..256 {
-            self.device_n_transfer[0][i] = 255 - self.rgb_transfer[0].0[255 - i];
-            self.device_n_transfer[1][i] = 255 - self.rgb_transfer[1].0[255 - i];
-            self.device_n_transfer[2][i] = 255 - self.rgb_transfer[2].0[255 - i];
-            self.device_n_transfer[3][i] = 255 - self.gray_transfer.0[255 - i];
-        }
 
         // ── Step 2: Overwrite RGB and gray with the caller-supplied LUTs ──
         self.rgb_transfer[0] = TransferLut(*r);
@@ -502,22 +492,7 @@ impl TransferSet<'_> {
             ],
             device_n: {
                 // A static identity table for all 8 DeviceN channels.
-                static DN: [[u8; 256]; 8] = {
-                    let mut t = [[0u8; 256]; 8];
-                    let mut ch = 0;
-                    while ch < 8 {
-                        let mut i = 0u8;
-                        loop {
-                            t[ch][i as usize] = i;
-                            if i == 255 {
-                                break;
-                            }
-                            i += 1;
-                        }
-                        ch += 1;
-                    }
-                    t
-                };
+                static DN: [[u8; 256]; 8] = [TransferLut::IDENTITY.0; 8];
                 &DN
             },
         }

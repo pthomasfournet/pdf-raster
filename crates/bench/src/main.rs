@@ -40,26 +40,32 @@ fn parse_config() -> Config {
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--iters" => match args.next() {
-                Some(v) => match v.parse::<u32>() {
+            "--iters" => {
+                let Some(v) = args.next() else {
+                    eprintln!("warning: --iters requires a value");
+                    continue;
+                };
+                match v.parse::<u32>() {
                     Ok(n) => cfg.iters = n,
                     Err(e) => eprintln!(
                         "warning: --iters {v:?} is not a valid u32 ({e}); using {}",
                         cfg.iters
                     ),
-                },
-                None => eprintln!("warning: --iters requires a value"),
-            },
-            "--stars" => match args.next() {
-                Some(v) => match v.parse::<usize>() {
+                }
+            }
+            "--stars" => {
+                let Some(v) = args.next() else {
+                    eprintln!("warning: --stars requires a value");
+                    continue;
+                };
+                match v.parse::<usize>() {
                     Ok(n) => cfg.stars = n,
                     Err(e) => eprintln!(
                         "warning: --stars {v:?} is not a valid usize ({e}); using {}",
                         cfg.stars
                     ),
-                },
-                None => eprintln!("warning: --stars requires a value"),
-            },
+                }
+            }
             other => eprintln!("warning: unknown flag {other:?}"),
         }
     }
@@ -270,8 +276,8 @@ fn bench_ours(cfg: &Config, params: &[(f64, f64, f64, f64, usize)]) -> f64 {
 fn main() {
     let cfg = parse_config();
     println!(
-        "Synthetic fill benchmark  {}×{}  {} stars  {} iters",
-        W, H, cfg.stars, cfg.iters
+        "Synthetic fill benchmark  {W}×{H}  {} stars  {} iters",
+        cfg.stars, cfg.iters
     );
     let params = star_params(cfg.stars);
     let ms_v = bench_vello(&cfg, &params);

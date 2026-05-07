@@ -212,7 +212,6 @@ impl ScreenParams {
         if self.size < 2 {
             return Err(Cow::Borrowed("ScreenParams::size must be >= 2"));
         }
-        // size is a power of two iff it has exactly one set bit.
         // Casting to u32 is safe: we already checked size >= 2 > 0, so the
         // sign bit is clear and no bits are lost.
         #[expect(
@@ -221,7 +220,7 @@ impl ScreenParams {
                       so the cast to u32 loses no bits"
         )]
         let size_u32 = self.size as u32;
-        if size_u32.count_ones() != 1 {
+        if !size_u32.is_power_of_two() {
             return Err(Cow::Borrowed("ScreenParams::size must be a power of two"));
         }
         if self.dot_radius < 1 {

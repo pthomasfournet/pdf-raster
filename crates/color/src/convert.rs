@@ -363,7 +363,7 @@ pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
 #[inline]
 #[must_use]
 pub const fn byte_to_col(x: u8) -> i32 {
-    let xi = x as i32; // u8 → i32 is lossless; `i32::from` is not const-stable yet
+    let xi = x as i32; // u8 → i32 is lossless; `i32::from` is not const-stable on stable Rust yet
     (xi << 8) | xi
 }
 
@@ -400,6 +400,30 @@ pub fn col_to_byte(x: i32) -> u8 {
 
 // ── Geometry rounding (matching SplashMath.h portable fallbacks) ──────────────
 
+/// Saturating cast of an integer-valued `f64` to `i32`.
+///
+/// Non-finite inputs map to `i32::MAX` for `+∞` and `i32::MIN` for `-∞` / NaN.
+/// Finite values outside the `i32` range saturate at the nearest endpoint.
+#[inline]
+fn saturate_f64_to_i32(x: f64) -> i32 {
+    if !x.is_finite() {
+        return if x == f64::INFINITY {
+            i32::MAX
+        } else {
+            i32::MIN
+        };
+    }
+    // x is finite: casting to i64 is well-defined for any finite f64 whose
+    // magnitude fits in i64 (which covers all practical PDF coordinates);
+    // try_from saturates the rare case of very large floats.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 → i64 cast; try_from on the next line saturates out-of-range values"
+    )]
+    let v = x as i64;
+    i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
+}
+
 /// Floor toward −∞, returning `i32`.
 ///
 /// Equivalent to C++ `splashFloor` — matches the portable fallback path.
@@ -423,25 +447,7 @@ pub fn col_to_byte(x: i32) -> u8 {
 #[inline]
 #[must_use]
 pub fn splash_floor(x: f64) -> i32 {
-    if !x.is_finite() {
-        // NaN and ±infinity are not valid PDF coordinates.
-        // Return a safe sentinel; callers should not pass non-finite values.
-        return if x == f64::INFINITY {
-            i32::MAX
-        } else {
-            i32::MIN
-        };
-    }
-    // x is finite: floor() returns a whole-number f64 still within f64's
-    // exact-integer range. Casting to i64 is well-defined for any finite f64
-    // whose magnitude fits in i64 (which covers all practical PDF coordinates).
-    // The subsequent try_from saturates for the rare case of very large floats.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "floor() result cast to i64; try_from saturates for out-of-range values on the next line"
-    )]
-    let v = x.floor() as i64;
-    i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
+    saturate_f64_to_i32(x.floor())
 }
 
 /// Ceil toward +∞, returning `i32`.
@@ -463,19 +469,7 @@ pub fn splash_floor(x: f64) -> i32 {
 #[inline]
 #[must_use]
 pub fn splash_ceil(x: f64) -> i32 {
-    if !x.is_finite() {
-        return if x == f64::INFINITY {
-            i32::MAX
-        } else {
-            i32::MIN
-        };
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "ceil() result cast to i64; try_from saturates for out-of-range values on the next line"
-    )]
-    let v = x.ceil() as i64;
-    i32::try_from(v).unwrap_or(if v > 0 { i32::MAX } else { i32::MIN })
+    saturate_f64_to_i32(x.ceil())
 }
 
 /// Round half-integers toward +∞, returning `i32`.

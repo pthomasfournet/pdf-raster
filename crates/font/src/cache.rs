@@ -62,8 +62,8 @@ impl GlyphCache {
 
     /// Remove all cached entries for the given face.
     ///
-    /// Call when a [`crate::face::FontFace`] is unloaded to prevent stale
-    /// bitmaps from persisting under a reused `FaceId`.
+    /// Call when a [`crate::face::FontFace`] is unloaded to release its
+    /// cached bitmaps eagerly rather than waiting for LRU eviction.
     pub fn evict_face(&self, face_id: FaceId) {
         self.inner.retain(|k, _| k.face_id != face_id);
     }
