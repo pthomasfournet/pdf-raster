@@ -2,6 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-05-07
+
+### Bug Fixes
+
+- Set LD_LIBRARY_PATH for any nvjpeg-linked binary
+- Drop VA-API from v0.6.0 matrix
+- Correct corrupted JITTER_Y Halton(3) values
+- Disk tier — split callback errors by side
+- RST handling + scaffolding cleanup pass
+
+### Chores
+
+- Scaffold v0.6.0 GPU baseline output directory
+- Add clangd config for the CUDA kernels
+- Release v0.7.0
+
+### Documentation
+
+- Close Phase 7 bench gate, open Phase 8 (custom on-GPU JPEG)
+- Defer Phase 8, open Phase 9 (active) and Phase 10 (planned)
+- Update Phase 9 task status through task 4 GPU side
+- Mark Phase 9 task 4 done; remaining tasks 5+6
+- Explain CUDA_ARCH selection + add cache/feature-flag table
+
+### Features
+
+- Add v0.6.0 baseline aggregation script
+- V0.6.0 baseline driver — pre-flight checks
+- V0.6.0 baseline driver — build phase
+- V0.6.0 baseline driver — bench phase + aggregation
+- Jpeg pipeline Phase 0 — CPU pre-pass for self-synchronizing decoder
+- Introduce ImageData enum (Phase 9 task 1)
+- Phase 9 task 2 — VRAM tier of the device image cache
+- Phase 9 task 3 — pinned host RAM demotion tier
+- Phase 9 task 4 (GPU side) — image blit kernel + DevicePageBuffer
+- Phase 9 task 4 — renderer integration (cache + GPU image blit)
+- Phase 9 task 5 — disk tier
+- Image-cache prefetcher
+
+### Other
+
+- V0.6.0 GPU baseline matrix — raw results
+- Security + correctness pass on Phase 0 CPU pre-pass
+- Review pass on ImageData; restore unused_results lint
+- Apply review findings on the ImageData hardening pass
+- Hardening pass on Phase 9 task 2
+- Apply review findings on the hardening pass
+- Hardening pass on Phase 9 task 3
+- Apply review findings on the host-tier hardening pass
+- Review pass on Phase 9 task 4 (GPU side)
+- Tighten page_h debug_assert to exact equality
+- Review pass on Phase 9 task 4 renderer integration
+- Disk tier review pass — single-copy promotes, sharper docs
+- Prefetcher review pass
+- Prefetcher polish + roadmap close-out
+
+### Performance
+
+- Disable nvJPEG dispatch on consumer Blackwell
+
+### Refactor
+
+- Simplifier sweep across remaining crates (color, raster, font, encode, gpu, pdf_raster, bench)
+- V0.6.0 driver as thin wrapper around tests/bench_corpus.sh
+
 ## [0.6.0] - 2026-05-07
 
 ### Bug Fixes
@@ -25,6 +90,7 @@ All notable changes to this project will be documented in this file.
 
 - Untrack ROADMAP_INTEL.md (gitignored)
 - Add .worktrees/ to .gitignore
+- Release v0.6.0
 
 ### Documentation
 
@@ -36,6 +102,7 @@ All notable changes to this project will be documented in this file.
 - Add version regression history table and bench_versions.sh
 - Fix stale lopdf reference in fuzz_ccitt comment
 - Update for v0.6.0 (lopdf rip-out, RAM-default output, new bench numbers)
+- Regenerate CHANGELOG for v0.6.0
 
 ### Features
 

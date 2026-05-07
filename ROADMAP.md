@@ -27,6 +27,19 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.7.0 (May 2026)
+
+**New since v0.6.0:**
+
+- **Device-resident image cache (3-tier).** New `cache` feature on the `gpu` and `pdf_interp` crates wires a `DeviceImageCache` with three tiers: VRAM (primary, refcount-pinned LRU), pinned host RAM (demote-on-evict / promote-on-hit), and disk (`<root>/<doc-sha256>/<content-hash>.bin` sidecar files for cross-session persistence). Keys: BLAKE3 content hash (cross-document dedup) + `(DocId, ObjId)` alias (same-document fast path). Disk writes are atomic via temp+rename, gated on env vars `PDF_RASTER_CACHE_DIR` / `PDF_RASTER_CACHE_BYTES`, invalidated automatically when the source PDF changes (DocId is BLAKE3 of the bytes).
+- **Device-resident page buffer + GPU image blit.** New `crates/gpu/kernels/blit_image.cu` 16×16-block kernel with f32 inverse-CTM nearest-neighbour sampling that matches the CPU path byte-for-byte (verified by an in-tree CPU-reference parity test). `DevicePageBuffer` is lazy-allocated on first GPU image; source-over composite onto the host bitmap happens in one `cudaMemcpyAsync` at `PageRenderer::finish`. `ImageData::Gpu(Arc<CachedDeviceImage>)` is the cached-decode product `decode_dct` returns when the cache is on.
+- **Image-cache prefetcher.** `pdf_interp::cache::spawn_prefetch` walks every page's `/XObject` resource dict at session open, dedupes by `ObjId`, and decodes `/DCTDecode` images on a small `std::thread` worker pool (default 2, capped at `MAX_PREFETCH_WORKERS = 16`). Decoder panics caught per-image so one bad XObject doesn't kill the run. Opt-in via `SessionConfig::prefetch`; default off because eager resource-dict walks are wasted work for short single-page renders. `RasterSession.doc` upgraded to `Arc<Document>` so the prefetcher can hold its own clone without changing how the renderer borrows.
+- **JPEG scaffolding correctness fixes (`crates/gpu/src/jpeg/`).** RST predictor reset is now driven by MCU index (`mcu_idx % restart_interval == 0`) instead of the bit reader's byte position — the byte-position chase worked by incidental ordering but a truncated MCU could leave the cursor short of the marker and silently skip the predictor reset. The `aa_fill.cu` `JITTER_Y` table had 8 wrong Halton(3) values at indices 17–23 and 44–47, found while bringing up gpu-validation tests; CPU `HALTON3` in `fill.rs` is now the source of truth.
+- **JPEG scaffolding cleanup.** Collapsed the double SOF scan in `JpegHeaders::parse` (non-baseline detection inline in the marker loop, no separate `jpeg_sof_type` pre-pass). `BitReader::refill` grew an 8-byte `u64::from_be_bytes` fast path on the common cap-zero case (~2× Huffman codeword throughput per textbooks). `canonical::fill_table` switched to `slice::fill`. VA-API adapter no longer caches `num_mcus` — derives from a shared `mcu_count_from_max_sampling` helper.
+- **Documentation.** README gains a "Picking CUDA_ARCH for your GPU" subsection mapping consumer GPU generations (Pascal → Blackwell, A100, H100) to the right `sm_NN` flag, plus a feature-flag table covering `nvjpeg`, `nvjpeg2k`, `gpu-aa`, `gpu-icc`, `gpu-deskew`, `cache`, `vaapi`. Build script default of `sm_80` is documented inline.
+
+**Bench gate (pending):** the device-resident-image-cache spec defines five acceptance criteria (cache hit rate ≥ 95% on logo-heavy multi-page renders, second-render time ≤ 30% of first-render, mode A no regression, no OOM on corpus 09 with default budgets, mode D beats mode A on at least 3 of corpora 04–08). v0.7.0 ships the implementation; the bench gate has not yet been run, so the architectural payoff is structurally complete but not yet validated end-to-end.
+
 ### v0.6.0 (May 2026)
 
 **New since v0.5.1:**
