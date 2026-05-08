@@ -7,3 +7,4 @@
 pub mod aa;
 pub mod composite;
 pub mod soft_mask;
+pub mod tile;
