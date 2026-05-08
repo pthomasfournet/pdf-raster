@@ -10,13 +10,16 @@ use super::GpuBackend;
 ///
 /// # Invariants enforced by `BlitParams::validate`
 /// - `src_w > 0`, `src_h > 0`, `dst_w > 0`, `dst_h > 0`
+/// - `src_layout` is `0` (RGB, 3 bytes/pixel) or `1` (Gray, 1 byte/pixel).
+///   Mask images (layout `2`) are CPU-only and must not reach the GPU.
 /// - `bbox` is `[x0, y0, x1, y1]` with `x0 <= x1` and `y0 <= y1`
 /// - `page_h.is_finite()` and `page_h > 0.0`; conventionally `page_h == dst_h as f32`
 /// - All six `inv_ctm` coefficients `is_finite()`
 ///
 /// Backends should call `validate()` at record time. Violating these
-/// invariants would propagate `NaN`/`Inf` into kernel arithmetic and
-/// produce garbage pixels (or panics in debug builds via `debug_assert`).
+/// invariants would propagate `NaN`/`Inf` into kernel arithmetic, route
+/// Mask images through the Gray code path silently, or produce garbage
+/// pixels (or panics in debug builds via `debug_assert`).
 pub struct BlitParams<'a, B: GpuBackend + ?Sized> {
     /// Source image in device memory.
     pub src: &'a B::DeviceBuffer,
@@ -26,7 +29,8 @@ pub struct BlitParams<'a, B: GpuBackend + ?Sized> {
     pub src_w: u32,
     /// Source image height in pixels (must be > 0).
     pub src_h: u32,
-    /// Source image channel layout (backend-defined enum value).
+    /// Source image channel layout: `0` = RGB, `1` = Gray. Other values
+    /// are rejected by `validate()`.
     pub src_layout: u32,
     /// Destination buffer width in pixels (must be > 0).
     pub dst_w: u32,
@@ -75,6 +79,14 @@ impl<B: GpuBackend + ?Sized> BlitParams<'_, B> {
         if !self.inv_ctm.iter().all(|c| c.is_finite()) {
             return Err(super::BackendError::new(BlitInvariantViolation(
                 "inv_ctm must contain only finite coefficients",
+            )));
+        }
+        // src_layout: 0 = RGB, 1 = Gray. Anything else (especially 2 = Mask)
+        // would fall through the kernel's `if (src_layout == 0) { RGB } else { Gray }`
+        // dispatch and silently produce wrong pixels.
+        if self.src_layout > 1 {
+            return Err(super::BackendError::new(BlitInvariantViolation(
+                "src_layout must be 0 (RGB) or 1 (Gray); Mask layout is CPU-only",
             )));
         }
         Ok(())
@@ -304,5 +316,36 @@ mod tests {
         p.inv_ctm[0] = f32::NAN;
         let err = p.validate().unwrap_err().to_string();
         assert!(err.contains("inv_ctm"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_layout_0_rgb() {
+        let mut p = ok_blit();
+        p.src_layout = 0;
+        p.validate().expect("layout 0 (RGB) is valid");
+    }
+
+    #[test]
+    fn validate_accepts_layout_1_gray() {
+        let mut p = ok_blit();
+        p.src_layout = 1;
+        p.validate().expect("layout 1 (Gray) is valid");
+    }
+
+    #[test]
+    fn validate_rejects_layout_2_mask() {
+        let mut p = ok_blit();
+        p.src_layout = 2;
+        let err = p.validate().unwrap_err().to_string();
+        assert!(err.contains("Mask"), "{err}");
+        assert!(err.contains("CPU-only"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_layout() {
+        let mut p = ok_blit();
+        p.src_layout = 999;
+        let err = p.validate().unwrap_err().to_string();
+        assert!(err.contains("src_layout"), "{err}");
     }
 }

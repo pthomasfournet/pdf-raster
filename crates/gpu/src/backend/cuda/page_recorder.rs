@@ -73,11 +73,7 @@ impl PageRecorder {
     /// the event.  The host can then block on the event with
     /// `wait_page` instead of synchronising the whole stream.
     pub(super) fn submit_page(&self) -> Result<PageFence> {
-        let event = self
-            .ctx
-            .stream()
-            .record_event(None)
-            .map_err(|e| BackendError::new(StringError(e.to_string())))?;
+        let event = self.ctx.stream().record_event(None).map_err(be)?;
         Ok(PageFence(event))
     }
 
@@ -87,10 +83,7 @@ impl PageRecorder {
         reason = "self-arg kept for symmetry with the trait method and forward-compat with future per-recorder fence pools"
     )]
     pub(super) fn wait_page(&self, fence: PageFence) -> Result<()> {
-        fence
-            .0
-            .synchronize()
-            .map_err(|e| BackendError::new(StringError(e.to_string())))
+        fence.0.synchronize().map_err(be)
     }
 
     pub(super) fn record_blit_image(
@@ -120,11 +113,12 @@ impl PageRecorder {
             x1: p.bbox[2],
             y1: p.bbox[3],
         };
-        // Trait passes layout as u32; kernel takes i32.  Values are
-        // `0 = Rgb`, `1 = Gray`; Mask layout is rejected by the
-        // legacy `blit_image_to_buffer` and not reachable through
-        // the trait (callers must filter at record time).
-        let layout_code = i32::try_from(p.src_layout).unwrap_or(0);
+        // Trait passes layout as u32; kernel takes i32. validate() above
+        // has already constrained the value to {0, 1}, so the cast is exact.
+        // Keeping the explicit cast (rather than `as i32`) so a future
+        // widening of valid layouts surfaces at this exact line.
+        let layout_code =
+            i32::try_from(p.src_layout).expect("validate() proved src_layout is 0 or 1, fits i32");
 
         ctx.launch_blit_image_async(
             p.src,
@@ -136,7 +130,7 @@ impl PageRecorder {
             &inv_ctm,
             p.page_h,
         )
-        .map_err(|e| BackendError::new(StringError(e.to_string())))
+        .map_err(be)
     }
 
     #[cfg(not(feature = "cache"))]
@@ -157,9 +151,10 @@ impl PageRecorder {
         // The trait API uses tile-local coordinates: callers compute
         // `x_min` / `y_min` into the segs they upload, so the kernel
         // origin is always (0, 0).  This matches `tile_fill` and
-        // simplifies the trait surface; renderer migration in task
-        // 1.10 may add a separate `origin` param if a non-zero
-        // device-pixel offset is needed.
+        // simplifies the trait surface; if a future renderer integration
+        // needs a non-zero device-pixel offset, AaFillParams should grow
+        // an explicit `origin` field rather than re-introducing implicit
+        // x_min/y_min on this code path.
         let x_min = 0.0_f32;
         let y_min = 0.0_f32;
         self.ctx
