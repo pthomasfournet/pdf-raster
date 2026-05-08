@@ -1,20 +1,20 @@
 
-System: load=12.26  cores=24  perf_paranoid=1
+System: load=9.73   cores=24  perf_paranoid=1
 Binary: target/release/pdf-raster-full-cache  backend=cuda
 Runs:   5 (warmup 1) — hyperfine mean±σ + mpstat/iostat
 
 corpus                                    mean ± σ   cpu avg  cpu peak  disk MB/s  flags
 ------                                      --------   -------  --------  ---------
-01-native-text-small                    249ms ±   14ms        0%        0%         1 MB/s  
-02-native-vector-text                   220ms ±   12ms        0%        0%         1 MB/s  
-03-native-text-dense                    496ms ±   13ms       31%       31%         2 MB/s  
-04-ebook-mixed                          877ms ±   12ms       56%       56%         8 MB/s  
-05-academic-book                       1276ms ±   30ms       58%       58%         6 MB/s  
-06-modern-layout-dct                   2914ms ±   64ms       79%       99%        22 MB/s  
-07-journal-dct-heavy                   9975ms ± 8948ms       49%       64%        24 MB/s  [high-σ 90%] 
-08-scan-dct-1927                      16302ms ±15359ms       42%       54%        21 MB/s  [high-σ 94%] 
-09-scan-dct-1836                      10292ms ± 5424ms       44%       71%         7 MB/s  [high-σ 53%] 
-10-scan-jbig2-jpx                     10246ms ±  130ms       23%       25%         5 MB/s  [low-cpu 23%] 
+01-native-text-small                    236ms ±   12ms        0%        0%         1 MB/s  
+02-native-vector-text                   212ms ±    7ms        0%        0%         1 MB/s  
+03-native-text-dense                    478ms ±    7ms       27%       27%         1 MB/s  [low-cpu 27%] 
+04-ebook-mixed                          874ms ±   18ms       55%       55%         8 MB/s  
+05-academic-book                       1232ms ±   11ms       58%       58%         6 MB/s  
+06-modern-layout-dct                   3008ms ±   49ms       79%       99%        22 MB/s  
+07-journal-dct-heavy                   1389ms ±   30ms       18%       27%        34 MB/s  [low-cpu 18%] 
+08-scan-dct-1927                       3506ms ±   72ms       33%       53%        29 MB/s  
+09-scan-dct-1836                       4313ms ±  157ms       33%       56%        21 MB/s  
+10-scan-jbig2-jpx                     10214ms ±   51ms       22%       25%         5 MB/s  [low-cpu 22%] 
 
 Flags:
   [high-σ N%]    stddev > 15% of mean — background interference likely
