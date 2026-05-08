@@ -785,7 +785,7 @@ Re-bench result: cold-render regression collapsed from 14× to 1.1–1.9× on lo
 
 ---
 
-## Phase 10 — Vulkan compute backend (PLANNED)
+## Phase 10 — Vulkan compute backend (IN PROGRESS — task 1 merged, tasks 2+3 pending)
 
 **Spec:** `docs/superpowers/specs/2026-05-07-phase-10-vulkan-compute-backend.md`
 
@@ -806,7 +806,10 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
 
 **Work items:**
 
-- [ ] **Task 1 — Backend trait + CUDA refactor** (~600 new + ~400 modified LoC). Extract `CudaBackend` from existing code; refactor Phase 9 cache + page buffer to be generic. Bench parity required.
+- [~] **Task 1 — Backend trait + CUDA refactor** (merged via `4c22ce0`).
+    - **Shipped:** `GpuBackend` trait + `*Params` structs with state-machine and invariant docs (`crates/gpu/src/backend/{mod,params}.rs`); `CudaBackend` init + alloc + budget + `record_*` + `submit_page` / `wait_page` (`crates/gpu/src/backend/cuda/`); the five existing kernels extracted into `lib_kernels::{aa, composite, icc, soft_mask, tile}`; `BackendError::msg`; `cuda_backend_smoke` + `cuda_backend_per_page` tests; `crates/gpu/src/cache/mod.rs` split into `budget` / `eviction` / `promotion` submodules.
+    - **Deliberately deferred:** renderer migration to the trait (the spec's `pdf_interp::renderer::page::gpu_ops` rewrite). The Phase 9 blit path is *already* per-page-batched (no `synchronize` between blits; only `buf.download()` at end-of-page), so migrating shape-only without an upload/download surface on the trait would just shuffle code. `DevicePageBuffer` and `DeviceImageCache` therefore stay un-generified for now; they generify alongside Task 3 once the trait grows the H↔D surface that the Vulkan side will need anyway. See the docstring on `DevicePageBuffer` (`crates/gpu/src/cache/page_buffer.rs`) for the in-tree rationale.
+    - **Not yet measured:** the spec's `±5%-of-pre-refactor` per-kernel bench gate. Deferred until Task 3 lands so the bench matrix runs CUDA + Vulkan together.
 - [ ] **Task 2 — Slang port of all kernels** (~1000 LoC). Translate 5 existing `.cu` files + Phase 9's `blit_image.cu` to `.slang`. nvcc compiles Slang→PTX for CUDA; SPIR-V backend used in task 3. **Riskiest task in Phase 10**; rollback plan is to keep `.cu` files alongside `.slang` until bench parity confirmed.
 - [ ] **Task 3 — Vulkan backend implementation** (~1500 LoC). `VulkanBackend` impl via `ash`; pipeline cache; descriptor set management; synchronisation; integrates behind the trait. Cross-vendor smoke test on at least one AMD or Intel GPU.
 
