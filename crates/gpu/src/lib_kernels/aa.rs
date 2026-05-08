@@ -79,6 +79,14 @@ impl GpuCtx {
         let n_pixels = (width as usize)
             .checked_mul(height as usize)
             .expect("width × height overflows usize");
+        // Empty output rectangle: nothing to fill, skip GPU dispatch entirely.
+        // cudarc rejects zero-size allocations, so we'd have to scaffold a
+        // placeholder otherwise — and the right answer for a 0-pixel output
+        // is an empty Vec regardless of `segs`. Mirrors `tile_fill`'s early
+        // return at lib_kernels/tile.rs:59-61.
+        if n_pixels == 0 {
+            return Ok(Vec::new());
+        }
         let n_segs = u32::try_from(segs.len() / 4).expect("segment count exceeds u32::MAX");
 
         let stream = &self.stream;
