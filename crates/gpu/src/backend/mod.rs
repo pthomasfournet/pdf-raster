@@ -19,6 +19,13 @@ use std::error::Error;
 use std::fmt;
 
 /// A backend-agnostic error type that wraps any `Error + Send + Sync`.
+///
+/// The inner `Box<dyn Error + Send + Sync>` carries the original backend-specific
+/// error. [`Display`](fmt::Display) delegates to the inner error directly;
+/// [`Error::source`] returns `None` because the inner message is already part of
+/// the `Display` output — exposing it via `source` would cause `{:#}`
+/// alternate-display to print the message twice. Mirrors the `GpuDecodeError`
+/// pattern in `crate::traits`.
 #[derive(Debug)]
 pub struct BackendError(Box<dyn Error + Send + Sync + 'static>);
 
@@ -31,6 +38,7 @@ impl BackendError {
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Delegate directly — no prefix — so the inner message is the full message.
         fmt::Display::fmt(&self.0, f)
     }
 }
@@ -40,16 +48,87 @@ impl Error for BackendError {}
 /// Convenience alias for `Result<T, BackendError>`.
 pub type Result<T> = std::result::Result<T, BackendError>;
 
+/// Reject zero-size allocation requests with a clear message.
+///
+/// Both Vulkan (`vkAllocateMemory` rejects 0) and CUDA (`cuMemAlloc(0)` returns
+/// `CUDA_ERROR_INVALID_VALUE`) refuse zero-size allocations; pre-checking gives
+/// a uniform, callable-side error rather than a driver-specific status.
+pub(crate) fn reject_zero_size(size: usize, what: &'static str) -> Result<()> {
+    if size == 0 {
+        return Err(BackendError::new(ZeroSizeAlloc(what)));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ZeroSizeAlloc(&'static str);
+
+impl fmt::Display for ZeroSizeAlloc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} called with size = 0; backends require size > 0",
+            self.0
+        )
+    }
+}
+
+impl Error for ZeroSizeAlloc {}
+
 /// Live VRAM budget snapshot returned by `GpuBackend::detect_vram_budget`.
+///
+/// Construct via [`VramBudget::new`] to enforce the `usable_bytes <= total_bytes`
+/// invariant; the public fields are kept for convenient pattern-matching but
+/// hand-construction skips the assertion.
 #[derive(Debug, Clone, Copy)]
 pub struct VramBudget {
     /// Total VRAM on the device in bytes.
     pub total_bytes: u64,
-    /// VRAM available for new allocations, accounting for driver overhead.
+    /// VRAM that allocations may safely consume in this process.
+    ///
+    /// Backends may apply a safety margin (e.g., a fraction of `free` reported
+    /// by the driver) to account for fragmentation and other processes'
+    /// allocations. Always `<= total_bytes`.
     pub usable_bytes: u64,
 }
 
+impl VramBudget {
+    /// Construct a `VramBudget`, asserting `usable <= total`.
+    ///
+    /// # Panics
+    /// Panics if `usable > total` — backends must apply their safety margin
+    /// before calling this constructor, not let the caller derive a value that
+    /// could exceed total VRAM.
+    #[must_use]
+    pub const fn new(total_bytes: u64, usable_bytes: u64) -> Self {
+        assert!(
+            usable_bytes <= total_bytes,
+            "VramBudget invariant violated: usable_bytes must not exceed total_bytes"
+        );
+        Self {
+            total_bytes,
+            usable_bytes,
+        }
+    }
+}
+
 /// Abstraction over a concrete GPU implementation.
+///
+/// # Per-page state machine
+///
+/// `record_*` methods accumulate work into a per-backend command list. Callers
+/// must follow the order:
+///
+/// ```text
+/// begin_page() → [record_*()…] → submit_page() → wait_page(fence)
+/// ```
+///
+/// Calling `record_*` outside a `begin_page` / `submit_page` pair, or calling
+/// `submit_page` twice without an intervening `begin_page`, is implementation-
+/// defined behaviour: backends may panic, return an error, or silently produce
+/// incorrect results. Single-threaded usage is the supported pattern; cross-
+/// thread interleaving requires external synchronisation even though the trait
+/// is `Send + Sync`.
 pub trait GpuBackend: Send + Sync {
     /// An opaque device-resident buffer handle.
     type DeviceBuffer: Send + Sync;
@@ -60,8 +139,14 @@ pub trait GpuBackend: Send + Sync {
 
     /// Allocate `size` bytes of device memory.
     ///
+    /// `size` must be greater than zero; passing `0` returns a `BackendError`
+    /// because both Vulkan (`vkAllocateMemory` rejects 0) and CUDA
+    /// (`cuMemAlloc(0)` returns `CUDA_ERROR_INVALID_VALUE`) fail this call.
+    /// Implementations should pre-check rather than fall through to the driver.
+    ///
     /// # Errors
-    /// Returns `BackendError` if the device allocation fails (OOM or driver error).
+    /// Returns `BackendError` if `size == 0`, or if the device allocation fails
+    /// (OOM or driver error).
     fn alloc_device(&self, size: usize) -> Result<Self::DeviceBuffer>;
     /// Free a device buffer previously returned by `alloc_device`.
     ///
@@ -73,8 +158,12 @@ pub trait GpuBackend: Send + Sync {
 
     /// Allocate `size` bytes of host-pinned (DMA-accessible) memory.
     ///
+    /// `size` must be greater than zero; the same zero-size constraints as
+    /// `alloc_device` apply.
+    ///
     /// # Errors
-    /// Returns `BackendError` if the pinned allocation fails (OOM or driver error).
+    /// Returns `BackendError` if `size == 0`, or if the pinned allocation fails
+    /// (OOM or driver error).
     fn alloc_host_pinned(&self, size: usize) -> Result<Self::HostBuffer>;
     /// Free a host-pinned buffer previously returned by `alloc_host_pinned`.
     ///
@@ -133,8 +222,12 @@ pub trait GpuBackend: Send + Sync {
 
     /// Initiate an asynchronous host-to-device upload; returns a fence.
     ///
+    /// `src.len()` must not exceed the device-side capacity of `dst`.
+    /// Implementations should reject the call rather than truncate.
+    ///
     /// # Errors
-    /// Returns `BackendError` if the upload cannot be enqueued.
+    /// Returns `BackendError` if the upload cannot be enqueued, or if
+    /// `src.len()` exceeds `dst`'s device capacity.
     fn upload_async(&self, dst: &Self::DeviceBuffer, src: &[u8]) -> Result<Self::PageFence>;
 
     /// Query the current VRAM budget from the driver.
@@ -142,4 +235,51 @@ pub trait GpuBackend: Send + Sync {
     /// # Errors
     /// Returns `BackendError` if the driver query fails.
     fn detect_vram_budget(&self) -> Result<VramBudget>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vram_budget_new_accepts_usable_le_total() {
+        let b = VramBudget::new(100, 75);
+        assert_eq!(b.total_bytes, 100);
+        assert_eq!(b.usable_bytes, 75);
+    }
+
+    #[test]
+    fn vram_budget_new_accepts_equal() {
+        let b = VramBudget::new(100, 100);
+        assert_eq!(b.total_bytes, 100);
+        assert_eq!(b.usable_bytes, 100);
+    }
+
+    #[test]
+    fn vram_budget_new_accepts_zero() {
+        // Degenerate but valid: a CPU-only backend may report no VRAM at all.
+        let b = VramBudget::new(0, 0);
+        assert_eq!(b.total_bytes, 0);
+        assert_eq!(b.usable_bytes, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "VramBudget invariant violated")]
+    fn vram_budget_new_panics_when_usable_exceeds_total() {
+        let _ = VramBudget::new(100, 101);
+    }
+
+    #[test]
+    fn reject_zero_size_passes_nonzero() {
+        assert!(reject_zero_size(1, "test").is_ok());
+        assert!(reject_zero_size(usize::MAX, "test").is_ok());
+    }
+
+    #[test]
+    fn reject_zero_size_returns_error_for_zero() {
+        let err = reject_zero_size(0, "alloc_device").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("alloc_device"), "missing context: {msg}");
+        assert!(msg.contains("size = 0"), "missing diagnostic: {msg}");
+    }
 }

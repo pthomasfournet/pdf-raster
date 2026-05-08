@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, PinnedHostSlice};
 
 use crate::GpuCtx;
-use crate::backend::{BackendError, GpuBackend, Result, VramBudget, params};
+use crate::backend::{BackendError, GpuBackend, Result, VramBudget, params, reject_zero_size};
 
 /// CUDA error adaptor.
 ///
@@ -60,6 +60,7 @@ impl GpuBackend for CudaBackend {
     type PageFence = page_recorder::PageFence;
 
     fn alloc_device(&self, size: usize) -> Result<Self::DeviceBuffer> {
+        reject_zero_size(size, "alloc_device")?;
         self.ctx.stream().alloc_zeros::<u8>(size).map_err(be)
     }
 
@@ -68,6 +69,7 @@ impl GpuBackend for CudaBackend {
     }
 
     fn alloc_host_pinned(&self, size: usize) -> Result<Self::HostBuffer> {
+        reject_zero_size(size, "alloc_host_pinned")?;
         let cuda_ctx = self.ctx.stream().context();
         // Safety: the caller must initialise every byte before reading it back.
         // Mirrors the pattern in `cache::host_tier::HostTier::alloc_pinned`.
@@ -125,9 +127,8 @@ impl GpuBackend for CudaBackend {
         // free and total are usize (bytes); `free * 3 / 4` keeps arithmetic in
         // integer space — no f64 cast, no precision loss, no sign ambiguity.
         let usable_bytes = (free as u64).saturating_mul(3) / 4;
-        Ok(VramBudget {
-            total_bytes: total as u64,
-            usable_bytes,
-        })
+        // VramBudget::new asserts usable <= total. cuMemGetInfo's free is always
+        // <= total, and 3/4 of free is <= free, so the invariant holds.
+        Ok(VramBudget::new(total as u64, usable_bytes))
     }
 }
