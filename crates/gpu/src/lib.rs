@@ -28,6 +28,7 @@ mod composite;
 pub(crate) mod cuda;
 
 pub mod backend;
+pub mod lib_kernels;
 
 #[cfg(feature = "cache")]
 pub mod blit;
@@ -112,15 +113,15 @@ pub const TILE_H: u32 = 16;
 /// Run `threshold_bench` with a CLUT workload to calibrate once baking is in the hot path.
 pub const GPU_ICC_CLUT_THRESHOLD: usize = 500_000;
 
-struct GpuKernels {
-    composite_rgba8: CudaFunction,
-    apply_soft_mask: CudaFunction,
-    aa_fill: CudaFunction,
-    tile_fill: CudaFunction,
-    icc_cmyk_matrix: CudaFunction,
-    icc_cmyk_clut: CudaFunction,
+pub(crate) struct GpuKernels {
+    pub(crate) composite_rgba8: CudaFunction,
+    pub(crate) apply_soft_mask: CudaFunction,
+    pub(crate) aa_fill: CudaFunction,
+    pub(crate) tile_fill: CudaFunction,
+    pub(crate) icc_cmyk_matrix: CudaFunction,
+    pub(crate) icc_cmyk_clut: CudaFunction,
     #[cfg(feature = "cache")]
-    blit_image: CudaFunction,
+    pub(crate) blit_image: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -136,8 +137,8 @@ struct GpuKernels {
 /// unit of parallelism.  If image decode is ever parallelized within a page, replace
 /// the shared stream with a `thread_local!` `Arc<CudaStream>` per rayon worker.
 pub struct GpuCtx {
-    stream: Arc<CudaStream>,
-    kernels: GpuKernels,
+    pub(crate) stream: Arc<CudaStream>,
+    pub(crate) kernels: GpuKernels,
 }
 
 impl GpuCtx {
@@ -182,36 +183,6 @@ impl GpuCtx {
     #[must_use]
     pub const fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
-    }
-
-    /// Porter-Duff source-over compositing on RGBA8 pixel pairs.
-    ///
-    /// `src` and `dst` must have the same length (4 × `n_pixels` bytes).
-    ///
-    /// Falls back to CPU if the pixel count is below [`GPU_COMPOSITE_THRESHOLD`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU dispatch or data transfer fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `src.len() != dst.len()` or `src.len()` is not a multiple of 4.
-    pub fn composite_rgba8(
-        &self,
-        src: &[u8],
-        dst: &mut [u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(src.len(), dst.len());
-        assert!(src.len().is_multiple_of(4));
-        let n = src.len() / 4;
-
-        if n < GPU_COMPOSITE_THRESHOLD {
-            composite_rgba8_cpu(src, dst);
-            return Ok(());
-        }
-
-        self.composite_rgba8_gpu(src, dst)
     }
 
     /// Multiply each RGBA pixel's alpha channel by the corresponding soft-mask byte.
@@ -576,31 +547,6 @@ impl GpuCtx {
         Ok(rgb)
     }
 
-    /// Unconditional GPU dispatch for `composite_rgba8` (skips threshold check).
-    fn composite_rgba8_gpu(
-        &self,
-        src: &[u8],
-        dst: &mut [u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let n = src.len() / 4;
-        let n_u32 = u32::try_from(n).expect("pixel count exceeds u32::MAX");
-        let stream = &self.stream;
-        let d_src = stream.clone_htod(src)?;
-        let mut d_dst = stream.clone_htod(dst.as_ref())?;
-
-        let cfg = launch_cfg(n);
-        let mut builder = stream.launch_builder(&self.kernels.composite_rgba8);
-        let _ = builder.arg(&d_src);
-        let _ = builder.arg(&mut d_dst);
-        let _ = builder.arg(&n_u32);
-        // SAFETY: 3 args match composite_rgba8 PTX signature; n_u32 verified above.
-        let _ = unsafe { builder.launch(cfg) }?;
-
-        stream.synchronize()?;
-        stream.memcpy_dtoh(&d_dst, dst)?;
-        Ok(())
-    }
-
     /// Unconditional GPU dispatch for `apply_soft_mask` (skips threshold check).
     fn apply_soft_mask_gpu(
         &self,
@@ -631,7 +577,7 @@ impl GpuCtx {
     clippy::cast_possible_truncation,
     reason = "callers validate n ≤ u32::MAX via u32::try_from before calling this; n.div_ceil(256) is therefore also ≤ u32::MAX"
 )]
-const fn launch_cfg(n: usize) -> LaunchConfig {
+pub(crate) const fn launch_cfg(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
