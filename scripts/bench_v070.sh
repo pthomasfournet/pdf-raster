@@ -70,11 +70,19 @@ declare -A MODE_BACKEND=(
 declare -A MODE_EXTRA=(
   [A]="" [D]="" [DC]="" [DCP]="--prefetch"
 )
+# Modes that need the disk-tier opt-in env var.  Without
+# PDF_RASTER_CACHE_DIR set, the disk tier stays disabled and the
+# in-memory tiers carry the cache (intentional: see disk_tier.rs
+# rationale).  DC and DCP exercise the disk path; A and D don't
+# touch the cache at all (A) or use only the in-memory tiers (D).
+declare -A MODE_DISK_CACHE=(
+  [A]="" [D]="" [DC]="" [DCP]="1"
+)
 declare -A MODE_LABEL=(
   [A]="CPU-only"
   [D]="Full GPU (no cache)"
-  [DC]="Full GPU + cache"
-  [DCP]="Full GPU + cache + prefetch"
+  [DC]="Full GPU + in-memory cache"
+  [DCP]="Full GPU + cache + disk tier + prefetch"
 )
 # Feature lists are filled in `builds()` after probing — nvjpeg2k is
 # optional and not present on every machine.
@@ -225,18 +233,25 @@ bench_mode() {
     fi
   fi
 
-  # Pass extra flags via PDF_RASTER_ARGS (read by tests/bench_corpus.sh's
-  # internal hyperfine command — see how --backend is propagated).
-  # The bench script accepts --backend natively; --prefetch is custom so
-  # it goes through the env-var override that bench_corpus.sh inherits.
+  # Disk-tier opt-in env var (modes DC + DCP).  Path matches the
+  # default the tier would have picked.
+  local disk_env=""
+  if [[ -n "${MODE_DISK_CACHE[$mode]}" ]]; then
+    disk_env="PDF_RASTER_CACHE_DIR=${HOME}/.cache/pdf-raster"
+  fi
+
+  # Pass extra flags via PDF_RASTER_EXTRA_ARGS (read by
+  # tests/bench_corpus.sh).  The bench script accepts --backend
+  # natively; --prefetch is custom so it goes through the env-var
+  # override.
   # shellcheck disable=SC2086
   if [[ -n "$extra" ]]; then
-    env $ld_path BIN="$bin" PDF_RASTER_EXTRA_ARGS="$extra" \
+    env $ld_path $disk_env BIN="$bin" PDF_RASTER_EXTRA_ARGS="$extra" \
       "$BENCH" --backend "$backend" \
       | tee "$out"
   else
     # shellcheck disable=SC2086
-    env $ld_path BIN="$bin" \
+    env $ld_path $disk_env BIN="$bin" \
       "$BENCH" --backend "$backend" \
       | tee "$out"
   fi

@@ -683,10 +683,14 @@ fn try_decode_dct_cached_lookup(
         );
         return Ok(image_descriptor_from_cached(cached, pdf_w, pdf_h));
     }
-    // Cross-document content-hash probe.  Hash once; reuse on miss.
+    // Three-tier probe: VRAM → host RAM → disk (when enabled).
+    // Re-binds the alias on hit so the same image referenced from a
+    // later page goes through the alias fast path.
     let hash = DeviceImageCache::hash_bytes(data);
-    if let Some(cached) = ctx.cache.lookup_by_hash(&hash) {
-        ctx.cache.alias(ctx.doc_id, ctx.obj_id, hash);
+    if let Some(cached) = ctx
+        .cache
+        .lookup_by_hash_for_doc(ctx.doc_id, ctx.obj_id, &hash)
+    {
         log::debug!("decode_dct: cache hit by content hash; alias rebound");
         return Ok(image_descriptor_from_cached(cached, pdf_w, pdf_h));
     }

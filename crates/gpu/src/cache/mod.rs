@@ -441,6 +441,31 @@ impl DeviceImageCache {
         self.promote_from_host(hash)
     }
 
+    /// Three-tier lookup keyed on a content hash + the doc-id used
+    /// to scope disk-tier entries.  Consults VRAM, host RAM, and
+    /// disk in that order.  Used by `decode_dct` after the
+    /// `(doc, obj)` alias miss + BLAKE3 hash compute, so a cold
+    /// process with a populated disk cache hits the disk tier
+    /// instead of paying for a re-decode.
+    ///
+    /// Re-binds the alias on a hit so subsequent same-document
+    /// lookups go through `lookup_by_id` and skip the hash compute.
+    #[must_use]
+    pub fn lookup_by_hash_for_doc(
+        &self,
+        doc: DocId,
+        obj: ObjId,
+        hash: &ContentHash,
+    ) -> Option<Arc<CachedDeviceImage>> {
+        if let Some(entry) = self.lookup_by_hash(hash) {
+            self.alias(doc, obj, *hash);
+            return Some(entry);
+        }
+        let promoted = self.promote_from_disk(doc, hash)?;
+        self.alias(doc, obj, *hash);
+        Some(promoted)
+    }
+
     /// Lift a host-tier entry back into VRAM and install it in the
     /// primary index.  Returns `None` if the host tier doesn't have it
     /// or the upload fails (treated as a cache miss; caller re-decodes).

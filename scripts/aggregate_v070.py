@@ -32,8 +32,8 @@ CORPORA = [
 MODES = [
     ("A", "A. CPU-only"),
     ("D", "D. Full GPU (no cache)"),
-    ("DC", "DC. Full GPU + cache"),
-    ("DCP", "DCP. Full GPU + cache + prefetch"),
+    ("DC", "DC. Full GPU + in-memory cache"),
+    ("DCP", "DCP. Full GPU + cache + disk + prefetch"),
 ]
 
 # bench_corpus.sh format:

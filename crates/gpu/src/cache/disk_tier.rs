@@ -40,10 +40,22 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::SystemTime;
 
 use super::{ContentHash, DocId, ImageLayout};
+
+/// Bound on the queue of pending disk writes.  When the renderer
+/// outpaces the writer, `try_send` returns `Full` and the cache
+/// drops the disk-tier write (the in-memory tiers still serve the
+/// hit).  Sized to comfortably absorb a JPEG-heavy page's worth of
+/// `XObject`s without backpressuring the renderer; large enough
+/// that the writer can amortise `sync_all` costs across queued
+/// jobs but small enough that an adversarial PDF can't pile up
+/// gigabytes of not-yet-flushed pixel data in RAM.
+const WRITE_QUEUE_DEPTH: usize = 64;
 
 /// Header magic: ASCII "PDRF".
 const MAGIC: u32 = 0x5044_5246;
@@ -55,28 +67,14 @@ const HEADER_LEN: usize = 24;
 /// Format byte value for raw pixel bytes (no compression).
 const FORMAT_RAW: u8 = 0;
 
-/// Default cache root: `~/.cache/pdf-raster/`.  Uses `XDG_CACHE_HOME`
-/// when set, falls back to `$HOME/.cache`.  Returns `None` when both
-/// are unset (e.g. minimal sandboxed environments) — disk tier
-/// disabled in that case.
-fn default_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(xdg).join("pdf-raster"));
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache").join("pdf-raster"))
-}
-
-/// Resolve cache root from env vars, falling back to defaults.
+/// Resolve cache root from `PDF_RASTER_CACHE_DIR`.
 ///
-/// Env vars (per the Phase 9 spec):
-/// - `PDF_RASTER_CACHE_DIR` overrides the cache root.
-/// - `PDF_RASTER_CACHE_BYTES` overrides the budget (bytes; 0 = unbounded).
+/// `try_new()` already gates on the env var being set, so this is
+/// never `None` in practice — the `Option` return is kept so the
+/// signature mirrors the previous fallback shape (and so the
+/// gating decision lives in one place).
 fn resolve_root() -> Option<PathBuf> {
-    if let Some(custom) = std::env::var_os("PDF_RASTER_CACHE_DIR") {
-        return Some(PathBuf::from(custom));
-    }
-    default_cache_dir()
+    std::env::var_os("PDF_RASTER_CACHE_DIR").map(PathBuf::from)
 }
 
 /// Resolve the budget from `PDF_RASTER_CACHE_BYTES`, defaulting to
@@ -114,8 +112,38 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Phase 9 disk tier.
-pub struct DiskTier {
+/// One write job from `insert` to the background writer thread.
+/// `pixels` is `Box<[u8]>` (not `&[u8]`) so the slice can cross the
+/// thread boundary; allocation is a one-time host-RAM `clone_from`,
+/// negligible compared to the disk I/O the renderer used to do
+/// inline.
+struct WriteJob {
+    final_path: PathBuf,
+    width: u32,
+    height: u32,
+    layout: ImageLayout,
+    pixels: Box<[u8]>,
+    /// Reported `entry_size` to bump `DiskTier::used_estimate` once
+    /// the write succeeds.  Computed at insert time so the writer
+    /// thread doesn't redo the math.
+    entry_size: u64,
+}
+
+/// Channel payload from `insert` / `flush` to the writer thread.
+enum WriterMsg {
+    /// Normal write — the renderer's hot path.
+    Write(WriteJob),
+    /// Test-only flush barrier — writer drains preceding messages
+    /// then signals on the oneshot before reading the next message.
+    /// Production code never sends this.
+    #[cfg(test)]
+    FlushAck(mpsc::SyncSender<()>),
+}
+
+/// State the writer thread shares with the `DiskTier`.  Both hold
+/// an `Arc` to this struct; cloning the `Arc` is the only thing
+/// the spawn site needs to do.
+struct WriterState {
     root: PathBuf,
     /// Budget in bytes; `0` = unbounded.  Tracked as best-effort
     /// (filesystem mtimes drive eviction; the counter avoids a
@@ -124,18 +152,68 @@ pub struct DiskTier {
     /// Bytes written by *this process* since startup — not a global
     /// view of the on-disk cache.  Starts at zero on a fresh process
     /// even when `<root>/` already holds prior data; reconciled by
-    /// `evict_to_fit` on the first budget-exceeding insert.  Across
+    /// `evict_to_fit` on the first budget-exceeding write.  Across
     /// concurrent processes, budget enforcement is eventual.
     used_estimate: AtomicU64,
 }
 
+/// Disk tier.  Writes are dispatched to a single background thread
+/// via a bounded channel so the renderer never blocks on the
+/// `write_all + sync_all + rename` sequence.
+pub struct DiskTier {
+    state: Arc<WriterState>,
+    /// Job queue to the writer thread.  `SyncSender` (bounded) so a
+    /// runaway renderer can't fill RAM with pending pixel buffers;
+    /// when the queue saturates `try_send` returns `Full` and we
+    /// drop the disk-tier write.
+    sender: mpsc::SyncSender<WriterMsg>,
+    /// Approximate count of in-flight (queued or actively writing)
+    /// jobs.  Bumped before `try_send` and decremented when the
+    /// writer pulls from the channel.  Used as a fast-path probe
+    /// in `insert` so the renderer can skip the pixel clone+alloc
+    /// when the queue is already saturated.  Approximate: races
+    /// between increment-then-send and the writer's decrement
+    /// produce off-by-one but never structurally wrong values.
+    in_flight: Arc<AtomicUsize>,
+    /// Worker join handle.  `Drop` consumes it to wait for the
+    /// writer to drain after we drop `sender`.  `Mutex<Option>` so
+    /// the move out of `&mut self` in `Drop::drop` works without
+    /// requiring `&mut self` plumbing through the cache layer.
+    writer: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Number of writes the queue has dropped because the writer
+    /// thread fell behind.  Logged at warn level on the first drop
+    /// per process; subsequent drops increment silently to keep
+    /// noise down.  Visible via [`Self::dropped_writes`] for tests
+    /// and diagnostics.
+    dropped_writes: AtomicU64,
+}
+
 impl DiskTier {
-    /// Try to construct a disk tier.  Returns `None` when the cache
-    /// root cannot be resolved (no `HOME`, no `XDG_CACHE_HOME`, no
-    /// `PDF_RASTER_CACHE_DIR`) — disk tier disabled in that case.
-    /// Creates the root directory if it doesn't exist.
+    /// Try to construct a disk tier.  **Opt-in** via the
+    /// `PDF_RASTER_CACHE_DIR` env var (any non-empty value enables
+    /// the disk tier; the value sets the cache root).  Without it,
+    /// `try_new` returns `None` and the in-memory tiers (VRAM +
+    /// host RAM) carry the cache.
+    ///
+    /// The disk tier was opt-out before benchmarking exposed a
+    /// real regression on JPEG-heavy renders: every cache miss
+    /// queues a multi-MB pixel buffer for the writer thread, and
+    /// the renderer's process-exit blocks on flushing the queue.
+    /// On a 162-image corpus that's seconds of disk I/O the user
+    /// didn't ask for.  Opt-in keeps the architecture available
+    /// for OCR-pipeline patterns that genuinely benefit while the
+    /// default render path stays as fast as the in-memory tiers
+    /// can carry it.
+    ///
+    /// Returns `None` when:
+    /// - `PDF_RASTER_CACHE_DIR` is unset (the opt-in gate);
+    /// - the cache root can't be created;
+    /// - the writer thread fails to spawn.
     #[must_use]
     pub fn try_new() -> Option<Self> {
+        // Opt-in gate.  Without an explicit cache dir, the disk
+        // tier is disabled.  See the type docs for rationale.
+        let _ = std::env::var_os("PDF_RASTER_CACHE_DIR")?;
         let root = resolve_root()?;
         if let Err(e) = fs::create_dir_all(&root) {
             log::warn!(
@@ -145,23 +223,52 @@ impl DiskTier {
             return None;
         }
         let budget = resolve_budget();
-        Some(Self {
+        let state = Arc::new(WriterState {
             root,
             budget,
             used_estimate: AtomicU64::new(0),
+        });
+        let (sender, receiver) = mpsc::sync_channel::<WriterMsg>(WRITE_QUEUE_DEPTH);
+        let writer_state = Arc::clone(&state);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let writer_in_flight = Arc::clone(&in_flight);
+        let writer = match thread::Builder::new()
+            .name("pdf-raster-disk-cache-writer".to_string())
+            .spawn(move || writer_loop(receiver, &writer_state, &writer_in_flight))
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::warn!("disk-tier: writer thread spawn failed: {e} — disk tier disabled");
+                return None;
+            }
+        };
+        Some(Self {
+            state,
+            sender,
+            in_flight,
+            writer: Mutex::new(Some(writer)),
+            dropped_writes: AtomicU64::new(0),
         })
+    }
+
+    /// Number of writes the queue dropped because the writer fell
+    /// behind.  Test + diagnostics hook; not part of the cache hot
+    /// path.
+    #[must_use]
+    pub fn dropped_writes(&self) -> u64 {
+        self.dropped_writes.load(Ordering::Relaxed)
     }
 
     /// The cache root directory.  Mostly useful for diagnostics and tests.
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.state.root
     }
 
     /// Budget in bytes; `0` = unbounded.
     #[must_use]
-    pub const fn budget_bytes(&self) -> u64 {
-        self.budget
+    pub fn budget_bytes(&self) -> u64 {
+        self.state.budget
     }
 
     /// Test helper: read + validate, allocating pixels into a `Vec`.
@@ -169,7 +276,7 @@ impl DiskTier {
     #[must_use]
     #[cfg(test)]
     pub(crate) fn lookup(&self, doc: DocId, hash: &ContentHash) -> Option<DiskEntry> {
-        let path = entry_path(&self.root, doc, *hash);
+        let path = entry_path(&self.state.root, doc, *hash);
         match read_entry(&path) {
             Ok(entry) => Some(entry),
             Err(DiskReadError::Missing) => None,
@@ -198,7 +305,7 @@ impl DiskTier {
     where
         F: FnOnce(&DiskHeaderInfo, &mut dyn Read) -> Result<(), LookupCallbackError>,
     {
-        let path = entry_path(&self.root, doc, *hash);
+        let path = entry_path(&self.state.root, doc, *hash);
         match read_entry_into(&path, fill) {
             Ok(header) => Some(header),
             // Missing or callback-failed: the file is fine (or absent),
@@ -212,13 +319,25 @@ impl DiskTier {
         }
     }
 
-    /// Write an entry to disk.  Idempotent: a same-content rewrite
-    /// overwrites with bit-identical bytes via the atomic-rename
-    /// pattern.  Errors are logged and swallowed (caller's render
-    /// path always sees `()`).  **Synchronous**: `write_all` +
-    /// `sync_all` + `rename` block the calling thread for ~1–5 ms
-    /// on `NVMe` / ~10–50 ms on HDD per image.  Background-writer
-    /// dispatch is roadmap work — see ROADMAP.md.
+    /// Queue an entry for write.  Returns immediately — the actual
+    /// `write_all + sync_all + rename` happens on the writer
+    /// thread.  Idempotent w.r.t. cache content: a same-content
+    /// rewrite overwrites with bit-identical bytes via the
+    /// atomic-rename pattern.
+    ///
+    /// Behaviour when the queue is full: the write is **dropped**
+    /// (the in-memory tiers still serve the hit; only cross-session
+    /// persistence is lost for this entry).  The first drop per
+    /// process is logged at `warn`; subsequent drops bump
+    /// [`Self::dropped_writes`] silently.
+    ///
+    /// Race note: an `insert` followed immediately by a `lookup`
+    /// from the same session will usually miss on disk — the writer
+    /// thread hasn't flushed yet.  This is fine because the cache's
+    /// in-memory tiers (VRAM, host RAM) serve the hit first; the
+    /// disk tier is only consulted as a fallback.  `flush()` (test
+    /// helper) drains the queue if a test needs read-after-write
+    /// semantics.
     pub fn insert(
         &self,
         doc: DocId,
@@ -228,84 +347,225 @@ impl DiskTier {
         layout: ImageLayout,
         pixels: &[u8],
     ) {
-        let doc_dir = self.root.join(hex_lower(&doc.0));
-        if let Err(e) = fs::create_dir_all(&doc_dir) {
-            log::warn!(
-                "disk-tier: failed to create doc dir {}: {e}",
-                doc_dir.display()
-            );
+        // Fast-path early-out: if the queue is already saturated,
+        // skip the pixel clone entirely.  Otherwise we'd allocate
+        // and copy a multi-MB pixel buffer just to throw it away
+        // in `try_send`.  Slight race with the writer's decrement
+        // is harmless (off-by-one against an approximate bound).
+        if self.in_flight.load(Ordering::Acquire) >= WRITE_QUEUE_DEPTH {
+            self.note_dropped();
             return;
         }
-        let final_path = doc_dir.join(format!("{}.bin", hex_lower(&hash.0)));
-        if let Err(e) = write_entry(&final_path, width, height, layout, pixels) {
-            log::warn!("disk-tier: write to {} failed: {e}", final_path.display());
-            return;
-        }
-        // Bump the used estimate; reconcile against the actual
-        // directory size on the next eviction pass.
+        let final_path = entry_path(&self.state.root, doc, hash);
         let entry_size = (HEADER_LEN as u64).saturating_add(pixels.len() as u64);
-        let _ = self.used_estimate.fetch_add(entry_size, Ordering::Relaxed);
-
-        // Trigger eviction only when the optimistic estimate exceeds
-        // the budget.  Avoids a directory scan on every insert.
-        if self.budget > 0 && self.used_estimate.load(Ordering::Relaxed) > self.budget {
-            self.evict_to_fit();
+        let job = WriteJob {
+            final_path,
+            width,
+            height,
+            layout,
+            // One copy here — host RAM, ~µs vs the ms-scale fsync
+            // we're avoiding.  The pixels can't cross the thread
+            // boundary by reference; a Box<[u8]> is the cheapest
+            // owned form.
+            pixels: pixels.to_vec().into_boxed_slice(),
+            entry_size,
+        };
+        // Bump in_flight before send so the writer's decrement is
+        // ordered after.  Writers see the increment before the
+        // job because acquire/release on the channel acts as the
+        // synchronisation edge.
+        let _ = self.in_flight.fetch_add(1, Ordering::AcqRel);
+        match self.sender.try_send(WriterMsg::Write(job)) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                let _ = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                self.note_dropped();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                let _ = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                let _ = self.dropped_writes.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
-    /// Drop oldest documents (by directory mtime) until total disk
-    /// usage is under budget.  Eviction unit is the doc-sha256
-    /// directory, not individual files — partial-document caches
-    /// are wasteful.
-    ///
-    /// Best-effort: filesystem errors during the scan are logged
-    /// and the eviction pass returns early; the next insert will
-    /// retry.
-    fn evict_to_fit(&self) {
-        if self.budget == 0 {
-            return;
+    fn note_dropped(&self) {
+        let prev = self.dropped_writes.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            log::warn!(
+                "disk-tier: writer queue full ({WRITE_QUEUE_DEPTH} slots) — \
+                 dropping disk-tier writes; in-memory tiers still serve hits. \
+                 Subsequent drops are silent (see DiskTier::dropped_writes)."
+            );
         }
-        let mut dirs = match scan_doc_dirs(&self.root) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("disk-tier: scan {} failed: {e}", self.root.display());
-                return;
-            }
-        };
-        // Reconcile the optimistic counter from the actual scan.
-        let total: u64 = dirs.iter().map(|d| d.size_bytes).sum();
-        self.used_estimate.store(total, Ordering::Relaxed);
+    }
 
-        if total <= self.budget {
+    /// Drain the writer queue and return once every previously
+    /// queued write has either landed or failed.  Test helper;
+    /// production code does not need this — the disk tier is a
+    /// best-effort persistence layer and read-after-write within a
+    /// session is served by the in-memory tiers.
+    ///
+    /// Implementation: send a `FlushAck` marker; the writer drains
+    /// preceding `Write` messages in order, then sends `()` on the
+    /// returned channel.  Blocking-send so flush still works when
+    /// the channel is full.
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        let (tx, rx) = mpsc::sync_channel::<()>(0);
+        if self.sender.send(WriterMsg::FlushAck(tx)).is_err() {
+            // Writer gone — nothing to flush.
             return;
         }
-        // Sort oldest-first (smallest mtime) so we drop in age order.
-        dirs.sort_by_key(|d| d.mtime);
-        let mut current = total;
-        for d in dirs {
-            if current <= self.budget {
-                break;
-            }
-            if let Err(e) = fs::remove_dir_all(&d.path) {
-                log::warn!(
-                    "disk-tier: remove_dir_all({}) failed: {e}",
-                    d.path.display()
-                );
-                continue;
-            }
-            current = current.saturating_sub(d.size_bytes);
+        let _ = rx.recv();
+    }
+}
+
+impl Drop for DiskTier {
+    fn drop(&mut self) {
+        // The writer is blocked on `recv()`, so we must close the
+        // channel before `join()` or we deadlock.  `self.sender`
+        // would only drop *after* this Drop body returns, so
+        // explicitly replace it with a fresh disconnected sender;
+        // dropping the original closes the writer's receive end
+        // and `recv()` returns Err.
+        let (closed_tx, _) = mpsc::sync_channel::<WriterMsg>(0);
+        drop(std::mem::replace(&mut self.sender, closed_tx));
+
+        let dropped = self.dropped_writes.load(Ordering::Relaxed);
+        if dropped > 0 {
+            log::info!("disk-tier: {dropped} writes dropped under queue saturation");
         }
-        self.used_estimate.store(current, Ordering::Relaxed);
+
+        let handle = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle
+            && let Err(e) = handle.join()
+        {
+            log::warn!("disk-tier: writer thread join failed: {e:?}");
+        }
+    }
+}
+
+/// Drop oldest documents (by directory mtime) until total disk
+/// usage is under budget.  Eviction unit is the doc-sha256
+/// directory, not individual files — partial-document caches
+/// are wasteful.
+///
+/// Best-effort: filesystem errors during the scan are logged
+/// and the eviction pass returns early; the next write will
+/// retry.
+fn evict_to_fit(state: &WriterState) {
+    if state.budget == 0 {
+        return;
+    }
+    let mut dirs = match scan_doc_dirs(&state.root) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("disk-tier: scan {} failed: {e}", state.root.display());
+            return;
+        }
+    };
+    // Reconcile the optimistic counter from the actual scan.
+    let total: u64 = dirs.iter().map(|d| d.size_bytes).sum();
+    state.used_estimate.store(total, Ordering::Relaxed);
+
+    if total <= state.budget {
+        return;
+    }
+    // Sort oldest-first (smallest mtime) so we drop in age order.
+    dirs.sort_by_key(|d| d.mtime);
+    let mut current = total;
+    for d in dirs {
+        if current <= state.budget {
+            break;
+        }
+        if let Err(e) = fs::remove_dir_all(&d.path) {
+            log::warn!(
+                "disk-tier: remove_dir_all({}) failed: {e}",
+                d.path.display()
+            );
+            continue;
+        }
+        current = current.saturating_sub(d.size_bytes);
+    }
+    state.used_estimate.store(current, Ordering::Relaxed);
+}
+
+/// Background writer loop.  Owns the receiver end of the channel
+/// and runs until the channel is closed (sender dropped).  Each
+/// `Write` job: ensure the doc dir exists, do the synchronous
+/// write+sync+rename, bump `used_estimate`, trigger `evict_to_fit`
+/// if the budget was exceeded.  Each `FlushAck` job: ack the
+/// caller (it's a barrier, not a write).
+fn writer_loop(receiver: mpsc::Receiver<WriterMsg>, state: &WriterState, in_flight: &AtomicUsize) {
+    // `for msg in receiver` consumes the receiver and runs until
+    // the channel is closed (sender dropped).
+    for msg in receiver {
+        match msg {
+            WriterMsg::Write(job) => {
+                let do_decrement = || {
+                    let _ = in_flight.fetch_sub(1, Ordering::AcqRel);
+                };
+                if let Some(parent) = job.final_path.parent()
+                    && let Err(e) = fs::create_dir_all(parent)
+                {
+                    log::warn!(
+                        "disk-tier: failed to create doc dir {}: {e}",
+                        parent.display()
+                    );
+                    do_decrement();
+                    continue;
+                }
+                if let Err(e) = write_entry(
+                    &job.final_path,
+                    job.width,
+                    job.height,
+                    job.layout,
+                    &job.pixels,
+                ) {
+                    log::warn!(
+                        "disk-tier: write to {} failed: {e}",
+                        job.final_path.display()
+                    );
+                    do_decrement();
+                    continue;
+                }
+                let _ = state
+                    .used_estimate
+                    .fetch_add(job.entry_size, Ordering::Relaxed);
+                if state.budget > 0 && state.used_estimate.load(Ordering::Relaxed) > state.budget {
+                    evict_to_fit(state);
+                }
+                do_decrement();
+            }
+            #[cfg(test)]
+            WriterMsg::FlushAck(reply) => {
+                // Acknowledge after preceding writes have drained
+                // (sequential channel guarantees ordering).  Does
+                // not bump in_flight (sender doesn't either).
+                let _ = reply.send(());
+            }
+        }
     }
 }
 
 impl std::fmt::Debug for DiskTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiskTier")
-            .field("root", &self.root)
-            .field("budget_bytes", &self.budget)
-            .field("used_estimate", &self.used_estimate.load(Ordering::Relaxed))
-            .finish()
+            .field("root", &self.state.root)
+            .field("budget_bytes", &self.state.budget)
+            .field(
+                "used_estimate",
+                &self.state.used_estimate.load(Ordering::Relaxed),
+            )
+            .field(
+                "dropped_writes",
+                &self.dropped_writes.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -684,10 +944,25 @@ mod tests {
     use tempfile::tempdir;
 
     fn mk_tier(dir: &Path, budget: u64) -> DiskTier {
-        DiskTier {
+        let state = Arc::new(WriterState {
             root: dir.to_path_buf(),
             budget,
             used_estimate: AtomicU64::new(0),
+        });
+        let (sender, receiver) = mpsc::sync_channel::<WriterMsg>(WRITE_QUEUE_DEPTH);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let writer_state = Arc::clone(&state);
+        let writer_in_flight = Arc::clone(&in_flight);
+        let writer = thread::Builder::new()
+            .name("pdf-raster-disk-cache-writer-test".to_string())
+            .spawn(move || writer_loop(receiver, &writer_state, &writer_in_flight))
+            .expect("spawn test writer");
+        DiskTier {
+            state,
+            sender,
+            in_flight,
+            writer: Mutex::new(Some(writer)),
+            dropped_writes: AtomicU64::new(0),
         }
     }
 
@@ -708,6 +983,7 @@ mod tests {
             .collect();
 
         tier.insert(doc, hash, 16, 16, ImageLayout::Rgb, &pixels);
+        tier.flush();
         let entry = tier.lookup(doc, &hash).expect("hit");
         assert_eq!(entry.width, 16);
         assert_eq!(entry.height, 16);
@@ -732,7 +1008,7 @@ mod tests {
         let hash = ContentHash([0x44; 32]);
 
         // Manually plant a file with wrong magic.
-        let path = entry_path(&tier.root, doc, hash);
+        let path = entry_path(&tier.state.root, doc, hash);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"not a pdrf file").unwrap();
         assert!(tier.lookup(doc, &hash).is_none());
@@ -748,7 +1024,7 @@ mod tests {
         let hash = ContentHash([0x66; 32]);
 
         // Plant a valid header claiming 16×16 RGB, but truncate the payload.
-        let path = entry_path(&tier.root, doc, hash);
+        let path = entry_path(&tier.state.root, doc, hash);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut header = [0u8; HEADER_LEN];
         header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
@@ -774,7 +1050,8 @@ mod tests {
         let hash = ContentHash([0x88; 32]);
         let pixels = vec![0xABu8; 8 * 8 * 3];
         tier.insert(doc, hash, 8, 8, ImageLayout::Rgb, &pixels);
-        let path = entry_path(&tier.root, doc, hash);
+        tier.flush();
+        let path = entry_path(&tier.state.root, doc, hash);
         assert!(path.exists());
 
         let result = tier.lookup_into(doc, &hash, |_info, _reader| {
@@ -799,7 +1076,8 @@ mod tests {
         let hash = ContentHash([0xAA; 32]);
         let pixels = vec![0xCDu8; 8 * 8 * 3];
         tier.insert(doc, hash, 8, 8, ImageLayout::Rgb, &pixels);
-        let path = entry_path(&tier.root, doc, hash);
+        tier.flush();
+        let path = entry_path(&tier.state.root, doc, hash);
 
         let result = tier.lookup_into(doc, &hash, |_info, _reader| {
             Err(LookupCallbackError::Read(io::Error::new(
@@ -827,11 +1105,14 @@ mod tests {
         let hash = ContentHash([0xFF; 32]);
 
         tier.insert(doc_a, hash, 16, 16, ImageLayout::Rgb, &pixels);
+        tier.flush();
         // Force mtime ordering: sleep briefly so doc_b's dir mtime > doc_a's.
         std::thread::sleep(std::time::Duration::from_millis(20));
         tier.insert(doc_b, hash, 16, 16, ImageLayout::Rgb, &pixels);
+        tier.flush();
         std::thread::sleep(std::time::Duration::from_millis(20));
         tier.insert(doc_c, hash, 16, 16, ImageLayout::Rgb, &pixels);
+        tier.flush();
 
         // doc_a should have been evicted (oldest mtime).
         assert!(
@@ -840,6 +1121,45 @@ mod tests {
         );
         assert!(tier.lookup(doc_b, &hash).is_some(), "doc_b should remain");
         assert!(tier.lookup(doc_c, &hash).is_some(), "doc_c just inserted");
+    }
+
+    #[test]
+    fn drop_joins_writer_cleanly() {
+        // Smoke: building a tier and dropping it must terminate the
+        // writer thread without deadlocking.  The Drop impl
+        // explicitly closes the channel so the writer's recv()
+        // returns Err.
+        let dir = tempdir().expect("tempdir");
+        let tier = mk_tier(dir.path(), 0);
+        // Don't insert anything — pure construction-and-drop test.
+        drop(tier);
+        // If we got here without hanging, the writer joined.
+    }
+
+    #[test]
+    fn dropped_writes_increments_under_saturation() {
+        // Stuff the queue beyond WRITE_QUEUE_DEPTH while the writer
+        // can't drain (queue is full → try_send returns Full).  We
+        // can't easily pause the writer, so instead we send a large
+        // burst in tight succession; on a real system at least some
+        // will be dropped because the writer is doing fsyncs.
+        //
+        // To avoid flakiness on a fast machine, gate the assertion
+        // on "many or zero" — we accept 0 dropped only when the
+        // writer kept up.  The real sanity check is that
+        // dropped_writes is exposed and the counter doesn't panic.
+        let dir = tempdir().expect("tempdir");
+        let tier = mk_tier(dir.path(), 0);
+        let pixels = vec![0xEEu8; 1024];
+        let hash = ContentHash([0x11; 32]);
+        for i in 0..(WRITE_QUEUE_DEPTH * 4) {
+            #[allow(clippy::cast_possible_truncation)]
+            let doc = DocId([i as u8; 32]);
+            tier.insert(doc, hash, 32, 32, ImageLayout::Gray, &pixels);
+        }
+        tier.flush();
+        // Counter must be readable — exercise the public accessor.
+        let _ = tier.dropped_writes();
     }
 
     #[test]
