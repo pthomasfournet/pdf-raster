@@ -41,14 +41,14 @@ const KERNELS: &[&str] = &[
 
 /// Candidate directories for CUDA toolkit libraries, in preference order.
 ///
-/// Covers versioned installs (cuda-12.8, cuda-12), the generic symlink
-/// (`/usr/local/cuda`), and the legacy flat layout (`/usr/local/cuda/lib64`).
-/// All GPU feature blocks use this same list so they all benefit from a
-/// cuda-12.8 install even when that version was added after the others.
+/// First the generic symlink (`/usr/local/cuda`, which on Ubuntu is managed
+/// by `update-alternatives` and points at whichever toolkit is selected),
+/// then the legacy flat layout. Versioned trees like `/usr/local/cuda-13`
+/// or `/usr/local/cuda-12.8` are reachable through the same symlink, so we
+/// don't enumerate them here — that just creates stale entries every time
+/// a new toolkit ships.
 /// Note: paths are x86-64-specific; GPU features are only supported on x86-64.
 const CUDA_LIB_DIRS: &[&str] = &[
-    "/usr/local/cuda-12.8/targets/x86_64-linux/lib",
-    "/usr/local/cuda-12/targets/x86_64-linux/lib",
     "/usr/local/cuda/targets/x86_64-linux/lib",
     "/usr/local/cuda/lib64",
 ];
@@ -64,10 +64,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVJPEG2K_INCLUDE_DIR");
 
     let nvcc_path = env::var("NVCC").unwrap_or_else(|_| {
-        for path in ["/usr/local/cuda-12.8/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
-            if PathBuf::from(path).exists() {
-                return path.to_owned();
-            }
+        let candidate = "/usr/local/cuda/bin/nvcc";
+        if PathBuf::from(candidate).exists() {
+            return candidate.to_owned();
         }
         "nvcc".to_owned()
     });
@@ -88,8 +87,12 @@ fn main() {
     // nvJPEG2000: libnvjpeg2k.so lives in a non-standard path (not in the CUDA
     // toolkit tree) and requires cudart for cudaMalloc / cudaMemcpy2D.
     if env::var("CARGO_FEATURE_NVJPEG2K").is_ok() {
+        // Path layout depends on which CUDA major version the libnvjpeg2k
+        // package was built for. CUDA 13 → /libnvjpeg2k/13, CUDA 12 →
+        // /libnvjpeg2k/12. Probe newest first.
         link_lib_in_dir(
             &[
+                "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13",
                 "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12",
                 "/usr/lib/x86_64-linux-gnu/libnvjpeg2k",
             ],
@@ -213,17 +216,26 @@ fn main() {
 /// placed in `OUT_DIR`.  Uses nvcc as the C++ compiler so the include path for
 /// nvjpeg2k headers is automatically available, and links with -lstdc++.
 ///
-/// The include directory defaults to `/usr/include/libnvjpeg2k/12` but can be
-/// overridden via the `NVJPEG2K_INCLUDE_DIR` environment variable (useful for
-/// non-standard installations or CI).
+/// The include directory is auto-probed (preferring `/usr/include/libnvjpeg2k/13`
+/// over `/12` to match the link-time library), and can be overridden via the
+/// `NVJPEG2K_INCLUDE_DIR` environment variable for non-standard installations.
 fn compile_nvjpeg2k_shim(out_dir: &Path, nvcc: &str) {
     let shim_src = PathBuf::from("shim/nvjpeg2k_shim.cpp");
     let shim_obj = out_dir.join("nvjpeg2k_shim.o");
     let shim_lib = out_dir.join("libnvjpeg2k_shim.a");
     let out_dir_s = out_dir.to_str().expect("OUT_DIR path non-UTF-8");
 
-    let include_dir = env::var("NVJPEG2K_INCLUDE_DIR")
-        .unwrap_or_else(|_| "/usr/include/libnvjpeg2k/12".to_owned());
+    let include_dir = env::var("NVJPEG2K_INCLUDE_DIR").unwrap_or_else(|_| {
+        for candidate in [
+            "/usr/include/libnvjpeg2k/13",
+            "/usr/include/libnvjpeg2k/12",
+        ] {
+            if PathBuf::from(candidate).exists() {
+                return candidate.to_owned();
+            }
+        }
+        "/usr/include/libnvjpeg2k/13".to_owned()
+    });
 
     // Compile the C++ source to an object file.
     let status = Command::new(nvcc)

@@ -12,8 +12,10 @@ path = "src/bin/threshold_bench.rs"
 # Requires libnvjpeg.so to be present at link time (ships with CUDA 12).
 nvjpeg = []
 # Enable GPU-accelerated JPEG 2000 decoding via NVIDIA nvJPEG2000.
-# Requires libnvjpeg2k.so at link time (installed at
-# /usr/lib/x86_64-linux-gnu/libnvjpeg2k/12/ on this system).
+# Requires libnvjpeg2k.so at link time. Install location depends on the
+# CUDA toolkit major version: /usr/lib/x86_64-linux-gnu/libnvjpeg2k/13/
+# for CUDA 13 packages, /usr/lib/x86_64-linux-gnu/libnvjpeg2k/12/ for
+# CUDA 12. build.rs probes both, preferring 13.
 nvjpeg2k = []
 # Enable GPU rotation via CUDA NPP nppiRotate_8u_C1R_Ctx.
 # Requires libnppig.so + libnppc.so + libcudart.so (all ship with CUDA 12).

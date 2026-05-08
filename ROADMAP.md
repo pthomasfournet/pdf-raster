@@ -444,7 +444,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release \
   --features nvjpeg,nvjpeg2k,gpu-aa,gpu-icc
 
 BIN=target/release/pdf-raster
-LD_LIB=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12:/usr/local/cuda-12.8/lib64
+LD_LIB=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13:/usr/local/cuda/lib64
 
 # Throughput vs pdftoppm
 env $LD_LIB hyperfine --warmup 3 --runs 8 \
@@ -793,7 +793,7 @@ Re-bench result: cold-render regression collapsed from 14× to 1.1–1.9× on lo
 
 **Why now (and why not before):**
 
-Vulkan compute on the dev machine (RTX 5070, driver 580.142) was confirmed 2026-05-07 to expose Vulkan 1.4.312, conformance 1.4.1.3, full subgroup operations (the equivalent of CUDA warp intrinsics), tensor cores via `VK_KHR_cooperative_matrix`, and the same SM array CUDA uses. Cross-vendor portability is the real reason — the same SPIR-V kernel runs on AMD (RADV), Intel (ANV), Apple (MoltenVK→Metal), and Mesa lavapipe (CPU debug).
+Vulkan compute on the dev machine (RTX 5070) was confirmed 2026-05-07 to expose Vulkan 1.4.312, conformance 1.4.1.3, full subgroup operations (the equivalent of CUDA warp intrinsics), tensor cores via `VK_KHR_cooperative_matrix`, and the same SM array CUDA uses. Cross-vendor portability is the real reason — the same SPIR-V kernel runs on AMD (RADV), Intel (ANV), Apple (MoltenVK→Metal), and Mesa lavapipe (CPU debug).
 
 What was missing before Phase 9 was *the abstraction layer to even consider a backend swap*. Phase 9 introduces backend-agnostic shapes (`ImageData::Gpu`, `CachedDeviceImage`, `DevicePageBuffer`); Phase 10 swaps the *implementation* behind those shapes from CUDA-specific to backend-trait-driven, with concrete CUDA and Vulkan backends.
 
