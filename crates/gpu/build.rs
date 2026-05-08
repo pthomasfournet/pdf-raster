@@ -226,10 +226,7 @@ fn compile_nvjpeg2k_shim(out_dir: &Path, nvcc: &str) {
     let out_dir_s = out_dir.to_str().expect("OUT_DIR path non-UTF-8");
 
     let include_dir = env::var("NVJPEG2K_INCLUDE_DIR").unwrap_or_else(|_| {
-        for candidate in [
-            "/usr/include/libnvjpeg2k/13",
-            "/usr/include/libnvjpeg2k/12",
-        ] {
+        for candidate in ["/usr/include/libnvjpeg2k/13", "/usr/include/libnvjpeg2k/12"] {
             if PathBuf::from(candidate).exists() {
                 return candidate.to_owned();
             }

@@ -779,11 +779,14 @@ impl NvJpegDecoder {
                 return Err(NvJpegError::CudaError(r));
             }
             // Probe: a recovering context returns an error here even though Retain
-            // succeeded and the pointer is non-null.
-            let mut _ver: u32 = 0;
+            // succeeded and the pointer is non-null. We only inspect the return
+            // code; the API-version out-param is discarded.
+            let mut ver = std::mem::MaybeUninit::<u32>::uninit();
             // SAFETY: cu_ctx is non-null (Retain succeeded); cuCtxGetApiVersion is a
-            // read-only probe that does not modify driver state.
-            let probe = unsafe { cuCtxGetApiVersion(cu_ctx, &raw mut _ver) };
+            // read-only probe that does not modify driver state. It writes a u32 to
+            // the out-param when the call returns CUDA_SUCCESS, leaving it untouched
+            // otherwise — we never read it either way.
+            let probe = unsafe { cuCtxGetApiVersion(cu_ctx, ver.as_mut_ptr()) };
             if probe == 0 {
                 ctx_ready = true;
                 break;
