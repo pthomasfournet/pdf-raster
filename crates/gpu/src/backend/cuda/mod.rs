@@ -1,9 +1,7 @@
 //! CUDA backend implementing `GpuBackend`.
 //!
 //! Wraps the existing `GpuCtx` and per-kernel `lib_kernels::*` functions.
-//! Per-page batching is recorded into a `PageRecorder`; see
-//! `page_recorder.rs`.  The `record_*` methods are stubbed for task 1.8;
-//! real wiring lands in task 1.9.
+//! Per-page batching is recorded into a `PageRecorder`; see `page_recorder.rs`.
 
 mod page_recorder;
 
@@ -117,8 +115,11 @@ impl GpuBackend for CudaBackend {
     }
 
     fn upload_async(&self, _dst: &Self::DeviceBuffer, _src: &[u8]) -> Result<Self::PageFence> {
-        // Stub: real upload-stream impl lands in task 1.11.
-        unimplemented!("upload_async stubbed; real impl in task 1.11")
+        // Stub: a dedicated copy-engine stream + event signalling will land
+        // alongside the prefetcher integration. Until then, panic loudly so
+        // accidental callers fail at the trait surface rather than silently
+        // returning a bogus fence.
+        unimplemented!("CudaBackend::upload_async is not implemented yet")
     }
 
     fn detect_vram_budget(&self) -> Result<VramBudget> {
