@@ -1,108 +1,269 @@
 //! CUDA page recorder — buffers `record_*` calls until `submit_page`.
 //!
-//! For task 1.8 this is a thin stub that accepts calls but does nothing.
-//! Task 1.9 swaps the body to call through to the existing per-kernel
-//! functions and remove per-kernel `synchronize` calls.
+//! All `record_*` methods route through the per-kernel
+//! `launch_<name>_async` helpers in `lib_kernels::*`, which queue the
+//! kernel onto the context's default stream **without** synchronising or
+//! downloading.  `submit_page` records a `CudaEvent`; `wait_page` blocks
+//! the host on it.  Callers therefore stall once per page rather than
+//! once per kernel.
+//!
+//! ## Concurrency note
+//!
+//! All buffer references in `params::*Params` are `&CudaSlice<u8>`
+//! (immutable), even for read-modify-write operands like the
+//! composite destination.  At the cudarc layer the kernel receives a
+//! raw `CUdeviceptr`, so the &-vs-&mut distinction has no effect on
+//! the launch.  In-place writes are race-free because the CUDA
+//! backend serialises every launch on a single shared stream — by the
+//! time the next launch starts, the previous one has finished writing.
+
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "record_* methods take params by value to mirror the GpuBackend trait shape; the trait could take &Params, but every backend would still want to destructure, so the by-value form is canonical"
+)]
 
 use std::sync::Arc;
 
+use cudarc::driver::CudaEvent;
+
+use super::{StringError, be};
 use crate::GpuCtx;
-use crate::backend::{Result, params};
+use crate::backend::{BackendError, Result, params};
+#[cfg(feature = "cache")]
+use crate::blit::{BlitBbox, InverseCtm};
 
 pub(super) struct PageRecorder {
-    #[expect(
-        dead_code,
-        reason = "used in task 1.9 when record_* methods call lib_kernels"
-    )]
     pub(super) ctx: Arc<GpuCtx>,
 }
 
 /// A synchronisation token returned by [`PageRecorder::submit_page`].
 ///
-/// For task 1.8 this is a zero-cost sentinel; task 1.9 will replace it
-/// with a real stream-event handle.
+/// Wraps a [`CudaEvent`] recorded on the backend's stream.  `wait_page`
+/// calls `event.synchronize()`, which blocks the host until every prior
+/// kernel queued on that stream has completed.
 #[derive(Debug)]
-pub struct PageFence;
+pub struct PageFence(CudaEvent);
 
 impl PageRecorder {
     pub(super) const fn new(ctx: Arc<GpuCtx>) -> Self {
         Self { ctx }
     }
 
-    // begin_page / submit_page / wait_page are stubs whose signatures must
-    // match the GpuBackend trait.  The `unused_self`, `unnecessary_wraps`, and
-    // `missing_const_for_fn` lints fire because the body is trivial; suppress
-    // them here until task 1.9 fills in the real impl.
+    /// Begin a new page.
+    ///
+    /// The CUDA backend has nothing to do here today — there's a single
+    /// shared stream and recording just means queuing into it.  The
+    /// method exists to mirror the `GpuBackend` trait shape so the
+    /// Vulkan backend (which **does** allocate a per-page command
+    /// buffer) and the CUDA backend share the same call site in
+    /// callers.
     #[expect(
         clippy::unused_self,
         clippy::unnecessary_wraps,
         clippy::missing_const_for_fn,
-        reason = "stub matching GpuBackend signature; real impl in task 1.9"
+        reason = "shape-only impl; the Vulkan equivalent will allocate a command buffer here"
     )]
     pub(super) fn begin_page(&self) -> Result<()> {
         Ok(())
     }
 
-    #[expect(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        clippy::missing_const_for_fn,
-        reason = "stub matching GpuBackend signature; real impl in task 1.9"
-    )]
+    /// Record a stream event for the current page's queued work.
+    ///
+    /// All prior `record_*` launches on this stream are ordered before
+    /// the event.  The host can then block on the event with
+    /// `wait_page` instead of synchronising the whole stream.
     pub(super) fn submit_page(&self) -> Result<PageFence> {
-        Ok(PageFence)
+        let event = self
+            .ctx
+            .stream()
+            .record_event(None)
+            .map_err(|e| BackendError::new(StringError(e.to_string())))?;
+        Ok(PageFence(event))
     }
 
+    /// Block until the work covered by `fence` has completed.
     #[expect(
         clippy::unused_self,
-        clippy::unnecessary_wraps,
-        clippy::missing_const_for_fn,
-        reason = "stub matching GpuBackend signature; real impl in task 1.9"
+        reason = "self-arg kept for symmetry with the trait method and forward-compat with future per-recorder fence pools"
     )]
-    pub(super) fn wait_page(&self, _fence: PageFence) -> Result<()> {
-        Ok(())
+    pub(super) fn wait_page(&self, fence: PageFence) -> Result<()> {
+        fence
+            .0
+            .synchronize()
+            .map_err(|e| BackendError::new(StringError(e.to_string())))
     }
 
     pub(super) fn record_blit_image(
         &self,
+        p: params::BlitParams<'_, super::CudaBackend>,
+    ) -> Result<()> {
+        Self::record_blit_image_inner(&self.ctx, p)
+    }
+
+    #[cfg(feature = "cache")]
+    fn record_blit_image_inner(
+        ctx: &Arc<GpuCtx>,
+        p: params::BlitParams<'_, super::CudaBackend>,
+    ) -> Result<()> {
+        let inv_ctm = InverseCtm {
+            u_dx: p.inv_ctm[0],
+            u_dy: p.inv_ctm[1],
+            v_dx: p.inv_ctm[2],
+            v_dy: p.inv_ctm[3],
+            tx: p.inv_ctm[4],
+            ty: p.inv_ctm[5],
+        };
+        let bbox = BlitBbox {
+            x0: p.bbox[0],
+            y0: p.bbox[1],
+            x1: p.bbox[2],
+            y1: p.bbox[3],
+        };
+        // Trait passes layout as u32; kernel takes i32.  Values are
+        // `0 = Rgb`, `1 = Gray`; Mask layout is rejected by the
+        // legacy `blit_image_to_buffer` and not reachable through
+        // the trait (callers must filter at record time).
+        let layout_code = i32::try_from(p.src_layout).unwrap_or(0);
+
+        ctx.launch_blit_image_async(
+            p.src,
+            (p.src_w, p.src_h),
+            layout_code,
+            p.dst,
+            (p.dst_w, p.dst_h),
+            bbox,
+            &inv_ctm,
+            p.page_h,
+        )
+        .map_err(|e| BackendError::new(StringError(e.to_string())))
+    }
+
+    #[cfg(not(feature = "cache"))]
+    fn record_blit_image_inner(
+        _ctx: &Arc<GpuCtx>,
         _p: params::BlitParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        // STUB: task 1.9 wires this to lib_kernels::blit
-        unimplemented!("record_blit_image stubbed; real wiring in task 1.9")
+        Err(BackendError::new(StringError(
+            "blit_image requires the gpu crate's `cache` feature".into(),
+        )))
     }
 
     pub(super) fn record_aa_fill(
         &self,
-        _p: params::AaFillParams<'_, super::CudaBackend>,
+        p: params::AaFillParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        unimplemented!("record_aa_fill stubbed; real wiring in task 1.9")
+        let eo = p.fill_rule != 0;
+        // The trait API uses tile-local coordinates: callers compute
+        // `x_min` / `y_min` into the segs they upload, so the kernel
+        // origin is always (0, 0).  This matches `tile_fill` and
+        // simplifies the trait surface; renderer migration in task
+        // 1.10 may add a separate `origin` param if a non-zero
+        // device-pixel offset is needed.
+        let x_min = 0.0_f32;
+        let y_min = 0.0_f32;
+        self.ctx
+            .launch_aa_fill_async(
+                p.segs, p.n_segs, x_min, y_min, p.width, p.height, eo, p.coverage,
+            )
+            .map_err(be)
     }
 
     pub(super) fn record_icc_clut(
         &self,
-        _p: params::IccClutParams<'_, super::CudaBackend>,
+        p: params::IccClutParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        unimplemented!("record_icc_clut stubbed; real wiring in task 1.9")
+        let clut_bytes = p.clut.len();
+        let grid_n = grid_n_from_clut_len(clut_bytes).ok_or_else(|| {
+            BackendError::new(StringError(format!(
+                "ICC CLUT length {clut_bytes} is not a valid grid_n^4 * 3"
+            )))
+        })?;
+        self.ctx
+            .launch_icc_clut_async(p.cmyk, p.rgb, p.clut, grid_n, p.n_pixels)
+            .map_err(be)
     }
 
     pub(super) fn record_tile_fill(
         &self,
-        _p: params::TileFillParams<'_, super::CudaBackend>,
+        p: params::TileFillParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        unimplemented!("record_tile_fill stubbed; real wiring in task 1.9")
+        let eo = p.fill_rule != 0;
+        let grid_w = p.width.div_ceil(crate::TILE_W);
+        self.ctx
+            .launch_tile_fill_async(
+                p.records,
+                p.tile_starts,
+                p.tile_counts,
+                grid_w,
+                p.width,
+                p.height,
+                eo,
+                p.coverage,
+            )
+            .map_err(be)
     }
 
     pub(super) fn record_composite(
         &self,
-        _p: params::CompositeParams<'_, super::CudaBackend>,
+        p: params::CompositeParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        unimplemented!("record_composite stubbed; real wiring in task 1.9")
+        self.ctx
+            .launch_composite_async(p.src, p.dst, p.n_pixels)
+            .map_err(be)
     }
 
     pub(super) fn record_apply_soft_mask(
         &self,
-        _p: params::SoftMaskParams<'_, super::CudaBackend>,
+        p: params::SoftMaskParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        unimplemented!("record_apply_soft_mask stubbed; real wiring in task 1.9")
+        self.ctx
+            .launch_soft_mask_async(p.pixels, p.mask, p.n_pixels)
+            .map_err(be)
+    }
+}
+
+/// Given a CLUT byte length, recover `grid_n` such that
+/// `len == grid_n^4 * 3`, or `None` if the length is invalid.
+///
+/// The CLUT layout is `(k * G³ + c * G² + m * G + y) * 3` bytes —
+/// `grid_n^4` 3-byte RGB nodes.  Typical PDF profiles use `grid_n` = 17
+/// or 33.
+fn grid_n_from_clut_len(len: usize) -> Option<u32> {
+    if !len.is_multiple_of(3) {
+        return None;
+    }
+    let nodes = len / 3;
+    // Integer 4th root by iteration: grid_n ≤ 255 in practice.
+    for grid in 2u32..=255 {
+        let g = grid as usize;
+        let pow4 = g.checked_mul(g)?.checked_mul(g)?.checked_mul(g)?;
+        if pow4 == nodes {
+            return Some(grid);
+        }
+        if pow4 > nodes {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_n_round_trips() {
+        assert_eq!(grid_n_from_clut_len(17 * 17 * 17 * 17 * 3), Some(17));
+        assert_eq!(grid_n_from_clut_len(33 * 33 * 33 * 33 * 3), Some(33));
+    }
+
+    #[test]
+    fn grid_n_rejects_non_multiple_of_3() {
+        assert_eq!(grid_n_from_clut_len(83_521 * 3 + 1), None);
+    }
+
+    #[test]
+    fn grid_n_rejects_non_4th_power() {
+        assert_eq!(grid_n_from_clut_len(100 * 3), None);
     }
 }

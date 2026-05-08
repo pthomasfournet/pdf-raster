@@ -1,6 +1,6 @@
 //! ICC CMYK→RGB kernel dispatch.
 
-use cudarc::driver::PushKernelArg;
+use cudarc::driver::{CudaSlice, PushKernelArg};
 
 use crate::{GPU_ICC_CLUT_THRESHOLD, GpuCtx, cmyk::icc_cmyk_to_rgb_cpu, launch_cfg};
 
@@ -103,29 +103,15 @@ impl GpuCtx {
 
         let d_cmyk = stream.clone_htod(cmyk)?;
         let rgb_init = vec![0u8; n * 3];
-        let mut d_rgb = stream.clone_htod(&rgb_init)?;
-
-        let cfg = launch_cfg(n);
+        let d_rgb = stream.clone_htod(&rgb_init)?;
 
         match clut {
             None => {
-                let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_matrix);
-                let _ = builder.arg(&d_cmyk);
-                let _ = builder.arg(&mut d_rgb);
-                let _ = builder.arg(&n_u32);
-                // SAFETY: 3 args match icc_cmyk_matrix PTX signature exactly.
-                let _ = unsafe { builder.launch(cfg) }?;
+                self.launch_icc_matrix_async(&d_cmyk, &d_rgb, n_u32)?;
             }
             Some((table, grid_n)) => {
                 let d_clut = stream.clone_htod(table)?;
-                let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_clut);
-                let _ = builder.arg(&d_cmyk);
-                let _ = builder.arg(&mut d_rgb);
-                let _ = builder.arg(&d_clut);
-                let _ = builder.arg(&grid_n);
-                let _ = builder.arg(&n_u32);
-                // SAFETY: 5 args match icc_cmyk_clut PTX signature exactly.
-                let _ = unsafe { builder.launch(cfg) }?;
+                self.launch_icc_clut_async(&d_cmyk, &d_rgb, &d_clut, grid_n, n_u32)?;
             }
         }
 
@@ -133,5 +119,60 @@ impl GpuCtx {
         let mut rgb = vec![0u8; n * 3];
         stream.memcpy_dtoh(&d_rgb, &mut rgb)?;
         Ok(rgb)
+    }
+
+    /// Async kernel launch for the ICC CMYK→RGB matrix kernel.
+    ///
+    /// Caller is responsible for stream ordering and any final D→H download.
+    /// Note: the public dispatcher always routes the matrix path to the CPU
+    /// AVX-512 fallback; this helper exists for completeness so tests can
+    /// exercise the GPU path directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying CUDA error if the launch fails.
+    pub(crate) fn launch_icc_matrix_async(
+        &self,
+        d_cmyk: &CudaSlice<u8>,
+        d_rgb: &CudaSlice<u8>,
+        n_pixels: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = launch_cfg(n_pixels as usize);
+        let stream = &self.stream;
+        let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_matrix);
+        let _ = builder.arg(d_cmyk);
+        let _ = builder.arg(d_rgb);
+        let _ = builder.arg(&n_pixels);
+        // SAFETY: 3 args match icc_cmyk_matrix PTX signature exactly.
+        let _ = unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Async kernel launch for the ICC CMYK→RGB 4D CLUT kernel.
+    ///
+    /// Caller is responsible for stream ordering and any final D→H download.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying CUDA error if the launch fails.
+    pub(crate) fn launch_icc_clut_async(
+        &self,
+        d_cmyk: &CudaSlice<u8>,
+        d_rgb: &CudaSlice<u8>,
+        d_clut: &CudaSlice<u8>,
+        grid_n: u32,
+        n_pixels: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = launch_cfg(n_pixels as usize);
+        let stream = &self.stream;
+        let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_clut);
+        let _ = builder.arg(d_cmyk);
+        let _ = builder.arg(d_rgb);
+        let _ = builder.arg(d_clut);
+        let _ = builder.arg(&grid_n);
+        let _ = builder.arg(&n_pixels);
+        // SAFETY: 5 args match icc_cmyk_clut PTX signature exactly.
+        let _ = unsafe { builder.launch(cfg) }?;
+        Ok(())
     }
 }

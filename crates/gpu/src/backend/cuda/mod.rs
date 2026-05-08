@@ -19,7 +19,7 @@ use crate::backend::{BackendError, GpuBackend, Result, VramBudget, params};
 /// `GpuCtx::init` returns `Box<dyn Error>` (not Send+Sync), so we wrap the
 /// stringified message in a type that is `Send + Sync + Error`.
 #[derive(Debug)]
-struct StringError(String);
+pub(super) struct StringError(pub(super) String);
 
 impl std::fmt::Display for StringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -30,7 +30,7 @@ impl std::fmt::Display for StringError {
 impl std::error::Error for StringError {}
 
 /// Convert any `Display` error to a `BackendError` via `StringError`.
-fn be(e: impl std::fmt::Display) -> BackendError {
+pub(super) fn be(e: impl std::fmt::Display) -> BackendError {
     BackendError::new(StringError(e.to_string()))
 }
 

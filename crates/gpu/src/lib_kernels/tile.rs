@@ -1,6 +1,6 @@
 //! Tile-parallel analytical fill kernel dispatch.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use crate::{GpuCtx, TILE_H, TILE_W, fill::TileRecord};
 
@@ -61,18 +61,66 @@ impl GpuCtx {
         }
         let stream = &self.stream;
 
-        // Upload inputs.
-        let d_records = if records.is_empty() {
-            // cudarc refuses zero-size allocations — use a dummy 1-element buffer.
-            stream.clone_htod(&[TileRecord::default()])?
+        // Upload inputs as byte buffers so they match the trait's
+        // `B::DeviceBuffer = CudaSlice<u8>` shape used by the async helper.
+        let placeholder = [TileRecord::default()];
+        let records_bytes: &[u8] = if records.is_empty() {
+            // cudarc refuses zero-size allocations — use a one-record placeholder.
+            bytemuck::cast_slice(&placeholder)
         } else {
-            stream.clone_htod(records)?
+            bytemuck::cast_slice(records)
         };
-        let d_tile_starts = stream.clone_htod(tile_starts)?;
-        let d_tile_counts = stream.clone_htod(tile_counts)?;
+        let d_records = stream.clone_htod(records_bytes)?;
+        let d_tile_starts = stream.clone_htod(bytemuck::cast_slice::<u32, u8>(tile_starts))?;
+        let d_tile_counts = stream.clone_htod(bytemuck::cast_slice::<u32, u8>(tile_counts))?;
         let d_cov_init = vec![0u8; n_pixels];
-        let mut d_coverage = stream.clone_htod(&d_cov_init)?;
+        let d_coverage = stream.clone_htod(&d_cov_init)?;
 
+        self.launch_tile_fill_async(
+            &d_records,
+            &d_tile_starts,
+            &d_tile_counts,
+            grid_w,
+            width,
+            height,
+            eo,
+            &d_coverage,
+        )?;
+
+        stream.synchronize()?;
+        let mut coverage = vec![0u8; n_pixels];
+        stream.memcpy_dtoh(&d_coverage, &mut coverage)?;
+        Ok(coverage)
+    }
+
+    /// Async kernel launch for the tile-parallel analytical fill kernel.
+    ///
+    /// Caller is responsible for stream ordering and any final D→H
+    /// download. This function does **not** call `synchronize` and does
+    /// **not** touch host memory.
+    ///
+    /// All buffers are passed by reference; the caller owns them and is
+    /// responsible for keeping them alive until the stream has executed
+    /// the launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying CUDA error if the launch fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all args mirror the PTX kernel signature; grouping would obscure the mapping"
+    )]
+    pub(crate) fn launch_tile_fill_async(
+        &self,
+        d_records: &CudaSlice<u8>,
+        d_tile_starts: &CudaSlice<u8>,
+        d_tile_counts: &CudaSlice<u8>,
+        grid_w: u32,
+        width: u32,
+        height: u32,
+        eo: bool,
+        d_coverage: &CudaSlice<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let grid_h = height.div_ceil(TILE_H);
         let cfg = LaunchConfig {
             grid_dim: (grid_w, grid_h, 1),
@@ -81,22 +129,19 @@ impl GpuCtx {
         };
 
         let eo_int: i32 = i32::from(eo);
+        let stream = &self.stream;
         let mut builder = stream.launch_builder(&self.kernels.tile_fill);
-        let _ = builder.arg(&d_records);
-        let _ = builder.arg(&d_tile_starts);
-        let _ = builder.arg(&d_tile_counts);
+        let _ = builder.arg(d_records);
+        let _ = builder.arg(d_tile_starts);
+        let _ = builder.arg(d_tile_counts);
         let _ = builder.arg(&grid_w);
         let _ = builder.arg(&width);
         let _ = builder.arg(&height);
         let _ = builder.arg(&eo_int);
-        let _ = builder.arg(&mut d_coverage);
+        let _ = builder.arg(d_coverage);
         // SAFETY: kernel arguments match the PTX signature exactly (8 args, no
         // x_min/y_min — coords are tile-local from build_tile_records).
         let _ = unsafe { builder.launch(cfg) }?;
-
-        stream.synchronize()?;
-        let mut coverage = vec![0u8; n_pixels];
-        stream.memcpy_dtoh(&d_coverage, &mut coverage)?;
-        Ok(coverage)
+        Ok(())
     }
 }
