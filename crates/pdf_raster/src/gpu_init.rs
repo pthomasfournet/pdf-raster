@@ -21,7 +21,7 @@ use std::cell::RefCell;
 
 #[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
 #[derive(Default)]
-pub(crate) enum DecoderInit<T> {
+pub enum DecoderInit<T> {
     #[default]
     Uninitialised,
     Ready(Option<T>),
@@ -32,19 +32,19 @@ pub(crate) enum DecoderInit<T> {
 // this lock too (used by crate::decode_queue::build_vaapi_queue).
 // Only held during construction, never during render.
 #[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
-pub(crate) static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Thread-local decoder slots ────────────────────────────────────────────────
 
 #[cfg(feature = "nvjpeg")]
 thread_local! {
-    pub(crate) static NVJPEG_DEC: RefCell<DecoderInit<gpu::nvjpeg::NvJpegDecoder>> =
+    pub static NVJPEG_DEC: RefCell<DecoderInit<gpu::nvjpeg::NvJpegDecoder>> =
         const { RefCell::new(DecoderInit::Uninitialised) };
 }
 
 #[cfg(feature = "nvjpeg2k")]
 thread_local! {
-    pub(crate) static NVJPEG2K_DEC: RefCell<DecoderInit<gpu::nvjpeg2k::NvJpeg2kDecoder>> =
+    pub static NVJPEG2K_DEC: RefCell<DecoderInit<gpu::nvjpeg2k::NvJpeg2kDecoder>> =
         const { RefCell::new(DecoderInit::Uninitialised) };
 }
 
@@ -56,7 +56,7 @@ thread_local! {
 /// human-readable message if it fails and `policy` is `ForceCuda`.  On `Auto`
 /// a failure is logged and silently skipped.
 #[cfg(feature = "nvjpeg")]
-pub(crate) fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
+pub fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
     NVJPEG_DEC.with(|cell| {
         // TLS is per-thread — only this thread writes this slot, so a single
         // check is sufficient before acquiring the construction lock.
@@ -98,7 +98,7 @@ pub(crate) fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
 
 /// Try to initialise this thread's nvJPEG2000 decoder.
 #[cfg(feature = "nvjpeg2k")]
-pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
+pub fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
     NVJPEG2K_DEC.with(|cell| {
         match *cell.borrow() {
             DecoderInit::Uninitialised => {}
@@ -142,14 +142,14 @@ pub(crate) fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
 /// Drop this thread's nvJPEG decoder immediately so the TLS destructor at
 /// process exit is a no-op — avoids the CUDA driver teardown race.
 #[cfg(feature = "nvjpeg")]
-pub(crate) fn release_nvjpeg_this_thread() {
+pub fn release_nvjpeg_this_thread() {
     NVJPEG_DEC.with(|cell| {
         *cell.borrow_mut() = DecoderInit::Uninitialised;
     });
 }
 
 #[cfg(feature = "nvjpeg2k")]
-pub(crate) fn release_nvjpeg2k_this_thread() {
+pub fn release_nvjpeg2k_this_thread() {
     NVJPEG2K_DEC.with(|cell| {
         *cell.borrow_mut() = DecoderInit::Uninitialised;
     });

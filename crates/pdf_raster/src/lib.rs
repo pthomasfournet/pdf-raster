@@ -132,9 +132,12 @@ pub use render::{
 ///
 /// After this call the TLS slots hold `Uninitialised`, so their own destructors
 /// at process exit are no-ops.
-#[expect(
-    clippy::missing_const_for_fn,
-    reason = "body is non-empty (calls non-const fns) when nvjpeg/nvjpeg2k features are enabled"
+#[cfg_attr(
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "body collapses to empty when no GPU-decoder feature is on"
+    )
 )]
 pub fn release_gpu_decoders() {
     #[cfg(feature = "nvjpeg")]

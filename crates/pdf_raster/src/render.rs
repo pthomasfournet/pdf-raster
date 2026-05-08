@@ -496,8 +496,14 @@ fn render_page_rgb_with_geom(
     not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
     expect(
         clippy::unnecessary_wraps,
+        reason = "Result<()> only carries an error from the nvjpeg/nvjpeg2k init paths"
+    )
+)]
+#[cfg_attr(
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")),
+    expect(
         clippy::missing_const_for_fn,
-        reason = "return type and body vary with GPU feature flags"
+        reason = "body collapses to a single match when no GPU-decoder feature is on"
     )
 )]
 fn lend_decoders(
@@ -508,9 +514,11 @@ fn lend_decoders(
     if matches!(effective_policy, BackendPolicy::CpuOnly) {
         return Ok(());
     }
-    // `session` and `renderer` are used inside `#[cfg]`-gated blocks below;
-    // suppress unused-variable warnings in CPU-only / no-GPU-decoder builds.
-    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
+    // `session` and `renderer` are used inside `#[cfg]`-gated blocks below.
+    // `session` is only read on the vaapi path; `renderer` only on the
+    // nvjpeg/nvjpeg2k/vaapi paths. Suppress the unused-variable warning when
+    // the relevant feature is off.
+    #[cfg(not(feature = "vaapi"))]
     let _ = session;
     #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
     let _ = renderer;
