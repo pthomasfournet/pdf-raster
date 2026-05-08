@@ -212,7 +212,7 @@ pub fn bake_cmyk_clut_cached(
         return Ok(Arc::clone(arc));
     }
     let table: Arc<[u8]> = bake_cmyk_clut(icc_bytes, grid_n)?.into();
-    cache.insert(key, Arc::clone(&table));
+    let _ = cache.insert(key, Arc::clone(&table));
     Ok(table)
 }
 

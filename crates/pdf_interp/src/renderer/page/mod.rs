@@ -409,7 +409,7 @@ impl<'doc> PageRenderer<'doc> {
     /// Used by the CLI to return the decoder to its thread-local slot
     /// after each page render so it survives across pages.
     #[cfg(feature = "nvjpeg")]
-    pub fn take_nvjpeg(&mut self) -> Option<NvJpegDecoder> {
+    pub const fn take_nvjpeg(&mut self) -> Option<NvJpegDecoder> {
         self.nvjpeg.take()
     }
 

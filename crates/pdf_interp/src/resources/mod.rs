@@ -270,6 +270,25 @@ impl<'doc> PageResources<'doc> {
     /// JPEG 2000 decoding for large `JPXDecode` streams when the `nvjpeg2k`
     /// feature is active.  Pass `None` for CPU-only behaviour on either path.
     #[must_use]
+    #[cfg_attr(
+        any(
+            all(
+                feature = "gpu-icc",
+                feature = "cache",
+                any(feature = "nvjpeg", feature = "vaapi", feature = "nvjpeg2k")
+            ),
+            all(
+                feature = "nvjpeg",
+                feature = "vaapi",
+                feature = "nvjpeg2k",
+                any(feature = "gpu-icc", feature = "cache")
+            )
+        ),
+        expect(
+            clippy::too_many_arguments,
+            reason = "thin forwarder to resolve_image; argument count is feature-gated"
+        )
+    )]
     pub fn image(
         &self,
         name: &[u8],

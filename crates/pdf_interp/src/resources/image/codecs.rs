@@ -418,6 +418,20 @@ fn append_ccitt_row(
     reason = "GPU dispatch paths (nvjpeg, vaapi) plus the CPU decode path are each short; \
               combining them in one function keeps the fallback logic visible"
 )]
+#[cfg_attr(
+    all(
+        feature = "nvjpeg",
+        feature = "vaapi",
+        feature = "gpu-icc",
+        feature = "cache"
+    ),
+    expect(
+        clippy::too_many_arguments,
+        reason = "decoder/cache handles are feature-gated cfg-args; bundling them \
+                  into a struct would force every caller to construct a partially-\
+                  populated context per call"
+    )
+)]
 pub(super) fn decode_dct(
     data: &[u8],
     pdf_w: u32,

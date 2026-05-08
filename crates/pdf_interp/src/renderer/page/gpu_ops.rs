@@ -169,7 +169,7 @@ pub(super) fn gpu_coverage_to_bitmap(
         for col in 0..=bw as usize {
             let is_covered = col < bw as usize && row_cov[col] > 0;
             if is_covered {
-                span_start.get_or_insert(col);
+                let _ = span_start.get_or_insert(col);
             } else if let Some(start) = span_start.take() {
                 let x0 = bx as i32 + start as i32;
                 let x1 = bx as i32 + col as i32 - 1;

@@ -55,6 +55,20 @@ use super::ImageColorSpace;
     clippy::too_many_lines,
     reason = "filter dispatch table; splitting per-filter would scatter the dispatch logic"
 )]
+#[cfg_attr(
+    all(
+        feature = "nvjpeg",
+        feature = "vaapi",
+        feature = "nvjpeg2k",
+        feature = "gpu-icc"
+    ),
+    expect(
+        clippy::too_many_arguments,
+        reason = "decoder handles are feature-gated cfg-args; bundling them into \
+                  a struct would force every caller to construct a partially-\
+                  populated context per call"
+    )
+)]
 pub fn decode_inline_image(
     doc: &Document,
     params: &[u8],

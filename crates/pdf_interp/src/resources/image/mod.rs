@@ -338,6 +338,27 @@ pub struct ImageDescriptor {
     clippy::too_many_lines,
     reason = "filter dispatch table; splitting per-filter would scatter the dispatch logic"
 )]
+#[cfg_attr(
+    any(
+        all(
+            feature = "gpu-icc",
+            feature = "cache",
+            any(feature = "nvjpeg", feature = "vaapi", feature = "nvjpeg2k")
+        ),
+        all(
+            feature = "nvjpeg",
+            feature = "vaapi",
+            feature = "nvjpeg2k",
+            any(feature = "gpu-icc", feature = "cache")
+        )
+    ),
+    expect(
+        clippy::too_many_arguments,
+        reason = "decoder/cache handles are feature-gated cfg-args; bundling them \
+                  into a struct would force every caller to construct a partially-\
+                  populated context per call"
+    )
+)]
 pub fn resolve_image(
     doc: &Document,
     page_dict: &Dictionary,
