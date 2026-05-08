@@ -97,6 +97,7 @@ impl PageRecorder {
         &self,
         p: params::BlitParams<'_, super::CudaBackend>,
     ) -> Result<()> {
+        p.validate()?;
         Self::record_blit_image_inner(&self.ctx, p)
     }
 
