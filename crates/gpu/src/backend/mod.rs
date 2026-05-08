@@ -2,8 +2,7 @@
 //!
 //! The `GpuBackend` trait is the single seam between the renderer and any
 //! concrete GPU implementation. Implementations are added as sibling modules
-//! (`backend::cuda`, `backend::vulkan`) — none exist yet; this module is the
-//! abstraction surface they will satisfy.
+//! (`backend::cuda`, `backend::vulkan`).
 //!
 //! Per-page semantics: callers use `begin_page` → `record_*` → `submit_page`
 //! → `wait_page` to batch a page's GPU work into a single submission, so the
@@ -13,6 +12,7 @@
 //! `record_*` calls; the backend resolves them to native pointers (CUDA) or
 //! buffer-device-addresses (Vulkan) at record time.
 
+pub mod cuda;
 pub mod params;
 
 use std::error::Error;
