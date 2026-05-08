@@ -5,3 +5,4 @@
 //! same `pub fn` entry points directly.
 
 pub mod composite;
+pub mod soft_mask;
