@@ -45,16 +45,23 @@ probe_path() {
     fi
   done
 }
+# `/usr/local/cuda` is the update-alternatives-managed symlink and is the
+# stable anchor across toolkit upgrades; the versioned dirs are listed as
+# fallbacks so a side-by-side install on a box without the symlink still
+# works. nvjpeg2k installs under a CUDA-major-version subdir on Ubuntu, so
+# we list `/13` and `/12` in that order.
 probe_path CUDA_LIB \
-  "/usr/local/cuda-12.8/lib64" \
   "/usr/local/cuda/lib64" \
+  "/usr/local/cuda-13.2/lib64" \
+  "/usr/local/cuda-13/lib64" \
+  "/usr/local/cuda-12.8/lib64" \
   "/usr/lib/x86_64-linux-gnu"
 probe_path NVJPEG2K_LIB \
+  "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13" \
   "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12" \
-  "/usr/local/cuda-12.8/lib64" \
   "/usr/local/cuda/lib64"
-CUDA_LIB="${CUDA_LIB:-/usr/local/cuda-12.8/lib64}"
-NVJPEG2K_LIB="${NVJPEG2K_LIB:-/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12}"
+CUDA_LIB="${CUDA_LIB:-/usr/local/cuda/lib64}"
+NVJPEG2K_LIB="${NVJPEG2K_LIB:-/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13}"
 
 HAVE_NVJPEG2K=0
 [[ -e "$NVJPEG2K_LIB/libnvjpeg2k.so" ]] && HAVE_NVJPEG2K=1

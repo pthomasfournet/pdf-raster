@@ -16,8 +16,30 @@ set -euo pipefail
 # ─── Configuration ────────────────────────────────────────────────────────────
 OUT_DIR="bench/v060"
 BENCH="tests/bench_corpus.sh"
-NVJPEG2K_LIB="/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12"
-CUDA_LIB="/usr/local/cuda-12.8/lib64"
+
+# Probe libnvjpeg2k + cudart locations: the historical pins (cuda-12.8 +
+# libnvjpeg2k/12) only existed on the original measurement box; later boxes
+# ship cuda-13.x. Fall through `/usr/local/cuda` (the update-alternatives
+# symlink) so this driver keeps reproducing the v0.6.0 baseline regardless
+# of which CUDA toolkit the machine has installed today.
+probe_lib() {
+  local var="$1"; shift
+  if [[ -n "${!var:-}" ]]; then return; fi
+  for cand in "$@"; do
+    [[ -e "$cand" ]] && eval "$var=\"\$cand\"" && return
+  done
+}
+probe_lib NVJPEG2K_LIB \
+  "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13" \
+  "/usr/lib/x86_64-linux-gnu/libnvjpeg2k/12"
+probe_lib CUDA_LIB \
+  "/usr/local/cuda/lib64" \
+  "/usr/local/cuda-13.2/lib64" \
+  "/usr/local/cuda-13/lib64" \
+  "/usr/local/cuda-12.8/lib64"
+NVJPEG2K_LIB="${NVJPEG2K_LIB:-/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13}"
+CUDA_LIB="${CUDA_LIB:-/usr/local/cuda/lib64}"
+
 MIN_FREE_GB=20
 
 # Mode → (binary suffix, --backend value).
