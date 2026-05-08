@@ -10,6 +10,15 @@
 //! - Disk tier (Task 5): `<root>/<doc>/<hash>.bin` sidecar files for
 //!   cross-process persistence; opt-in via [`DeviceImageCache::with_disk`].
 //!
+//! # Module layout
+//!
+//! - [`budget`] — VRAM cap struct; auto-detect from `cudaMemGetInfo`.
+//! - [`eviction`] — LRU scan, demote-to-host, monotonic LRU clock.
+//! - [`promotion`] — host-tier and disk-tier promote-on-hit paths.
+//! - [`host_tier`] — pinned-memory tier (`pub(crate)`).
+//! - [`disk_tier`] — sidecar-file tier (`pub`).
+//! - [`page_buffer`] — per-page composition target ([`DevicePageBuffer`]).
+//!
 //! # Concurrency model
 //!
 //! The cache is `&self` everywhere and safe to call from any number of
@@ -26,13 +35,17 @@
 //! until the last consumer drops its `Arc` — that's the desired behaviour:
 //! pulling memory from under an in-flight kernel would corrupt the page.
 
+mod budget;
 mod disk_tier;
+mod eviction;
 mod host_tier;
 mod page_buffer;
+mod promotion;
 
+pub use budget::VramBudget;
 pub use disk_tier::{DiskTier, LookupCallbackError};
 pub use host_tier::HostBudget;
-pub(crate) use host_tier::{HostEntry, HostTier};
+pub(crate) use host_tier::HostTier;
 pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
 
 use std::sync::Arc;
@@ -65,46 +78,6 @@ pub struct DocId(pub [u8; 32]);
 /// index from returning stale content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjId(pub u32);
-
-/// VRAM budget for the cache.  See `CacheBudget` in the Phase 9 spec for
-/// the full three-tier struct; this is the VRAM-only subset.
-#[derive(Debug, Clone, Copy)]
-pub struct VramBudget {
-    /// Maximum bytes the cache is allowed to hold on the device.  When a
-    /// new entry would exceed this, the cache evicts in LRU order until
-    /// the new entry fits or there is nothing more to evict.
-    pub vram_bytes: u64,
-}
-
-impl VramBudget {
-    /// Spec-mandated VRAM hard cap: 6 GiB.  Caps `auto_detect` so we
-    /// don't claim every byte on a workstation GPU shared with a
-    /// desktop compositor, and serves as the value of [`Self::DEFAULT`]
-    /// for tests and callers who can't probe the device.
-    pub const HARD_CAP_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-
-    /// Conservative default for tests and non-GPU contexts.  Production
-    /// code should prefer [`Self::auto_detect`] when a stream is on hand.
-    pub const DEFAULT: Self = Self {
-        vram_bytes: Self::HARD_CAP_BYTES,
-    };
-
-    /// Auto-tune from `cudaMemGetInfo`.  Returns `min(75% of free,
-    /// HARD_CAP_BYTES)`, matching the spec's "default min(75% of free
-    /// VRAM, 6 GB)" rule.
-    ///
-    /// # Errors
-    /// Returns an error if `cudaMemGetInfo` fails (e.g. no CUDA device).
-    pub fn auto_detect(stream: &CudaStream) -> Result<Self, CacheError> {
-        let ctx = stream.context();
-        let (free, _total) = ctx.mem_get_info().map_err(CacheError::cuda)?;
-        // Saturating mul guards against absurd `free` values from a buggy driver.
-        let three_quarters = (free as u64).saturating_mul(3) / 4;
-        Ok(Self {
-            vram_bytes: three_quarters.min(Self::HARD_CAP_BYTES),
-        })
-    }
-}
 
 /// Component layout of a cached decoded image.  Matches `ImageColorSpace`
 /// in `pdf_interp` but kept here to avoid a circular dependency.
@@ -151,7 +124,7 @@ pub struct CachedDeviceImage {
     /// LRU timestamp.  Updated on every cache hit via a single atomic store
     /// (no CAS needed; later writes always win and exact ordering doesn't
     /// matter for LRU correctness).
-    last_used: AtomicU64,
+    pub(super) last_used: AtomicU64,
 }
 
 impl CachedDeviceImage {
@@ -164,13 +137,13 @@ impl CachedDeviceImage {
         self.device_ptr.len() as u64
     }
 
-    fn touch(&self, tick: u64) {
+    pub(super) fn touch(&self, tick: u64) {
         // Relaxed is sufficient: LRU ordering is approximate and doesn't
         // synchronise any other state.
         self.last_used.store(tick, Ordering::Relaxed);
     }
 
-    fn last_used(&self) -> u64 {
+    pub(super) fn last_used(&self) -> u64 {
         self.last_used.load(Ordering::Relaxed)
     }
 }
@@ -222,7 +195,7 @@ pub enum CacheError {
 }
 
 impl CacheError {
-    const fn cuda(e: cudarc::driver::DriverError) -> Self {
+    pub(super) const fn cuda(e: cudarc::driver::DriverError) -> Self {
         Self::Cuda(e)
     }
 }
@@ -285,31 +258,31 @@ pub struct ContentHash(pub [u8; 32]);
 /// promoted slab would look like the oldest VRAM entry to the next
 /// eviction.
 pub struct DeviceImageCache {
-    primary: DashMap<ContentHash, Arc<CachedDeviceImage>>,
+    pub(super) primary: DashMap<ContentHash, Arc<CachedDeviceImage>>,
     /// Maps `(DocId, ObjId)` to the content hash that resolves it.  An
     /// alias entry is cheap (40 bytes) and lets us skip BLAKE3 hashing
     /// on every same-document re-render.
-    by_doc_obj: DashMap<(DocId, ObjId), ContentHash>,
-    /// Host RAM demotion target.  Populated when [`Self::evict_to_fit`]
+    pub(super) by_doc_obj: DashMap<(DocId, ObjId), ContentHash>,
+    /// Host RAM demotion target.  Populated when the eviction path
     /// reclaims a VRAM slab; consulted by [`Self::lookup_by_hash`] on
     /// a primary miss.
-    host: HostTier,
+    pub(super) host: HostTier,
     /// Phase 9 disk tier — sidecar cache directory keyed by
     /// `(DocId, ContentHash)`.  `None` disables disk persistence
     /// (fully in-process cache).  Wired in via [`Self::with_disk`].
-    disk: Option<DiskTier>,
-    budget: VramBudget,
+    pub(super) disk: Option<DiskTier>,
+    pub(super) budget: VramBudget,
     /// Monotonic LRU clock.  Incremented on every observable cache
     /// event in either tier.
-    tick: AtomicU64,
+    pub(super) tick: AtomicU64,
     /// Sum of `vram_bytes()` over every entry currently held by the
     /// primary index.  Maintained on insert / evict.
-    used_bytes: AtomicU64,
+    pub(super) used_bytes: AtomicU64,
     /// Owned CUDA stream for upload work.  Held by `Arc` so per-call
     /// upload paths can clone cheaply, and so the host tier's D2H copy
     /// can synchronise on it before publishing a demoted entry.  The
     /// CUDA context is reachable as `self.stream.context()`.
-    stream: Arc<CudaStream>,
+    pub(super) stream: Arc<CudaStream>,
 }
 
 /// Bundled arguments for [`DeviceImageCache::insert`].
@@ -466,99 +439,6 @@ impl DeviceImageCache {
         Some(promoted)
     }
 
-    /// Lift a host-tier entry back into VRAM and install it in the
-    /// primary index.  Returns `None` if the host tier doesn't have it
-    /// or the upload fails (treated as a cache miss; caller re-decodes).
-    fn promote_from_host(&self, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
-        let host_entry = self.host.lookup(hash, self.next_tick())?;
-        let bytes = host_entry.pinned.num_bytes() as u64;
-        // Make room in the VRAM tier.  If we can't (every entry pinned
-        // by in-flight kernels), fall back to a cache miss; the host
-        // entry stays in place for a future retry.
-        if self.evict_to_fit(bytes).is_err() {
-            return None;
-        }
-        // Pass the `PinnedHostSlice` directly so cudarc's `HostSlice`
-        // impl records the H→D copy against the slice's internal event
-        // — without that, dropping `host_entry` while the DMA is still
-        // in flight would let `PinnedHostSlice::Drop` free the source
-        // buffer mid-copy.  Calling `as_slice()` first would route
-        // through the plain `[u8]` impl whose `SyncOnDrop` is a no-op.
-        let device_ptr = self
-            .stream
-            .clone_htod(&host_entry.pinned)
-            .map_err(|e| log::warn!("host-tier promotion upload failed: {e}"))
-            .ok()?;
-        let new_entry = Arc::new(CachedDeviceImage {
-            device_ptr,
-            width: host_entry.width,
-            height: host_entry.height,
-            layout: host_entry.layout,
-            last_used: AtomicU64::new(self.next_tick()),
-        });
-        match self.primary.entry(*hash) {
-            Entry::Occupied(occ) => {
-                // Another thread won the same race — return their entry.
-                Some(occ.get().clone())
-            }
-            Entry::Vacant(vac) => {
-                let _ = self
-                    .used_bytes
-                    .fetch_add(new_entry.vram_bytes(), Ordering::Relaxed);
-                let _ = vac.insert(new_entry.clone());
-                Some(new_entry)
-            }
-        }
-    }
-
-    /// Lift a disk-tier entry back into VRAM.  Reads the file via
-    /// `posix_fadvise(WILLNEED)` + `read_exact` directly into a
-    /// fresh pinned host slab (no transient `Vec`), uploads to
-    /// VRAM, and installs in the primary index.  The host tier is
-    /// also populated as a side effect so a later same-session
-    /// lookup that misses VRAM hits host RAM instead of going back
-    /// to disk.
-    ///
-    /// Returns `None` on disk miss, malformed file, allocation
-    /// failure, or upload error — caller treats as a cache miss and
-    /// re-decodes the source bytes.
-    fn promote_from_disk(&self, doc: DocId, hash: &ContentHash) -> Option<Arc<CachedDeviceImage>> {
-        let disk = self.disk.as_ref()?;
-        // Slab outlives the callback; the closure fills it via
-        // `read_exact` and hands ownership back via `pinned`.
-        let mut pinned: Option<cudarc::driver::PinnedHostSlice<u8>> = None;
-        let info = disk.lookup_into(doc, hash, |info, reader| {
-            // Pinned alloc and slab-access failures are caller-side
-            // — tag them `Resource` so a transient pinned-pool
-            // exhaustion doesn't delete the (perfectly fine) disk
-            // entry.
-            let mut slab = HostTier::alloc_pinned(self.stream.context(), info.expected_pixel_bytes)
-                .map_err(|e| {
-                    LookupCallbackError::Resource(std::io::Error::other(format!(
-                        "alloc_pinned failed: {e}"
-                    )))
-                })?;
-            let dst = slab.as_mut_slice().map_err(|e| {
-                LookupCallbackError::Resource(std::io::Error::other(format!(
-                    "pinned slab access failed: {e}"
-                )))
-            })?;
-            reader.read_exact(dst).map_err(LookupCallbackError::Read)?;
-            pinned = Some(slab);
-            Ok(())
-        })?;
-        let pinned = pinned?;
-        log::debug!(
-            "disk-tier: hit for ({doc:?}, {hash:?}) {}×{} {:?}",
-            info.width,
-            info.height,
-            info.layout,
-        );
-        let host_entry = HostEntry::new(pinned, info.width, info.height, info.layout);
-        let _arc = self.host.insert(*hash, host_entry, self.next_tick());
-        self.promote_from_host(hash)
-    }
-
     /// Bind an existing primary entry to a `(DocId, ObjId)` alias.  Used
     /// after a content-hash hit to make subsequent same-document lookups
     /// O(1).
@@ -705,132 +585,6 @@ impl DeviceImageCache {
     #[must_use]
     pub const fn stream_arc(&self) -> &Arc<CudaStream> {
         &self.stream
-    }
-
-    /// Copy the bytes of an evicted VRAM entry into pinned host memory
-    /// and install in the host tier so a future lookup avoids re-decode.
-    ///
-    /// Skipped when the host tier already holds this hash (re-demoting
-    /// would waste pinned RAM on identical bytes), or when the host
-    /// budget is zero (host tier disabled), or when the D2H copy fails
-    /// (logged; not propagated — demotion is a best-effort optimisation,
-    /// not a correctness requirement).
-    fn demote_to_host(&self, hash: ContentHash, evicted: &Arc<CachedDeviceImage>) {
-        if self.host.budget_bytes() == 0 {
-            return;
-        }
-        if self.host.lookup(&hash, self.next_tick()).is_some() {
-            return;
-        }
-        match HostTier::build_from_device(
-            self.stream.context(),
-            &self.stream,
-            &evicted.device_ptr,
-            evicted.width,
-            evicted.height,
-            evicted.layout,
-        ) {
-            Ok(host_entry) => {
-                let _ = self.host.insert(hash, host_entry, self.next_tick());
-            }
-            Err(e) => {
-                log::warn!(
-                    "demotion D2H copy failed (hash={hash:?}, {}×{} {:?}): {e}",
-                    evicted.width,
-                    evicted.height,
-                    evicted.layout,
-                );
-            }
-        }
-    }
-
-    /// Evict in LRU order until `needed` bytes of free budget exist.
-    ///
-    /// Each evicted entry is demoted to the host tier (best effort)
-    /// before its device memory is released, so a subsequent lookup
-    /// can DMA back from pinned host RAM rather than re-decode the
-    /// source bytes.
-    ///
-    /// Returns [`CacheError::OverBudget`] when nothing more is reclaimable
-    /// (every entry is pinned by an outstanding `Arc`) or when an
-    /// internal safety bound is hit — the latter is a livelock guard
-    /// against pathological pin churn under heavy concurrent inserts.
-    fn evict_to_fit(&self, needed: u64) -> Result<(), CacheError> {
-        // Bound the loop so a starvation pattern (every candidate gets
-        // pinned the moment we read its strong_count) cannot spin
-        // forever.  `2 × len() + 4` lets every entry be considered
-        // twice plus a small constant; in practice most calls reclaim
-        // in one or two iterations.
-        let max_iters = self.primary.len().saturating_mul(2).saturating_add(4);
-        for _ in 0..max_iters {
-            let used = self.used_bytes.load(Ordering::Relaxed);
-            if used
-                .checked_add(needed)
-                .is_some_and(|n| n <= self.budget.vram_bytes)
-            {
-                return Ok(());
-            }
-
-            let oldest: Option<(ContentHash, u64)> = self
-                .primary
-                .iter()
-                .filter_map(|e| {
-                    let arc = e.value();
-                    // Only entries with strong_count == 1 are reclaimable;
-                    // anything else is pinned by an in-flight kernel.
-                    (Arc::strong_count(arc) == 1).then(|| (*e.key(), arc.last_used()))
-                })
-                .min_by_key(|&(_, ts)| ts);
-
-            let Some((key, _)) = oldest else {
-                return Err(CacheError::OverBudget {
-                    needed,
-                    used: self.used_bytes.load(Ordering::Relaxed),
-                    budget: self.budget.vram_bytes,
-                });
-            };
-
-            // A concurrent `lookup_by_*` may race in and clone the Arc
-            // between the strong_count check above and `primary.remove`
-            // below.  When that happens the slab is removed from the
-            // index but kept alive by the lookup-holder's Arc — VRAM
-            // stays occupied until they drop it.  We still subtract its
-            // bytes from `used_bytes` because the cache budget tracks
-            // "bytes managed by the cache", not "bytes physically live
-            // in VRAM"; the lookup-holder's bytes are charged to them
-            // until their Arc drops.
-            if let Some((_, removed)) = self.primary.remove(&key) {
-                let bytes = removed.vram_bytes();
-                debug_assert!(
-                    self.used_bytes.load(Ordering::Relaxed) >= bytes,
-                    "used_bytes underflow: tracked {} B, evicting entry holds {bytes} B",
-                    self.used_bytes.load(Ordering::Relaxed),
-                );
-                let _ = self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                // Demote to host RAM if not already cached there.  The
-                // copy runs on `self.stream` and synchronises before
-                // returning, so when `removed` (and its `CudaSlice`)
-                // drops at end of scope the bytes are stable on host.
-                self.demote_to_host(key, &removed);
-            }
-            // Invite the OS scheduler if budget hasn't moved.  Cheap on x86.
-            std::hint::spin_loop();
-        }
-        // Hit the safety bound — almost certainly because of churn.
-        // Surface as OverBudget so the caller can retry or back off
-        // rather than block indefinitely.
-        Err(CacheError::OverBudget {
-            needed,
-            used: self.used_bytes.load(Ordering::Relaxed),
-            budget: self.budget.vram_bytes,
-        })
-    }
-
-    fn next_tick(&self) -> u64 {
-        // Relaxed is fine: ordering between ticks of different threads is
-        // not load-bearing for LRU correctness, only monotonicity per
-        // thread, which `fetch_add` guarantees.
-        self.tick.fetch_add(1, Ordering::Relaxed)
     }
 }
 
