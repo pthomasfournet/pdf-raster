@@ -25,7 +25,7 @@ pub struct BlitParams<'a, B: GpuBackend + ?Sized> {
     /// Destination bounding box `[x0, y0, x1, y1]` in page-space pixels.
     pub bbox: [i32; 4],
     /// Page height used for PDF → raster coordinate flip.
-    pub page_h: i32,
+    pub page_h: f32,
     /// Inverse current transformation matrix (6 coefficients: a b c d e f).
     pub inv_ctm: [f32; 6],
 }
@@ -46,14 +46,17 @@ pub struct AaFillParams<'a, B: GpuBackend + ?Sized> {
     pub fill_rule: u8,
 }
 
-/// Parameters for a GPU ICC CMYK→RGB colour transform.
+/// Parameters for a GPU ICC CMYK→RGB CLUT lookup.
+///
+/// The matrix fast-path is handled on the CPU (AVX-512); only the CLUT
+/// kernel runs on the GPU, so `clut` is required.
 pub struct IccClutParams<'a, B: GpuBackend + ?Sized> {
     /// Input CMYK pixels in device memory.
     pub cmyk: &'a B::DeviceBuffer,
     /// Output RGB pixels in device memory.
     pub rgb: &'a B::DeviceBuffer,
-    /// CLUT table in device memory; `None` selects the matrix fast-path.
-    pub clut: Option<&'a B::DeviceBuffer>,
+    /// CLUT table in device memory.
+    pub clut: &'a B::DeviceBuffer,
     /// Number of pixels to transform.
     pub n_pixels: u32,
 }

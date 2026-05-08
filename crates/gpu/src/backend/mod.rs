@@ -1,8 +1,9 @@
 //! GPU backend abstraction layer.
 //!
-//! The `GpuBackend` trait is the single seam between the renderer and the
-//! GPU implementation. Two backends exist: CUDA (default on NVIDIA) and
-//! Vulkan (cross-vendor; opt-in via the `vulkan` feature).
+//! The `GpuBackend` trait is the single seam between the renderer and any
+//! concrete GPU implementation. Implementations are added as sibling modules
+//! (`backend::cuda`, `backend::vulkan`) — none exist yet; this module is the
+//! abstraction surface they will satisfy.
 //!
 //! Per-page semantics: callers use `begin_page` → `record_*` → `submit_page`
 //! → `wait_page` to batch a page's GPU work into a single submission, so the
@@ -48,8 +49,7 @@ pub struct VramBudget {
     pub usable_bytes: u64,
 }
 
-/// Per-trait declaration. Concrete backends live in `backend::cuda` and
-/// `backend::vulkan` (the latter under the `vulkan` feature flag).
+/// Abstraction over a concrete GPU implementation.
 pub trait GpuBackend: Send + Sync {
     /// An opaque device-resident buffer handle.
     type DeviceBuffer: Send + Sync;
@@ -64,6 +64,11 @@ pub trait GpuBackend: Send + Sync {
     /// Returns `BackendError` if the device allocation fails (OOM or driver error).
     fn alloc_device(&self, size: usize) -> Result<Self::DeviceBuffer>;
     /// Free a device buffer previously returned by `alloc_device`.
+    ///
+    /// The caller must ensure no outstanding `PageFence` still references this
+    /// buffer. Calling `wait_page` on every fence the buffer participated in
+    /// before `free_device` is always safe; the backend may otherwise treat
+    /// such a call as undefined behaviour or a panic.
     fn free_device(&self, buf: Self::DeviceBuffer);
 
     /// Allocate `size` bytes of host-pinned (DMA-accessible) memory.
@@ -72,6 +77,11 @@ pub trait GpuBackend: Send + Sync {
     /// Returns `BackendError` if the pinned allocation fails (OOM or driver error).
     fn alloc_host_pinned(&self, size: usize) -> Result<Self::HostBuffer>;
     /// Free a host-pinned buffer previously returned by `alloc_host_pinned`.
+    ///
+    /// The caller must ensure no outstanding `PageFence` still references this
+    /// buffer. Calling `wait_page` on every fence the buffer participated in
+    /// before `free_host_pinned` is always safe; the backend may otherwise treat
+    /// such a call as undefined behaviour or a panic.
     fn free_host_pinned(&self, buf: Self::HostBuffer);
 
     /// Begin accumulating GPU work for a new page.
