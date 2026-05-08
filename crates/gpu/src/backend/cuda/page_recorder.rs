@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaEvent;
 
-use super::{StringError, be};
+use super::be;
 use crate::GpuCtx;
 use crate::backend::{BackendError, Result, params};
 #[cfg(feature = "cache")]
@@ -138,9 +138,9 @@ impl PageRecorder {
         _ctx: &Arc<GpuCtx>,
         _p: params::BlitParams<'_, super::CudaBackend>,
     ) -> Result<()> {
-        Err(BackendError::new(StringError(
-            "blit_image requires the gpu crate's `cache` feature".into(),
-        )))
+        Err(BackendError::msg(
+            "blit_image requires the gpu crate's `cache` feature",
+        ))
     }
 
     pub(super) fn record_aa_fill(
@@ -170,9 +170,9 @@ impl PageRecorder {
     ) -> Result<()> {
         let clut_bytes = p.clut.len();
         let grid_n = grid_n_from_clut_len(clut_bytes).ok_or_else(|| {
-            BackendError::new(StringError(format!(
+            BackendError::msg(format!(
                 "ICC CLUT length {clut_bytes} is not a valid grid_n^4 * 3"
-            )))
+            ))
         })?;
         self.ctx
             .launch_icc_clut_async(p.cmyk, p.rgb, p.clut, grid_n, p.n_pixels)

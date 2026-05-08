@@ -34,7 +34,31 @@ impl BackendError {
     pub fn new<E: Error + Send + Sync + 'static>(e: E) -> Self {
         Self(Box::new(e))
     }
+
+    /// Build a `BackendError` from a free-form message.
+    ///
+    /// Convenience for callsites that don't have an underlying [`Error`]
+    /// to wrap — typically backend invariants ('feature X not enabled',
+    /// 'malformed input length'). `Display` for the resulting error
+    /// prints the message verbatim.
+    #[must_use]
+    pub fn msg(message: impl Into<String>) -> Self {
+        Self(Box::new(MsgError(message.into())))
+    }
 }
+
+/// Internal carrier used by [`BackendError::msg`] so the inner type
+/// satisfies `Error + Send + Sync + 'static`.
+#[derive(Debug)]
+struct MsgError(String);
+
+impl fmt::Display for MsgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for MsgError {}
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -281,5 +305,18 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("alloc_device"), "missing context: {msg}");
         assert!(msg.contains("size = 0"), "missing diagnostic: {msg}");
+    }
+
+    #[test]
+    fn backend_error_msg_displays_verbatim() {
+        let err = BackendError::msg("widget broke");
+        assert_eq!(err.to_string(), "widget broke");
+    }
+
+    #[test]
+    fn backend_error_msg_accepts_string_and_str() {
+        let _from_str = BackendError::msg("static");
+        let _from_string = BackendError::msg(String::from("owned"));
+        let _from_format = BackendError::msg(format!("formatted {}", 42));
     }
 }

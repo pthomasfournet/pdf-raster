@@ -15,9 +15,11 @@ use crate::backend::{BackendError, GpuBackend, Result, VramBudget, params, rejec
 /// CUDA error adaptor.
 ///
 /// `GpuCtx::init` returns `Box<dyn Error>` (not Send+Sync), so we wrap the
-/// stringified message in a type that is `Send + Sync + Error`.
+/// stringified message in a type that is `Send + Sync + Error`. Used only
+/// inside [`be`]; non-driver-error callsites should use
+/// [`BackendError::msg`] directly.
 #[derive(Debug)]
-pub(super) struct StringError(pub(super) String);
+struct StringError(String);
 
 impl std::fmt::Display for StringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
