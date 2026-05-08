@@ -27,6 +27,8 @@ mod cmyk;
 mod composite;
 pub(crate) mod cuda;
 
+pub mod backend;
+
 #[cfg(feature = "cache")]
 pub mod blit;
 #[cfg(feature = "cache")]
