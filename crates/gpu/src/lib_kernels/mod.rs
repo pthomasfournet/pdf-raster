@@ -6,5 +6,6 @@
 
 pub mod aa;
 pub mod composite;
+pub mod icc;
 pub mod soft_mask;
 pub mod tile;
