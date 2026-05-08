@@ -9,3 +9,6 @@ pub mod composite;
 pub mod icc;
 pub mod soft_mask;
 pub mod tile;
+
+#[cfg(feature = "cache")]
+pub use crate::blit;
