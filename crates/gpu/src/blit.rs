@@ -22,7 +22,7 @@
 //! acceptance criterion — bilinear or different rounding would break
 //! parity with the CPU baseline.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use crate::GpuCtx;
 use crate::cache::{CachedDeviceImage, DevicePageBuffer, ImageLayout};
@@ -141,10 +141,6 @@ impl GpuCtx {
         bbox: BlitBbox,
         page_h: f32,
     ) -> Result<(), BlitError> {
-        // 16×16 blocks: 256 threads / block, full-warp aligned, fits
-        // in any modern SM's register budget for this kernel.
-        const TILE: u32 = 16;
-
         // Caller contract: bbox is non-inverted.  An inverted bbox
         // would silently render zero pixels (BlitBbox::width returns
         // 0 via saturating_sub), masking a programming error.  The
@@ -180,6 +176,61 @@ impl GpuCtx {
             ImageLayout::Gray => 1,
             ImageLayout::Mask => return Err(BlitError::UnsupportedLayout),
         };
+        if bbox.width() == 0 || bbox.height() == 0 {
+            return Ok(());
+        }
+
+        self.launch_blit_image_async(
+            &src.device_ptr,
+            (src.width, src.height),
+            layout_code,
+            &dst.rgba,
+            (dst.width, dst.height),
+            bbox,
+            &inv_ctm,
+            page_h,
+        )
+    }
+
+    /// Async kernel launch for the image-blit kernel.
+    ///
+    /// This is the trait-facing variant: it takes raw device byte
+    /// buffers and dimensions, instead of the Phase 9 cache wrappers
+    /// `CachedDeviceImage` / `DevicePageBuffer`.  It does **not**
+    /// synchronise, does **not** touch host memory, and is the helper
+    /// `CudaBackend::record_blit_image` calls.
+    ///
+    /// The caller is responsible for keeping `d_src`, `d_dst`, and the
+    /// inverse-CTM upload alive until the stream has executed the
+    /// launch (the helper allocates the inverse-CTM device buffer
+    /// internally and returns once the kernel is queued).
+    ///
+    /// `layout_code` is the kernel's enum value: `0 = Rgb`, `1 = Gray`.
+    /// Mask layout is rejected by the public wrapper before this
+    /// helper is reached.
+    ///
+    /// # Errors
+    /// - [`BlitError::DimensionsTooLarge`] if any dim doesn't fit i32.
+    /// - [`BlitError::Cuda`] for any underlying cudarc failure.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "kernel arg count is fixed by the PTX signature; grouping into a struct would just hide the mapping"
+    )]
+    pub(crate) fn launch_blit_image_async(
+        &self,
+        d_src: &CudaSlice<u8>,
+        src_dims: (u32, u32),
+        layout_code: i32,
+        d_dst: &CudaSlice<u8>,
+        dst_dims: (u32, u32),
+        bbox: BlitBbox,
+        inv_ctm: &InverseCtm,
+        page_h: f32,
+    ) -> Result<(), BlitError> {
+        // 16×16 blocks: 256 threads / block, full-warp aligned, fits
+        // in any modern SM's register budget for this kernel.
+        const TILE: u32 = 16;
+
         let bw = bbox.width();
         let bh = bbox.height();
         if bw == 0 || bh == 0 {
@@ -198,17 +249,17 @@ impl GpuCtx {
         let inv_ctm_arr = inv_ctm.as_array();
         let d_inv_ctm = stream.clone_htod(&inv_ctm_arr).map_err(BlitError::cuda)?;
 
-        let src_w = i32::try_from(src.width).map_err(|_| BlitError::DimensionsTooLarge)?;
-        let src_h = i32::try_from(src.height).map_err(|_| BlitError::DimensionsTooLarge)?;
-        let dst_w = i32::try_from(dst.width).map_err(|_| BlitError::DimensionsTooLarge)?;
-        let dst_h = i32::try_from(dst.height).map_err(|_| BlitError::DimensionsTooLarge)?;
+        let src_w = i32::try_from(src_dims.0).map_err(|_| BlitError::DimensionsTooLarge)?;
+        let src_h = i32::try_from(src_dims.1).map_err(|_| BlitError::DimensionsTooLarge)?;
+        let dst_w = i32::try_from(dst_dims.0).map_err(|_| BlitError::DimensionsTooLarge)?;
+        let dst_h = i32::try_from(dst_dims.1).map_err(|_| BlitError::DimensionsTooLarge)?;
 
         let mut builder = stream.launch_builder(&self.kernels.blit_image);
-        let _ = builder.arg(&src.device_ptr);
+        let _ = builder.arg(d_src);
         let _ = builder.arg(&src_w);
         let _ = builder.arg(&src_h);
         let _ = builder.arg(&layout_code);
-        let _ = builder.arg(&mut dst.rgba);
+        let _ = builder.arg(d_dst);
         let _ = builder.arg(&dst_w);
         let _ = builder.arg(&dst_h);
         let _ = builder.arg(&bbox.x0);

@@ -37,6 +37,22 @@ pub const RGBA_BPP: usize = 4;
 ///
 /// Drop releases the device memory; the buffer doesn't need to outlive
 /// the page render.
+///
+/// # Backend abstraction
+///
+/// `DevicePageBuffer` is intentionally **not** generic over
+/// [`crate::backend::GpuBackend`].  The internals call
+/// `CudaStream::alloc_zeros`, `memcpy_dtoh`, and `synchronize` directly
+/// — the `GpuBackend` trait abstracts away streams (Vulkan has command
+/// buffers + fences, not streams) and does not yet expose a
+/// `download_*` / `alloc_zeros` equivalent.  Generifying would either
+/// require those trait methods (not yet designed) or a `PhantomData`
+/// type parameter that adds noise without buying abstraction.
+///
+/// Same applies to [`crate::cache::DeviceImageCache`], which is more
+/// deeply CUDA-coupled (`clone_htod`, `memcpy_dtoh`, pinned-pool
+/// promotion).  Generification of both is tracked as follow-up after
+/// the Vulkan backend's transfer / upload surface settles.
 pub struct DevicePageBuffer {
     /// Width × height × 4 bytes, row-major RGBA8.
     pub rgba: CudaSlice<u8>,

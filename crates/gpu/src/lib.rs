@@ -27,6 +27,9 @@ mod cmyk;
 mod composite;
 pub(crate) mod cuda;
 
+pub mod backend;
+pub mod lib_kernels;
+
 #[cfg(feature = "cache")]
 pub mod blit;
 #[cfg(feature = "cache")]
@@ -61,9 +64,7 @@ pub mod vaapi;
 
 use std::sync::Arc;
 
-use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
-};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 
 const PTX_COMPOSITE: &str = include_str!(concat!(env!("OUT_DIR"), "/composite_rgba8.ptx"));
@@ -110,15 +111,15 @@ pub const TILE_H: u32 = 16;
 /// Run `threshold_bench` with a CLUT workload to calibrate once baking is in the hot path.
 pub const GPU_ICC_CLUT_THRESHOLD: usize = 500_000;
 
-struct GpuKernels {
-    composite_rgba8: CudaFunction,
-    apply_soft_mask: CudaFunction,
-    aa_fill: CudaFunction,
-    tile_fill: CudaFunction,
-    icc_cmyk_matrix: CudaFunction,
-    icc_cmyk_clut: CudaFunction,
+pub(crate) struct GpuKernels {
+    pub(crate) composite_rgba8: CudaFunction,
+    pub(crate) apply_soft_mask: CudaFunction,
+    pub(crate) aa_fill: CudaFunction,
+    pub(crate) tile_fill: CudaFunction,
+    pub(crate) icc_cmyk_matrix: CudaFunction,
+    pub(crate) icc_cmyk_clut: CudaFunction,
     #[cfg(feature = "cache")]
-    blit_image: CudaFunction,
+    pub(crate) blit_image: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -134,8 +135,8 @@ struct GpuKernels {
 /// unit of parallelism.  If image decode is ever parallelized within a page, replace
 /// the shared stream with a `thread_local!` `Arc<CudaStream>` per rayon worker.
 pub struct GpuCtx {
-    stream: Arc<CudaStream>,
-    kernels: GpuKernels,
+    pub(crate) stream: Arc<CudaStream>,
+    pub(crate) kernels: GpuKernels,
 }
 
 impl GpuCtx {
@@ -181,455 +182,13 @@ impl GpuCtx {
     pub const fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
-
-    /// Porter-Duff source-over compositing on RGBA8 pixel pairs.
-    ///
-    /// `src` and `dst` must have the same length (4 × `n_pixels` bytes).
-    ///
-    /// Falls back to CPU if the pixel count is below [`GPU_COMPOSITE_THRESHOLD`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU dispatch or data transfer fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `src.len() != dst.len()` or `src.len()` is not a multiple of 4.
-    pub fn composite_rgba8(
-        &self,
-        src: &[u8],
-        dst: &mut [u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(src.len(), dst.len());
-        assert!(src.len().is_multiple_of(4));
-        let n = src.len() / 4;
-
-        if n < GPU_COMPOSITE_THRESHOLD {
-            composite_rgba8_cpu(src, dst);
-            return Ok(());
-        }
-
-        self.composite_rgba8_gpu(src, dst)
-    }
-
-    /// Multiply each RGBA pixel's alpha channel by the corresponding soft-mask byte.
-    ///
-    /// `pixels` is RGBA8 interleaved; `mask` is one byte per pixel.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU dispatch or data transfer fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `pixels.len() != mask.len() * 4`.
-    pub fn apply_soft_mask(
-        &self,
-        pixels: &mut [u8],
-        mask: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(pixels.len(), mask.len() * 4);
-        let n = mask.len();
-
-        if n < GPU_SOFTMASK_THRESHOLD {
-            apply_soft_mask_cpu(pixels, mask);
-            return Ok(());
-        }
-
-        self.apply_soft_mask_gpu(pixels, mask)
-    }
-
-    /// Compute per-pixel AA coverage for a filled path using 64-sample jittered
-    /// supersampling on the GPU.
-    ///
-    /// `segs` is a flat `[x0, y0, x1, y1]` f32 slice — 4 floats per segment.
-    /// `x_min` / `y_min` are the device-pixel coordinates of the top-left corner of
-    /// the output coverage rectangle. The output is `width * height` bytes, one byte
-    /// per pixel (0 = fully outside, 255 = fully inside).
-    ///
-    /// Falls back to [`aa_fill_cpu`] when the pixel count is below
-    /// [`GPU_AA_FILL_THRESHOLD`] or `segs` is empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU dispatch or data transfer fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `segs.len()` is not a multiple of 4 or if `width * height` overflows
-    /// `u32::MAX`.
-    pub fn aa_fill(
-        &self,
-        segs: &[f32],
-        x_min: f32,
-        y_min: f32,
-        width: u32,
-        height: u32,
-        eo: bool,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        assert!(
-            segs.len().is_multiple_of(4),
-            "segs.len() must be a multiple of 4 (got {})",
-            segs.len()
-        );
-        let n_pixels = (width as usize)
-            .checked_mul(height as usize)
-            .expect("width × height overflows usize");
-
-        if segs.is_empty() || n_pixels < GPU_AA_FILL_THRESHOLD {
-            return Ok(aa_fill_cpu(segs, x_min, y_min, width, height, eo));
-        }
-
-        self.aa_fill_gpu(segs, x_min, y_min, width, height, eo)
-    }
-
-    /// Unconditional GPU dispatch for `aa_fill` (skips threshold check).
-    ///
-    /// Use this when the caller has already decided GPU is appropriate
-    /// (e.g. benchmarking or when the area is known to be large).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU data transfer or kernel launch fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `segs.len()` is not a multiple of 4 or if `width * height`
-    /// overflows `u32::MAX`.
-    pub fn aa_fill_gpu(
-        &self,
-        segs: &[f32],
-        x_min: f32,
-        y_min: f32,
-        width: u32,
-        height: u32,
-        eo: bool,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        assert!(
-            segs.len().is_multiple_of(4),
-            "segs.len() must be a multiple of 4 (got {})",
-            segs.len()
-        );
-        let n_pixels = (width as usize)
-            .checked_mul(height as usize)
-            .expect("width × height overflows usize");
-        let n_segs = u32::try_from(segs.len() / 4).expect("segment count exceeds u32::MAX");
-        let n_pixels_u32 = u32::try_from(n_pixels).expect("pixel count exceeds u32::MAX");
-
-        let stream = &self.stream;
-
-        // Upload segments and allocate coverage output on device.
-        let d_segs = stream.clone_htod(segs)?;
-        let d_coverage_init = vec![0u8; n_pixels];
-        let mut d_coverage = stream.clone_htod(&d_coverage_init)?;
-
-        // Launch: one block per output pixel, 64 threads per block.
-        let cfg = LaunchConfig {
-            grid_dim: (n_pixels_u32, 1, 1),
-            block_dim: (64, 1, 1),
-            shared_mem_bytes: 8, // two i32 warp_counts
-        };
-
-        let eo_int: i32 = i32::from(eo);
-        let mut builder = stream.launch_builder(&self.kernels.aa_fill);
-        let _ = builder.arg(&d_segs);
-        let _ = builder.arg(&n_segs);
-        let _ = builder.arg(&x_min);
-        let _ = builder.arg(&y_min);
-        let _ = builder.arg(&width);
-        let _ = builder.arg(&height);
-        let _ = builder.arg(&eo_int);
-        let _ = builder.arg(&mut d_coverage);
-        // SAFETY: kernel arguments match the PTX signature; bounds verified above.
-        let _ = unsafe { builder.launch(cfg) }?;
-
-        stream.synchronize()?;
-        let mut coverage = vec![0u8; n_pixels];
-        stream.memcpy_dtoh(&d_coverage, &mut coverage)?;
-        Ok(coverage)
-    }
-
-    /// Tile-parallel analytical fill rasterisation using signed-area integration.
-    ///
-    /// This is the GPU equivalent of the CPU scanline scanner but uses analytical
-    /// per-pixel coverage (analytical trapezoid integrals) rather than sampling.
-    ///
-    /// All coordinates in `records` are already tile-local (produced by
-    /// [`build_tile_records`]); no origin offset is applied in the kernel.
-    ///
-    /// # Arguments
-    ///
-    /// - `records` — tile records sorted by `(tile_y << 16 | tile_x)`, one per
-    ///   (segment, tile-row) crossing.  Build with [`build_tile_records`].
-    /// - `tile_starts` / `tile_counts` — prefix-sum index into `records` per flat
-    ///   tile index `tile_y * grid_w + tile_x`.  Both have length `grid_w * grid_h`.
-    /// - `grid_w` — number of tiles in the x direction (`width.div_ceil(TILE_W)`).
-    /// - `width` / `height` — fill bbox size in device pixels (coverage buffer dims).
-    /// - `eo` — `true` for even-odd fill rule, `false` for non-zero winding.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<u8>` of `width × height` coverage bytes (0 = outside, 255 = inside).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU data transfer or kernel launch fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `tile_starts.len() != tile_counts.len()`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "all 7 args are required: records + index arrays + grid/pixel dims + fill rule; no grouping is natural here"
-    )]
-    pub fn tile_fill(
-        &self,
-        records: &[TileRecord],
-        tile_starts: &[u32],
-        tile_counts: &[u32],
-        grid_w: u32,
-        width: u32,
-        height: u32,
-        eo: bool,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        assert_eq!(
-            tile_starts.len(),
-            tile_counts.len(),
-            "tile_starts and tile_counts must have the same length"
-        );
-        let n_pixels = (width as usize)
-            .checked_mul(height as usize)
-            .expect("width × height overflows usize");
-        if n_pixels == 0 {
-            return Ok(Vec::new());
-        }
-        let stream = &self.stream;
-
-        // Upload inputs.
-        let d_records = if records.is_empty() {
-            // cudarc refuses zero-size allocations — use a dummy 1-element buffer.
-            stream.clone_htod(&[TileRecord::default()])?
-        } else {
-            stream.clone_htod(records)?
-        };
-        let d_tile_starts = stream.clone_htod(tile_starts)?;
-        let d_tile_counts = stream.clone_htod(tile_counts)?;
-        let d_cov_init = vec![0u8; n_pixels];
-        let mut d_coverage = stream.clone_htod(&d_cov_init)?;
-
-        let grid_h = height.div_ceil(TILE_H);
-        let cfg = LaunchConfig {
-            grid_dim: (grid_w, grid_h, 1),
-            block_dim: (TILE_W, TILE_H, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let eo_int: i32 = i32::from(eo);
-        let mut builder = stream.launch_builder(&self.kernels.tile_fill);
-        let _ = builder.arg(&d_records);
-        let _ = builder.arg(&d_tile_starts);
-        let _ = builder.arg(&d_tile_counts);
-        let _ = builder.arg(&grid_w);
-        let _ = builder.arg(&width);
-        let _ = builder.arg(&height);
-        let _ = builder.arg(&eo_int);
-        let _ = builder.arg(&mut d_coverage);
-        // SAFETY: kernel arguments match the PTX signature exactly (8 args, no
-        // x_min/y_min — coords are tile-local from build_tile_records).
-        let _ = unsafe { builder.launch(cfg) }?;
-
-        stream.synchronize()?;
-        let mut coverage = vec![0u8; n_pixels];
-        stream.memcpy_dtoh(&d_coverage, &mut coverage)?;
-        Ok(coverage)
-    }
-
-    /// Convert CMYK pixels to RGB using a GPU kernel.
-    ///
-    /// `cmyk` is interleaved CMYK, 4 bytes per pixel (PDF convention: 0 = no ink,
-    /// 255 = full ink).  Returns interleaved RGB, 3 bytes per pixel.
-    ///
-    /// Two dispatch paths:
-    /// - `clut` is `None` — uses the fast matrix kernel (subtractive complement
-    ///   formula, identical to the CPU fallback).
-    /// - `clut` is `Some((table, grid_n))` — uses the 4D quadrilinear CLUT kernel.
-    ///   `table` must be `grid_n^4 * 3` bytes, ordered
-    ///   `(k * G³ + c * G² + m * G + y) * 3` (RGB output values, u8).
-    ///   `grid_n` is typically 17 (83 521 nodes) or 33 (1 185 921 nodes).
-    ///
-    /// Falls back to [`icc_cmyk_to_rgb_cpu`] when `n_pixels < GPU_ICC_CLUT_THRESHOLD`
-    /// or `cmyk` is empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU data transfer or kernel launch fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `cmyk.len()` is not a multiple of 4, or if `clut` is `Some` and
-    /// `table.len() != grid_n^4 * 3`.
-    pub fn icc_cmyk_to_rgb(
-        &self,
-        cmyk: &[u8],
-        clut: Option<(&[u8], u32)>,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        assert!(
-            cmyk.len().is_multiple_of(4),
-            "cmyk.len() must be a multiple of 4 (got {})",
-            cmyk.len()
-        );
-
-        // Early-out before any CLUT validation: empty input always produces empty output.
-        let n = cmyk.len() / 4;
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-
-        if let Some((table, grid_n)) = clut {
-            // grid_n ≤ 255 is enforced by the baking API; checked_pow guards future misuse.
-            let expected = (grid_n as usize)
-                .checked_pow(4)
-                .and_then(|n| n.checked_mul(3))
-                .unwrap_or_else(|| {
-                    panic!("grid_n({grid_n})^4*3 overflows usize — grid_n must be ≤ 255")
-                });
-            assert_eq!(
-                table.len(),
-                expected,
-                "CLUT table length {got} ≠ grid_n({grid_n})^4*3={expected}",
-                got = table.len(),
-            );
-        }
-        // Matrix path (clut=None): CPU AVX-512 always beats GPU on this machine —
-        // threshold_bench showed the PCIe round-trip cost exceeds the compute cost
-        // at all measured sizes (256–4M pixels).  Always use the CPU path here.
-        if clut.is_none() {
-            return Ok(icc_cmyk_to_rgb_cpu(cmyk, None));
-        }
-        if n < GPU_ICC_CLUT_THRESHOLD {
-            return Ok(icc_cmyk_to_rgb_cpu(cmyk, clut));
-        }
-
-        self.icc_cmyk_to_rgb_gpu(cmyk, clut)
-    }
-
-    /// Unconditional GPU dispatch for CMYK→RGB (skips threshold check).
-    ///
-    /// Use this when the caller has already decided GPU is appropriate
-    /// (e.g. benchmarking or when the pixel count is known to be large).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if GPU data transfer or kernel launch fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `cmyk.len()` is not a multiple of 4 or if the pixel count
-    /// overflows `u32::MAX`.
-    pub fn icc_cmyk_to_rgb_gpu(
-        &self,
-        cmyk: &[u8],
-        clut: Option<(&[u8], u32)>,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        assert!(
-            cmyk.len().is_multiple_of(4),
-            "cmyk.len() must be a multiple of 4 (got {})",
-            cmyk.len()
-        );
-        let n = cmyk.len() / 4;
-        let n_u32 = u32::try_from(n).expect("pixel count exceeds u32::MAX");
-        let stream = &self.stream;
-
-        let d_cmyk = stream.clone_htod(cmyk)?;
-        let rgb_init = vec![0u8; n * 3];
-        let mut d_rgb = stream.clone_htod(&rgb_init)?;
-
-        let cfg = launch_cfg(n);
-
-        match clut {
-            None => {
-                let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_matrix);
-                let _ = builder.arg(&d_cmyk);
-                let _ = builder.arg(&mut d_rgb);
-                let _ = builder.arg(&n_u32);
-                // SAFETY: 3 args match icc_cmyk_matrix PTX signature exactly.
-                let _ = unsafe { builder.launch(cfg) }?;
-            }
-            Some((table, grid_n)) => {
-                let d_clut = stream.clone_htod(table)?;
-                let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_clut);
-                let _ = builder.arg(&d_cmyk);
-                let _ = builder.arg(&mut d_rgb);
-                let _ = builder.arg(&d_clut);
-                let _ = builder.arg(&grid_n);
-                let _ = builder.arg(&n_u32);
-                // SAFETY: 5 args match icc_cmyk_clut PTX signature exactly.
-                let _ = unsafe { builder.launch(cfg) }?;
-            }
-        }
-
-        stream.synchronize()?;
-        let mut rgb = vec![0u8; n * 3];
-        stream.memcpy_dtoh(&d_rgb, &mut rgb)?;
-        Ok(rgb)
-    }
-
-    /// Unconditional GPU dispatch for `composite_rgba8` (skips threshold check).
-    fn composite_rgba8_gpu(
-        &self,
-        src: &[u8],
-        dst: &mut [u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let n = src.len() / 4;
-        let n_u32 = u32::try_from(n).expect("pixel count exceeds u32::MAX");
-        let stream = &self.stream;
-        let d_src = stream.clone_htod(src)?;
-        let mut d_dst = stream.clone_htod(dst.as_ref())?;
-
-        let cfg = launch_cfg(n);
-        let mut builder = stream.launch_builder(&self.kernels.composite_rgba8);
-        let _ = builder.arg(&d_src);
-        let _ = builder.arg(&mut d_dst);
-        let _ = builder.arg(&n_u32);
-        // SAFETY: 3 args match composite_rgba8 PTX signature; n_u32 verified above.
-        let _ = unsafe { builder.launch(cfg) }?;
-
-        stream.synchronize()?;
-        stream.memcpy_dtoh(&d_dst, dst)?;
-        Ok(())
-    }
-
-    /// Unconditional GPU dispatch for `apply_soft_mask` (skips threshold check).
-    fn apply_soft_mask_gpu(
-        &self,
-        pixels: &mut [u8],
-        mask: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let n = mask.len();
-        let n_u32 = u32::try_from(n).expect("pixel count exceeds u32::MAX");
-        let stream = &self.stream;
-        let mut d_pixels = stream.clone_htod(pixels.as_ref())?;
-        let d_mask = stream.clone_htod(mask)?;
-
-        let cfg = launch_cfg(n);
-        let mut builder = stream.launch_builder(&self.kernels.apply_soft_mask);
-        let _ = builder.arg(&mut d_pixels);
-        let _ = builder.arg(&d_mask);
-        let _ = builder.arg(&n_u32);
-        // SAFETY: 3 args match apply_soft_mask PTX signature; n_u32 verified above.
-        let _ = unsafe { builder.launch(cfg) }?;
-
-        stream.synchronize()?;
-        stream.memcpy_dtoh(&d_pixels, pixels)?;
-        Ok(())
-    }
 }
 
 #[expect(
     clippy::cast_possible_truncation,
     reason = "callers validate n ≤ u32::MAX via u32::try_from before calling this; n.div_ceil(256) is therefore also ≤ u32::MAX"
 )]
-const fn launch_cfg(n: usize) -> LaunchConfig {
+pub(crate) const fn launch_cfg(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
