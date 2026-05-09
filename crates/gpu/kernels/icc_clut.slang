@@ -13,9 +13,9 @@
 // The CUDA source uses `__fmaf_rn` for FMA-with-round-to-nearest semantics.
 // Slang exposes the same via the `precise` keyword on the result variable
 // (suppresses aggressive reassociation) — see SPIR-V `precise` decoration.
-// CLUT access uses StructuredBuffer<uint8_t> (flat buffer); a Texture3D
-// alternative exists per spec (Option B) but is deferred — this Option-A
-// port matches the byte-for-byte CUDA layout exactly.
+// CLUT access uses StructuredBuffer<uint8_t> (flat buffer); the Texture3D
+// + sampler alternative is a perf-only follow-up (see ROADMAP Phase 10
+// Task 3 follow-ups) — this layout matches the CUDA path byte-for-byte.
 
 // ── Matrix entry point ──────────────────────────────────────────────────────
 

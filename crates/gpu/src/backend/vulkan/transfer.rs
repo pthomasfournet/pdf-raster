@@ -1,14 +1,12 @@
 //! Host↔device transfer helpers.
 //!
-//! Today's implementation is the simplest correct shape: synchronous
-//! one-shot upload/download via a `HOST_VISIBLE` staging buffer and a
-//! one-time-submit command buffer on the compute queue, with
+//! Synchronous upload/download via a reusable `HOST_VISIBLE` staging
+//! buffer (grown to the high-water-mark of any transfer seen so far)
+//! and a one-time-submit command buffer on the compute queue, with
 //! `vkQueueWaitIdle` for completion.
 //!
-//! Spec follow-up: a dedicated transfer queue (`TRANSFER` family without
-//! `GRAPHICS` or `COMPUTE`) plus a timeline-semaphore handoff so the
-//! prefetcher can overlap uploads with rendering.  Tracked in the spec's
-//! "Vulkan dedicated transfer queue for the prefetcher" section.
+//! The dedicated-transfer-queue path (overlap DMA with rendering) is a
+//! follow-up — see ROADMAP Phase 10 Task 3 follow-ups.
 
 #![expect(
     clippy::significant_drop_tightening,
@@ -71,12 +69,8 @@ impl TransferContext {
     }
 
     /// Synchronous upload: copy `src` into `dst[0..src.len()]`, block
-    /// until complete.
-    ///
-    /// Used by the trait's `upload_async` (which currently completes
-    /// before returning, so the fence it hands back is already signalled)
-    /// and directly by tests.  A real async path with a dedicated transfer
-    /// queue is a spec follow-up.
+    /// until complete.  Used by the trait's `upload_async` (which hands
+    /// back an already-signalled fence today) and by tests.
     pub(super) fn upload_sync(
         &self,
         allocator: &SlabAllocator,
