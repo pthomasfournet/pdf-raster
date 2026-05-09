@@ -785,7 +785,7 @@ Re-bench result: cold-render regression collapsed from 14× to 1.1–1.9× on lo
 
 ---
 
-## Phase 10 — Vulkan compute backend (IN PROGRESS — task 1 merged, tasks 2+3 pending)
+## Phase 10 — Vulkan compute backend (IN PROGRESS — backend infrastructure shipped; renderer migration + bench gate pending)
 
 **Spec:** `docs/superpowers/specs/2026-05-07-phase-10-vulkan-compute-backend.md`
 
@@ -822,8 +822,16 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
         - **`record_tile_fill` parity test.** No CPU reference exists for `tile_fill` — only the GPU paths use it.  Blocked on sub-task 2a's CPU twin.  The Vulkan kernel itself runs and `dispatch_kernel`'s parity check would catch divergence vs. CUDA, but we don't have an oracle.
         - **`OnceLock::get_or_try_init` usage.** Stable-API gap (rust-lang/rust#109737).  Today's manual race-loser cleanup in `pipeline.rs::get` is correct; switch when stable.
         - **Cross-vendor smoke (AMD-RADV, Intel-ANV, lavapipe).** Needs CI-runner or loaner hardware.  Lavapipe is installed on the dev box but currently flagged as unmaintained on Ubuntu 24.04; revisit with the next Mesa update.
+- [ ] **Task 4 — Renderer integration + bench gate** (~1500 LoC across `pdf_interp`, `pdf_raster`, `cli`).  Today the Vulkan backend exists and parity-tests against CPU references, but the renderer dispatches CUDA via `GpuCtx` directly — no end-to-end Vulkan path.  Closing the phase needs:
+    - **`RasterSession` holds a backend discriminator** (enum or `Box<dyn GpuBackend>`).  `BackendPolicy` already exists in `pdf_raster::render` for CUDA-vs-CPU; extend with `Vulkan`.
+    - **Migrate kernel call sites in `pdf_interp` to the trait surface.**  Four sites: `gpu_ops::try_gpu_aa_fill`, `gpu_ops::try_gpu_tile_fill`, `renderer/page/mod.rs::blit_image_to_buffer`, `resources/image/codecs.rs::icc_cmyk_to_rgb`.  Each currently does `ctx.kernel(...)` which allocates+uploads+launches+downloads in one call; the trait expects pre-allocated `&DeviceBuffer`s inside a `begin_page → record_* → submit_page → wait_page` cycle.  Real surgery; not just a method-call rewrite.
+    - **CLI flag**: `--backend vulkan` plumbs through `RasterOptions` into `RasterSession::new`.  Already exists in spec (`BackendPreference::ForceVulkan`); needs the actual wire-up.
+    - **Phase 9 cache stays CUDA-only for now.**  `DeviceImageCache` and `DevicePageBuffer` are `CudaSlice<u8>`-typed and used in 33 call sites across `pdf_interp` + `pdf_raster`.  Generifying them over `B: GpuBackend` is a multi-thousand-LoC refactor; the pragmatic close is to gate the cache as CUDA-only (matches its existing `cache` Cargo feature shape) and let the Vulkan path render uncached, like Phase 9-pre-2026-05-07.  A future task (Phase 10c?) can generify once the renderer migration is stable.
+    - **Bench gate measurement** runs on the migrated CLI: full `bench/v07x/` matrix with `--backend vulkan` alongside the existing CUDA columns; record CUDA-path drift (must stay within ±5 % of pre-task-4 numbers) and Vulkan-vs-CUDA per-corpus timing (must stay within 15 %).
 
 **Bench gate:** Phase 10 ships if (1) CUDA path performance unchanged within ±5%; (2) Vulkan path functional on RTX 5070 with pixel-diff ≤ 1 LSB vs CUDA; (3) Vulkan timing within 15% of CUDA on RTX 5070; (4) cross-vendor proof of life on AMD or Intel.
+
+**Status of bench gate:** criteria 1 and 3 are unmeasurable until task 4 lands (the renderer doesn't dispatch Vulkan yet).  Criterion 2 is *partially* met by the 15 parity tests in `crates/gpu/tests/cu_vs_slang_parity.rs` — same kernel, same input, both backends produce ≤ 1 LSB outputs — but that's per-kernel, not end-to-end page render.  Criterion 4 is blocked on hardware.
 
 **Total scope:** ~3100 LoC new Rust + ~1000 LoC Slang + ~400 LoC modified. Estimated ~6-8 weeks elapsed (3-4 weeks tasks 1+2; 3-4 weeks task 3).
 
