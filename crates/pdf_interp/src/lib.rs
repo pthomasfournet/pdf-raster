@@ -179,38 +179,37 @@ fn action_is_js(doc: &Document, obj: &pdf::Object) -> bool {
 
 /// Return the number of pages in `doc`.
 ///
-/// Saturates at [`u32::MAX`] for pathological documents (>4 billion pages).
+/// Reads `/Pages /Count` directly (O(1) on well-formed PDFs); falls back to
+/// the eager tree-walk count if the catalog entry is missing or malformed.
 #[must_use]
 pub fn page_count(doc: &Document) -> u32 {
-    doc.page_count()
+    doc.page_count_fast()
 }
 
 /// Resolve a 1-based page number to its `pdf::ObjectId`.
 ///
-/// Iterates `doc.get_pages()` once and counts as it goes so a single pass
-/// produces both the actual page count and the requested entry.
+/// Logarithmic in document page count: descends the `/Pages` tree using
+/// each node's `/Count` to skip whole subtrees rather than walking every
+/// leaf.
 ///
 /// # Errors
-/// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document.
+/// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document;
+/// [`InterpError::Pdf`] if the page tree itself is malformed.
 pub(crate) fn resolve_page_id(doc: &Document, page_num: u32) -> Result<pdf::ObjectId, InterpError> {
     if page_num == 0 {
         return Err(InterpError::PageOutOfRange {
             page: 0,
-            total: doc.page_count(),
+            total: doc.page_count_fast(),
         });
     }
-    let mut found: Option<pdf::ObjectId> = None;
-    let mut total: u32 = 0;
-    for (_, id) in doc.get_pages() {
-        total = total.saturating_add(1);
-        if total == page_num {
-            found = Some(id);
-        }
+    let total = doc.page_count_fast();
+    if page_num > total {
+        return Err(InterpError::PageOutOfRange {
+            page: page_num,
+            total,
+        });
     }
-    found.ok_or(InterpError::PageOutOfRange {
-        page: page_num,
-        total,
-    })
+    doc.get_page(page_num - 1).map_err(InterpError::Pdf)
 }
 
 /// Page geometry: visible dimensions in PDF points, rotation, and user-space scale.

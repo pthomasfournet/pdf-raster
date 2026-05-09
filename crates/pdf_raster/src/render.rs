@@ -119,8 +119,11 @@ impl From<pdf_interp::InterpError> for RasterError {
 /// `mpsc::Sender` is `Send + Sync`).
 pub struct RasterSession {
     pub(crate) doc: Arc<pdf::Document>,
-    /// Page-number → object-ID map, built once at construction.
-    pub(crate) pages: std::collections::BTreeMap<u32, pdf::ObjectId>,
+    /// Lazy page-id cache.  Populated on first access via
+    /// [`pdf::Document::get_page`].  Empty immediately after [`open_session`].
+    /// Wrapped in `RwLock` because `RasterSession` is `Sync` and rayon
+    /// page-render threads will read/write concurrently.
+    pub(crate) page_cache: std::sync::RwLock<std::collections::HashMap<u32, pdf::ObjectId>>,
     pub(crate) total_pages: u32,
     pub(crate) policy: BackendPolicy,
     /// VA-API DRM render node path. Retained in non-vaapi builds for forward
@@ -190,6 +193,46 @@ impl RasterSession {
     pub const fn policy(&self) -> BackendPolicy {
         self.policy
     }
+
+    /// Number of pages currently cached in the page-id resolver.
+    ///
+    /// Used by integration tests to verify the session's lazy invariants
+    /// (open returns a session with an empty cache; rendering a page
+    /// populates exactly one entry).  Not part of the stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cached_page_count(&self) -> usize {
+        self.page_cache.read().map_or(0, |m| m.len())
+    }
+
+    /// Resolve a 1-based page number to its object id, populating the cache
+    /// on first call.  Logarithmic in the document page count.
+    ///
+    /// # Errors
+    /// [`RasterError::PageOutOfRange`] when `page_num` is `0` or exceeds
+    /// `self.total_pages`; [`RasterError::Pdf`] when the underlying page-tree
+    /// descent fails (malformed `/Pages` node).
+    pub(crate) fn resolve_page(&self, page_num: u32) -> Result<pdf::ObjectId, RasterError> {
+        if page_num == 0 || page_num > self.total_pages {
+            return Err(RasterError::PageOutOfRange {
+                page: page_num,
+                total: self.total_pages,
+            });
+        }
+        if let Ok(guard) = self.page_cache.read()
+            && let Some(id) = guard.get(&page_num)
+        {
+            return Ok(*id);
+        }
+        let id = self
+            .doc
+            .get_page(page_num - 1)
+            .map_err(|e| RasterError::from(pdf_interp::InterpError::from(e)))?;
+        if let Ok(mut guard) = self.page_cache.write() {
+            let _ = guard.insert(page_num, id);
+        }
+        Ok(id)
+    }
 }
 
 // Compile-time assertions: RasterSession must be Sync (shared across rayon threads) and
@@ -203,9 +246,12 @@ const _: fn() = || {
 
 /// Open a PDF and create a [`RasterSession`] for rendering.
 ///
-/// Eagerly builds the page-ID map so repeated per-page calls are O(1) lookups.
-/// GPU context (AA/ICC) is initialised here; JPEG decoders are initialised
-/// lazily per rayon worker thread on first page render.
+/// Reads `/Pages /Count` directly (O(1) on well-formed PDFs) and defers
+/// per-page id resolution until the first render of each page — opening
+/// a 100 000-page document and rendering one page no longer pays for a
+/// full page-tree walk.  GPU context (AA/ICC) is initialised here; JPEG
+/// decoders are initialised lazily per rayon worker thread on first page
+/// render.
 ///
 /// # Errors
 ///
@@ -217,13 +263,7 @@ pub fn open_session(
     config: &SessionConfig,
 ) -> Result<RasterSession, RasterError> {
     let doc = Arc::new(pdf_interp::open(path).map_err(RasterError::from)?);
-    let pages: std::collections::BTreeMap<u32, pdf::ObjectId> = doc.get_pages().collect();
-    let total_pages = u32::try_from(pages.len()).map_err(|_| {
-        RasterError::InvalidPageGeometry(format!(
-            "document has {} pages which exceeds u32::MAX — this is not a valid PDF",
-            pages.len()
-        ))
-    })?;
+    let total_pages = doc.page_count_fast();
 
     // Reject `ForceVulkan` at the policy gate when the `vulkan` feature
     // wasn't compiled in; otherwise initialise the Vulkan backend up
@@ -324,7 +364,7 @@ pub fn open_session(
 
     Ok(RasterSession {
         doc,
-        pages,
+        page_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         total_pages,
         policy: config.policy,
         #[cfg(not(feature = "vaapi"))]
@@ -489,13 +529,7 @@ fn render_page_rgb_with_geom(
         });
     }
 
-    let page_id = *session
-        .pages
-        .get(&page_num)
-        .ok_or(RasterError::PageOutOfRange {
-            page: page_num,
-            total: session.total_pages,
-        })?;
+    let page_id = session.resolve_page(page_num)?;
 
     let ops = pdf_interp::parse_page(doc, page_num)?;
 
