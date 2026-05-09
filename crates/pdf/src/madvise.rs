@@ -58,9 +58,10 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Build a `File` whose contents are `bytes`.  Returned file is a fresh
-    /// open of the temp file (writable handle stays in scope above for the
-    /// caller's `tmp`-borrow lifetime).
+    /// Build a `File` whose contents are `bytes`.  The on-disk path is
+    /// unlinked when the inner `NamedTempFile` drops at end of this
+    /// function, but the returned fd keeps the inode alive on Linux for
+    /// as long as the test holds it (POSIX unlink-while-open semantics).
     fn temp_file_with(bytes: &[u8]) -> std::fs::File {
         let mut tmp = tempfile::NamedTempFile::new().expect("create tmp");
         tmp.write_all(bytes).expect("write");
