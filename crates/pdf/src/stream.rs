@@ -100,19 +100,51 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
                 let new_len = out.len().saturating_mul(2).min(MAX_DECOMPRESSED);
                 out.resize(new_len, 0);
             }
-            Err(e) => {
-                // libdeflate's zlib decoder rejects raw deflate; fall back to
-                // flate2's DeflateDecoder for the leading-header-missing case
-                // that the previous implementation tolerated.
+            Err(DecompressionError::BadData) => {
+                // libdeflate rejects raw deflate (no zlib header), corrupt
+                // zlib, AND truncated streams (it's all-or-nothing — even a
+                // valid prefix that hits EOF surfaces as BadData). Try raw
+                // deflate (skip 2-byte zlib header) as a header-missing
+                // fallback; if that also fails, fall through to the flate2
+                // path which tolerates partial output the way the
+                // pre-libdeflate code did for real-world malformed PDFs.
                 if data.len() > 2
                     && let Ok(raw) = decompress_raw_deflate(&data[2..])
                 {
                     return Ok(raw);
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("libdeflate: {e:?}"),
-                ));
+                return decompress_zlib_flate2_fallback(data);
+            }
+        }
+    }
+}
+
+/// Last-ditch flate2-based decompression that mirrors the no-default-features
+/// path's partial-tolerance semantics.  Used when libdeflate's strict mode
+/// rejects a stream that flate2 might decode partially (truncated or
+/// checksum-corrupt content streams seen in real-world PDFs).
+#[cfg(feature = "libdeflate")]
+fn decompress_zlib_flate2_fallback(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use std::io::Read;
+
+    let initial_cap = data.len().saturating_mul(3).min(16 * 1024 * 1024);
+    let mut out = Vec::with_capacity(initial_cap);
+    let mut decoder = ZlibDecoder::new(data);
+    match decoder.read_to_end(&mut out) {
+        Ok(_) => Ok(out),
+        Err(_) if out.is_empty() && data.len() > 2 => {
+            out.clear();
+            let mut raw_dec = DeflateDecoder::new(&data[2..]);
+            raw_dec.read_to_end(&mut out)?;
+            Ok(out)
+        }
+        Err(e) => {
+            if out.is_empty() {
+                Err(e)
+            } else {
+                // Partial decompression — use what we have (truncated stream).
+                Ok(out)
             }
         }
     }
