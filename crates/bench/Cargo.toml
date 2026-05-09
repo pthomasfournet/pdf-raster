@@ -19,6 +19,9 @@ pdf_interp = { path = "../pdf_interp" }
 pdf_raster = { path = "../pdf_raster" }
 vello_cpu  = "0.0.7"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [lints.rust]
 unsafe_code  = "deny"
 missing_docs = "allow"

@@ -122,6 +122,7 @@ dependencies = [
  "pdf_interp",
  "pdf_raster",
  "raster",
+ "rustix",
  "vello_cpu",
 ]
 
