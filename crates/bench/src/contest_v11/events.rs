@@ -19,9 +19,7 @@ pub struct EventResult {
 }
 
 const RENDER_DPI: f64 = 150.0;
-fn scale_at_150_dpi() -> f64 {
-    RENDER_DPI / 72.0
-}
+const SCALE_AT_RENDER_DPI: f64 = RENDER_DPI / 72.0;
 
 /// E1 — open archive, render `page_idx`, time `argv[0]` → bitmap.
 /// `page_idx` is clamped to `[1, total_pages]`.
@@ -34,7 +32,7 @@ pub fn e1(archive: &Path, page_idx: u32) -> Result<EventResult, String> {
         return Err("archive has zero pages".into());
     }
     let target = page_idx.clamp(1, total);
-    let _bmp = render_page_rgb(&session, target, scale_at_150_dpi())
+    let _bmp = render_page_rgb(&session, target, SCALE_AT_RENDER_DPI)
         .map_err(|e| format!("render_page_rgb: {e}"))?;
     Ok(EventResult {
         name: "E1",
@@ -55,7 +53,7 @@ pub fn e2(archive: &Path, first_page: u32, count: u32) -> Result<EventResult, St
     let mut rendered = 0u32;
     for offset in 0..count {
         let p = (first_page.saturating_add(offset)).clamp(1, total);
-        let _bmp = render_page_rgb(&session, p, scale_at_150_dpi())
+        let _bmp = render_page_rgb(&session, p, SCALE_AT_RENDER_DPI)
             .map_err(|e| format!("render_page_rgb (page {p}): {e}"))?;
         rendered += 1;
     }
@@ -91,7 +89,7 @@ pub fn e3(list_path: &Path) -> Result<EventResult, String> {
         if session.total_pages() == 0 {
             continue;
         }
-        let _bmp = render_page_rgb(&session, 1, scale_at_150_dpi())
+        let _bmp = render_page_rgb(&session, 1, SCALE_AT_RENDER_DPI)
             .map_err(|e| format!("render_page_rgb({}, 1): {e}", archive.display()))?;
         rendered += 1;
     }
@@ -125,7 +123,7 @@ pub fn e4(archive: &Path) -> Result<EventResult, String> {
         // `% (total - 1) + 1` which off-by-one-skipped the last page.
         let p = u32::try_from(state % u64::from(total) + 1)
             .expect("modulo total fits in u32 by construction");
-        let _bmp = render_page_rgb(&session, p, scale_at_150_dpi())
+        let _bmp = render_page_rgb(&session, p, SCALE_AT_RENDER_DPI)
             .map_err(|e| format!("render_page_rgb (page {p}): {e}"))?;
         rendered += 1;
     }

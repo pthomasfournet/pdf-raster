@@ -18,7 +18,11 @@ mod io_uring_open;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const DEFAULT_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
+/// Default size budget for `build-archive` — counts INPUT fixture bytes
+/// consumed during concatenation, not output bytes.  qpdf deduplicates
+/// shared PDF objects, so the resulting archive is typically 2–3× smaller
+/// than this number.  See `archive::build` doc-comment.
+const DEFAULT_INPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB of input fixtures
 
 /// Pull the next positional arg or print `hint` and exit 1.  Avoids the
 /// `.expect()`-with-Rust-panic-style-message UX that was here before
@@ -62,7 +66,7 @@ fn main() -> ExitCode {
                     next_or_exit(&mut args, "usage: contest_v11 build-archive <out> [bytes]")?
                         .into();
                 let target_bytes = match args.next() {
-                    None => DEFAULT_ARCHIVE_BYTES,
+                    None => DEFAULT_INPUT_BYTES,
                     Some(s) => s.parse::<u64>().map_err(|_| {
                         eprintln!("bytes: expected u64, got {s:?}");
                         ExitCode::from(1)
@@ -165,8 +169,11 @@ fn usage() {
         "usage: contest_v11 <subcommand>
 
 Subcommands:
-  build-archive <out> [bytes]   Build a synthetic PDF archive of approximately
-                                <bytes> bytes (default: 10 GiB) at <out>.
+  build-archive <out> [bytes]   Build a synthetic PDF archive at <out>.
+                                <bytes> = INPUT fixture-byte budget (qpdf
+                                deduplicates objects, so output is ~2-3x
+                                smaller).  Default: 10 GiB input → ~3-4
+                                GiB output.
   e1 <archive> [page]           First-pixel: render a single page.
   e2 <archive> [first] [count]  Sustained: render N consecutive pages.
   e3 <archives.txt>             Cross-doc: render page 1 of each archive.

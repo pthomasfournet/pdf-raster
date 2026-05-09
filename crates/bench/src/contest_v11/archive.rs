@@ -86,8 +86,18 @@ pub fn build(out: &Path, target_bytes: u64) -> Result<(), String> {
         }
     }
 
-    if pages_spec.len() < 2 {
-        return Err("internal: empty pages spec".into());
+    // qpdf needs the base + at least one extra (path, "1-z") pair under
+    // --pages to produce a meaningful concatenation.  After the two
+    // base-related removes below, `pages_spec` becomes the --pages body —
+    // it must contain at least one extra pair (≥ 2 entries) for qpdf
+    // not to reject the invocation.  So pre-remove length ≥ 4.
+    if pages_spec.len() < 4 {
+        return Err(format!(
+            "target_bytes {target_bytes} too small to fill an archive: \
+             only {} fixture entries enqueued, need at least 4 \
+             (one base + one extra page-spec pair)",
+            pages_spec.len(),
+        ));
     }
 
     // qpdf invocation: `qpdf <base> --pages <p1> 1-z <p2> 1-z ... -- <out>`.
