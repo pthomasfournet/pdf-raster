@@ -55,12 +55,104 @@ pub(crate) fn apply_flate(
     data: &[u8],
     params: Option<&dyn DictLookup>,
 ) -> Result<Vec<u8>, std::io::Error> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::Read;
-
     if data.is_empty() {
         return Ok(Vec::new());
     }
+
+    let mut out = decompress_zlib(data)?;
+
+    if let Some(p) = params {
+        out = apply_png_predictor(out, p)
+            .map_err(|s| std::io::Error::new(std::io::ErrorKind::InvalidData, s))?;
+    }
+    Ok(out)
+}
+
+/// Maximum decompressed size we will accept, to defeat decompression bombs.
+#[cfg(feature = "libdeflate")]
+const MAX_DECOMPRESSED: usize = 1 << 30; // 1 GiB
+
+#[cfg(feature = "libdeflate")]
+fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use libdeflater::{DecompressionError, Decompressor};
+
+    // libdeflate is a non-streaming, in-memory decoder: it needs the output
+    // buffer sized up-front. Start at 4× input (typical text streams compress
+    // 3-6×), then double on InsufficientSpace until either we succeed or hit
+    // the 1 GiB cap.
+    let initial_cap = data.len().saturating_mul(4).clamp(64, 16 * 1024 * 1024);
+    let mut out = vec![0u8; initial_cap];
+    let mut decoder = Decompressor::new();
+
+    loop {
+        match decoder.zlib_decompress(data, &mut out) {
+            Ok(n) => {
+                out.truncate(n);
+                return Ok(out);
+            }
+            Err(DecompressionError::InsufficientSpace) => {
+                if out.len() >= MAX_DECOMPRESSED {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "FlateDecode: decompressed output exceeds 1 GiB cap",
+                    ));
+                }
+                let new_len = out.len().saturating_mul(2).min(MAX_DECOMPRESSED);
+                out.resize(new_len, 0);
+            }
+            Err(e) => {
+                // libdeflate's zlib decoder rejects raw deflate; fall back to
+                // flate2's DeflateDecoder for the leading-header-missing case
+                // that the previous implementation tolerated.
+                if data.len() > 2
+                    && let Ok(raw) = decompress_raw_deflate(&data[2..])
+                {
+                    return Ok(raw);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("libdeflate: {e:?}"),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "libdeflate")]
+fn decompress_raw_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use libdeflater::{DecompressionError, Decompressor};
+    let mut out = vec![0u8; data.len().saturating_mul(4).clamp(64, 16 * 1024 * 1024)];
+    let mut decoder = Decompressor::new();
+    loop {
+        match decoder.deflate_decompress(data, &mut out) {
+            Ok(n) => {
+                out.truncate(n);
+                return Ok(out);
+            }
+            Err(DecompressionError::InsufficientSpace) => {
+                if out.len() >= MAX_DECOMPRESSED {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "FlateDecode (raw): decompressed output exceeds 1 GiB cap",
+                    ));
+                }
+                let new_len = out.len().saturating_mul(2).min(MAX_DECOMPRESSED);
+                out.resize(new_len, 0);
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("libdeflate raw: {e:?}"),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "libdeflate"))]
+fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use std::io::Read;
 
     // Cap the initial reservation: 3× input is a good guess for the typical
     // text/PostScript-ish payload, but capping at 16 MiB avoids reserving
@@ -82,11 +174,6 @@ pub(crate) fn apply_flate(
             }
             // Partial decompression — use what we have (truncated stream).
         }
-    }
-
-    if let Some(p) = params {
-        out = apply_png_predictor(out, p)
-            .map_err(|s| std::io::Error::new(std::io::ErrorKind::InvalidData, s))?;
     }
     Ok(out)
 }
@@ -365,6 +452,23 @@ mod tests {
         enc.write_all(original).unwrap();
         let compressed = enc.finish().unwrap();
         let decompressed = apply_flate(&compressed, None).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn flate_roundtrip_large_grow_buffer() {
+        // Exercises the InsufficientSpace -> resize loop in the libdeflate
+        // backend by feeding it highly-compressible input that decompresses
+        // to ~1 MiB (well above the 4× initial reservation for repetitive
+        // input that compresses to a few KiB).
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let original: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&original).unwrap();
+        let compressed = enc.finish().unwrap();
+        let decompressed = apply_flate(&compressed, None).unwrap();
+        assert_eq!(decompressed.len(), original.len());
         assert_eq!(decompressed, original);
     }
 }
