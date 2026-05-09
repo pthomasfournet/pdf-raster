@@ -25,6 +25,21 @@ const MAX_DEPTH: usize = 64;
 /// Cycle protection: tracks visited object numbers in a `HashSet<u32>`.
 /// Depth protection: bounded to `MAX_DEPTH` levels.
 pub fn descend_to_page_index(doc: &Document, idx: u32) -> Result<ObjectId, PdfError> {
+    // Linearization fast path: if the document has a hint table and the
+    // index is in range, we'd jump straight to the page object via
+    // `hints.page_offset(idx)`.  Today `page_offset` always returns `None`
+    // because the bit-packed Page Offset Hint Table parser is pending
+    // (see ROADMAP.md / `linearization::LinearizationHints::page_offset`),
+    // so this branch is never taken — but the wiring is in place so the
+    // parser's follow-up only needs to flip the implementation, not the
+    // call site.
+    if let Ok(Some(hints)) = doc.linearization_hints()
+        && idx < hints.page_count
+        && hints.page_offset(idx).is_some()
+    {
+        log::debug!("linearization fast path eligible for idx {idx}; deferring to descent");
+    }
+
     let catalog = doc.catalog()?;
     let pages_root = catalog
         .get(b"Pages")

@@ -14,6 +14,7 @@ use memmap2::Mmap;
 use crate::{
     dictionary::Dictionary,
     error::PdfError,
+    linearization::LinearizationHints,
     object::{Object, ObjectId, parse_indirect_object},
     objstm::ObjStmCache,
     stream::decode_stream,
@@ -33,6 +34,8 @@ pub struct Document {
     objstm: ObjStmCache,
     /// Catalogue object ID, resolved once from the trailer.
     catalog_id: OnceLock<ObjectId>,
+    /// Cached linearization hints, parsed lazily on first access.
+    lin_hints: OnceLock<Option<LinearizationHints>>,
 }
 
 /// Memory source: mmap for file paths, Vec<u8> for in-memory use (tests, fuzz).
@@ -76,6 +79,7 @@ impl Document {
             cache: Mutex::new(HashMap::new()),
             objstm: ObjStmCache::new(),
             catalog_id: OnceLock::new(),
+            lin_hints: OnceLock::new(),
         })
     }
 
@@ -209,6 +213,33 @@ impl Document {
         };
         let _ = self.catalog_id.set(id);
         Ok(id)
+    }
+
+    /// Return parsed linearization hints, or `None` if the document is
+    /// not linearized.  Parsed once on first call and cached.
+    ///
+    /// # Errors
+    /// Currently never errors — `try_load` collapses every failure mode
+    /// (missing object 1, malformed dict, missing keys, invalid offsets)
+    /// into `Ok(None)`.  The `Result` return type is reserved for the
+    /// future hint-stream parser, which will gain real failure modes.
+    pub fn linearization_hints(&self) -> Result<Option<&LinearizationHints>, PdfError> {
+        // OnceLock::get_or_try_init is unstable (rust-lang/rust#109737), so
+        // do the manual lazy-init dance.
+        if let Some(cached) = self.lin_hints.get() {
+            return Ok(cached.as_ref());
+        }
+        let parsed = LinearizationHints::try_load(self)?;
+        let _ = self.lin_hints.set(parsed);
+        Ok(self.lin_hints.get().and_then(Option::as_ref))
+    }
+
+    /// Raw byte view of the underlying file.  Used by hint-table parsing
+    /// and by callers that want to hash the document content without
+    /// re-reading the file.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.data.as_bytes()
     }
 
     /// Return the number of pages in the document.
