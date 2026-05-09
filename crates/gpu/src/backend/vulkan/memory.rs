@@ -152,7 +152,7 @@ impl HostBuffer {
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "self.size came from `u64::try_from(usize)` at alloc time, so the round-trip back to usize is exact on 64-bit; on 32-bit it can only saturate at allocations > 4 GB which gpu-allocator wouldn't have made"
+        reason = "self.size was set from a `usize` at alloc time via `u64::try_from(usize)`, so the round-trip back to usize is exact on every host"
     )]
     pub const fn as_slice(&self) -> &[u8] {
         // Safety: gpu-allocator returns a valid `*mut u8` that stays
@@ -164,7 +164,7 @@ impl HostBuffer {
     /// Mutable view of the persistently-mapped contents.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "see as_slice — the cast is exact for any allocation gpu-allocator could have made on this host"
+        reason = "see as_slice — usize→u64→usize round-trip is exact"
     )]
     pub const fn as_mut_slice(&mut self) -> &mut [u8] {
         let len = self.size as usize;
@@ -279,12 +279,11 @@ impl SlabAllocator {
             "pdf-raster host staging buffer",
         )?;
         // gpu-allocator persistently maps CpuToGpu allocations.  If the
-        // pointer is missing, it's a gpu-allocator bug or an OOM that
-        // wasn't surfaced — roll back cleanly and report.
+        // pointer is missing, free what we have and report.
         let mapped_ptr = if let Some(nn) = allocation.mapped_ptr() {
             nn.as_ptr().cast::<u8>()
         } else {
-            self.rollback_alloc(buffer, allocation, "alloc_host: no mapped pointer");
+            free_buffer(&self.inner, buffer, allocation, "alloc_host rollback");
             return Err(BackendError::msg(
                 "host buffer allocation has no mapped pointer (gpu-allocator returned None)",
             ));
@@ -296,26 +295,6 @@ impl SlabAllocator {
             allocation: Some(allocation),
             parent: self.inner.clone(),
         })
-    }
-
-    /// Roll back a partially-constructed allocation: free the
-    /// gpu-allocator block (logging if free returns a Result error;
-    /// we're already on an error path) and destroy the unbound buffer.
-    fn rollback_alloc(&self, buffer: vk::Buffer, allocation: Allocation, ctx: &str) {
-        let mut allocator = self
-            .inner
-            .allocator
-            .lock()
-            .expect("allocator mutex poisoned");
-        if let Err(e) = allocator.free(allocation) {
-            log::warn!("rollback ({ctx}): gpu-allocator free returned: {e}");
-        }
-        drop(allocator);
-        // Safety: caller guarantees the buffer was just created via
-        // vkCreateBuffer and no other handle exists.
-        unsafe {
-            self.inner.device.device.destroy_buffer(buffer, None);
-        }
     }
 
     /// Free a device buffer.  Drop runs the actual free; the explicit
@@ -398,11 +377,7 @@ impl SlabAllocator {
             )
         };
         if let Err(code) = bind_result {
-            self.rollback_alloc(
-                buffer,
-                allocation,
-                "create_and_bind: vkBindBufferMemory failed",
-            );
+            free_buffer(&self.inner, buffer, allocation, "create_and_bind rollback");
             return Err(BackendError::msg(format!(
                 "vkBindBufferMemory failed: {code:?}"
             )));

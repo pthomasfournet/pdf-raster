@@ -218,11 +218,10 @@ impl PageRecorder {
                 .map_err(vk_err("vkEndCommandBuffer"))?;
         }
         let signal_value = s.next_value;
-        s.next_value = s.next_value.checked_add(1).ok_or_else(|| {
-            BackendError::msg(
-                "timeline semaphore value would overflow u64 — process has been running long enough to render 2^64 pages, restart it",
-            )
-        })?;
+        s.next_value = s
+            .next_value
+            .checked_add(1)
+            .ok_or_else(|| BackendError::msg("timeline semaphore overflowed u64"))?;
 
         let mut tl_submit = vk::TimelineSemaphoreSubmitInfo::default()
             .signal_semaphore_values(std::slice::from_ref(&signal_value));
@@ -246,11 +245,8 @@ impl PageRecorder {
     }
 
     pub(super) fn wait_page(&self, fence: PageFence) -> Result<()> {
-        // Hold the mutex across the wait so callers on other threads
-        // observe the Submitted → Idle transition atomically; without
-        // this, a parallel begin_page on another thread could squeak in
-        // before state flips and produce a confusing error.  Trait
-        // contract is single-threaded anyway; this is belt-and-braces.
+        // Hold the mutex across the wait so the Submitted → Idle
+        // transition is atomic w.r.t. concurrent begin_page calls.
         let mut s = self.inner.lock().expect("recorder mutex poisoned");
         if s.state != State::Submitted {
             return Err(BackendError::msg(format!(
@@ -263,9 +259,7 @@ impl PageRecorder {
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        // u64::MAX = wait forever.  vkWaitSemaphores blocks the calling
-        // thread but does not require external synchronisation, so
-        // holding our own mutex here is safe.
+        // u64::MAX = wait forever.
         unsafe {
             self.device
                 .device
@@ -323,23 +317,15 @@ impl PageRecorder {
         push[16..20].copy_from_slice(&p.height.to_ne_bytes());
         push[20..24].copy_from_slice(&i32::from(p.fill_rule != 0).to_ne_bytes());
         // Workgroup = 1 pixel (64 lanes). Grid = total pixel count.
-        // Architectural ceiling: Vulkan caps `maxComputeWorkGroupCount[0]`
-        // at as low as 65535; a 256×256 image already exceeds that.  Real
-        // pages need a 2D dispatch — kernel re-parametrisation is a
-        // follow-up.  For now, fail loudly so callers don't see the
-        // driver's vague ERROR_DEVICE_LOST.
+        // The kernel uses a 1D dispatch over pixels which exceeds Vulkan's
+        // guaranteed `maxComputeWorkGroupCount[0]` (65535) for any image
+        // larger than ~256×256; `dispatch_kernel`'s `check_dispatch_size`
+        // fails the call with a useful message before the driver does.
+        // Spec follow-up: reparametrise as 2D (width × height) workgroups.
         let total_pixels = p
             .width
             .checked_mul(p.height)
             .ok_or_else(|| BackendError::msg("aa_fill: width * height overflowed u32"))?;
-        let max_x = self.device.max_workgroup_count[0];
-        if total_pixels > max_x {
-            return Err(BackendError::msg(format!(
-                "aa_fill: dispatch of {total_pixels} workgroups exceeds device's \
-                 maxComputeWorkGroupCount[0] = {max_x}; the kernel needs a 2D \
-                 dispatch re-parametrisation for images larger than ~{max_x} pixels"
-            )));
-        }
         self.dispatch_kernel(
             KernelId::AaFill,
             &[p.segs.handle(), p.coverage.handle()],
@@ -440,17 +426,10 @@ impl PageRecorder {
         Ok(())
     }
 
-    /// Common dispatch flow: allocate a descriptor set, write the buffer
-    /// bindings, bind the pipeline, push constants, dispatch, then emit
-    /// a compute→compute memory barrier so the next dispatch sees the
-    /// writes.
-    ///
-    /// The recorder mutex is held for the entire body — we mutate `s.cmd`
-    /// (which is the single in-flight command buffer) and `s.desc_pool`
-    /// (which allocates from a single per-page pool).  Dropping and
-    /// re-acquiring the lock would let two threads race on `s.cmd`, which
-    /// is undefined behaviour at the Vulkan level (command buffers are
-    /// not externally synchronised by default).
+    /// Allocate a descriptor set, bind pipeline + buffers + push constants,
+    /// dispatch, emit a compute→compute memory barrier.  Holds the mutex
+    /// for the whole body so two threads can't race on `s.cmd` (command
+    /// buffers are not externally synchronised by default).
     fn dispatch_kernel(
         &self,
         id: KernelId,

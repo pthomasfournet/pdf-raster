@@ -141,7 +141,7 @@ pub struct IccClutParams<'a, B: GpuBackend + ?Sized> {
 /// The CLUT layout is `(k * G^3 + c * G^2 + m * G + y) * 3` bytes —
 /// `grid_n^4` 3-byte RGB nodes.  Typical PDF profiles use `grid_n` of
 /// 17 or 33.  Shared between the CUDA and Vulkan backends; both
-/// recovers `grid_n` from the buffer size at record time.
+/// recover `grid_n` from the buffer size at record time.
 #[must_use]
 pub fn grid_n_from_clut_len(len: usize) -> Option<u32> {
     if !len.is_multiple_of(3) {

@@ -34,18 +34,10 @@ use crate::backend::{GpuBackend, Result, VramBudget, params, reject_zero_size};
 /// The trait surface is identical to the CUDA backend; switching is a
 /// one-line change at the renderer's `RasterSession` constructor.
 pub struct VulkanBackend {
-    // Field declaration order matters: Rust drops struct fields in
-    // declaration order (top to bottom).  We need recorder + transfer
-    // dropped FIRST so their command pools / semaphores get destroyed
-    // while the device is still alive; then pipelines (which destroys
-    // VkPipeline + layouts); then memory (which calls vkDestroyBuffer
-    // on the device); then finally the device.  The Arc<DeviceCtx>
-    // ensures all the children keep the device alive even if we got
-    // the drop order wrong, but explicit order is clearer.
+    // Field order = drop order: children that record into command buffers
+    // / hold pool handles must drop before the device they were created on.
     transfer: transfer::TransferContext,
     recorder: recorder::PageRecorder,
-    /// Held as `Arc` so the recorder keeps a clone — pipelines must
-    /// outlive every command buffer that bound them.
     #[expect(
         dead_code,
         reason = "kept for explicit drop ordering; readers go via recorder's Arc clone"
@@ -68,9 +60,6 @@ impl VulkanBackend {
         let pipelines = pipeline::PipelineCache::new(device.clone())?;
         let recorder = recorder::PageRecorder::new(device.clone(), pipelines.clone())?;
         let transfer = transfer::TransferContext::new(device.clone())?;
-        // Order here mirrors the struct's drop order (declaration order):
-        // transfer → recorder → pipelines → memory → device.  Both
-        // initialisation and tear-down read top-down for clarity.
         Ok(Self {
             transfer,
             recorder,

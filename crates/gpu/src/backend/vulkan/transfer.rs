@@ -21,6 +21,20 @@ use super::device::DeviceCtx;
 use super::error::vk_err;
 use super::memory::{DeviceBuffer, SlabAllocator};
 
+/// Convert a host-side `usize` length to `u64` and verify it doesn't
+/// exceed the device-side buffer capacity.  `op_label` and `cap_label`
+/// only show up in the error message, e.g. `("upload_sync", "dst capacity")`.
+fn check_len(len: usize, capacity: u64, op_label: &str, cap_label: &str) -> Result<u64> {
+    let len_u64 = u64::try_from(len)
+        .map_err(|_| BackendError::msg(format!("{op_label}: length ({len}) exceeds u64")))?;
+    if len_u64 > capacity {
+        return Err(BackendError::msg(format!(
+            "{op_label}: length ({len_u64}) exceeds {cap_label} ({capacity})"
+        )));
+    }
+    Ok(len_u64)
+}
+
 pub(super) struct TransferContext {
     device: Arc<DeviceCtx>,
     /// Reusable command pool for transient one-shot transfer command
@@ -42,12 +56,12 @@ impl TransferContext {
     }
 
     /// Synchronous upload: copy `src` into `dst[0..src.len()]`, block
-    /// until complete, return.
+    /// until complete.
     ///
     /// Used by the trait's `upload_async` (which currently completes
-    /// before returning, so the fence it hands back is already
-    /// signalled) and directly by tests.  A real async path with a
-    /// dedicated transfer queue is a spec follow-up.
+    /// before returning, so the fence it hands back is already signalled)
+    /// and directly by tests.  A real async path with a dedicated transfer
+    /// queue is a spec follow-up.
     pub(super) fn upload_sync(
         &self,
         allocator: &SlabAllocator,
@@ -57,32 +71,14 @@ impl TransferContext {
         if src.is_empty() {
             return Ok(());
         }
-        let src_len = u64::try_from(src.len())
-            .map_err(|_| BackendError::msg("upload_sync: src.len() exceeds u64"))?;
-        if src_len > dst.size() {
-            return Err(BackendError::msg(format!(
-                "upload_sync: src.len() ({src_len}) exceeds dst capacity ({})",
-                dst.size()
-            )));
-        }
-
-        // Stage: HOST_VISIBLE buffer of exactly src.len() bytes.
+        let len = check_len(src.len(), dst.size(), "upload_sync", "dst capacity")?;
         let mut staging = allocator.alloc_host(src.len())?;
         staging.as_mut_slice().copy_from_slice(src);
-
-        self.run_one_shot(|cmd| unsafe {
-            let region = [vk::BufferCopy::default()
-                .src_offset(0)
-                .dst_offset(0)
-                .size(src_len)];
-            self.device
-                .device
-                .cmd_copy_buffer(cmd, staging.handle(), dst.handle(), &region);
-        })
+        self.copy_via_staging(staging.handle(), dst.handle(), len)
     }
 
-    /// Synchronous download: copy `src[0..len]` into `dst`, block until
-    /// complete.
+    /// Synchronous download: copy `src[0..dst.len()]` into `dst`, block
+    /// until complete.
     pub(super) fn download_sync(
         &self,
         allocator: &SlabAllocator,
@@ -92,44 +88,35 @@ impl TransferContext {
         if dst.is_empty() {
             return Ok(());
         }
-        let dst_len = u64::try_from(dst.len())
-            .map_err(|_| BackendError::msg("download_sync: dst.len() exceeds u64"))?;
-        if dst_len > src.size() {
-            return Err(BackendError::msg(format!(
-                "download_sync: dst.len() ({dst_len}) exceeds src size ({})",
-                src.size()
-            )));
-        }
-
+        let len = check_len(dst.len(), src.size(), "download_sync", "src size")?;
         let mut staging = allocator.alloc_host(dst.len())?;
-
-        self.run_one_shot(|cmd| unsafe {
-            let region = [vk::BufferCopy::default()
-                .src_offset(0)
-                .dst_offset(0)
-                .size(dst_len)];
-            self.device
-                .device
-                .cmd_copy_buffer(cmd, src.handle(), staging.handle(), &region);
-        })?;
-
+        self.copy_via_staging(src.handle(), staging.handle(), len)?;
         dst.copy_from_slice(staging.as_mut_slice());
         Ok(())
     }
 
+    /// Submit a single `vkCmdCopyBuffer(src→dst, len)` and wait for it
+    /// to complete.  Caller chooses which side is the staging buffer.
+    fn copy_via_staging(&self, src: vk::Buffer, dst: vk::Buffer, len: u64) -> Result<()> {
+        self.run_one_shot(|cmd| {
+            let region = [vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(len)];
+            // Safety: cmd is in Recording state per run_one_shot's contract.
+            unsafe {
+                self.device.device.cmd_copy_buffer(cmd, src, dst, &region);
+            }
+        })
+    }
+
     /// Allocate a one-shot command buffer, run `f` to record into it,
-    /// submit it, wait for the queue to idle, then reset the pool.
-    /// Slow but correct; only used for upload/download today.
+    /// submit it, wait for the queue to idle.  Slow but correct.
     ///
-    /// Pool reset (rather than `free_command_buffers`) is the canonical
-    /// idiom for one-shot command buffers and is leak-safe even when an
-    /// error path bails before the explicit free.  We reset *at the
-    /// start* of each run so the previous transfer's buffer is reclaimed
-    /// regardless of how that one ended.
+    /// Resets the pool at the start of each call so a prior failed run
+    /// can't leak its command buffer; this is leak-safe in all error
+    /// paths below.
     fn run_one_shot<F: FnOnce(vk::CommandBuffer)>(&self, f: F) -> Result<()> {
-        // Reset upfront so a prior failed transfer can't leave the pool
-        // dirty.  TRANSIENT lets us reset cheaply.  Safe to call even on
-        // an empty pool.
         unsafe {
             self.device
                 .device

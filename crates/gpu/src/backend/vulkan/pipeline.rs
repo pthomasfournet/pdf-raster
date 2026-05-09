@@ -140,11 +140,9 @@ impl PipelineCache {
 
     /// Get (or build, if first call) the compiled kernel for `id`.
     ///
-    /// `OnceLock::get_or_try_init` is still nightly (rust-lang/rust#109737),
-    /// so we manually do the get-then-set-then-cleanup-loser dance.  The
-    /// race window is tiny in practice (only first-dispatch contention)
-    /// and a duplicate compile is correctness-safe — the loser's pipeline
-    /// is destroyed by `destroy_one` before we return.
+    /// First-dispatch contention: a racing compile is correctness-safe;
+    /// the loser's pipeline is destroyed before we return.
+    /// TODO: switch to `OnceLock::get_or_try_init` once stable (rust-lang/rust#109737).
     fn get(&self, id: KernelId) -> Result<&CompiledKernel> {
         let slot = &self.slots[id as usize];
         if let Some(c) = slot.get() {
