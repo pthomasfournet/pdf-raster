@@ -36,6 +36,10 @@ gpu-icc = ["dep:gpu"]
 # Requires CUDA 12 and a NVIDIA GPU.  When off, the renderer compiles with
 # the CPU-only `ImageData::Cpu` arm and the cache module is excluded.
 cache = ["dep:gpu", "gpu/cache"]
+# Vulkan compute backend (Phase 10).  When on, the renderer can route
+# kernel call sites through VulkanBackend instead of GpuCtx; selection
+# happens at runtime via `BackendHandle`.
+vulkan = ["dep:gpu", "gpu/vulkan"]
 # Build FreeType from source (cross-compilation, static builds).
 bundled = ["font/bundled"]
 

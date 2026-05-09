@@ -384,6 +384,11 @@ pub enum BackendArg {
     Cuda,
     /// Require VA-API JPEG — error loudly if the DRM device cannot be opened.
     Vaapi,
+    /// Require the Vulkan compute backend — error loudly if Vulkan
+    /// initialisation fails.  Phase 9 image cache is unavailable under
+    /// this mode (CUDA-only); the kernels themselves dispatch through
+    /// `VulkanBackend`.
+    Vulkan,
 }
 
 impl Args {
@@ -404,15 +409,20 @@ impl Args {
             BackendArg::Cpu => BackendPolicy::CpuOnly,
             BackendArg::Cuda => BackendPolicy::ForceCuda,
             BackendArg::Vaapi => BackendPolicy::ForceVaapi,
+            BackendArg::Vulkan => BackendPolicy::ForceVulkan,
         };
 
         if self.vaapi_device != DEFAULT_VAAPI_DEVICE
-            && matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceCuda)
+            && matches!(
+                policy,
+                BackendPolicy::CpuOnly | BackendPolicy::ForceCuda | BackendPolicy::ForceVulkan
+            )
         {
             let backend_name = match policy {
                 BackendPolicy::CpuOnly => "cpu",
                 BackendPolicy::ForceCuda => "cuda",
-                _ => unreachable!("matched CpuOnly | ForceCuda above"),
+                BackendPolicy::ForceVulkan => "vulkan",
+                _ => unreachable!("matched CpuOnly | ForceCuda | ForceVulkan above"),
             };
             return Err(format!(
                 "--vaapi-device has no effect with --backend {backend_name}.\n\

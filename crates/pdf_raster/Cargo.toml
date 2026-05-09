@@ -33,6 +33,12 @@ gpu-deskew = ["dep:gpu", "gpu/gpu-deskew"]
 # renderer dispatches cached images to a GPU blit kernel.  Requires
 # CUDA 12 and a NVIDIA GPU.
 cache = ["dep:gpu", "gpu/cache", "pdf_interp/cache"]
+# Vulkan compute backend (Phase 10).  Routes the kernel call sites
+# through `gpu::backend::vulkan::VulkanBackend` instead of the CUDA
+# `GpuCtx`.  Phase 9 image cache is unavailable in this mode (cache
+# is CUDA-only today); the renderer falls back to per-page-uncached
+# JPEG decode.
+vulkan = ["dep:gpu", "gpu/vulkan", "pdf_interp/vulkan"]
 # Enable GPU vs CPU parity tests (requires a CUDA device at test time).
 gpu-validation = ["gpu/gpu-validation"]
 # Build FreeType from source (cross-compilation, static builds).

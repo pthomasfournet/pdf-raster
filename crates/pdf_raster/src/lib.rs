@@ -169,6 +169,14 @@ pub enum BackendPolicy {
     /// Returns [`RasterError::BackendUnavailable`] if the VA-API device cannot
     /// be opened rather than falling back to CPU.
     ForceVaapi,
+    /// Require the Vulkan compute backend.  Returns
+    /// [`RasterError::BackendUnavailable`] if Vulkan initialisation fails.
+    ///
+    /// Phase 9's image cache is CUDA-only today; under `ForceVulkan` the
+    /// session runs without the cache (matches the pre-Phase-9 GPU path).
+    /// The kernels themselves (aa_fill, tile_fill, icc_clut, soft_mask,
+    /// composite, blit_image) all dispatch through `VulkanBackend`.
+    ForceVulkan,
 }
 
 // ── Session configuration ─────────────────────────────────────────────────────

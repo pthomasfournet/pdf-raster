@@ -33,6 +33,8 @@ vaapi      = ["pdf_raster/vaapi"]
 # Phase 9 device-resident image cache.  Decoded JPEGs stay in VRAM
 # across pages with cross-document content-hash dedup.
 cache      = ["pdf_raster/cache"]
+# Vulkan compute backend (Phase 10).  Adds `--backend vulkan` to the CLI.
+vulkan     = ["pdf_raster/vulkan"]
 
 [dependencies]
 pdf_raster  = { path = "../pdf_raster" }
