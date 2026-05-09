@@ -10,6 +10,9 @@
 #[cfg(unix)]
 use std::fs::File;
 
+#[cfg(unix)]
+use rustix::fs::{Advice, fadvise};
+
 /// Tell the kernel "we will touch arbitrary 4 KB ranges; don't readahead."
 ///
 /// Call once on document open, before any byte access.  Errors are
@@ -19,7 +22,6 @@ use std::fs::File;
 /// The `len` argument is `None`, which the kernel interprets as "to EOF".
 #[cfg(unix)]
 pub fn advise_random(file: &File) {
-    use rustix::fs::{Advice, fadvise};
     let _ = fadvise(file, 0, None, Advice::Random);
 }
 
@@ -40,7 +42,6 @@ pub fn advise_random(file: &File) {
     )
 )]
 pub fn advise_willneed(file: &File, offset: u64, len: u64) {
-    use rustix::fs::{Advice, fadvise};
     let Some(nz_len) = std::num::NonZeroU64::new(len) else {
         return;
     };
@@ -52,33 +53,32 @@ pub fn advise_random(_: &std::fs::File) {}
 #[cfg(not(unix))]
 pub fn advise_willneed(_: &std::fs::File, _: u64, _: u64) {}
 
-#[cfg(test)]
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Build a `File` whose contents are `bytes`.  Returned file is a fresh
+    /// open of the temp file (writable handle stays in scope above for the
+    /// caller's `tmp`-borrow lifetime).
+    fn temp_file_with(bytes: &[u8]) -> std::fs::File {
+        let mut tmp = tempfile::NamedTempFile::new().expect("create tmp");
+        tmp.write_all(bytes).expect("write");
+        tmp.reopen().expect("reopen")
+    }
+
     #[test]
     fn advise_random_does_not_panic() {
-        let mut tmp = tempfile::NamedTempFile::new().expect("create tmp");
-        tmp.write_all(b"hello world").expect("write");
-        let file = tmp.reopen().expect("reopen");
-        advise_random(&file);
+        advise_random(&temp_file_with(b"hello world"));
     }
 
     #[test]
     fn advise_willneed_does_not_panic() {
-        let mut tmp = tempfile::NamedTempFile::new().expect("create tmp");
-        tmp.write_all(b"hello world").expect("write");
-        let file = tmp.reopen().expect("reopen");
-        advise_willneed(&file, 0, 11);
+        advise_willneed(&temp_file_with(b"hello world"), 0, 11);
     }
 
     #[test]
     fn advise_willneed_zero_length_is_no_op() {
-        let mut tmp = tempfile::NamedTempFile::new().expect("create tmp");
-        tmp.write_all(b"hello").expect("write");
-        let file = tmp.reopen().expect("reopen");
-        advise_willneed(&file, 0, 0);
+        advise_willneed(&temp_file_with(b"hello"), 0, 0);
     }
 }
