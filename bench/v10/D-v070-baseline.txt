@@ -1,0 +1,22 @@
+
+System: load=2.93   cores=24  perf_paranoid=1
+Binary: /tmp/pdf-raster-cuda-v070-baseline  backend=cuda
+Runs:   5 (warmup 1) — hyperfine mean±σ + mpstat/iostat
+
+corpus                                    mean ± σ   cpu avg  cpu peak  disk MB/s  flags
+------                                      --------   -------  --------  ---------
+01-native-text-small                    253ms ±   12ms        0%        0%         1 MB/s  
+02-native-vector-text                   554ms ±   41ms        4%        4%         0 MB/s  
+03-native-text-dense                    834ms ±   19ms       11%       11%         1 MB/s  [low-cpu 11%] 
+04-ebook-mixed                          858ms ±   32ms       48%       48%         7 MB/s  
+05-academic-book                       1322ms ±   54ms       63%       63%         6 MB/s  
+SKIP  06-modern-layout-dct              (file not found)
+SKIP  07-journal-dct-heavy              (file not found)
+SKIP  08-scan-dct-1927                  (file not found)
+SKIP  09-scan-dct-1836                  (file not found)
+SKIP  10-scan-jbig2-jpx                 (file not found)
+
+Flags:
+  [high-σ N%]    stddev > 15% of mean — background interference likely
+  [low-cpu N%]   avg CPU < 30% on multi-page corpus — contention or I/O bound
+  [cold=Nms>>mean] cold-cache single run >> hyperfine mean — scheduling outlier
