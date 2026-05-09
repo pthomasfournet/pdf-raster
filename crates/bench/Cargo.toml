@@ -14,6 +14,7 @@ path = "src/contest_v11/main.rs"
 [dependencies]
 raster     = { path = "../raster" }
 color      = { path = "../color" }
+encode     = { path = "../encode" }
 pdf        = { path = "../pdf" }
 pdf_interp = { path = "../pdf_interp" }
 pdf_raster = { path = "../pdf_raster" }

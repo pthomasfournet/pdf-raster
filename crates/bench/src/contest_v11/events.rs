@@ -21,7 +21,9 @@ pub struct EventResult {
 const RENDER_DPI: f64 = 150.0;
 const SCALE_AT_RENDER_DPI: f64 = RENDER_DPI / 72.0;
 
-/// E1 — open archive, render `page_idx`, time `argv[0]` → bitmap.
+/// E1 — open archive, render `page_idx`, write PPM to disk.  Times the
+/// full pipeline including the disk write so the comparison against
+/// mutool / pdftoppm (which always write a PPM file) is apples-to-apples.
 /// `page_idx` is clamped to `[1, total_pages]`.
 pub fn e1(archive: &Path, page_idx: u32) -> Result<EventResult, String> {
     let t0 = Instant::now();
@@ -32,11 +34,18 @@ pub fn e1(archive: &Path, page_idx: u32) -> Result<EventResult, String> {
         return Err("archive has zero pages".into());
     }
     let target = page_idx.clamp(1, total);
-    let _bmp = render_page_rgb(&session, target, SCALE_AT_RENDER_DPI)
+    let bmp = render_page_rgb(&session, target, SCALE_AT_RENDER_DPI)
         .map_err(|e| format!("render_page_rgb: {e}"))?;
+    let out_path = std::env::temp_dir().join("p11_pdf_raster_e1.ppm");
+    let file = std::fs::File::create(&out_path)
+        .map_err(|e| format!("create {}: {e}", out_path.display()))?;
+    encode::write_ppm(&bmp, std::io::BufWriter::new(file))
+        .map_err(|e| format!("write_ppm: {e}"))?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let _ = std::fs::remove_file(&out_path);
     Ok(EventResult {
         name: "E1",
-        elapsed_ms: t0.elapsed().as_secs_f64() * 1e3,
+        elapsed_ms,
         pages_rendered: 1,
     })
 }

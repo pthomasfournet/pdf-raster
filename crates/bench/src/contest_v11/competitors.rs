@@ -65,8 +65,17 @@ pub fn mutool_render(archive: &Path, page: u32, out: &Path) -> CompetitorResult 
     let mut cmd = Command::new("mutool");
     cmd.args([
         "draw",
+        // -r resolution, -q quiet (suppress progress noise that goes to
+        // stderr, which would otherwise trip our error-forwarding path),
+        // -P parallel rendering (no-op on un-banded single-page render
+        // but signals "use the fast path you've got"), -N disable ICC
+        // color management (equalises since pdf-raster does not run
+        // Little CMS by default for RGB output either).
         "-r",
         "150",
+        "-q",
+        "-P",
+        "-N",
         "-o",
         out_str,
         archive_str,
