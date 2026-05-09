@@ -87,18 +87,36 @@ impl Object {
         }
     }
 
+    /// Strict integer-only accessor.  Returns `Some` only for `Object::Integer`
+    /// or `Object::Real` whose value is exactly representable as an integer
+    /// (i.e. `r.fract() == 0.0`).  Used by [`Self::as_u32`] / [`Self::as_u64`]
+    /// so they don't silently truncate `100.5` to `100` for dict keys whose
+    /// spec'd domain is integer (`/Count`, `/N`, `/O`, byte offsets, …).
+    fn as_integer(&self) -> Option<i64> {
+        match self {
+            Self::Integer(n) => Some(*n),
+            Self::Real(r) if r.is_finite() && r.fract() == 0.0 => Some(*r as i64),
+            _ => None,
+        }
+    }
+
     /// Numeric accessor that rejects negatives and `> u32::MAX`.  Convenient
     /// for PDF dict keys whose spec'd domain is non-negative `Integer`
     /// (`/Count`, `/N`, `/O`, page numbers, …).  Returns `None` for any
-    /// non-numeric or out-of-range value.
+    /// non-integer, non-numeric, or out-of-range value.
+    ///
+    /// `Object::Real` values are accepted only when the value is exactly
+    /// representable as an integer — `100.0` ✓, `100.5` ✗.  Dict keys
+    /// that lie about their type get rejected rather than silently
+    /// truncated.
     pub fn as_u32(&self) -> Option<u32> {
-        u32::try_from(self.as_i64()?).ok()
+        u32::try_from(self.as_integer()?).ok()
     }
 
     /// Same as [`Self::as_u32`] but for byte offsets and lengths that
     /// genuinely need the full `u64` range.
     pub fn as_u64(&self) -> Option<u64> {
-        u64::try_from(self.as_i64()?).ok()
+        u64::try_from(self.as_integer()?).ok()
     }
 
     pub fn as_f32(&self) -> Option<f32> {
@@ -393,6 +411,30 @@ mod tests {
     fn boolean() {
         assert_eq!(parse(b"true"), Object::Boolean(true));
         assert_eq!(parse(b"false"), Object::Boolean(false));
+    }
+
+    /// `as_u32` accepts integer-valued reals (`100.0` → `Some(100)`) but
+    /// rejects fractional reals (`100.5` → `None`).  Dict keys whose
+    /// spec'd domain is integer (`/Count`, `/N`, `/O`, byte offsets, …)
+    /// must not silently truncate.
+    #[test]
+    fn as_u32_rejects_fractional_real() {
+        assert_eq!(Object::Integer(42).as_u32(), Some(42));
+        assert_eq!(Object::Real(42.0).as_u32(), Some(42));
+        assert_eq!(Object::Real(42.5).as_u32(), None);
+        assert_eq!(Object::Real(-1.0).as_u32(), None);
+        assert_eq!(Object::Real(f32::NAN).as_u32(), None);
+        assert_eq!(Object::Real(f32::INFINITY).as_u32(), None);
+        assert_eq!(Object::Integer(-1).as_u32(), None);
+        assert_eq!(Object::Boolean(true).as_u32(), None);
+    }
+
+    #[test]
+    fn as_u64_rejects_fractional_real() {
+        assert_eq!(Object::Integer(42).as_u64(), Some(42));
+        assert_eq!(Object::Real(12345.0).as_u64(), Some(12345));
+        assert_eq!(Object::Real(12345.5).as_u64(), None);
+        assert_eq!(Object::Integer(-1).as_u64(), None);
     }
 
     #[test]

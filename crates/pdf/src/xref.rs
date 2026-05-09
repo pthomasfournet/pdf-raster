@@ -290,14 +290,21 @@ fn read_xref_stream(
     let index_pairs: Vec<u32> = match dict.get(b"Index") {
         Some(Object::Array(a)) => a
             .iter()
-            .map(|o| obj_to_u32(o, "/Index"))
+            .map(|o| {
+                o.as_u32().ok_or_else(|| {
+                    PdfError::BadXref(format!("xref stream /Index: bad integer {o:?}"))
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?,
         _ => {
             // Default: one subsection starting at 0, covering /Size objects.
             let size = dict
                 .get(b"Size")
                 .ok_or_else(|| PdfError::BadXref("xref stream: missing /Size".into()))?;
-            vec![0, obj_to_u32(size, "/Size")?]
+            let size_u32 = size.as_u32().ok_or_else(|| {
+                PdfError::BadXref(format!("xref stream /Size: bad integer {size:?}"))
+            })?;
+            vec![0, size_u32]
         }
     };
     if !index_pairs.len().is_multiple_of(2) {
@@ -400,18 +407,6 @@ fn decode_xref_stream(raw: &[u8], dict: &Dictionary) -> Result<Vec<u8>, PdfError
         Some(other) => Err(PdfError::DecodeFailed(format!(
             "unsupported xref stream filter: {}",
             String::from_utf8_lossy(other)
-        ))),
-    }
-}
-
-/// Convert an `Object::Integer` to a non-negative `u32`, rejecting negatives,
-/// non-integers, and values that would overflow.  `label` is interpolated into
-/// the error message to identify which dict key was being read.
-fn obj_to_u32(obj: &Object, label: &str) -> Result<u32, PdfError> {
-    match obj {
-        Object::Integer(n) if *n >= 0 && *n <= i64::from(u32::MAX) => Ok(*n as u32),
-        other => Err(PdfError::BadXref(format!(
-            "xref stream {label}: bad integer {other:?}"
         ))),
     }
 }

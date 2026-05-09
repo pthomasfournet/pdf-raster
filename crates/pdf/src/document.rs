@@ -246,6 +246,10 @@ impl Document {
     /// Return parsed linearization hints, or `None` if the document is
     /// not linearized.  Parsed once on first call and cached.
     ///
+    /// `LinearizationHints` is `Copy` (24 bytes), so callers receive an
+    /// owned value rather than a borrow that would tie up the document
+    /// for its lifetime.
+    ///
     /// # Errors
     /// Currently never errors — `try_load` collapses every failure mode
     /// (missing object 1, malformed dict, missing keys, invalid offsets)
@@ -253,11 +257,10 @@ impl Document {
     /// future hint-stream parser, which will gain real failure modes;
     /// the call site can switch to `OnceLock::get_or_try_init` when
     /// stable (rust-lang/rust#109737).
-    pub fn linearization_hints(&self) -> Result<Option<&LinearizationHints>, PdfError> {
-        Ok(self
+    pub fn linearization_hints(&self) -> Result<Option<LinearizationHints>, PdfError> {
+        Ok(*self
             .lin_hints
-            .get_or_init(|| LinearizationHints::try_load(self).ok().flatten())
-            .as_ref())
+            .get_or_init(|| LinearizationHints::try_load(self).ok().flatten()))
     }
 
     /// Raw byte view of the underlying file.  Used by hint-table parsing
@@ -291,6 +294,11 @@ impl Document {
     /// the eager-walk fallback inside the page-tree descent.
     #[must_use]
     fn read_page_count_uncached(&self) -> u32 {
+        // Linearized PDFs declare /N up front; trust it without descending
+        // into the catalog dict.
+        if let Ok(Some(hints)) = self.linearization_hints() {
+            return hints.page_count;
+        }
         let Ok(pages_root) = self.pages_root_id() else {
             return self.page_count();
         };
