@@ -7,11 +7,15 @@
 //!
 //! Spec follow-up: a dedicated transfer queue (`TRANSFER` family without
 //! `GRAPHICS` or `COMPUTE`) plus a timeline-semaphore handoff so the
-//! prefetcher can overlap uploads with rendering.  That's tracked in
-//! the spec's "Vulkan dedicated transfer queue for the prefetcher"
-//! section and gated on the prefetcher's measured critical path.
+//! prefetcher can overlap uploads with rendering.  Tracked in the spec's
+//! "Vulkan dedicated transfer queue for the prefetcher" section.
 
-use std::sync::Arc;
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "the staging Mutex<Option<HostBuffer>> is held across Vulkan calls intentionally — releasing it between the host-side write and the GPU-side wait would let a second upload observe the same staging buffer mid-DMA"
+)]
+
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 
@@ -19,7 +23,7 @@ use crate::backend::{BackendError, Result};
 
 use super::device::DeviceCtx;
 use super::error::vk_err;
-use super::memory::{DeviceBuffer, SlabAllocator};
+use super::memory::{DeviceBuffer, HostBuffer, SlabAllocator};
 
 /// Convert a host-side `usize` length to `u64` and verify it doesn't
 /// exceed the device-side buffer capacity.  `op_label` and `cap_label`
@@ -42,6 +46,13 @@ pub(super) struct TransferContext {
     /// interleave; matches the canonical "one pool per logical stream
     /// of submissions" pattern.
     cmd_pool: vk::CommandPool,
+    /// Reusable staging buffer, grown to the high-water-mark of any
+    /// upload/download seen so far.  `None` until the first transfer;
+    /// reallocated only when a request exceeds the current capacity.
+    /// Wrapped in `Mutex` so concurrent transfers serialise (also
+    /// matches the recorder's single-in-flight invariant — `run_one_shot`
+    /// holds the queue across the wait).
+    staging: Mutex<Option<HostBuffer>>,
 }
 
 impl TransferContext {
@@ -52,7 +63,11 @@ impl TransferContext {
         // Safety: device is live; create_command_pool returns Result on failure.
         let cmd_pool = unsafe { device.device.create_command_pool(&pool_info, None) }
             .map_err(vk_err("vkCreateCommandPool (transfer)"))?;
-        Ok(Self { device, cmd_pool })
+        Ok(Self {
+            device,
+            cmd_pool,
+            staging: Mutex::new(None),
+        })
     }
 
     /// Synchronous upload: copy `src` into `dst[0..src.len()]`, block
@@ -72,9 +87,19 @@ impl TransferContext {
             return Ok(());
         }
         let len = check_len(src.len(), dst.size(), "upload_sync", "dst capacity")?;
-        let mut staging = allocator.alloc_host(src.len())?;
-        staging.as_mut_slice().copy_from_slice(src);
-        self.copy_via_staging(staging.handle(), dst.handle(), len)
+        // Hold the staging slot for the entire operation: write the
+        // payload, kick off the GPU copy, wait for completion.  Releasing
+        // the lock between write and wait would let a second upload
+        // observe the same staging buffer mid-DMA.
+        let mut staging_slot = self
+            .staging
+            .lock()
+            .expect("transfer staging mutex poisoned");
+        let staging = ensure_staging(allocator, &mut staging_slot, src.len())?;
+        staging.as_mut_slice()[..src.len()].copy_from_slice(src);
+        let staging_handle = staging.handle();
+        let dst_handle = dst.handle();
+        self.copy_via_staging(staging_handle, dst_handle, len)
     }
 
     /// Synchronous download: copy `src[0..dst.len()]` into `dst`, block
@@ -89,9 +114,18 @@ impl TransferContext {
             return Ok(());
         }
         let len = check_len(dst.len(), src.size(), "download_sync", "src size")?;
-        let mut staging = allocator.alloc_host(dst.len())?;
-        self.copy_via_staging(src.handle(), staging.handle(), len)?;
-        dst.copy_from_slice(staging.as_mut_slice());
+        let mut staging_slot = self
+            .staging
+            .lock()
+            .expect("transfer staging mutex poisoned");
+        let staging = ensure_staging(allocator, &mut staging_slot, dst.len())?;
+        let staging_handle = staging.handle();
+        let src_handle = src.handle();
+        self.copy_via_staging(src_handle, staging_handle, len)?;
+        // GPU has finished writing the staging buffer (queue_wait_idle
+        // inside copy_via_staging).  HOST_COHERENT means the read sees
+        // the latest data without an explicit invalidate.
+        dst.copy_from_slice(&staging.as_slice()[..dst.len()]);
         Ok(())
     }
 
@@ -172,8 +206,40 @@ impl TransferContext {
     }
 }
 
+/// Make sure the cached staging buffer is at least `min_size` bytes;
+/// allocate or grow as needed.  Returns a mutable reference to the
+/// (now-large-enough) buffer.
+fn ensure_staging<'a>(
+    allocator: &SlabAllocator,
+    slot: &'a mut Option<HostBuffer>,
+    min_size: usize,
+) -> Result<&'a mut HostBuffer> {
+    let current_capacity = slot.as_ref().map_or(0, HostBuffer::size);
+    let needed = u64::try_from(min_size).expect("min_size fits u64");
+    if needed > current_capacity {
+        // Grow geometrically so a sequence of slowly-increasing sizes
+        // doesn't reallocate every call.
+        let grown = std::cmp::max(needed, current_capacity.saturating_mul(2));
+        let grown_usize = usize::try_from(grown)
+            .map_err(|_| BackendError::msg("staging grow size exceeds usize"))?;
+        // Drop the old buffer first so its VkBuffer + allocation are
+        // released before we ask for the new one.
+        *slot = None;
+        *slot = Some(allocator.alloc_host(grown_usize)?);
+    }
+    Ok(slot.as_mut().expect("ensure_staging always populates"))
+}
+
 impl Drop for TransferContext {
     fn drop(&mut self) {
+        // The cached staging buffer is dropped via the `Mutex<Option<...>>`
+        // field's normal drop.  Order matters: the HostBuffer's Drop
+        // calls into its Arc<Inner> (the SlabAllocator) and ultimately
+        // vkDestroyBuffer on the device.  The device is kept alive by
+        // our own Arc<DeviceCtx>; the SlabAllocator is kept alive by
+        // the HostBuffer's parent Arc.  Field declaration order means
+        // staging drops *before* cmd_pool, which is fine — they're
+        // independent.
         // Safety: VulkanBackend::drop calls device_wait_idle before any
         // module Drop runs, so no command buffers are in flight.
         unsafe {

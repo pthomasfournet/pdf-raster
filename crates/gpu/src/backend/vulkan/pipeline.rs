@@ -270,11 +270,9 @@ impl PipelineCache {
         // VkPipelineCache so the driver can warm-start compilation from
         // its on-disk blob.
         let pipelines = unsafe {
-            self.device.device.create_compute_pipelines(
-                self.vk_cache,
-                &pipeline_info,
-                None,
-            )
+            self.device
+                .device
+                .create_compute_pipelines(self.vk_cache, &pipeline_info, None)
         };
         let pipeline = match pipelines {
             Ok(mut v) => v.remove(0),
@@ -329,11 +327,7 @@ impl Drop for PipelineCache {
         // down handles.  Failures are logged but not propagated — we're
         // already on the destruction path and the cache is opportunistic.
         // Safety: vk_cache is owned by us, populated above.
-        let data = unsafe {
-            self.device
-                .device
-                .get_pipeline_cache_data(self.vk_cache)
-        };
+        let data = unsafe { self.device.device.get_pipeline_cache_data(self.vk_cache) };
         match data {
             Ok(bytes) if !bytes.is_empty() => {
                 if let Err(e) = write_cache_file(&bytes) {
