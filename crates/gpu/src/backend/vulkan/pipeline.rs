@@ -112,25 +112,54 @@ struct CompiledKernel {
 }
 
 /// Lazy pipeline cache.  Uses `OnceLock<CompiledKernel>` per slot — one
-/// dispatch builds the pipeline, the rest reuse it.
+/// dispatch builds the pipeline, the rest reuse it.  The host-side
+/// `VkPipelineCache` (at `vk_cache`) accelerates compile time
+/// across runs by persisting driver-internal pipeline state to a file.
 pub(super) struct PipelineCache {
     device: Arc<DeviceCtx>,
     /// Slots indexed by `KernelId as usize`.  `OnceLock` so the first
     /// caller initialises and the rest read; thread-safe by construction.
     slots: [std::sync::OnceLock<CompiledKernel>; 6],
+    /// Driver-side pipeline cache — populated from disk at startup if a
+    /// matching file exists, written back at Drop.  Vulkan validates the
+    /// cache header (driver UUID etc.) so a cache from a different driver
+    /// version is silently ignored.  `vk::PipelineCache::null()` is a
+    /// valid passthrough; we never expose this handle directly.
+    vk_cache: vk::PipelineCache,
 }
 
+/// Filename of the on-disk pipeline-cache blob.  Lives under the user's
+/// XDG cache root.  Vulkan's own header tags the device/driver, so a
+/// shared filename is safe — mismatched caches are rejected at load.
+const CACHE_FILENAME: &str = "vulkan_pipeline_cache.bin";
+
 impl PipelineCache {
-    /// Construct an empty cache.  No pipelines are built until first
-    /// dispatch.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Result kept for forward-compat: pipeline-cache file load (spec follow-up) can fail with IO/Vulkan errors"
-    )]
+    /// Construct the cache, attempting to seed the driver-side
+    /// `VkPipelineCache` from the on-disk blob.  A missing or unreadable
+    /// file is logged at info level and treated as a cold start.
     pub(super) fn new(device: Arc<DeviceCtx>) -> Result<Arc<Self>> {
+        let initial_data = match read_cache_file() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::debug!("vulkan_pipeline_cache.bin not loaded: {e}");
+                Vec::new()
+            }
+        };
+        let mut info = vk::PipelineCacheCreateInfo::default();
+        if !initial_data.is_empty() {
+            info = info.initial_data(&initial_data);
+        }
+        // Safety: device is live; ash validates the create-info shape.
+        let vk_cache = unsafe {
+            device
+                .device
+                .create_pipeline_cache(&info, None)
+                .map_err(vk_err("vkCreatePipelineCache"))?
+        };
         Ok(Arc::new(Self {
             device,
             slots: Default::default(),
+            vk_cache,
         }))
     }
 
@@ -237,10 +266,12 @@ impl PipelineCache {
             .stage(stage)
             .layout(pipeline_layout)];
 
-        // Safety: pipeline_info outlives this call.
+        // Safety: pipeline_info outlives this call.  Pass our persistent
+        // VkPipelineCache so the driver can warm-start compilation from
+        // its on-disk blob.
         let pipelines = unsafe {
             self.device.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
+                self.vk_cache,
                 &pipeline_info,
                 None,
             )
@@ -294,6 +325,31 @@ impl PipelineCache {
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
+        // Persist the driver-side pipeline cache to disk before tearing
+        // down handles.  Failures are logged but not propagated — we're
+        // already on the destruction path and the cache is opportunistic.
+        // Safety: vk_cache is owned by us, populated above.
+        let data = unsafe {
+            self.device
+                .device
+                .get_pipeline_cache_data(self.vk_cache)
+        };
+        match data {
+            Ok(bytes) if !bytes.is_empty() => {
+                if let Err(e) = write_cache_file(&bytes) {
+                    log::debug!("vulkan_pipeline_cache.bin not written: {e}");
+                }
+            }
+            Ok(_) => {} // empty cache, nothing to persist
+            Err(e) => log::warn!("vkGetPipelineCacheData failed: {e:?}"),
+        }
+        // Safety: created via vkCreatePipelineCache in Self::new.
+        unsafe {
+            self.device
+                .device
+                .destroy_pipeline_cache(self.vk_cache, None);
+        }
+
         // Take all kernels out of the OnceLocks first so we don't hold a
         // borrow into self.slots while calling self.destroy_one.
         let kernels: Vec<CompiledKernel> = self
@@ -305,6 +361,30 @@ impl Drop for PipelineCache {
             self.destroy_one(c);
         }
     }
+}
+
+/// Resolve the absolute path to the on-disk pipeline cache:
+/// `$XDG_CACHE_HOME/pdf-raster/<file>` (falling back to `$HOME/.cache/...`).
+/// Returns `None` if neither env var is set — pure-batch builds with no
+/// home directory just skip the cache.
+fn cache_path() -> Option<std::path::PathBuf> {
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(cache_root.join("pdf-raster").join(CACHE_FILENAME))
+}
+
+fn read_cache_file() -> std::io::Result<Vec<u8>> {
+    let path = cache_path().ok_or_else(|| std::io::Error::other("no $XDG_CACHE_HOME or $HOME"))?;
+    std::fs::read(&path)
+}
+
+fn write_cache_file(bytes: &[u8]) -> std::io::Result<()> {
+    let path = cache_path().ok_or_else(|| std::io::Error::other("no $XDG_CACHE_HOME or $HOME"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, bytes)
 }
 
 /// Pipeline handles needed to record a dispatch.  The Vulkan handles are
