@@ -34,6 +34,12 @@ pub struct Document {
     objstm: ObjStmCache,
     /// Catalogue object ID, resolved once from the trailer.
     catalog_id: OnceLock<ObjectId>,
+    /// `/Pages` root reference, resolved once from the catalog.  Cached
+    /// because every page-tree descent reads it.
+    pages_root_id: OnceLock<ObjectId>,
+    /// `/Pages /Count`, memoised on first read.  Falls back to the eager
+    /// walk on malformed catalogs.
+    page_count_cache: OnceLock<u32>,
     /// Cached linearization hints, parsed lazily on first access.
     lin_hints: OnceLock<Option<LinearizationHints>>,
 }
@@ -80,6 +86,8 @@ impl Document {
             cache: Mutex::new(HashMap::new()),
             objstm: ObjStmCache::new(),
             catalog_id: OnceLock::new(),
+            pages_root_id: OnceLock::new(),
+            page_count_cache: OnceLock::new(),
             lin_hints: OnceLock::new(),
         })
     }
@@ -185,6 +193,25 @@ impl Document {
         self.get_dict(id)
     }
 
+    /// Resolve `id` and return the underlying `Arc<Object>` if it is a
+    /// dictionary or stream-with-dict.
+    ///
+    /// Unlike [`Self::get_dict`], this does NOT clone the dictionary —
+    /// the caller borrows directly from the cached `Arc<Object>`.  Use
+    /// this on hot paths (e.g., page-tree descent) where every saved
+    /// `HashMap<Vec<u8>, Object>` clone matters.  Callers must accept
+    /// that the borrow lives only as long as the returned `Arc`.
+    pub fn get_dict_arc(&self, id: ObjectId) -> Result<Arc<Object>, PdfError> {
+        let obj = self.get_object(id)?;
+        match obj.as_ref() {
+            Object::Dictionary(_) | Object::Stream(_) => Ok(obj),
+            _ => Err(PdfError::BadObject {
+                id: id.0,
+                detail: format!("expected Dictionary or Stream, got {}", obj.enum_variant()),
+            }),
+        }
+    }
+
     // ── Document structure ────────────────────────────────────────────────────
 
     /// Return the document catalogue dictionary.
@@ -223,16 +250,14 @@ impl Document {
     /// Currently never errors — `try_load` collapses every failure mode
     /// (missing object 1, malformed dict, missing keys, invalid offsets)
     /// into `Ok(None)`.  The `Result` return type is reserved for the
-    /// future hint-stream parser, which will gain real failure modes.
+    /// future hint-stream parser, which will gain real failure modes;
+    /// the call site can switch to `OnceLock::get_or_try_init` when
+    /// stable (rust-lang/rust#109737).
     pub fn linearization_hints(&self) -> Result<Option<&LinearizationHints>, PdfError> {
-        // OnceLock::get_or_try_init is unstable (rust-lang/rust#109737), so
-        // do the manual lazy-init dance.
-        if let Some(cached) = self.lin_hints.get() {
-            return Ok(cached.as_ref());
-        }
-        let parsed = LinearizationHints::try_load(self)?;
-        let _ = self.lin_hints.set(parsed);
-        Ok(self.lin_hints.get().and_then(Option::as_ref))
+        Ok(self
+            .lin_hints
+            .get_or_init(|| LinearizationHints::try_load(self).ok().flatten())
+            .as_ref())
     }
 
     /// Raw byte view of the underlying file.  Used by hint-table parsing
@@ -250,26 +275,49 @@ impl Document {
 
     /// Return the number of pages without walking the page tree.
     ///
-    /// Reads `/Pages /Count` directly from the catalog.  Falls back to the
-    /// eager [`Self::page_count`] (full tree walk) if the catalog is malformed.
+    /// Reads `/Pages /Count` directly from the catalog and memoises it on
+    /// first call.  Falls back to the eager [`Self::page_count`] (full tree
+    /// walk) if the catalog is malformed.
     ///
-    /// O(1) on well-formed PDFs; O(pages) on malformed ones.  The caller
-    /// can use this on hot paths without a perf footgun.
+    /// Cached, so repeated calls are a relaxed-load away from the answer.
     #[must_use]
     pub fn page_count_fast(&self) -> u32 {
-        let Ok(catalog) = self.catalog() else {
+        *self
+            .page_count_cache
+            .get_or_init(|| self.read_page_count_uncached())
+    }
+
+    /// Inner page-count read.  Used by `page_count_fast` (memoised) and
+    /// the eager-walk fallback inside the page-tree descent.
+    #[must_use]
+    fn read_page_count_uncached(&self) -> u32 {
+        let Ok(pages_root) = self.pages_root_id() else {
             return self.page_count();
         };
-        let Some(pages_id) = catalog.get(b"Pages").and_then(Object::as_reference) else {
+        let Ok(dict) = self.get_dict(pages_root) else {
             return self.page_count();
         };
-        let Ok(dict) = self.get_dict(pages_id) else {
-            return self.page_count();
-        };
-        match dict.get(b"Count").and_then(Object::as_i64) {
-            Some(n) if (0..=i64::from(u32::MAX)).contains(&n) => n as u32,
-            _ => self.page_count(),
+        dict.get(b"Count")
+            .and_then(Object::as_i64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or_else(|| self.page_count())
+    }
+
+    /// Return the catalog's `/Pages` reference, memoised on first call.
+    ///
+    /// `pages_root` is invariant for the document, so caching it avoids
+    /// re-cloning the catalog dictionary on every page-tree descent.
+    pub fn pages_root_id(&self) -> Result<ObjectId, PdfError> {
+        if let Some(id) = self.pages_root_id.get() {
+            return Ok(*id);
         }
+        let catalog = self.catalog()?;
+        let id = catalog
+            .get(b"Pages")
+            .and_then(Object::as_reference)
+            .ok_or(PdfError::MissingKey("Pages"))?;
+        let _ = self.pages_root_id.set(id);
+        Ok(id)
     }
 
     /// Resolve a 0-based page index to its `ObjectId` via logarithmic descent.

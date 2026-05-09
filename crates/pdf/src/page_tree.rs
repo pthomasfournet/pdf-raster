@@ -34,13 +34,8 @@ const MAX_DEPTH: usize = 64;
 // None on every call, so wiring it in would just add overhead; the fast
 // path lands when the real parser does.
 pub fn descend_to_page_index(doc: &Document, idx: u32) -> Result<ObjectId, PdfError> {
-    let catalog = doc.catalog()?;
-    let pages_root = catalog
-        .get(b"Pages")
-        .and_then(Object::as_reference)
-        .ok_or(PdfError::MissingKey("Pages"))?;
-
-    let total = page_count_from_root(doc, pages_root)?;
+    let pages_root = doc.pages_root_id()?;
+    let total = doc.page_count_fast();
     if idx >= total {
         return Err(PdfError::PageOutOfRange { page: idx, total });
     }
@@ -56,38 +51,57 @@ pub fn descend_to_page_index(doc: &Document, idx: u32) -> Result<ObjectId, PdfEr
                 detail: "cyclic /Kids reference during descent".into(),
             });
         }
-        let dict = doc.get_dict(current)?;
-        let node_type = dict.get(b"Type").and_then(Object::as_name).unwrap_or(b"");
+        let node_obj = doc.get_dict_arc(current)?;
+        let node_dict = node_obj.as_dict().expect("get_dict_arc guarantees a dict");
+        let node_type = node_dict
+            .get(b"Type")
+            .and_then(Object::as_name)
+            .unwrap_or(b"");
         if node_type == b"Page" {
             return Ok(current);
         }
 
-        // Interior /Pages node — pick the kid whose subtree contains `remaining`.
-        let kids = resolve_kids(doc, current, &dict)?;
+        let kids = resolve_kids(doc, current, node_dict)?;
+
+        // Flat-tree fast path: when /Count exactly matches kids.len(), every
+        // kid is implicitly a leaf with count 1.  Skip the per-kid /Type +
+        // /Count probes and index directly.  This is the common case for
+        // shallow PDFs (catalog → /Pages with all leaves directly attached).
+        let parent_count = node_dict
+            .get(b"Count")
+            .and_then(Object::as_i64)
+            .and_then(|n| u32::try_from(n).ok());
+        if parent_count == Some(u32::try_from(kids.len()).unwrap_or(u32::MAX)) {
+            // Bounds: idx < total ≤ Σ /Count along the descent path, and
+            // here parent /Count == kids.len(), so `remaining` is a valid
+            // index into kids[].
+            let kid = kids
+                .get(remaining as usize)
+                .copied()
+                .ok_or_else(|| PdfError::BadObject {
+                    id: current.0,
+                    detail: format!(
+                        "flat /Pages: remaining={remaining} >= kids.len()={}",
+                        kids.len()
+                    ),
+                })?;
+            return Ok(kid);
+        }
+
+        // Mixed tree — sum /Count across siblings.
         let mut descended = false;
-        for kid_ref in kids {
-            let kid_dict = doc.get_dict(kid_ref)?;
-            let kid_type = kid_dict
-                .get(b"Type")
-                .and_then(Object::as_name)
-                .unwrap_or(b"");
-            let kid_count: u32 = if kid_type == b"Page" {
-                1
-            } else {
-                kid_dict
-                    .get(b"Count")
-                    .and_then(Object::as_i64)
-                    .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(|| PdfError::BadObject {
-                        id: kid_ref.0,
-                        detail: "interior page-tree node missing /Count".into(),
-                    })?
-            };
+        for kid_ref in &kids {
+            let kid_obj = doc.get_dict_arc(*kid_ref)?;
+            let kid_dict = kid_obj.as_dict().expect("get_dict_arc guarantees a dict");
+            let kid_count = kid_subtree_count(*kid_ref, kid_dict)?;
             if remaining < kid_count {
-                if kid_type == b"Page" {
-                    return Ok(kid_ref);
+                // Found the kid containing the requested page.  If the kid
+                // itself is a leaf, return immediately to avoid the
+                // top-of-loop re-fetch on the next iteration.
+                if kid_dict.get(b"Type").and_then(Object::as_name) == Some(b"Page") {
+                    return Ok(*kid_ref);
                 }
-                current = kid_ref;
+                current = *kid_ref;
                 descended = true;
                 break;
             }
@@ -108,66 +122,79 @@ pub fn descend_to_page_index(doc: &Document, idx: u32) -> Result<ObjectId, PdfEr
     })
 }
 
-/// Read `/Pages /Count` from the root.  Falls back to a full eager walk
-/// if the value is missing, negative, or out of range — malformed PDFs in
-/// the wild ship like this and silently picking the wrong page would be
-/// worse than the linear scan.
-fn page_count_from_root(doc: &Document, pages_root: ObjectId) -> Result<u32, PdfError> {
-    let dict = doc.get_dict(pages_root)?;
-    if let Some(n) = dict.get(b"Count").and_then(Object::as_i64)
-        && let Ok(count) = u32::try_from(n)
-    {
-        return Ok(count);
+/// Read a kid's subtree page count: 1 for leaves (Page), `/Count` for
+/// interior /Pages nodes.  Returns `BadObject` if an interior node lacks
+/// a valid `/Count`.
+fn kid_subtree_count(kid_id: ObjectId, kid_dict: &Dictionary) -> Result<u32, PdfError> {
+    let is_leaf = kid_dict.get(b"Type").and_then(Object::as_name) == Some(b"Page");
+    if is_leaf {
+        return Ok(1);
     }
-    log::warn!("page_count: /Pages /Count missing or invalid; falling back to eager count");
-    Ok(u32::try_from(doc.get_pages().count()).unwrap_or(u32::MAX))
+    kid_dict
+        .get(b"Count")
+        .and_then(Object::as_i64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| PdfError::BadObject {
+            id: kid_id.0,
+            detail: "interior page-tree node missing /Count".into(),
+        })
 }
 
 /// `/Kids` may be either an inline array or an indirect reference to one
 /// (corpus-04 ships the second form).  Resolve both into a `Vec<ObjectId>`.
 ///
-/// Returns the indirect-reference entries; non-reference entries (illegal
-/// per spec, but seen on malformed inputs) are skipped with a warning so a
-/// debugger can see how many were dropped.
+/// Rejects malformed `/Kids` entries (non-references) hard rather than
+/// silently filtering them out.  The descent indexes into the result by
+/// page index, so a filtered list breaks the page-index invariant: a
+/// `/Kids [3 0 R 4 0 R 99]` with `/Count 3` would silently misroute
+/// page 2 to a `BadObject` error rather than the `99` slot the source
+/// document intended.  Hard-fail surfaces the corruption to the caller.
 fn resolve_kids(
     doc: &Document,
     node_id: ObjectId,
     node_dict: &Dictionary,
 ) -> Result<Vec<ObjectId>, PdfError> {
     let kids_obj = node_dict.get(b"Kids").ok_or(PdfError::MissingKey("Kids"))?;
-    match kids_obj {
-        Object::Array(a) => Ok(extract_refs(a)),
+    let arr_slice: &[Object] = match kids_obj {
+        Object::Array(a) => a,
         Object::Reference(rid) => {
             let resolved = doc.get_object(*rid)?;
-            match resolved.as_ref() {
-                Object::Array(a) => Ok(extract_refs(a)),
-                _ => Err(PdfError::BadObject {
-                    id: rid.0,
-                    detail: "/Kids reference does not resolve to an array".into(),
-                }),
-            }
+            return refs_from_array_or_err(resolved.as_ref(), node_id);
         }
+        _ => {
+            return Err(PdfError::BadObject {
+                id: node_id.0,
+                detail: "/Kids is neither an array nor a reference".into(),
+            });
+        }
+    };
+    refs_from_array(arr_slice, node_id)
+}
+
+fn refs_from_array_or_err(obj: &Object, node_id: ObjectId) -> Result<Vec<ObjectId>, PdfError> {
+    match obj {
+        Object::Array(a) => refs_from_array(a, node_id),
         _ => Err(PdfError::BadObject {
             id: node_id.0,
-            detail: "/Kids is neither an array nor a reference".into(),
+            detail: "/Kids reference does not resolve to an array".into(),
         }),
     }
 }
 
-/// Filter an `Object` slice down to its indirect-reference entries, warning
-/// when non-reference entries are silently skipped (malformed PDFs ship
-/// with inline integers / booleans inside `/Kids` and we don't want to
-/// crash on them).
-fn extract_refs(arr: &[Object]) -> Vec<ObjectId> {
+fn refs_from_array(arr: &[Object], node_id: ObjectId) -> Result<Vec<ObjectId>, PdfError> {
     let refs: Vec<ObjectId> = arr.iter().filter_map(Object::as_reference).collect();
     if refs.len() != arr.len() {
-        log::warn!(
-            "resolve_kids: {}/{} /Kids entries were not indirect references; non-refs skipped",
-            arr.len() - refs.len(),
-            arr.len()
-        );
+        return Err(PdfError::BadObject {
+            id: node_id.0,
+            detail: format!(
+                "/Kids contains {} non-reference entries (have {} of {} as refs)",
+                arr.len() - refs.len(),
+                refs.len(),
+                arr.len()
+            ),
+        });
     }
-    refs
+    Ok(refs)
 }
 
 #[cfg(test)]
@@ -295,6 +322,49 @@ xref\n0 9\n\
 trailer\n<</Size 9 /Root 1 0 R>>\n\
 startxref\n543\n%%EOF"
             .to_vec()
+    }
+
+    /// Hand-built two-page PDF with a deliberately malformed /Kids array
+    /// containing an inline integer (`99`) where a reference should be.
+    /// `resolve_kids` must return `BadObject` rather than silently dropping
+    /// the bad entry — silent filtering would misroute page 2 (the slot the
+    /// integer occupies) to a misleading "ran out of /Kids" error.
+    fn malformed_kids_pdf() -> Vec<u8> {
+        // Byte offsets (computed exactly):
+        //   header                                                              9 bytes  → obj1 at 9
+        //   obj1 catalog                                                       47 bytes  → obj2 at 56
+        //   obj2 /Pages /Kids [3 0 R 99 4 0 R] /Count 3                        64 bytes  → obj3 at 120
+        //   obj3 leaf                                                          69 bytes  → obj4 at 189
+        //   obj4 leaf                                                          69 bytes  → xref at 258
+        b"%PDF-1.4\n\
+1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n\
+2 0 obj\n<</Type /Pages /Kids [3 0 R 99 4 0 R] /Count 3>>\nendobj\n\
+3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n\
+4 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n\
+xref\n0 5\n\
+0000000000 65535 f\r\n\
+0000000009 00000 n\r\n\
+0000000056 00000 n\r\n\
+0000000120 00000 n\r\n\
+0000000189 00000 n\r\n\
+trailer\n<</Size 5 /Root 1 0 R>>\n\
+startxref\n258\n%%EOF"
+            .to_vec()
+    }
+
+    #[test]
+    fn descend_rejects_non_reference_kids() {
+        let doc = Document::from_bytes_owned(malformed_kids_pdf()).expect("open");
+        let err = descend_to_page_index(&doc, 0).expect_err("malformed /Kids must error");
+        match err {
+            PdfError::BadObject { detail, .. } => {
+                assert!(
+                    detail.contains("non-reference"),
+                    "expected non-reference error, got: {detail}"
+                );
+            }
+            other => panic!("expected BadObject, got {other:?}"),
+        }
     }
 
     #[test]
