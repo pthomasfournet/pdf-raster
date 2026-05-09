@@ -19,6 +19,7 @@ mod error;
 mod lexer;
 mod object;
 mod objstm;
+mod page_tree;
 mod stream;
 mod xref;
 
@@ -26,3 +27,4 @@ pub use dictionary::Dictionary;
 pub use document::Document;
 pub use error::PdfError;
 pub use object::{Object, ObjectId, Stream, StringFormat};
+pub use page_tree::descend_to_page_index;
