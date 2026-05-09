@@ -7,10 +7,17 @@ edition = "2024"
 name = "bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "contest_v11"
+path = "src/contest_v11/main.rs"
+
 [dependencies]
-raster    = { path = "../raster" }
-color     = { path = "../color" }
-vello_cpu = "0.0.7"
+raster     = { path = "../raster" }
+color      = { path = "../color" }
+pdf        = { path = "../pdf" }
+pdf_interp = { path = "../pdf_interp" }
+pdf_raster = { path = "../pdf_raster" }
+vello_cpu  = "0.0.7"
 
 [lints.rust]
 unsafe_code  = "deny"

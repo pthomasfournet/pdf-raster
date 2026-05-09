@@ -118,6 +118,9 @@ name = "bench"
 version = "0.7.0"
 dependencies = [
  "color 0.7.0",
+ "pdf",
+ "pdf_interp",
+ "pdf_raster",
  "raster",
  "vello_cpu",
 ]
