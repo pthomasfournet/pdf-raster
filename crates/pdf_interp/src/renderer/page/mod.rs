@@ -749,26 +749,17 @@ impl<'doc> PageRenderer<'doc> {
             PipeSrc::Pattern(p as &dyn Pattern)
         });
 
-        // GPU fill dispatch — only for solid-colour fills (patterns not yet
-        // GPU-accelerated).  Arc::clone releases the borrow before the mutable
-        // self borrow inside the try_* helpers.
+        // GPU fill dispatch — solid-colour fills only (patterns not yet
+        // GPU-accelerated).  Cloning the `Arc` releases the immutable borrow
+        // before the mutable `self` borrow inside the helpers.
         //
-        // Dispatch order:
-        //   1. Tile-parallel analytical fill (GPU_TILE_FILL_THRESHOLD) — exact
-        //      analytical coverage, best for large solid fills.
-        //   2. Warp-ballot 64-sample AA (GPU_AA_FILL_THRESHOLD) — stochastic
-        //      but faster for medium-sized fills.
-        //   3. CPU scanline AA (always available as final fallback).
-        //
-        // Backend selection: prefer Vulkan when attached, fall back to CUDA
-        // when Vulkan returns false or isn't attached.  In practice the two
-        // are mutually exclusive at session-open time (`pdf_raster::render`
-        // wires one or the other), so the second branch only fires under
-        // BackendPolicy::Auto / ForceCuda; the explicit ordering keeps the
-        // dispatch readable rather than implicit via `else`.
-        //
-        // The nested ifs keep the pattern guard (tiled.is_none()) separate
-        // from the GPU-availability guard to make each condition readable.
+        // Dispatch order per backend: tile-parallel analytical (large fills)
+        // → warp-ballot 64-sample AA (medium fills) → CPU scanline AA
+        // (always-available fallback).  The Vulkan branch fires before the
+        // CUDA branch when both are present, but in practice
+        // `pdf_raster::render::open_session` wires only one of them based
+        // on `BackendPolicy`, so the second branch only runs under
+        // `Auto` / `ForceCuda`.
         #[cfg(feature = "vulkan")]
         if tiled.is_none()
             && let Some(vk) = self.vk_backend.clone()
@@ -781,19 +772,14 @@ impl<'doc> PageRenderer<'doc> {
             }
         }
         #[cfg(feature = "gpu-aa")]
-        #[expect(
-            clippy::collapsible_if,
-            reason = "outer guard (no tiling pattern) and inner guard (GPU context present) \
-                      are logically distinct; collapsing would obscure the separation"
-        )]
-        if tiled.is_none() {
-            if let Some(ctx) = self.gpu_ctx.clone() {
-                if self.try_gpu_tile_fill(path, even_odd, &pipe, &src, &ctx) {
-                    return;
-                }
-                if self.try_gpu_aa_fill(path, even_odd, &pipe, &src, &ctx) {
-                    return;
-                }
+        if tiled.is_none()
+            && let Some(ctx) = self.gpu_ctx.clone()
+        {
+            if self.try_gpu_tile_fill(path, even_odd, &pipe, &src, &ctx) {
+                return;
+            }
+            if self.try_gpu_aa_fill(path, even_odd, &pipe, &src, &ctx) {
+                return;
             }
         }
 

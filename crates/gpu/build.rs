@@ -228,14 +228,38 @@ fn main() {
 /// We intentionally invoke `--version` rather than just checking
 /// existence: a stale symlink, a wrapper that requires unavailable
 /// libraries, or a build-host without CUDA installed should all be
-/// treated as "no NVCC".
+/// treated as "no NVCC".  On probe failure we emit a `cargo:warning`
+/// with the diagnostic so the user can see *why* nvcc was rejected
+/// (spawn error vs. non-zero exit) without `--verbose` builds.
 fn nvcc_works(nvcc: &str) -> bool {
-    Command::new(nvcc)
+    match Command::new(nvcc)
         .arg("--version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                println!(
+                    "cargo:warning=nvcc probe `{nvcc} --version` exited with {} (no stderr output)",
+                    o.status,
+                );
+            } else {
+                println!(
+                    "cargo:warning=nvcc probe `{nvcc} --version` exited with {}: {stderr}",
+                    o.status,
+                );
+            }
+            false
+        }
+        Err(e) => {
+            println!("cargo:warning=nvcc probe `{nvcc} --version` could not be spawned: {e}");
+            false
+        }
+    }
 }
 
 /// Compile every kernel's `.cu` source to PTX via `nvcc`.
@@ -250,7 +274,10 @@ fn compile_cuda_kernels(kernels_dir: &Path, out_dir: &Path, nvcc: &str) {
         let src = kernels_dir.join(format!("{kernel}.cu"));
         let ptx = out_dir.join(format!("{kernel}.ptx"));
 
-        let status = Command::new(nvcc)
+        // Capture stderr so a kernel-compile failure shows nvcc's actual
+        // diagnostic (e.g. "unsupported arch", missing intrinsic) rather
+        // than a bare exit-status panic.
+        let output = Command::new(nvcc)
             .args([
                 "--ptx",
                 &format!("-arch={arch}"),
@@ -260,12 +287,14 @@ fn compile_cuda_kernels(kernels_dir: &Path, out_dir: &Path, nvcc: &str) {
                 ptx.to_str().expect("OUT_DIR path contains non-UTF-8"),
                 src.to_str().expect("kernel source path contains non-UTF-8"),
             ])
-            .status()
+            .output()
             .unwrap_or_else(|e| panic!("failed to run nvcc ({nvcc}): {e}"));
 
         assert!(
-            status.success(),
-            "nvcc failed for {kernel}.cu (arch={arch})"
+            output.status.success(),
+            "nvcc failed for {kernel}.cu (arch={arch}, status={}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
         );
     }
 }
@@ -308,7 +337,7 @@ fn compile_slang_kernels(kernels_dir: &Path, out_dir: &Path) {
         let profile = slang_profile(kernel);
 
         let entry = slang_entry(kernel);
-        let status = Command::new(&slangc)
+        let output = Command::new(&slangc)
             .args([
                 "-target",
                 "spirv",
@@ -320,14 +349,16 @@ fn compile_slang_kernels(kernels_dir: &Path, out_dir: &Path) {
                 spv.to_str().expect("OUT_DIR path contains non-UTF-8"),
                 src.to_str().expect("slang source path contains non-UTF-8"),
             ])
-            .status()
+            .output()
             .unwrap_or_else(|e| {
                 panic!("failed to run slangc ({slangc}): {e} — install the Vulkan SDK or `apt install slang`")
             });
 
         assert!(
-            status.success(),
-            "slangc failed for {kernel}.slang (profile={profile}); see stderr above for details"
+            output.status.success(),
+            "slangc failed for {kernel}.slang (profile={profile}, status={}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
         );
     }
 }
