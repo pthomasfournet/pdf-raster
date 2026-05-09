@@ -868,57 +868,65 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
 
 ---
 
-## Phase 11 — Memory-frugal rendering and parse caching (NOT STARTED)
+## Phase 11 — Million-page-archive contest (CONTEST IMPLEMENTATION COMPLETE — bench gate pending)
 
-**Motivation:** pdf-raster wins on raw throughput for the workload we optimised for, but several design choices common in long-lived PDF renderers haven't been adopted here yet. All are ROI-positive for an archival pipeline that re-renders the same corpus across config iterations and may push very high page resolutions. Items ranked by ROI:
+**Reframe.**  An earlier draft of this phase (titled "memory-frugal rendering and parse caching") was a feature-parity checklist of things MuPDF and PDFium have that we don't.  The first task on it was a sidecar cache for the parsed page tree.  A pre-implementation microbench killed it: the existing `Document::get_pages()` walk takes 76 µs–1.34 ms across the full corpus (16-page through 601-page documents).  Adding a 150-LoC sidecar plus an invalidation surface to save a millisecond was a textbook bad trade.
 
-### Task 0 — Incremental-update / xref-chain correctness audit
+The actual gap was at a different layer.  MuPDF and PDFium don't *cache* the page-tree walk — they don't *do* it on open.  Their `LoadDocument` parses xref + the catalog's `/Pages` root and that's it; per-page resolution is logarithmic.  Ours was linear, eagerly populating a `BTreeMap<u32, ObjectId>` of every page in `pdf_raster::open_session` before rendering even one page.  On a 100k-page archival PDF that's millions of `get_object` calls per cold open, regardless of which page the caller asked for.
 
-PDFs that have been re-saved by editors (Acrobat, etc.) accumulate appended xref sections after the original. The full xref *chain* must be walked and merged: later revisions shadow objects in earlier ones. Stopping at the first xref silently renders the *original* revision of an edited document — a correctness bug, not a perf one, and one that hits archival corpora hard since most PDFs in those corpora have been re-saved.
+So the real Phase 11 is not "close the feature checklist" but "win a benchmark on the workload competitors weren't optimised for."  We define a four-event contest, build the harness that scores it against `mutool` and `pdftoppm`, and ship the layer changes needed to dominate it on a 10 GB synthetic archive.
 
-**Approach:** read `pdf_interp` xref handling. Confirm it (a) follows `Prev` entries in trailer dicts back through the chain, (b) handles both xref tables and xref streams (PDF 1.5+) in the same chain, (c) merges revisions with later-wins semantics. Add a regression fixture: a multi-revision PDF where revision 2 overrides a page from revision 1; assert we render revision 2's page. If the parser already does this, the audit is documentation; if not, this becomes a real bug fix.
+**Contest workload (`crates/bench/src/contest_v11/`, binary `contest_v11`):**
 
-**Scope:** 0 LoC if already correct (just a fixture + test). 100–300 LoC in `pdf_interp` if not.
+| Event | Workload | What it measures |
+|---|---|---|
+| **E1 — first-pixel** | Open archive, render page 50000, time end-to-end | Cold-path latency: process startup + xref + page-tree resolve + render |
+| **E2 — sustained** | Render 100 consecutive pages from one session | Warm-cache throughput; per-page cost on the lazy path |
+| **E3 — cross-doc** | Render page 1 of each of N archives in a list | Process amortisation; fadvise-based xref-tail prefetch |
+| **E4 — random-access** | Render 1000 deterministically-random page indices | Tree-walk depth handling; mmap fault locality |
 
-### Task 1 — Sidecar parse cache for the parsed page tree
+**What shipped (commits on `phase-11`, in order):**
 
-Persist a *minimal* page-index → page-dict-objnum mapping (plus document content hash) to a sidecar file; second-and-later renders skip the page-tree walk and jump straight to the page dict via xref lookup. The mapping is tiny (~8 bytes/page) and survives the document. The expensive *contents* of each page (resource dicts, content streams) still parse lazily on first access — they don't go in the cache. For an archival pipeline that re-renders the same corpus across config iterations (different DPI, different OCR settings, regenerated cache), this is a real win on every re-run.
+- **Logarithmic page-tree descent** (`b0600ab`).  New `crates/pdf/src/page_tree.rs::descend_to_page_index(doc, idx) -> Result<ObjectId, _>` walks only root → leaf using each interior node's `/Count` to choose the correct `/Kids` branch.  Cycle protection via `HashSet<u32>`, depth bound at 64.  `Document::get_page(idx)` and `Document::page_count_fast()` (reads `/Pages /Count` directly, falls back to eager walk on malformed catalogs) added on top.  TDD: tests landed first as `todo!()` red-light at `893a90c`, then implementation passed all four.  `resolve_kids` handles both inline-array and indirect-Reference forms of `/Kids` (corpus-04 hits the second).
+- **`RasterSession` lazy refactor** (`bb64737`).  `pages: BTreeMap<u32, ObjectId>` field replaced with `page_cache: RwLock<HashMap<u32, ObjectId>>`, populated on demand via `RasterSession::resolve_page` (read-then-write pattern; idempotent under contention; poisoned-lock-tolerant).  `pdf_raster::open_session` no longer materialises a per-page map at all — it just stashes `total_pages = doc.page_count_fast()`.  `pdf_interp::page_count` and `resolve_page_id` migrated to the lazy API.  Compile-time `assert_sync<RasterSession>()` / `assert_send<RasterSession>()` invariants kept intact.  Integration test (`crates/pdf_raster/tests/lazy_session.rs`) verifies the cache is empty immediately after `open_session` and grows by exactly one entry per page rendered.  Render output of corpus-04 page 100 byte-identical to master baseline (md5 `6c5703a00b2abd45b8c7ebbc31b54ba8`).
+- **Linearization (Fast Web View) detection** (`892b3ff`).  New `crates/pdf/src/linearization.rs::LinearizationHints::try_load` probes object 1 for the `/Linearized` dict and parses `/N`, `/O`, `/H[0]`, `/H[1]`.  `Document::linearization_hints()` caches the result via a manual `OnceLock` lazy-init dance (because `OnceLock::get_or_try_init` is unstable, rust-lang/rust#109737).  `Document::bytes()` exposes the underlying mmap as `&[u8]` for future hint-stream parsing.  `descend_to_page_index` has the fast-path probe wired in; today it falls through because `page_offset` returns `None` (the bit-packed Page Offset Hint Table parser per PDF 1.7 § F.4.5 is deferred — better no parser than a half-correct one that silently misdirects lookups).
+- **`posix_fadvise` plumbing on the `Document` mmap** (`3b9bcbd`, lint scope fix in `a045326`).  `crates/pdf/src/madvise.rs::advise_random` is called immediately after `File::open` and tells the kernel "I'll touch arbitrary 4 KB ranges; don't readahead."  `advise_willneed(file, offset, len)` exported for content-stream prefetch later.  Routed through `rustix` so the `pdf` crate's `unsafe_code = "deny"` invariant holds.  No-op on non-Unix.
+- **Lazy GPU init audit — no refactor needed** (`c3705ee`).  Baselined `pdf-raster --help` at ~1.0 ms median (hyperfine, 30 runs, prewarmed).  Spec threshold for shipping a refactor was ≥ 2 ms improvement.  `cudarc 0.19.4` and `ash 0.38.0` already lazy-init via `libloading` at first call, not at dlopen; workspace-wide grep for `lazy_static!`, `once_cell::Lazy`, `#[ctor]` returns zero hits in production code.  Audit doc-comment added to `GpuCtx::init` in `crates/gpu/src/lib.rs:155-177` so future-us doesn't re-investigate.  The 10–30 ms claim in the original spec was speculative; the real cost is binary-load + clap, not GPU init.
+- **libdeflate backend for FlateDecode** (`c64a695`, partial-tolerance fix in `6139ef9`).  `libdeflater 1.25.2` behind a default-on `libdeflate` Cargo feature.  `apply_flate` dispatches via `decompress_zlib` (libdeflate) or falls back to `flate2`/miniz_oxide on `--no-default-features`.  Microbench (`crates/pdf/examples/flate_bench.rs`) using public `decompressed_content` API: corpus-03 (text-heavy, 774 small streams) **1.47×** faster, corpus-04 (DCT-heavy, 715 large streams, 11.4 MiB raw → 774 MB decompressed) **2.40×** faster.  Render byte-parity against master baseline preserved.  The fallback retains flate2's silent partial-decompression tolerance for truncated/checksum-corrupt content streams that real-world malformed PDFs ship — libdeflate is all-or-nothing (validates Adler-32 before returning `Ok`), so any `BadData` error falls through to a flate2-based last-ditch attempt that accepts partial output.
+- **PGO + BOLT release build script** (`9e2b70f`).  `scripts/release_pgo_build.sh` runs profile-generate → train (10 pages of corpus-04) → `llvm-profdata merge` → profile-use rebuild.  BOLT applied on top when `llvm-bolt` is on `PATH`; skipped with a clear message otherwise.  Verified end-to-end on the dev box; final binary at 3.26 MB.  Workflow integration (CI hook) deferred until v0.9.0 actually ships.
+- **Bench harness skeleton + qpdf archive builder** (`34e1e3f`).  Second `[[bin]]` target `contest_v11` in `crates/bench/`.  `archive::build(out, target_bytes)` cycles through corpus-04/05/08/09 fixtures, concatenating via `qpdf <base> --pages <p> 1-z ...`.  `target_bytes` is *cumulative input fixture bytes*, not output bytes — qpdf deduplicates shared PDF objects and the output is typically 2–3× smaller, so a 10 GiB output requires passing ~25–30 GiB as `target_bytes`.  Documented in the function doc-comment so the next caller doesn't get surprised.
+- **Four-event runners + competitor wrappers** (`b6c3781`).  `events::{e1,e2,e3,e4}` use `pdf_raster::{open_session, render_page_rgb}` at 150 DPI; `_bmp` discards (we're benching, not rendering to disk; PPM encode + filesystem cost would be noise).  E4 uses a fixed-seed xorshift64 (`0xDEAD_BEEF_DEAD_BEEF`) so successive runs touch the same pages.  `competitors::{mutool_render, pdftoppm_render}` invoke the subprocesses, time them, clean up output files.  Missing competitors degrade to `None` rather than failing the run.  E3 prefetches the last 4 KB of each archive via `rustix::fs::fadvise(WillNeed)` (`io_uring_open::warm_xref_tails`) — the spec originally proposed `io_uring` but `posix_fadvise` is the same kernel hint and avoids the async-runtime tax.
 
-**Approach:** on open, hash document content with BLAKE3 (already a dep). Look up sidecar at `<cache-root>/<doc-blake3>.idx`. On hit: load the index, skip page-tree traversal. On miss: traverse page tree as today, write the index after. Sidecar format is fixed-size: 32-byte header (magic + page count) + N×8 bytes (objnums). Disable with an opt-out flag for testing.
+**Smoke result on a 335 MB synthetic archive (E1, page 1, 9900X3D + RTX 5070):**
 
-**Scope:** ~150 LoC in `pdf_interp`. No GPU code touched. Smaller than the original `~300 LoC` estimate because we're caching only the index, not parsed content.
+| Engine | First-pixel time |
+|---|---|
+| pdf-raster | **4.2 ms** |
+| pdftoppm | 15.9 ms |
+| mutool draw | 18.7 ms |
 
-### Task 2 — Banded rendering for memory-pressure escape
+We're already 4× faster than `pdftoppm` and 4.5× faster than `mutool` on this slice.  The 10 GB archive run in Task 11 (below) tests whether the lead holds when mmap actually pages.
 
-Render horizontal bands of a page instead of allocating a full-page framebuffer. For 600 DPI archival book scans (~25 MP/page → ~75 MB framebuffer), full-page allocation pins working set at gigabytes when a Rayon pool spreads across pages. Banding caps per-page peak memory at `band_height × width × 4` bytes regardless of page size.
+**What's left — Task 11 (the bench gate):**
 
-**Approach:** add `RasterOptions::band_height: Option<u32>`. When set, the rasteriser scanline-sweep iterates bands instead of the full page; each band gets independently flushed to the output encoder. Path commands need clipping to the active band's y-range — reuse the existing scissor-rect plumbing. Banding interacts with the GPU page buffer (Phase 9): a banded render writes bands to host directly, skipping `DevicePageBuffer`.
+Build a 10 GB output archive (~30 GB qpdf-input target), build 50–100 cross-doc archives for E3, run the four-event harness 5 times, write `bench/v11/results.md`, update `ROADMAP.md`'s release-history block with the v0.9.0 numbers.  Phase 11 ships if pdf-raster wins or ties at least three of four events on the 10 GB workload.
 
-**Fallback hierarchy (the key design point):** banding is not just an opt-in flag — it's the *escape valve*. On allocation failure during full-page render, retry with progressively smaller band heights before declaring failure. The fallback chain: full-page → band_height=2048 → band_height=1024 → band_height=512 → fail. This is the standard pattern in production banded raster tools (halve band height + thread count under memory pressure before giving up); pages that today crash the renderer would degrade gracefully.
+**What stays deferred:**
 
-**Scope:** ~500 LoC in `raster/` + `pdf_raster/`. Real engineering effort because the scanline sweep wasn't designed with bands in mind. Pays off only for very large pages — gate on `page_height_px ≥ 6000` or explicit user opt-in or OOM-fallback trigger.
+The original Phase-11 draft had three tasks that are still real future work but are not contest-shaped, so they aren't part of this phase:
 
-### Task 3 — Multi-resolution image cache
+- **Banded rendering as an OOM escape valve.**  Useful when 600+ DPI archival book scans exceed working-set memory; current corpus fits comfortably.  Defer until a real OOM workload appears.
+- **Multi-resolution image cache** (`(content_hash, l2factor)` keys).  Pays off only when the same corpus is rendered at multiple DPIs in sequence.  No current consumer does that.  Worth re-scoping if a multi-DPI workload materialises.
+- **Display-list intermediate.**  Flat byte buffer with bitfield-packed command headers (not `Vec<DisplayCmd>` — established C-renderer practice; the data-structure decision is recorded here so future-us doesn't ship the wrong shape).  Pays off when something consumes the same parsed page twice; nothing does today.
 
-Cache decoded images keyed by `(image_id, l2factor, rect)` rather than just `image_id`. When a render at 150 DPI follows a render at 300 DPI of the same corpus, the second render subsamples the cached high-res pixmap instead of re-decoding the source JPEG. Subsampling RGB is much cheaper than re-running zune-jpeg + colour conversion.
+**Out of scope (re-affirming from the original):**
 
-**Approach:** extend the Phase 9 `DeviceImageCache` key from content-hash-only to `(content_hash, l2factor)`. Cache the natural-resolution decode; on lookup, find the smallest-l2factor cached entry and box-filter or area-average down to the target. New cache entries always insert at l2factor=0 (full resolution) so other render passes can reuse.
+A 2-stage interpretation+render pipeline within a single document.  pdf-raster already parallelises across pages with Rayon, which dominates per-document pipelining on any multi-core machine — confirmed empirically by the May-2026 baseline matrix (3–10 % gain over serial vs. Rayon-per-page's much larger lead).  Network-streaming PDF (HTTP range requests).  Not our user; PDFium's browser use case, not a CLI tool's.  AVX-512 simdjson-style PDF lexer.  Real engineering effort with a real win, but the contest events don't bottleneck on dictionary parsing — deferred to a future phase.
 
-**Scope:** ~200 LoC in `crates/gpu/src/cache/`. Only pays off when the same corpus is rendered at multiple DPIs — currently nothing does that, so this is real-only-when-needed work. Worth scoping now because the change to the cache key is API-shaped (touches `dual_index`, eviction key comparison, etc.); rather build it once than back-port it.
+**Spec / plan archives (gitignored, on disk for the implementing developer):**
 
-### Task 4 — Display-list intermediate (deferred until needed)
-
-Flatten content-stream interpretation into a reusable display list once, then replay it to whatever sink. Amortises interpretation cost across multi-DPI output, render-then-extract-text, and multiple band-passes for task 2.
-
-**Data structure (when this lands):** a flat byte buffer with bitfield-packed command headers, not `Vec<DisplayCmd>`. Trivial commands (pop_clip, end_group) take one 32-bit header; complex commands (fill_path with a long path + colour) span 40–200 bytes inline. Avoids per-command heap allocations and stays cache-friendly. Existing C renderers in the field do this for the same reason and it's the right shape regardless of language.
-
-**Defer until:** something actually consumes the same page twice. Right now nothing in the pipeline does. Premature abstraction otherwise — but record the data-structure decision now so future-us doesn't ship `Vec<Box<DisplayCmd>>` and have to rewrite it.
-
-**Sequencing:** task 0 first (correctness — fixture-and-audit, may be a no-op). Task 1 next (highest perf ROI, smallest blast radius). Task 2 only if 600 DPI scans become OOM-prone in practice. Task 3 only when multi-DPI re-rendering becomes a real workload. Task 4 stays deferred.
-
-**Out of scope:** a 2-stage interpretation+render pipeline within a single document. pdf-raster already parallelises across pages with Rayon, which dominates a per-document pipeline on any multi-core machine. Confirmed empirically by the May-2026 baseline matrix — a 2-stage pipeline approach gains only 3–10 % over serial on the same workload, well below what Rayon-per-page already delivers.
-
-**Validation against external designs:** the Phase 9 `DeviceImageCache` eviction policy (refcount-pinned LRU, `Arc::strong_count == 1` as the eviction-eligible check at `crates/gpu/src/cache/eviction.rs:153`) is the canonical pattern in long-lived production renderers — refcount as the in-use flag, not a separate "pinned" boolean. Convergent design with established practice; no change needed.
+- `docs/superpowers/specs/2026-05-09-phase-11-million-page-archive-contest.md` — full spec including the rejected ideas section ("`io_uring` for general I/O — REJECTED.  mmap *is* streaming on Linux..." etc.).  These rejections are deliberate and documented so future-us doesn't re-propose them under new names.
+- `docs/superpowers/plans/2026-05-09-phase-11-million-page-archive-contest.md` — task-by-task implementation plan with TDD red-light/green-light steps.
 
 ---
 
