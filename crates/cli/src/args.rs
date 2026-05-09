@@ -385,9 +385,8 @@ pub enum BackendArg {
     /// Require VA-API JPEG — error loudly if the DRM device cannot be opened.
     Vaapi,
     /// Require the Vulkan compute backend — error loudly if Vulkan
-    /// initialisation fails.  Phase 9 image cache is unavailable under
-    /// this mode (CUDA-only); the kernels themselves dispatch through
-    /// `VulkanBackend`.
+    /// initialisation fails.  The device-resident image cache is
+    /// CUDA-only; under this mode the session runs without it.
     Vulkan,
 }
 
