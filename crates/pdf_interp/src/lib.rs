@@ -196,19 +196,14 @@ pub fn page_count(doc: &Document) -> u32 {
 /// [`InterpError::PageOutOfRange`] if `page_num` is 0 or exceeds the document;
 /// [`InterpError::Pdf`] if the page tree itself is malformed.
 pub(crate) fn resolve_page_id(doc: &Document, page_num: u32) -> Result<pdf::ObjectId, InterpError> {
-    if page_num == 0 {
-        return Err(InterpError::PageOutOfRange {
-            page: 0,
-            total: doc.page_count_fast(),
-        });
-    }
     let total = doc.page_count_fast();
-    if page_num > total {
+    if page_num == 0 || page_num > total {
         return Err(InterpError::PageOutOfRange {
             page: page_num,
             total,
         });
     }
+    // 1-based → 0-based.  Underflow guarded by `page_num != 0` above.
     doc.get_page(page_num - 1).map_err(InterpError::Pdf)
 }
 

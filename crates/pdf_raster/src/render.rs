@@ -106,6 +106,14 @@ impl From<pdf_interp::InterpError> for RasterError {
     }
 }
 
+/// Direct conversion from `pdf::PdfError` so call sites can write
+/// `e.into()` instead of the two-level `RasterError::from(InterpError::from(e))`.
+impl From<pdf::PdfError> for RasterError {
+    fn from(e: pdf::PdfError) -> Self {
+        Self::from(pdf_interp::InterpError::from(e))
+    }
+}
+
 // ── RasterSession ─────────────────────────────────────────────────────────────
 
 /// An opened PDF document ready for per-page rendering.
@@ -213,6 +221,13 @@ impl RasterSession {
     /// `self.total_pages`; [`RasterError::Pdf`] when the underlying page-tree
     /// descent fails (malformed `/Pages` node).
     pub(crate) fn resolve_page(&self, page_num: u32) -> Result<pdf::ObjectId, RasterError> {
+        // The upper bound check is duplicated by `Document::get_page` below,
+        // but performing it here lets us return a 1-based `PageOutOfRange`
+        // directly; without it, a too-large `page_num` would surface as
+        // `RasterError::Pdf(... PageOutOfRange { page: 0-based, ... })`,
+        // which is harder to interpret in CLI / API consumers.  The check
+        // for `page_num == 0` is load-bearing — it guards `page_num - 1`
+        // against `u32` underflow.
         if page_num == 0 || page_num > self.total_pages {
             return Err(RasterError::PageOutOfRange {
                 page: page_num,
@@ -224,10 +239,7 @@ impl RasterSession {
         {
             return Ok(*id);
         }
-        let id = self
-            .doc
-            .get_page(page_num - 1)
-            .map_err(|e| RasterError::from(pdf_interp::InterpError::from(e)))?;
+        let id = self.doc.get_page(page_num - 1)?;
         if let Ok(mut guard) = self.page_cache.write() {
             let _ = guard.insert(page_num, id);
         }

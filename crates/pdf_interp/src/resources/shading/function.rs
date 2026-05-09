@@ -87,17 +87,6 @@ pub(super) fn eval_exponential(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f6
         .collect()
 }
 
-/// Evaluate a Type 3 Stitching function (test entry point).
-#[cfg(test)]
-pub(super) fn eval_stitching(
-    doc: &Document,
-    fn_dict: &Dictionary,
-    t: f64,
-    n: usize,
-) -> Option<Vec<f64>> {
-    eval_stitching_depth(doc, fn_dict, t, n, 0)
-}
-
 fn eval_stitching_depth(
     doc: &Document,
     fn_dict: &Dictionary,
