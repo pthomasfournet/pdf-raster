@@ -24,17 +24,28 @@ Given a PDF file, pdf-raster renders each page to an 8-bit grayscale buffer in m
 
 ### GPU (optional)
 
-Two GPU backends are available on Linux:
+Three GPU backends are available on Linux:
 
-**NVIDIA (CUDA 12):**
+**NVIDIA (CUDA 12 or 13):**
 
 | Feature | Minimum GPU | Library required |
 |---|---|---|
-| `nvjpeg` | Any CUDA 12-capable NVIDIA GPU | `libnvjpeg.so` (ships with CUDA 12) |
-| `nvjpeg2k` | Any CUDA 12-capable NVIDIA GPU | `libnvjpeg2k.so` (separate download) |
-| `gpu-aa` | Any CUDA 12-capable NVIDIA GPU | CUDA runtime |
-| `gpu-icc` | Any CUDA 12-capable NVIDIA GPU | CUDA runtime |
-| `gpu-deskew` | Any CUDA 12-capable NVIDIA GPU | CUDA NPP (`libnppig.so`, `libnppc.so`) |
+| `nvjpeg` | Any CUDA-capable NVIDIA GPU | `libnvjpeg.so` (ships with CUDA 12 or 13 toolkit) |
+| `nvjpeg2k` | Any CUDA-capable NVIDIA GPU | `libnvjpeg2k.so` (separate download; build script probes `/13` then `/12`) |
+| `gpu-aa` | Any CUDA-capable NVIDIA GPU | CUDA runtime |
+| `gpu-icc` | Any CUDA-capable NVIDIA GPU | CUDA runtime |
+| `gpu-deskew` | Any CUDA-capable NVIDIA GPU | CUDA NPP (`libnppig.so`, `libnppc.so`) |
+| `cache` | Any CUDA-capable NVIDIA GPU | CUDA runtime; opt-in disk-tier persistence via `PDF_RASTER_CACHE_DIR` |
+
+`cudarc` is pinned to the `cuda-12080` driver-API binding so the same source builds against both 12.x and 13.x drivers (forward-compatible per the CUDA driver-API ABI).
+
+**Vulkan compute (cross-vendor — NVIDIA, AMD, Intel, Apple via `MoltenVK`):**
+
+| Feature | Supported hardware | Libraries required |
+|---|---|---|
+| `vulkan` | Any Vulkan 1.3+ device | Vulkan ICD (e.g. `mesa-vulkan-drivers`, `nvidia-driver`); `slangc` from the LunarG Vulkan SDK at *build* time |
+
+Vulkan covers the AA-fill and tile-fill kernels (the same shapes as `gpu-aa`).  No `nvjpeg` / `cache` support today; under `--backend vulkan` the renderer runs uncached and JPEGs decode on the CPU.  Verified on RTX 5070; cross-vendor smoke (AMD-RADV, Intel-ANV, Apple Metal-via-MoltenVK) pending hardware.
 
 **VA-API (Linux iGPU/dGPU — AMD VCN, Intel Quick Sync, Intel Arc):**
 
@@ -44,20 +55,19 @@ Two GPU backends are available on Linux:
 
 VA-API provides hardware JPEG baseline decode. CMYK and progressive JPEGs fall through to CPU. When both `nvjpeg` and `vaapi` are active, nvJPEG takes priority; VA-API fires as fallback.
 
-All GPU features fall back to CPU automatically if initialisation fails — a message is logged but no error is returned.
+All GPU features fall back to CPU automatically if initialisation fails — a message is logged but no error is returned.  Use `--backend cuda` / `--backend vulkan` / `--backend vaapi` to convert silent fallbacks into hard errors.
 
 ## Platform support
 
 | Platform | CPU SIMD | GPU acceleration | Status |
 |---|---|---|---|
-| x86-64 AMD (Ryzen) | AVX-512 + AVX2 | NVIDIA CUDA + AMD VA-API | **Supported** |
-| x86-64 Intel (consumer) | AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
-| x86-64 Intel (Xeon) | AVX-512 + AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
-| aarch64 Linux (Graviton, RPi) | NEON + SVE2† | — | **Supported (CPU only)** |
-| Apple Silicon (M1–M4) | NEON | — (no Metal backend yet) | CPU only, compile clean |
-| AMD/Radeon ROCm | — | — | Not yet implemented |
-| Apple Metal | — | — | Not yet implemented (Phase F) |
-| Vulkan compute | — | — | Not yet implemented |
+| x86-64 AMD (Ryzen) | AVX-512 + AVX2 | NVIDIA CUDA + AMD VA-API + Vulkan | **Supported** |
+| x86-64 Intel (consumer) | AVX2 | NVIDIA CUDA + Intel VA-API + Vulkan | **Supported** |
+| x86-64 Intel (Xeon) | AVX-512 + AVX2 | NVIDIA CUDA + Intel VA-API + Vulkan | **Supported** |
+| aarch64 Linux (Graviton, RPi) | NEON + SVE2† | Vulkan (Mesa) | CPU full, Vulkan untested on aarch64 |
+| Apple Silicon (M1–M4) | NEON | Vulkan via `MoltenVK` (untested) | CPU full, Vulkan untested |
+| AMD/Radeon ROCm | — | — | Not implemented (Vulkan covers Radeon) |
+| Apple Metal (native) | — | — | Not implemented (Vulkan via `MoltenVK` is the path) |
 
 † SVE2 requires `nightly-sve2` Cargo feature and nightly Rust.
 
@@ -67,18 +77,21 @@ Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0" }
 ```
 
-For GPU acceleration — NVIDIA (CUDA 12) + VA-API (Linux iGPU/dGPU):
+For GPU acceleration — NVIDIA (CUDA 12 or 13) + Vulkan (cross-vendor) + VA-API (Linux iGPU/dGPU):
 
 ```toml
 [dependencies]
-# CUDA GPU features (NVIDIA only):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew"] }
+# CUDA GPU features (NVIDIA only; full feature set including the Phase 9 cache):
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew", "cache"] }
+
+# Vulkan compute (cross-vendor — NVIDIA, AMD, Intel, Apple via MoltenVK):
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0", features = ["vulkan"] }
 
 # VA-API (AMD/Intel iGPU on Linux — libva required):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0", features = ["vaapi"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0", features = ["vaapi"] }
 ```
 
 To track the latest commit on `master` instead of a pinned tag:

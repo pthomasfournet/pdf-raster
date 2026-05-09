@@ -57,9 +57,12 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 
 **CPU:** x86-64 (AMD and Intel) and `aarch64` (ARM). AVX2/AVX-512 on x86-64; NEON (and SVE2 on nightly) on aarch64. Build with `-C target-cpu=native` to enable AVX-512 or native NEON width.
 
-**GPU (optional):** NVIDIA via CUDA 12, and Linux iGPU/dGPU via VA-API (AMD VCN, Intel Quick Sync, Intel Arc). AMD/Radeon ROCm and Apple Metal backends are not yet implemented. All GPU features fall back to CPU automatically when unavailable.
+**GPU (optional):**
+- **NVIDIA via CUDA 12 or 13** — full feature set (nvJPEG, nvJPEG2000, AA fill, ICC CLUT, ICC matrix, deskew, image cache).  `cudarc` is pinned to the `cuda-12080` driver-API binding so the same source builds against both 12.x and 13.x drivers (forward-compatible per the CUDA driver-API ABI).
+- **Cross-vendor via Vulkan compute** — AA fill and tile fill kernels run on any Vulkan 1.3+ device (NVIDIA, AMD, Intel, Apple via `MoltenVK`). Verified on RTX 5070; cross-vendor smoke pending hardware.  No nvJPEG / cache support under Vulkan today.
+- **Linux iGPU/dGPU via VA-API** — JPEG baseline decode on AMD VCN, Intel Quick Sync, Intel Arc.
 
-**Planned:** Apple Metal (macOS/Apple Silicon) → Vulkan compute. See [getting-started.md](docs/getting-started.md#platform-support) for details.
+All GPU features fall back to CPU automatically when unavailable.  AMD/Radeon ROCm and Apple Metal-native backends are not implemented (Vulkan covers Apple via `MoltenVK`).
 
 ## Build
 
@@ -67,10 +70,15 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 # CPU-only (no CUDA)
 cargo build --release -p cli
 
-# With all GPU features (CUDA 12, NVIDIA GPU required)
+# With all GPU features (CUDA 12 or 13 toolkit, NVIDIA GPU required)
 # Default CUDA_ARCH is sm_80 (Ampere); override for older or newer GPUs.
 CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
   --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew,pdf_raster/cache"
+
+# With Vulkan compute backend (cross-vendor; no NVIDIA dependency).
+# Requires the LunarG Vulkan SDK on the build host (slangc compiles the
+# .slang shaders to SPIR-V).  Vulkan 1.3+ ICD on the runtime host.
+cargo build --release -p pdf-raster --features "pdf_raster/vulkan"
 ```
 
 ### Picking `CUDA_ARCH` for your GPU
@@ -92,15 +100,16 @@ Look up your card's exact Compute Capability at [developer.nvidia.com/cuda-gpus]
 
 | Flag | What it enables | Required runtime |
 |---|---|---|
-| `nvjpeg` | GPU JPEG decode for `DCTDecode` | `libnvjpeg.so` (ships with CUDA 12) |
+| `nvjpeg` | GPU JPEG decode for `DCTDecode` | `libnvjpeg.so` (ships with CUDA 12 or 13 toolkit) |
 | `nvjpeg2k` | GPU JPEG-2000 decode for `JPXDecode` | `libnvjpeg2k.so` |
 | `gpu-aa` | GPU supersampled anti-aliased fill | CUDA |
 | `gpu-icc` | GPU CMYK→RGB ICC transform | CUDA |
 | `gpu-deskew` | GPU deskew rotation via NPP | CUDA + NPP |
 | `cache` | Device-resident image cache (3-tier VRAM/host/disk) | CUDA |
 | `vaapi` | Linux iGPU/dGPU JPEG decode (AMD/Intel) | `libva.so.2` + DRM render node |
+| `vulkan` | Vulkan compute backend for AA / tile fill (cross-vendor) | Vulkan 1.3+ ICD; pulls in `gpu-aa`. Slang shaders compiled to SPIR-V via `slangc` from the `LunarG` Vulkan SDK |
 
-All GPU features fall back to CPU automatically when the runtime requirement is missing, except `--policy ForceCuda` / `--policy ForceVaapi` which fail loudly.
+All GPU features fall back to CPU automatically when the runtime requirement is missing, except `--backend cuda` / `--backend vulkan` / `--backend vaapi` which fail loudly with a clear error.
 
 ## Testing
 

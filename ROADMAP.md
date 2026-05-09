@@ -27,6 +27,32 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.8.0 (May 2026)
+
+**New since v0.7.0:**
+
+- **Vulkan compute backend (Phase 10).**  All six GPU kernels (`composite_rgba8`, `apply_soft_mask`, `aa_fill`, `tile_fill`, `icc_clut`, `blit_image`) now also exist as Slang shaders compiled to SPIR-V at build time, run by a new `VulkanBackend` (`crates/gpu/src/backend/vulkan/`) implementing a backend-agnostic `GpuBackend` trait.  CLI flag: `--backend vulkan`.  Cross-vendor support is the goal (NVIDIA, AMD, Intel, Apple via `MoltenVK`); only RTX 5070 has been on-machine tested so far.  Phase 9 device-resident image cache stays CUDA-only — under `--backend vulkan` the renderer runs uncached, matching pre-Phase-9 behaviour.
+- **GpuBackend trait + CudaBackend skeleton.**  `crates/gpu/src/backend/{mod,params,cuda}.rs` factor the per-page state machine (`begin_page` → `record_*` → `submit_page` → `wait_page`) out of `GpuCtx`.  The CUDA renderer path still goes through `GpuCtx` directly (no measurable benefit from a shape-only port; the `DevicePageBuffer` migration is what would force the trait through, and that's deferred until the cache itself becomes generic over `B`).
+- **Renderer integration.**  `PageRenderer` gained an `Option<Arc<VulkanBackend>>` field beside `gpu_ctx`; the fill dispatch prefers Vulkan when set.  `pdf_interp::renderer::page::vk_ops` wraps the trait surface for AA fill and tile fill.  ICC CMYK→RGB on Vulkan is intentionally deferred — under `ForceVulkan` the renderer falls through to the CPU `cmyk_to_rgb_reflectance` matrix (same shape as Phase 9-pre).
+- **Build-script bug fix (pre-existing).**  `crates/gpu/build.rs` previously keyed PTX compilation on a feature-flag heuristic that didn't include `pdf_interp::gpu-aa` / `gpu-icc` (those features don't propagate to the gpu crate's build env).  A build with `--features "vulkan,gpu-aa"` or `gpu-aa` alone produced 0-byte placeholder PTX, then crashed at runtime with `CUDA_ERROR_INVALID_IMAGE`.  Now keys on a real `nvcc --version` probe and emits `cargo:rustc-cfg=ptx_placeholder` only when nvcc is genuinely missing.  `GpuCtx::init` short-circuits under that cfg with a clear message pointing at the build host's missing nvcc rather than letting the driver throw.
+- **Hardening pass on Vulkan dispatch.**  `n_segs` overflow check (was a saturating cast that would silently corrupt coverage on adversarial input), `checked_pixel_count` overflow guard, in-place segment shift (saved one `Vec<f32>` allocation per AA fill), `alloc_or_warn` / `upload_or_warn` / `warn_err` helpers consolidate ten near-identical error-handling blocks, NVCC stderr captured on probe and per-kernel compile failures so build diagnostics are actionable instead of bare exit-status panics.
+- **Documentation.**  `docs/api-reference.md`, `docs/cli-reference.md`, `docs/getting-started.md`, `docs/benchmarks.md`, `ARCHITECTURE.md`, and `README.md` updated for `--backend vulkan` and the Vulkan compute backend.  `bench/v10/` ships the Phase-10 bench-gate matrix.
+
+**Bench gate (Phase 10 step 4 — see `bench/v10/results.md`):**
+
+Vector-heavy subset (corpora 01-05) on RTX 5070 + 9900X3D.  DCT-heavy corpora 06-10 deliberately skipped because the Vulkan binary doesn't include nvjpeg, so they would compare CPU JPEG decode against silicon and bias the result.
+
+| Criterion | Threshold | Result |
+|---|---|---|
+| 1 — CUDA path no regression vs v0.7.0 mode D | ≤ +5% slower | **PASS** on all 5 corpora (Δ range −11.2% … +2.6%) |
+| 2 — Vulkan pixel-diff vs CUDA | ≤ 1 LSB | **PASS** (16/16 byte-identical on corpus-02; 358/358 byte-identical Vulkan-vs-CPU on corpus-04) |
+| 3 — Vulkan timing vs CUDA on RTX 5070 | ≤ 1.15× | **PASS** on all 5 corpora — Vulkan is *faster* than CUDA (V/D 0.27–0.82×).  Not strictly apples-to-apples either way: CUDA mode D pays nvjpeg / ICC-CLUT init even on text-only corpora that don't decode JPEGs; the Vulkan binary skips those |
+| 4 — cross-vendor proof of life on AMD or Intel | first-pixel render | **BLOCKED** on hardware (no AMD/Intel GPU on the dev box) |
+
+The criterion-1 baseline is **live-captured** (the v0.7.0 binary rebuilt and re-benched on the same hardware) rather than read from `bench/v070/D.txt`.  Driver/system state has drifted since v0.7.0 — corpus-02 reported 212 ms there but ~500 ms today on the same v0.7.0 binary — so the stale numbers would have flagged Phase 10 as a 130% regression that's actually entirely environmental.
+
+**What this means:** Phase 10 is **functionally complete** on NVIDIA hardware (the only vendor we can test on this dev box).  Vulkan rendering is byte-identical to CPU + CUDA, ships a clean `--backend vulkan` CLI flag, and times within the spec on the kernels Phase 10 actually migrated.  Cross-vendor smoke (AMD-RADV, Intel-ANV, lavapipe) stays open as a Task 3 follow-up.
+
 ### v0.7.0 (May 2026)
 
 **New since v0.6.0:**

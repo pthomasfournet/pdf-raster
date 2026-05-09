@@ -230,14 +230,18 @@ if !page.diagnostics.has_images && page.diagnostics.has_vector_text {
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendPolicy {
-    Auto,       // GPU when available, silent CPU fallback (default)
-    CpuOnly,    // Skip all GPU init entirely
-    ForceCuda,  // Require CUDA; error if unavailable
-    ForceVaapi, // Require VA-API JPEG; error if unavailable
+    Auto,        // GPU when available, silent CPU fallback (default)
+    CpuOnly,     // Skip all GPU init entirely
+    ForceCuda,   // Require CUDA; error if unavailable
+    ForceVaapi,  // Require VA-API JPEG; error if unavailable
+    ForceVulkan, // Require the Vulkan compute backend; error if unavailable
+                 // (or if the binary was built without `--features vulkan`)
 }
 ```
 
 Controls which compute backend is used. `Auto` matches pre-v0.4.0 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active.
+
+`ForceVulkan` runs the AA-fill and tile-fill kernels on the Vulkan compute backend (cross-vendor: NVIDIA, AMD, Intel, Apple via `MoltenVK`).  The device-resident image cache is CUDA-only, so under `ForceVulkan` the renderer runs uncached and JPEGs decode + ICC CMYK→RGB stay on the CPU paths.
 
 ---
 
@@ -382,19 +386,30 @@ Implements `std::error::Error`. `InterpError::Pdf(e)` chains to `pdf::PdfError`.
 **aarch64:**
 - NEON is used unconditionally (mandatory on all ARMv8-A). No runtime detection needed.
 - SVE2 (`svcnt_u8_z` popcount tier) is available behind the `nightly-sve2` Cargo feature on nightly Rust. Gives up to 4× NEON throughput on wide-SVE2 server chips (Graviton4 full width).
-- `cargo check --target aarch64-unknown-linux-gnu` is clean; no Apple Metal GPU backend yet.
+- `cargo check --target aarch64-unknown-linux-gnu` is clean; no Apple Metal native backend yet (Vulkan via `MoltenVK` covers Apple).
 
 ### GPU
 
-**NVIDIA (CUDA 12):**
+**NVIDIA (CUDA 12 or 13):**
 
 | Feature flag | Minimum requirement | Notes |
 |---|---|---|
-| `nvjpeg` | CUDA 12-capable NVIDIA GPU | `libnvjpeg.so` ships with CUDA 12 toolkit |
-| `nvjpeg2k` | CUDA 12-capable NVIDIA GPU | `libnvjpeg2k.so` is a separate download |
-| `gpu-aa` | CUDA 12-capable NVIDIA GPU | CUDA runtime only |
-| `gpu-icc` | CUDA 12-capable NVIDIA GPU | CUDA runtime only |
-| `gpu-deskew` | CUDA 12-capable NVIDIA GPU | Requires CUDA NPP: `libnppig.so` + `libnppc.so` |
+| `nvjpeg` | CUDA-capable NVIDIA GPU | `libnvjpeg.so` ships with CUDA 12 or 13 toolkit |
+| `nvjpeg2k` | CUDA-capable NVIDIA GPU | `libnvjpeg2k.so` is a separate download; build script probes `/13` then `/12` |
+| `gpu-aa` | CUDA-capable NVIDIA GPU | CUDA runtime only |
+| `gpu-icc` | CUDA-capable NVIDIA GPU | CUDA runtime only |
+| `gpu-deskew` | CUDA-capable NVIDIA GPU | Requires CUDA NPP: `libnppig.so` + `libnppc.so` |
+| `cache` | CUDA-capable NVIDIA GPU | Phase 9 3-tier image cache (CUDA-only) |
+
+`cudarc` is pinned to the `cuda-12080` driver-API binding; the same source builds against both 12.x and 13.x drivers.
+
+**Vulkan compute (cross-vendor — NVIDIA, AMD, Intel, Apple via `MoltenVK`):**
+
+| Feature flag | Supported hardware | Libraries required |
+|---|---|---|
+| `vulkan` | Any Vulkan 1.3+ device | Vulkan ICD (e.g. `mesa-vulkan-drivers`, NVIDIA driver); `slangc` from the LunarG Vulkan SDK at *build* time. Implies `gpu-aa`. |
+
+Vulkan covers the AA-fill and tile-fill kernels. `cache` and `nvjpeg` stay CUDA-only; under `--backend vulkan` the renderer runs uncached and JPEGs decode on the CPU.
 
 **VA-API (Linux iGPU/dGPU — AMD VCN, Intel Quick Sync, Intel Arc):**
 
@@ -410,14 +425,13 @@ GPU initialisation failures at runtime print a warning to stderr and fall back t
 
 | Platform | CPU SIMD | GPU acceleration | Status |
 |---|---|---|---|
-| x86-64 AMD (Ryzen) | AVX-512 + AVX2 | NVIDIA CUDA + AMD VA-API | **Supported** |
-| x86-64 Intel (consumer) | AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
-| x86-64 Intel (Xeon) | AVX-512 + AVX2 | NVIDIA CUDA + Intel VA-API | **Supported** |
-| aarch64 Linux (Graviton, RPi) | NEON + SVE2 † | — | **Supported (CPU only)** |
-| Apple Silicon (M1–M4) | NEON | — (no Metal backend yet) | CPU only, compile clean |
-| AMD/Radeon ROCm | — | — | Not yet implemented |
-| Apple Metal | — | — | Not yet implemented |
-| Vulkan compute | — | — | Not yet implemented |
+| x86-64 AMD (Ryzen) | AVX-512 + AVX2 | NVIDIA CUDA + AMD VA-API + Vulkan | **Supported** |
+| x86-64 Intel (consumer) | AVX2 | NVIDIA CUDA + Intel VA-API + Vulkan | **Supported** |
+| x86-64 Intel (Xeon) | AVX-512 + AVX2 | NVIDIA CUDA + Intel VA-API + Vulkan | **Supported** |
+| aarch64 Linux (Graviton, RPi) | NEON + SVE2 † | Vulkan (Mesa) | CPU full, Vulkan untested on aarch64 |
+| Apple Silicon (M1–M4) | NEON | Vulkan via `MoltenVK` (untested) | CPU full, Vulkan untested |
+| AMD/Radeon ROCm | — | — | Not implemented (Vulkan covers Radeon) |
+| Apple Metal (native) | — | — | Not implemented (Vulkan via `MoltenVK` is the path) |
 
 † SVE2 requires `nightly-sve2` Cargo feature and nightly Rust.
 
@@ -427,15 +441,17 @@ GPU initialisation failures at runtime print a warning to stderr and fall back t
 
 | Feature | Requires | Effect |
 |---|---|---|
-| `nvjpeg` | CUDA 12, `libnvjpeg.so` | GPU JPEG decode (DCTDecode). Falls back to CPU zune-jpeg below 512×512 px. |
-| `nvjpeg2k` | CUDA 12, `libnvjpeg2k.so` | GPU JPEG 2000 decode (JPXDecode). Falls back to CPU OpenJPEG below 512×512 px or for sub-sampled chroma. |
-| `gpu-aa` | CUDA 12 | GPU supersampled AA fill (64-sample warp-ballot kernel). Falls back to CPU 4× scanline AA below 256 px. |
-| `gpu-icc` | CUDA 12 | GPU ICC CMYK→RGB via 4D CLUT. Falls back to CPU AVX-512 matrix formula below 500 000 px. |
-| `gpu-deskew` | CUDA 12, CUDA NPP | GPU bilinear rotation (nppiRotate). Falls back to CPU bilinear when disabled. |
+| `nvjpeg` | CUDA 12 or 13, `libnvjpeg.so` | GPU JPEG decode (DCTDecode). Falls back to CPU zune-jpeg below 512×512 px. |
+| `nvjpeg2k` | CUDA 12 or 13, `libnvjpeg2k.so` | GPU JPEG 2000 decode (JPXDecode). Falls back to CPU OpenJPEG below 512×512 px or for sub-sampled chroma. |
+| `gpu-aa` | CUDA 12 or 13 | GPU supersampled AA fill (64-sample warp-ballot kernel). Falls back to CPU 4× scanline AA below 256 px. |
+| `gpu-icc` | CUDA 12 or 13 | GPU ICC CMYK→RGB via 4D CLUT. Falls back to CPU AVX-512 matrix formula below 500 000 px. |
+| `gpu-deskew` | CUDA 12 or 13, CUDA NPP | GPU bilinear rotation (nppiRotate). Falls back to CPU bilinear when disabled. |
+| `cache` | CUDA 12 or 13 | Phase 9 device-resident image cache (3-tier VRAM/host/disk). Cross-document content-hash dedup. CUDA-only; no Vulkan support today. Disk-tier persistence is opt-in via `PDF_RASTER_CACHE_DIR`. |
 | `vaapi` | `libva.so.2`, `libva-drm.so.2` | VA-API JPEG baseline decode on Linux iGPU/dGPU. Falls back to CPU on CMYK/progressive JPEG. When `nvjpeg` is also active, nvJPEG takes priority. |
+| `vulkan` | Vulkan 1.3+ ICD; LunarG `slangc` at build time. Implies `gpu-aa`. | Phase 10 Vulkan compute backend. AA-fill and tile-fill kernels run on any Vulkan 1.3+ device (NVIDIA, AMD, Intel, Apple via `MoltenVK`). No nvJPEG / `cache` support under this backend. |
 | `gpu-validation` | CUDA device at test time | Enables GPU vs CPU parity tests (`cargo test -p gpu --features gpu-validation`). |
 
-GPU initialisation failures print a warning to stderr and fall back to CPU — they do not return errors.
+GPU initialisation failures print a warning to stderr and fall back to CPU — they do not return errors.  `cudarc` is pinned to the `cuda-12080` driver-API binding so the same source builds against both 12.x and 13.x drivers (forward-compatible per the CUDA driver-API ABI).
 
 ### GPU dispatch thresholds
 

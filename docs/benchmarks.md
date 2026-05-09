@@ -147,6 +147,35 @@ Built with nvJPEG, GPU AA fill, and ICC CLUT features. nvJPEG2000 is not availab
 
 ---
 
+## Phase 10 Vulkan compute backend (RTX 5070 + 9900X3D)
+
+End-to-end render timings for `--backend cpu` (mode A), `--backend cuda` with `nvjpeg,gpu-aa,gpu-icc` (mode D), and `--backend vulkan` with `vulkan,gpu-aa` (mode V).  Vector-/text-heavy corpora 01–05 only — DCT-heavy corpora 06–10 deliberately skipped because the Vulkan binary doesn't include nvjpeg, so they would compare CPU JPEG decode against silicon and bias the result away from what Phase 10 actually migrated.
+
+**Build:** `CUDA_ARCH=sm_120 scripts/bench_v10.sh`.  Hyperfine 5 runs / 1 warmup; `posix_fadvise(FADV_DONTNEED)` cache eviction between runs.
+
+| # | Document | Pages | A. CPU-only | D. CUDA full GPU | V. Vulkan |
+|---|---|---|---|---|---|
+| 01 | Native text, small | 16 | 52 ± 1 ms | 254 ± 9 ms | 166 ± 4 ms |
+| 02 | Native vector + text | 16 | 19 ± 1 ms | 492 ± 9 ms | 134 ± 3 ms |
+| 03 | Native text, dense | 254 | 251 ± 5 ms | 856 ± 11 ms | 371 ± 4 ms |
+| 04 | Ebook, mixed | 358 | 373 ± 4 ms | 830 ± 4 ms | 486 ± 5 ms |
+| 05 | Academic book | 601 | 887 ± 13 ms | 1234 ± 27 ms | 1018 ± 14 ms |
+
+**Bench-gate criteria** (per ROADMAP.md / `bench/v10/results.md`):
+
+| Criterion | Threshold | Result |
+|---|---|---|
+| 1 — CUDA path no regression vs v0.7.0 mode D | ≤ +5% slower | **PASS** on all 5 corpora (Δ −11.2% … +2.6% vs live-captured v0.7.0 baseline) |
+| 2 — Vulkan pixel-diff ≤ 1 LSB vs CUDA | byte-identical | **PASS** (16/16 byte-identical on corpus-02; 358/358 byte-identical Vulkan-vs-CPU on corpus-04) |
+| 3 — Vulkan timing within 15% of CUDA | ≤ 1.15× | **PASS** — Vulkan is *faster* than CUDA on every corpus (V/D 0.27–0.82×) |
+| 4 — Cross-vendor proof of life on AMD or Intel | first-pixel render | **BLOCKED** on hardware (no AMD/Intel GPU on this dev box) |
+
+The Vulkan-faster-than-CUDA result is not strictly apples-to-apples either way: CUDA mode D pays nvjpeg / ICC-CLUT init even on text-only corpora that don't decode JPEGs; the Vulkan binary skips those.  The *intent* of criterion 3 — Vulkan within striking distance of CUDA on the AA / tile-fill kernels Phase 10 actually migrated — is satisfied.
+
+The criterion-1 baseline is **live-captured** rather than read from `bench/v070/D.txt`.  Driver/system state has drifted since v0.7.0 — corpus-02 reported 212 ms there but ~500 ms today on the same v0.7.0 binary — so the stale numbers would have flagged Phase 10 as a 130% regression that was actually entirely environmental.  `scripts/bench_v10.sh` checks out `v0.7.0`, rebuilds, re-benches, and stores the live result in `bench/v10/D-v070-baseline.txt` for the comparison.
+
+---
+
 ## Version regression history (CPU-only, cold cache)
 
 All five minor versions benchmarked on the Ryzen 9 9900X3D, CPU-only backend, 150 DPI, cold cache. No pdftoppm reference — this table is purely for tracking regression and improvement across releases.

@@ -133,7 +133,7 @@ A built-in spill policy polls `/proc/meminfo` every 100 ms and falls subsequent 
 
 | Flag | Default | Description |
 |---|---|---|
-| `--backend auto\|cpu\|cuda\|vaapi` | `auto` | Compute backend for image decoding and GPU fills. |
+| `--backend auto\|cpu\|cuda\|vaapi\|vulkan` | `auto` | Compute backend for image decoding and GPU fills. |
 | `--vaapi-device PATH` | `/dev/dri/renderD128` | VA-API DRM render node (only used with `auto` or `vaapi`). |
 
 **`auto`** — GPU when available, silent CPU fallback (same as pre-v0.4.0).
@@ -142,13 +142,18 @@ A built-in spill policy polls `/proc/meminfo` every 100 ms and falls subsequent 
 
 **`cuda`** — Require CUDA. Exits with an error if nvJPEG or the GPU context cannot be initialised. Use this to confirm the GPU path is actually active rather than silently falling back.
 
+**`vulkan`** — Require the Vulkan compute backend (Phase 10).  Exits with an error if Vulkan initialisation fails or the binary was built without `--features vulkan`.  AA-fill and tile-fill kernels dispatch through `VulkanBackend`; the device-resident image cache is CUDA-only, so under this mode JPEGs decode and composite via the CPU path and ICC CMYK→RGB also stays on the CPU AVX-512 fallback.  Cross-vendor (NVIDIA, AMD, Intel, Apple via `MoltenVK`).
+
 **`vaapi`** — Require VA-API JPEG decoding. Exits with an error if the DRM device cannot be opened. Use this to confirm iGPU/dGPU decoding is active.
 
-`--vaapi-device` has no effect with `--backend cpu` or `--backend cuda` — pdf-raster will reject the combination with a clear error rather than silently ignoring it.
+`--vaapi-device` has no effect with `--backend cpu`, `--backend cuda`, or `--backend vulkan` — pdf-raster will reject the combination with a clear error rather than silently ignoring it.
 
 ```bash
 # Confirm CUDA is active (fails loudly if no NVIDIA GPU)
 pdf-raster --backend cuda -r 150 document.pdf out
+
+# Confirm Vulkan is active (fails loudly if no Vulkan 1.3+ device)
+pdf-raster --backend vulkan -r 150 document.pdf out
 
 # Force CPU-only (useful for benchmarking without GPU)
 pdf-raster --backend cpu -r 150 document.pdf out

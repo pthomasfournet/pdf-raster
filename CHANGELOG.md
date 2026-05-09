@@ -2,6 +2,75 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-05-09
+
+### Bug Fixes
+
+- Async disk writer + opt-in tier + cold-start lookup
+- Review pass — page_h to f32, doc accuracy, IccClut clut required
+- Move cuda_backend_smoke imports inside cfg-gated fn
+- Silence underscore-binding lint on cuCtxGetApiVersion probe
+- Clear -D warnings clippy across feature matrix
+- Clear -D warnings clippy across feature matrix
+- Probe CUDA + nvjpeg2k locations instead of pinning cuda-12.8
+- Hardening pass on Phase 10 task 2
+- Hardening pass on Vulkan backend
+
+### Chores
+
+- Drop stale CUDA-12.8 path pins after driver/toolkit bump
+
+### Documentation
+
+- Backfill v0.7.0 release notes
+- Document why DevicePageBuffer / DeviceImageCache stay un-generified
+- Mark Phase 10 task 1 partial — trait + CudaBackend shipped
+- Phase 10 Task 3 follow-ups + scrub stale comments
+- Phase 10 Task 4 — renderer migration + bench gate
+
+### Features
+
+- Scaffold GpuBackend trait + Params
+- CudaBackend init + alloc + budget; record_* stubbed
+- Wire CudaBackend record_* + submit_page/wait_page
+- Phase 10 task 2 — Slang port of all kernels
+- Phase 10 task 3 — Vulkan compute backend
+- Aa_fill 2D dispatch + blit_image push-constant inv_ctm
+- Persist VkPipelineCache to disk across runs
+- Reusable staging buffer in Vulkan TransferContext
+- Plumb BackendPolicy::ForceVulkan + --backend vulkan
+- ForceVulkan errors loudly until renderer migration lands
+- Wire VulkanBackend through the renderer + nvcc-probe build fix
+
+### Other
+
+- Add image-cache matrix driver
+- Auto-probe CUDA + nvjpeg2k library paths
+- Treat nvjpeg2k as optional, not gating
+- Full matrix on both reference machines — gate FAILS
+- Re-bench after disk-tier rework — gate goes from 14× → 1.1-1.9× regression
+- Trait surface — zero-size rejection, VramBudget invariant, state-machine docs
+- BlitParams::validate enforces NaN/Inf/zero-dim invariants
+- Aa_fill_gpu early-returns on n_pixels == 0
+- Drop stale phase/task refs from doc + panic msg
+- Cuda_backend_smoke — actionable expect/assert messages
+- Reject Mask layout in BlitParams::validate, use be() helper, drop task ref
+- BackendError::msg constructor, demote StringError to private
+- Phase 10 task 4 step 4 — bench gate, all measurable criteria PASS
+
+### Refactor
+
+- Extract composite_rgba8 into lib_kernels::composite
+- Extract apply_soft_mask into lib_kernels::soft_mask
+- Extract aa_fill + aa_fill_gpu into lib_kernels::aa
+- Extract tile_fill into lib_kernels::tile
+- Extract icc_cmyk_to_rgb into lib_kernels::icc
+- Re-export blit under lib_kernels for symmetry
+- Split mod.rs into budget/eviction/promotion submodules
+- Simplify pass on Vulkan backend
+- Hardening + simplify pass on the ForceVulkan surface
+- Hardening + simplify pass on Vulkan dispatch and build.rs
+
 ## [0.7.0] - 2026-05-07
 
 ### Bug Fixes

@@ -244,28 +244,76 @@ the rayon pool drops — this avoids the CUDA driver teardown race at process ex
 
 ### 3.6 `gpu`
 
-CUDA kernels and VA-API decoders. Not linked unless at least one `gpu-*` or `vaapi`
-feature is active.
+GPU compute kernels (CUDA + Vulkan), CUDA decoders, and VA-API decoders.  Not
+linked unless at least one `gpu-*` / `vaapi` / `vulkan` / `cache` feature is
+active.
 
-**`GpuCtx`** — one per process, holds the CUDA context and all compiled PTX kernels
-as `cudarc` modules. Shared via `Arc<GpuCtx>`.
+**Backend abstraction.**  `crates/gpu/src/backend/` factors the per-page state
+machine out of the legacy `GpuCtx`:
 
-**Kernel inventory**
+```text
+GpuBackend trait          (backend/mod.rs)
+├── CudaBackend           (backend/cuda/)        — wraps GpuCtx + per-page recorder
+└── VulkanBackend         (backend/vulkan/)      — ash 0.38 + gpu-allocator + slangc-compiled SPIR-V
+```
 
-| Kernel | File | Operation | Threshold |
-|---|---|---|---|
-| `composite_rgba8` | composite_rgba8.cu | Porter-Duff source-over | 500K px |
-| `apply_soft_mask` | (same) | Per-pixel alpha multiply | 500K px |
-| `aa_fill` | aa_fill.cu | 64-sample jittered AA coverage (warp ballot) | 256 px |
-| `tile_fill` | tile_fill.cu | Analytical 16×16 tile fill | 256 px |
-| `icc_clut` | icc_clut.cu | CMYK→RGB via 4D quadrilinear CLUT | 500K px |
-| `icc_clut` | icc_clut.cu | CMYK→RGB via matrix (always CPU) | — |
+The trait surface is `begin_page → record_* → submit_page → wait_page`, with
+six `record_*` methods (one per kernel) plus `alloc_device` / `alloc_host_pinned`
+/ `upload_async`.  GATs (`type DeviceBuffer`) make it usable only as a generic
+parameter, not `dyn` — callers monomorphise per backend.  Today the renderer
+holds `Option<Arc<GpuCtx>>` for CUDA and `Option<Arc<VulkanBackend>>` for
+Vulkan as parallel fields rather than going through the trait at every call
+site; the trait is the long-term seam, the parallel-field shape is the
+pragmatic Phase 10 close that keeps the Phase 9 cache (which is `CudaSlice<u8>`-typed
+in 33 sites) un-generified.
+
+**`GpuCtx`** (CUDA) — one per process, holds the CUDA context and all compiled
+PTX kernels as `cudarc` modules.  Shared via `Arc<GpuCtx>`.  `cudarc` is pinned
+to the `cuda-12080` driver-API binding so the same source builds against both
+CUDA 12.x and 13.x drivers (forward-compatible per the CUDA driver-API ABI).
+
+**`VulkanBackend`** — one per process; loads the Vulkan instance, picks a
+discrete device (ranks discrete > integrated > virtual > CPU), creates a single
+compute queue, and lazy-loads SPIR-V → `VkPipeline` per kernel.  Persistent
+`VkPipelineCache` blob at `$XDG_CACHE_HOME/pdf-raster/vulkan_pipeline_cache.bin`
+across runs.  Shared via `Arc<VulkanBackend>`.  The renderer dispatches AA fill
+and tile fill through this; ICC CMYK→RGB and the `cache` feature stay CUDA-only,
+so `--backend vulkan` runs uncached and the CMYK matrix path falls to CPU AVX-512.
+
+**Kernel inventory.**  All six kernels exist in **both** `.cu` (CUDA, compiled
+to PTX by `nvcc`) and `.slang` (Slang, compiled to SPIR-V by `slangc`) at build
+time, gated on the `vulkan` feature.
+
+| Kernel | CUDA file | Slang file | Operation | Threshold |
+|---|---|---|---|---|
+| `composite_rgba8` | composite_rgba8.cu | composite_rgba8.slang | Porter-Duff source-over | 500K px |
+| `apply_soft_mask` | (same) | apply_soft_mask.slang | Per-pixel alpha multiply | 500K px |
+| `aa_fill` | aa_fill.cu | aa_fill.slang | 64-sample jittered AA coverage (warp ballot / `WaveActiveSum`) | 256 px |
+| `tile_fill` | tile_fill.cu | tile_fill.slang | Analytical 16×16 tile fill | 256 px |
+| `icc_clut` | icc_clut.cu | icc_clut.slang | CMYK→RGB via 4D quadrilinear CLUT | 500K px |
+| `icc_clut` matrix | icc_clut.cu | icc_clut.slang | CMYK→RGB via matrix (always CPU) | — |
+| `blit_image` | blit_image.cu | blit_image.slang | Cached-image source-over composite (Phase 9) | always |
+
+15 kernel-level parity tests in `crates/gpu/tests/cu_vs_slang_parity.rs` confirm
+SPIR-V vs CUDA outputs within ≤ 1 LSB per channel on the dev box.
+
+**Build-script model.**  `crates/gpu/build.rs` probes `nvcc --version` directly:
+when nvcc works, real PTX is compiled regardless of features.  When nvcc fails
+(no CUDA toolkit on a CI runner), 0-byte placeholder PTX files are written and
+`cargo:rustc-cfg=ptx_placeholder` is emitted; `GpuCtx::init` short-circuits
+under that cfg with a clear error pointing at the build host.  Slang→SPIR-V
+compile is gated on `CARGO_FEATURE_VULKAN`.
 
 **Optional decoders** (feature-gated)
 - `nvjpeg` — `NvJpegDecoder`, TLS one-per-thread, primary `GPU_HYBRID`, fallback `DEFAULT`
 - `nvjpeg2k` — `NvJpeg2kDecoder`, same TLS pattern; C++ exception shim in `shim/nvjpeg2k_shim.cpp`
 - `gpu-deskew` — `npp_rotate()` via `nppiRotate_8u_C1R_Ctx`
 - `vaapi` — `VapiJpegDecoder`; VA-API JPEG baseline decode on Linux iGPU/dGPU (AMD VCN, Intel Quick Sync, Intel Arc); links `libva.so.2` + `libva-drm.so.2`. Dispatch priority: nvJPEG → VA-API → zune-jpeg (CPU). CMYK and progressive JPEG fall through to CPU.
+
+**Phase 9 image cache** (`cache` feature, CUDA-only)
+- `DeviceImageCache` — three tiers: VRAM (refcount-pinned LRU), pinned host RAM (`cuMemAllocHost` slabs, demote-on-evict / promote-on-hit), disk (`<root>/<doc-blake3>/<content-hash>.bin` sidecar files; opt-in via `PDF_RASTER_CACHE_DIR`).
+- `DevicePageBuffer` — zero-init RGBA8 per page; lazy-allocated on first GPU image; downloaded + alpha-composited onto the host bitmap at `PageRenderer::finish`.
+- BLAKE3 content hashing keys cross-document dedup; `(DocId, ObjId)` alias keys same-document fast paths.
 
 **CPU fallbacks** — every GPU function has a pure-Rust CPU counterpart. The
 dispatch logic is in the same function; the threshold is the only branch.
