@@ -31,7 +31,7 @@
 )]
 #![expect(
     clippy::significant_drop_tightening,
-    reason = "the inner Mutex<State1> is held across Vulkan calls intentionally — single-page-in-flight design serialises every record_* through the same lock"
+    reason = "the inner Mutex<RecorderState> is held across Vulkan calls intentionally — single-page-in-flight design serialises every record_* through the same lock"
 )]
 
 use std::sync::Arc;
@@ -76,7 +76,7 @@ enum State {
 
 /// Inner mutable state guarded by a single mutex.  Cheap to lock — the
 /// recorder is single-page-in-flight by design.
-struct State1 {
+struct RecorderState {
     state: State,
     /// Monotonically increasing timeline value; the next submission will
     /// signal `next_value` and the matching `wait_page` will wait on it.
@@ -99,8 +99,8 @@ pub(super) struct PageRecorder {
     pipelines: Arc<PipelineCache>,
     timeline: vk::Semaphore,
     cmd_pool: vk::CommandPool,
-    /// Mutex for the State1 above.
-    inner: Mutex<State1>,
+    /// Mutex for the `RecorderState` above.
+    inner: Mutex<RecorderState>,
 }
 
 /// Maximum descriptor sets allocated per page.  One per `record_*` call;
@@ -159,7 +159,7 @@ impl PageRecorder {
             pipelines,
             timeline,
             cmd_pool,
-            inner: Mutex::new(State1 {
+            inner: Mutex::new(RecorderState {
                 state: State::Idle,
                 next_value: 1,
                 cmd,
@@ -218,7 +218,11 @@ impl PageRecorder {
                 .map_err(vk_err("vkEndCommandBuffer"))?;
         }
         let signal_value = s.next_value;
-        s.next_value = s.next_value.checked_add(1).expect("timeline overflow");
+        s.next_value = s.next_value.checked_add(1).ok_or_else(|| {
+            BackendError::msg(
+                "timeline semaphore value would overflow u64 — process has been running long enough to render 2^64 pages, restart it",
+            )
+        })?;
 
         let mut tl_submit = vk::TimelineSemaphoreSubmitInfo::default()
             .signal_semaphore_values(std::slice::from_ref(&signal_value));
@@ -242,19 +246,32 @@ impl PageRecorder {
     }
 
     pub(super) fn wait_page(&self, fence: PageFence) -> Result<()> {
+        // Hold the mutex across the wait so callers on other threads
+        // observe the Submitted → Idle transition atomically; without
+        // this, a parallel begin_page on another thread could squeak in
+        // before state flips and produce a confusing error.  Trait
+        // contract is single-threaded anyway; this is belt-and-braces.
+        let mut s = self.inner.lock().expect("recorder mutex poisoned");
+        if s.state != State::Submitted {
+            return Err(BackendError::msg(format!(
+                "wait_page called from {:?} state; expected Submitted",
+                s.state
+            )));
+        }
         let semaphores = [self.timeline];
         let values = [fence.value];
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        // u64::MAX = wait forever.
+        // u64::MAX = wait forever.  vkWaitSemaphores blocks the calling
+        // thread but does not require external synchronisation, so
+        // holding our own mutex here is safe.
         unsafe {
             self.device
                 .device
                 .wait_semaphores(&wait_info, u64::MAX)
                 .map_err(vk_err("vkWaitSemaphores"))?;
         }
-        let mut s = self.inner.lock().expect("recorder mutex poisoned");
         s.state = State::Idle;
         Ok(())
     }
@@ -306,10 +323,23 @@ impl PageRecorder {
         push[16..20].copy_from_slice(&p.height.to_ne_bytes());
         push[20..24].copy_from_slice(&i32::from(p.fill_rule != 0).to_ne_bytes());
         // Workgroup = 1 pixel (64 lanes). Grid = total pixel count.
+        // Architectural ceiling: Vulkan caps `maxComputeWorkGroupCount[0]`
+        // at as low as 65535; a 256×256 image already exceeds that.  Real
+        // pages need a 2D dispatch — kernel re-parametrisation is a
+        // follow-up.  For now, fail loudly so callers don't see the
+        // driver's vague ERROR_DEVICE_LOST.
         let total_pixels = p
             .width
             .checked_mul(p.height)
             .ok_or_else(|| BackendError::msg("aa_fill: width * height overflowed u32"))?;
+        let max_x = self.device.max_workgroup_count[0];
+        if total_pixels > max_x {
+            return Err(BackendError::msg(format!(
+                "aa_fill: dispatch of {total_pixels} workgroups exceeds device's \
+                 maxComputeWorkGroupCount[0] = {max_x}; the kernel needs a 2D \
+                 dispatch re-parametrisation for images larger than ~{max_x} pixels"
+            )));
+        }
         self.dispatch_kernel(
             KernelId::AaFill,
             &[p.segs.handle(), p.coverage.handle()],
@@ -354,10 +384,11 @@ impl PageRecorder {
         &self,
         p: params::IccClutParams<'_, super::VulkanBackend>,
     ) -> Result<()> {
-        // Push: grid_n(u32), n(u32).  Recover grid_n from CLUT length.
+        // Push: grid_n(u32), n(u32).  Recover grid_n from CLUT length
+        // via the shared helper used by both backends.
         let clut_bytes = usize::try_from(p.clut.size())
             .map_err(|_| BackendError::msg("ICC CLUT size does not fit in usize"))?;
-        let grid_n = grid_n_from_clut_len(clut_bytes).ok_or_else(|| {
+        let grid_n = params::grid_n_from_clut_len(clut_bytes).ok_or_else(|| {
             BackendError::msg(format!(
                 "ICC CLUT length {clut_bytes} is not a valid grid_n^4 * 3"
             ))
@@ -395,10 +426,31 @@ impl PageRecorder {
         ))
     }
 
+    /// Bail if `groups` exceeds the device's `maxComputeWorkGroupCount`
+    /// per axis.  Without this, an oversized dispatch returns an opaque
+    /// `ERROR_DEVICE_LOST` from the driver later — much harder to debug.
+    fn check_dispatch_size(&self, groups: (u32, u32, u32), kernel: &str) -> Result<()> {
+        let limits = self.device.max_workgroup_count;
+        if groups.0 > limits[0] || groups.1 > limits[1] || groups.2 > limits[2] {
+            return Err(BackendError::msg(format!(
+                "{kernel}: dispatch ({},{},{}) exceeds device maxComputeWorkGroupCount ({},{},{})",
+                groups.0, groups.1, groups.2, limits[0], limits[1], limits[2]
+            )));
+        }
+        Ok(())
+    }
+
     /// Common dispatch flow: allocate a descriptor set, write the buffer
     /// bindings, bind the pipeline, push constants, dispatch, then emit
     /// a compute→compute memory barrier so the next dispatch sees the
     /// writes.
+    ///
+    /// The recorder mutex is held for the entire body — we mutate `s.cmd`
+    /// (which is the single in-flight command buffer) and `s.desc_pool`
+    /// (which allocates from a single per-page pool).  Dropping and
+    /// re-acquiring the lock would let two threads race on `s.cmd`, which
+    /// is undefined behaviour at the Vulkan level (command buffers are
+    /// not externally synchronised by default).
     fn dispatch_kernel(
         &self,
         id: KernelId,
@@ -409,10 +461,15 @@ impl PageRecorder {
     ) -> Result<()> {
         debug_assert_eq!(buffers.len(), sizes.len());
 
+        // Look up pipeline handles BEFORE locking — `pipelines.handles`
+        // can take its own internal locks (PipelineCache's per-slot
+        // OnceLock); locking ours first would risk an inversion.
         let handles = self.pipelines.handles(id)?;
         debug_assert_eq!(buffers.len(), handles.n_storage_buffers as usize);
 
-        let s = self.inner.lock().expect("recorder mutex poisoned");
+        self.check_dispatch_size(groups, id.label())?;
+
+        let mut s = self.inner.lock().expect("recorder mutex poisoned");
         if s.state != State::Recording {
             return Err(BackendError::msg(format!(
                 "dispatch_kernel called from {:?} state; expected Recording",
@@ -468,7 +525,6 @@ impl PageRecorder {
             self.device.device.update_descriptor_sets(&writes, &[]);
         }
 
-        let dispatch_groups = (groups.0, groups.1, groups.2);
         // Safety: cmd is in recording state; pipeline & layout are live.
         unsafe {
             self.device.device.cmd_bind_pipeline(
@@ -493,12 +549,9 @@ impl PageRecorder {
                     push,
                 );
             }
-            self.device.device.cmd_dispatch(
-                s.cmd,
-                dispatch_groups.0,
-                dispatch_groups.1,
-                dispatch_groups.2,
-            );
+            self.device
+                .device
+                .cmd_dispatch(s.cmd, groups.0, groups.1, groups.2);
 
             // Global compute→compute memory barrier so the next dispatch
             // sees these writes.  Pessimistic but correct (the CUDA
@@ -514,20 +567,30 @@ impl PageRecorder {
             self.device.device.cmd_pipeline_barrier2(s.cmd, &dep_info);
         }
 
-        drop(s);
-        // Increment AFTER successful encode so a partial failure doesn't
-        // leak a slot.
-        let mut s2 = self.inner.lock().expect("recorder mutex poisoned");
-        s2.desc_sets_in_flight = s2.desc_sets_in_flight.saturating_add(1);
+        // Increment under the same lock so two concurrent record_* calls
+        // can't both observe an unincremented count and over-allocate.
+        s.desc_sets_in_flight = s.desc_sets_in_flight.saturating_add(1);
         Ok(())
     }
 }
 
 impl Drop for PageRecorder {
     fn drop(&mut self) {
+        // Recover from a poisoned mutex rather than panicking inside
+        // Drop — a panic here is a double-panic which aborts the process
+        // and can mask the original failure.  After a poison, the inner
+        // state may be inconsistent, but the Vulkan handles themselves
+        // are still owned by us and need to be destroyed.
+        let s = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                log::warn!("PageRecorder mutex was poisoned at drop; destroying handles anyway");
+                poisoned.into_inner()
+            }
+        };
         // Safety: device_wait_idle was called by VulkanBackend::drop
-        // before us, so all submissions are complete.
-        let s = self.inner.lock().expect("recorder mutex poisoned (drop)");
+        // before us, so all submissions are complete and no work
+        // references these handles.
         unsafe {
             self.device
                 .device
@@ -536,25 +599,4 @@ impl Drop for PageRecorder {
             self.device.device.destroy_semaphore(self.timeline, None);
         }
     }
-}
-
-/// Recover `grid_n` such that `len == grid_n^4 * 3`, or `None`.
-/// Mirrors the CUDA backend's helper at
-/// `crates/gpu/src/backend/cuda/page_recorder.rs::grid_n_from_clut_len`.
-fn grid_n_from_clut_len(len: usize) -> Option<u32> {
-    if !len.is_multiple_of(3) {
-        return None;
-    }
-    let nodes = len / 3;
-    for grid in 2u32..=255 {
-        let g = grid as usize;
-        let pow4 = g.checked_mul(g)?.checked_mul(g)?.checked_mul(g)?;
-        if pow4 == nodes {
-            return Some(grid);
-        }
-        if pow4 > nodes {
-            return None;
-        }
-    }
-    None
 }

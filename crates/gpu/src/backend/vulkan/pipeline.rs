@@ -20,6 +20,7 @@
 //! width.  We don't pin a `requiredSubgroupSize` — the kernel adapts via
 //! its `groupshared` cross-subgroup reduction.
 
+use std::ffi::CStr;
 use std::sync::Arc;
 
 use ash::vk;
@@ -65,10 +66,19 @@ impl KernelId {
     /// the same `"main"` name in the .spv binary.  The `-entry` arg in
     /// build.rs picks *which* function ends up as `"main"` for kernels
     /// that have multiple entry points (`icc_clut.slang`'s matrix vs CLUT).
-    const fn entry_point(self) -> &'static str {
-        // All slangc-emitted SPIR-V uses "main" — see comment above.
-        let _ = self;
-        "main"
+    const ENTRY_POINT: &'static CStr = c"main";
+
+    /// Human-readable kernel name for diagnostics.  Matches the source
+    /// filename (and the function name in the .cu / .slang).
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Composite => "composite_rgba8",
+            Self::ApplySoftMask => "apply_soft_mask",
+            Self::AaFill => "aa_fill",
+            Self::TileFill => "tile_fill",
+            Self::IccClut => "icc_cmyk_clut",
+            Self::BlitImage => "blit_image",
+        }
     }
 
     /// Number of `STORAGE_BUFFER` descriptors in set 0.
@@ -129,24 +139,23 @@ impl PipelineCache {
     }
 
     /// Get (or build, if first call) the compiled kernel for `id`.
+    ///
+    /// `OnceLock::get_or_try_init` is still nightly (rust-lang/rust#109737),
+    /// so we manually do the get-then-set-then-cleanup-loser dance.  The
+    /// race window is tiny in practice (only first-dispatch contention)
+    /// and a duplicate compile is correctness-safe — the loser's pipeline
+    /// is destroyed by `destroy_one` before we return.
     fn get(&self, id: KernelId) -> Result<&CompiledKernel> {
         let slot = &self.slots[id as usize];
-        // OnceLock::get_or_try_init isn't stable; use the explicit pattern.
         if let Some(c) = slot.get() {
             return Ok(c);
         }
         let compiled = self.compile(id)?;
-        // Race: if another thread races us we discard ours; both produce
-        // the same VkPipeline shape so functional correctness holds, but
-        // the loser leaks a pipeline.  Tolerated for first-dispatch
-        // contention in a backend that's almost always single-threaded
-        // per page.  TODO: switch to OnceLock::get_or_try_init when stable.
         match slot.set(compiled) {
             Ok(()) => Ok(slot.get().expect("just set")),
             Err(extra) => {
-                // Someone beat us; clean up our duplicate.
                 self.destroy_one(&extra);
-                Ok(slot.get().expect("set by the other thread"))
+                Ok(slot.get().expect("set by the racing thread"))
             }
         }
     }
@@ -193,9 +202,27 @@ impl PipelineCache {
         // Safety: SPIR-V comes from `slangc -target spirv` at build time;
         // it's pre-validated by `spirv-val` and aligned to 4 bytes (any
         // SPIR-V file is, per spec).  We wrap in a Cursor to feed
-        // ash::util::read_spv which expects a Read.
-        let words = ash::util::read_spv(&mut std::io::Cursor::new(spirv))
-            .map_err(|e| BackendError::msg(format!("read_spv({:?}): {e}", id.entry_point())))?;
+        // ash::util::read_spv which expects a Read.  The Vec<u32> result
+        // is dropped at the end of `compile`; the shader module owns its
+        // own copy of the SPIR-V after vkCreateShaderModule succeeds.
+        //
+        // If read_spv fails (would only happen if our build-baked SPIR-V
+        // bytes have a non-multiple-of-4 length, which the SPIR-V spec
+        // forbids — so this branch is unreachable in practice), still
+        // tear down the layouts we already created.
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(spirv)).map_err(|e| {
+            // Safety: handles owned by us; nothing else holds them; we're
+            // bailing out before they could be used.
+            unsafe {
+                self.device
+                    .device
+                    .destroy_pipeline_layout(pipeline_layout, None);
+                self.device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+            }
+            BackendError::msg(format!("read_spv({}): {e}", id.label()))
+        })?;
         let sm_info = vk::ShaderModuleCreateInfo::default().code(&words);
         let shader_module = unsafe { self.device.device.create_shader_module(&sm_info, None) }
             .map_err(vk_err("vkCreateShaderModule"))
@@ -208,12 +235,10 @@ impl PipelineCache {
                     .destroy_descriptor_set_layout(descriptor_set_layout, None);
             })?;
 
-        let entry_point_c = std::ffi::CString::new(id.entry_point())
-            .expect("entry-point name has no NULs by construction");
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
-            .name(entry_point_c.as_c_str());
+            .name(KernelId::ENTRY_POINT);
         let pipeline_info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout)];
@@ -242,7 +267,7 @@ impl PipelineCache {
                 }
                 return Err(BackendError::msg(format!(
                     "vkCreateComputePipelines for {} failed: {code:?}",
-                    id.entry_point()
+                    id.label()
                 )));
             }
         };
@@ -288,26 +313,27 @@ impl Drop for PipelineCache {
     }
 }
 
-/// Public accessor returned to the recorder; carries enough handles for
-/// it to bind and dispatch.  Borrowed for the lifetime of `&PipelineCache`.
-pub(super) struct PipelineHandles<'a> {
+/// Pipeline handles needed to record a dispatch.  The Vulkan handles are
+/// `Copy` and remain valid for the lifetime of the owning `PipelineCache`,
+/// which is tied to the `Arc<PipelineCache>` the recorder holds; no
+/// separate borrow is needed here.
+#[derive(Clone, Copy)]
+pub(super) struct PipelineHandles {
     pub(super) pipeline: vk::Pipeline,
     pub(super) layout: vk::PipelineLayout,
     pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) n_storage_buffers: u32,
-    _life: std::marker::PhantomData<&'a ()>,
 }
 
 impl PipelineCache {
     /// Get pipeline handles for `id`, lazily compiling on first call.
-    pub(super) fn handles(&self, id: KernelId) -> Result<PipelineHandles<'_>> {
+    pub(super) fn handles(&self, id: KernelId) -> Result<PipelineHandles> {
         let c = self.get(id)?;
         Ok(PipelineHandles {
             pipeline: c.pipeline,
             layout: c.pipeline_layout,
             descriptor_set_layout: c.descriptor_set_layout,
             n_storage_buffers: id.n_storage_buffers(),
-            _life: std::marker::PhantomData,
         })
     }
 }

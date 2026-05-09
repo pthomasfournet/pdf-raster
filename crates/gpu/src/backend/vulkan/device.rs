@@ -10,7 +10,7 @@
 
 use ash::ext::memory_budget;
 use ash::vk;
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 use std::sync::Arc;
 
 use crate::backend::{BackendError, Result};
@@ -32,6 +32,11 @@ pub(super) struct DeviceCtx {
     pub(super) phys: vk::PhysicalDevice,
     /// Cached memory properties (memoryTypeBits → `MemoryType` lookup).
     pub(super) mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// Per-axis maximum workgroup count for `vkCmdDispatch`.  Vulkan's
+    /// guaranteed minimum is `(65535, 65535, 65535)`; checked at dispatch
+    /// time so the kernel-launch helpers can fail with a useful message
+    /// instead of letting the driver return `ERROR_DEVICE_LOST`.
+    pub(super) max_workgroup_count: [u32; 3],
     /// Total VRAM advertised by the driver — fixed across the device's lifetime.
     pub(super) vram_total: u64,
     /// Whether `VK_EXT_memory_budget` was successfully enabled (gates
@@ -76,6 +81,12 @@ pub(super) fn init() -> Result<Arc<DeviceCtx>> {
     let (phys, compute_queue_family) = pick_physical_device(&instance)?;
     let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
 
+    // Pull the dispatch group-count limit once.  Spec guarantees ≥ 65535
+    // per axis; some software ICDs (lavapipe) report u32::MAX which is
+    // fine — we only check against this to fail loudly, not to clamp.
+    let dev_props = unsafe { instance.get_physical_device_properties(phys) };
+    let max_workgroup_count = dev_props.limits.max_compute_work_group_count;
+
     let (device, compute_queue, has_memory_budget) =
         create_device(&instance, phys, compute_queue_family)?;
 
@@ -87,6 +98,7 @@ pub(super) fn init() -> Result<Arc<DeviceCtx>> {
         compute_queue,
         phys,
         mem_props,
+        max_workgroup_count,
         vram_total,
         has_memory_budget,
         instance,
@@ -118,14 +130,26 @@ fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice,
         return Err(BackendError::msg("no Vulkan physical devices found"));
     }
 
-    for phys in physicals {
-        let props = unsafe { instance.get_physical_device_properties(phys) };
+    // Prefer discrete GPUs over integrated/virtual/CPU ICDs.  Stable sort
+    // by descending device-type rank so we walk the best candidate first
+    // but still fall through to weaker devices (e.g. lavapipe) if no
+    // discrete GPU meets the API-version requirement.
+    let mut ranked: Vec<_> = physicals
+        .into_iter()
+        .map(|p| {
+            let props = unsafe { instance.get_physical_device_properties(p) };
+            (device_type_rank(props.device_type), p, props)
+        })
+        .collect();
+    ranked.sort_by_key(|(r, _, _)| *r);
+
+    for (_, phys, props) in ranked {
         // Require Vulkan 1.3 core; we depend on synchronization2,
         // timelineSemaphore, BDA, and 8-bit storage as core features.
-        if vk::api_version_major(props.api_version) < 1
-            || (vk::api_version_major(props.api_version) == 1
-                && vk::api_version_minor(props.api_version) < 3)
-        {
+        // `props.api_version` is the maximum API version this driver
+        // supports; comparing against the packed VK_API_VERSION_1_3
+        // constant gives a single integer comparison.
+        if props.api_version < vk::API_VERSION_1_3 {
             continue;
         }
 
@@ -158,7 +182,7 @@ fn create_device(
         name == memory_budget::NAME
     });
 
-    let mut enabled_exts: Vec<*const i8> = Vec::new();
+    let mut enabled_exts: Vec<*const c_char> = Vec::new();
     if has_memory_budget {
         enabled_exts.push(memory_budget::NAME.as_ptr());
     }
@@ -196,6 +220,18 @@ fn create_device(
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
     Ok((device, queue, has_memory_budget))
+}
+
+/// Rank physical-device types so we prefer discrete > integrated > virtual > CPU.
+/// Lower number ⇒ higher preference.
+const fn device_type_rank(t: vk::PhysicalDeviceType) -> u8 {
+    match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        vk::PhysicalDeviceType::CPU => 3,
+        _ => 4,
+    }
 }
 
 /// Sum of every `DEVICE_LOCAL` heap on the picked physical device.

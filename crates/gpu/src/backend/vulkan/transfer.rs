@@ -20,7 +20,6 @@ use crate::backend::{BackendError, Result};
 use super::device::DeviceCtx;
 use super::error::vk_err;
 use super::memory::{DeviceBuffer, SlabAllocator};
-use super::recorder::PageFence;
 
 pub(super) struct TransferContext {
     device: Arc<DeviceCtx>,
@@ -42,39 +41,13 @@ impl TransferContext {
         Ok(Self { device, cmd_pool })
     }
 
-    /// Upload `src` into `dst[0..src.len()]` and block until complete.
-    ///
-    /// Returns an already-signalled fence so callers can compose with
-    /// the per-page `wait_page` flow.
-    #[expect(
-        clippy::unused_self,
-        reason = "shape-only — real allocator handle lives on the backend; this method exists so the trait's upload_async has somewhere to dispatch through (the backend forwards to upload_sync today)"
-    )]
-    pub(super) fn upload_async(&self, dst: &DeviceBuffer, src: &[u8]) -> Result<PageFence> {
-        let src_len = u64::try_from(src.len())
-            .map_err(|_| BackendError::msg("upload_async: src.len() exceeds u64"))?;
-        if src_len > dst.size() {
-            return Err(BackendError::msg(format!(
-                "upload_async: src.len() ({src_len}) exceeds dst capacity ({})",
-                dst.size()
-            )));
-        }
-        if src.is_empty() {
-            return Ok(PageFence::immediate());
-        }
-        // We don't have a SlabAllocator handle here — it lives on the
-        // backend.  Provide an explicit method that takes a borrow of
-        // the allocator (called by the public surface in mod.rs).
-        Err(BackendError::msg(
-            "upload_async called without allocator handle; use VulkanBackend::upload(...) directly",
-        ))
-    }
-
     /// Synchronous upload: copy `src` into `dst[0..src.len()]`, block
     /// until complete, return.
     ///
-    /// Internal helper used by tests and the public `upload_async`
-    /// once the allocator lives on the same struct (Phase 10 follow-up).
+    /// Used by the trait's `upload_async` (which currently completes
+    /// before returning, so the fence it hands back is already
+    /// signalled) and directly by tests.  A real async path with a
+    /// dedicated transfer queue is a spec follow-up.
     pub(super) fn upload_sync(
         &self,
         allocator: &SlabAllocator,
@@ -145,9 +118,25 @@ impl TransferContext {
     }
 
     /// Allocate a one-shot command buffer, run `f` to record into it,
-    /// submit it, wait for the queue to idle, then free the command
-    /// buffer.  Slow but correct; only used for upload/download today.
+    /// submit it, wait for the queue to idle, then reset the pool.
+    /// Slow but correct; only used for upload/download today.
+    ///
+    /// Pool reset (rather than `free_command_buffers`) is the canonical
+    /// idiom for one-shot command buffers and is leak-safe even when an
+    /// error path bails before the explicit free.  We reset *at the
+    /// start* of each run so the previous transfer's buffer is reclaimed
+    /// regardless of how that one ended.
     fn run_one_shot<F: FnOnce(vk::CommandBuffer)>(&self, f: F) -> Result<()> {
+        // Reset upfront so a prior failed transfer can't leave the pool
+        // dirty.  TRANSIENT lets us reset cheaply.  Safe to call even on
+        // an empty pool.
+        unsafe {
+            self.device
+                .device
+                .reset_command_pool(self.cmd_pool, vk::CommandPoolResetFlags::empty())
+                .map_err(vk_err("vkResetCommandPool (transfer)"))?;
+        }
+
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.cmd_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -189,10 +178,9 @@ impl TransferContext {
                 .device
                 .queue_wait_idle(self.device.compute_queue)
                 .map_err(vk_err("vkQueueWaitIdle (transfer)"))?;
-            self.device
-                .device
-                .free_command_buffers(self.cmd_pool, &[cmd]);
         }
+        // No explicit free: the next call's reset_command_pool reclaims
+        // the buffer.  This mirrors the recorder's pool-reset idiom.
         Ok(())
     }
 }

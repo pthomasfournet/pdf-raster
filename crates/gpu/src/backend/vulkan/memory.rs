@@ -150,17 +150,24 @@ impl HostBuffer {
     }
     /// Read-only view of the persistently-mapped contents.
     #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "self.size came from `u64::try_from(usize)` at alloc time, so the round-trip back to usize is exact on 64-bit; on 32-bit it can only saturate at allocations > 4 GB which gpu-allocator wouldn't have made"
+    )]
+    pub const fn as_slice(&self) -> &[u8] {
         // Safety: gpu-allocator returns a valid `*mut u8` that stays
         // mapped for the allocation's lifetime; the slice lifetime is
-        // tied to `&self` so the pointer is dereferenceable.  `size`
-        // is the requested allocation size, so it's a safe upper bound.
-        let len = usize::try_from(self.size).unwrap_or(usize::MAX);
+        // tied to `&self` so the pointer is dereferenceable.
+        let len = self.size as usize;
         unsafe { std::slice::from_raw_parts(self.mapped_ptr, len) }
     }
     /// Mutable view of the persistently-mapped contents.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        let len = usize::try_from(self.size).unwrap_or(usize::MAX);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "see as_slice — the cast is exact for any allocation gpu-allocator could have made on this host"
+    )]
+    pub const fn as_mut_slice(&mut self) -> &mut [u8] {
+        let len = self.size as usize;
         // Safety: same as `as_slice`, with `&mut self` enforcing
         // exclusive access at the Rust-borrow level.
         unsafe { std::slice::from_raw_parts_mut(self.mapped_ptr, len) }
@@ -271,28 +278,17 @@ impl SlabAllocator {
             MemoryLocation::CpuToGpu,
             "pdf-raster host staging buffer",
         )?;
-        // gpu-allocator persistently maps CpuToGpu allocations; pull the
-        // pointer for slice access.
-        let mapped_ptr = allocation
-            .mapped_ptr()
-            .map_or(std::ptr::null_mut(), |nn| nn.as_ptr().cast::<u8>());
-        if mapped_ptr.is_null() {
-            // Roll back the allocation + buffer if the pointer is missing.
-            let mut allocator = self
-                .inner
-                .allocator
-                .lock()
-                .expect("allocator mutex poisoned");
-            let _ = allocator.free(allocation);
-            drop(allocator);
-            // Safety: created via vkCreateBuffer above; nothing else holds the handle.
-            unsafe {
-                self.inner.device.device.destroy_buffer(buffer, None);
-            }
+        // gpu-allocator persistently maps CpuToGpu allocations.  If the
+        // pointer is missing, it's a gpu-allocator bug or an OOM that
+        // wasn't surfaced — roll back cleanly and report.
+        let mapped_ptr = if let Some(nn) = allocation.mapped_ptr() {
+            nn.as_ptr().cast::<u8>()
+        } else {
+            self.rollback_alloc(buffer, allocation, "alloc_host: no mapped pointer");
             return Err(BackendError::msg(
                 "host buffer allocation has no mapped pointer (gpu-allocator returned None)",
             ));
-        }
+        };
         Ok(HostBuffer {
             buffer,
             size: u64::try_from(size).expect("size fits u64"),
@@ -300,6 +296,26 @@ impl SlabAllocator {
             allocation: Some(allocation),
             parent: self.inner.clone(),
         })
+    }
+
+    /// Roll back a partially-constructed allocation: free the
+    /// gpu-allocator block (logging if free returns a Result error;
+    /// we're already on an error path) and destroy the unbound buffer.
+    fn rollback_alloc(&self, buffer: vk::Buffer, allocation: Allocation, ctx: &str) {
+        let mut allocator = self
+            .inner
+            .allocator
+            .lock()
+            .expect("allocator mutex poisoned");
+        if let Err(e) = allocator.free(allocation) {
+            log::warn!("rollback ({ctx}): gpu-allocator free returned: {e}");
+        }
+        drop(allocator);
+        // Safety: caller guarantees the buffer was just created via
+        // vkCreateBuffer and no other handle exists.
+        unsafe {
+            self.inner.device.device.destroy_buffer(buffer, None);
+        }
     }
 
     /// Free a device buffer.  Drop runs the actual free; the explicit
@@ -381,20 +397,14 @@ impl SlabAllocator {
                 allocation.offset(),
             )
         };
-        if let Err(e) = bind_result {
-            let mut allocator = self
-                .inner
-                .allocator
-                .lock()
-                .expect("allocator mutex poisoned");
-            let _ = allocator.free(allocation);
-            drop(allocator);
-            // Safety: same as the rollback above.
-            unsafe {
-                self.inner.device.device.destroy_buffer(buffer, None);
-            }
+        if let Err(code) = bind_result {
+            self.rollback_alloc(
+                buffer,
+                allocation,
+                "create_and_bind: vkBindBufferMemory failed",
+            );
             return Err(BackendError::msg(format!(
-                "vkBindBufferMemory failed: {e:?}"
+                "vkBindBufferMemory failed: {code:?}"
             )));
         }
 

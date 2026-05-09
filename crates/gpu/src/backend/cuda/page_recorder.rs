@@ -169,7 +169,7 @@ impl PageRecorder {
         p: params::IccClutParams<'_, super::CudaBackend>,
     ) -> Result<()> {
         let clut_bytes = p.clut.len();
-        let grid_n = grid_n_from_clut_len(clut_bytes).ok_or_else(|| {
+        let grid_n = params::grid_n_from_clut_len(clut_bytes).ok_or_else(|| {
             BackendError::msg(format!(
                 "ICC CLUT length {clut_bytes} is not a valid grid_n^4 * 3"
             ))
@@ -215,51 +215,5 @@ impl PageRecorder {
         self.ctx
             .launch_soft_mask_async(p.pixels, p.mask, p.n_pixels)
             .map_err(be)
-    }
-}
-
-/// Given a CLUT byte length, recover `grid_n` such that
-/// `len == grid_n^4 * 3`, or `None` if the length is invalid.
-///
-/// The CLUT layout is `(k * G³ + c * G² + m * G + y) * 3` bytes —
-/// `grid_n^4` 3-byte RGB nodes.  Typical PDF profiles use `grid_n` = 17
-/// or 33.
-fn grid_n_from_clut_len(len: usize) -> Option<u32> {
-    if !len.is_multiple_of(3) {
-        return None;
-    }
-    let nodes = len / 3;
-    // Integer 4th root by iteration: grid_n ≤ 255 in practice.
-    for grid in 2u32..=255 {
-        let g = grid as usize;
-        let pow4 = g.checked_mul(g)?.checked_mul(g)?.checked_mul(g)?;
-        if pow4 == nodes {
-            return Some(grid);
-        }
-        if pow4 > nodes {
-            return None;
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grid_n_round_trips() {
-        assert_eq!(grid_n_from_clut_len(17 * 17 * 17 * 17 * 3), Some(17));
-        assert_eq!(grid_n_from_clut_len(33 * 33 * 33 * 33 * 3), Some(33));
-    }
-
-    #[test]
-    fn grid_n_rejects_non_multiple_of_3() {
-        assert_eq!(grid_n_from_clut_len(83_521 * 3 + 1), None);
-    }
-
-    #[test]
-    fn grid_n_rejects_non_4th_power() {
-        assert_eq!(grid_n_from_clut_len(100 * 3), None);
     }
 }

@@ -135,6 +135,55 @@ pub struct IccClutParams<'a, B: GpuBackend + ?Sized> {
     pub n_pixels: u32,
 }
 
+/// Recover `grid_n` such that `clut_byte_len == grid_n^4 * 3`, or `None`
+/// if the length is not a valid CLUT layout.
+///
+/// The CLUT layout is `(k * G^3 + c * G^2 + m * G + y) * 3` bytes —
+/// `grid_n^4` 3-byte RGB nodes.  Typical PDF profiles use `grid_n` of
+/// 17 or 33.  Shared between the CUDA and Vulkan backends; both
+/// recovers `grid_n` from the buffer size at record time.
+#[must_use]
+pub fn grid_n_from_clut_len(len: usize) -> Option<u32> {
+    if !len.is_multiple_of(3) {
+        return None;
+    }
+    let nodes = len / 3;
+    // Integer 4th root by iteration: grid_n ≤ 255 in practice (PDF
+    // profiles rarely exceed 33; 255 is a generous upper bound).
+    for grid in 2u32..=255 {
+        let g = grid as usize;
+        let pow4 = g.checked_mul(g)?.checked_mul(g)?.checked_mul(g)?;
+        if pow4 == nodes {
+            return Some(grid);
+        }
+        if pow4 > nodes {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod clut_helpers_tests {
+    use super::grid_n_from_clut_len;
+
+    #[test]
+    fn round_trips_typical_grids() {
+        assert_eq!(grid_n_from_clut_len(17 * 17 * 17 * 17 * 3), Some(17));
+        assert_eq!(grid_n_from_clut_len(33 * 33 * 33 * 33 * 3), Some(33));
+    }
+
+    #[test]
+    fn rejects_non_multiple_of_3() {
+        assert_eq!(grid_n_from_clut_len(83_521 * 3 + 1), None);
+    }
+
+    #[test]
+    fn rejects_non_4th_power() {
+        assert_eq!(grid_n_from_clut_len(100 * 3), None);
+    }
+}
+
 /// Parameters for a GPU tile-parallel analytical fill.
 pub struct TileFillParams<'a, B: GpuBackend + ?Sized> {
     /// Packed tile-fill records in device memory.
