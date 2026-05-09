@@ -9,7 +9,10 @@
 use std::collections::HashSet;
 
 use crate::{
-    dictionary::Dictionary, document::Document, error::PdfError, object::Object, object::ObjectId,
+    dictionary::Dictionary,
+    document::Document,
+    error::PdfError,
+    object::{Object, ObjectId},
 };
 
 /// Maximum page-tree depth.  Bounds descent against pathological / cyclic PDFs.
@@ -217,6 +220,22 @@ startxref\n255\n%%EOF"
         match err {
             PdfError::PageOutOfRange { page, total } => {
                 assert_eq!(page, 2);
+                assert_eq!(total, 2);
+            }
+            other => panic!("expected PageOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// `u32::MAX` is a representative pathological index — the function must
+    /// reject it cleanly with `PageOutOfRange`, not panic on overflow during
+    /// `remaining` arithmetic and not silently truncate.
+    #[test]
+    fn descend_rejects_u32_max_index() {
+        let doc = Document::from_bytes_owned(two_page_pdf()).unwrap();
+        let err = descend_to_page_index(&doc, u32::MAX).expect_err("u32::MAX must error");
+        match err {
+            PdfError::PageOutOfRange { page, total } => {
+                assert_eq!(page, u32::MAX);
                 assert_eq!(total, 2);
             }
             other => panic!("expected PageOutOfRange, got {other:?}"),
