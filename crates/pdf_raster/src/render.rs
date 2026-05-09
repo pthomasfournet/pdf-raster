@@ -222,6 +222,22 @@ pub fn open_session(
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     let gpu_ctx = init_gpu_ctx(config.policy)?;
 
+    // Phase 10 Task 4 is mid-flight: the Vulkan backend exists and is
+    // parity-tested per kernel, but the renderer's kernel call sites
+    // still dispatch through `GpuCtx`.  Until that wiring lands,
+    // `ForceVulkan` errors loudly so callers don't silently get the
+    // CPU path under the impression they're testing Vulkan.
+    if matches!(config.policy, BackendPolicy::ForceVulkan) {
+        return Err(RasterError::BackendUnavailable(
+            "BackendPolicy::ForceVulkan: renderer migration in progress \
+             (Phase 10 Task 4).  The Vulkan backend exists and passes per-kernel \
+             parity tests, but the per-page render path still dispatches via \
+             CudaBackend.  Use `--backend cuda` (or omit for `Auto`) until the \
+             migration ships.  See ROADMAP.md Phase 10 Task 4."
+                .to_owned(),
+        ));
+    }
+
     let vaapi_device = config.vaapi_device.clone();
 
     #[cfg(feature = "vaapi")]
@@ -324,11 +340,13 @@ pub fn open_session(
 
 /// Initialise the CUDA GPU context for AA fill and ICC colour transforms.
 ///
-/// Returns `None` on `CpuOnly`; errors loudly on `ForceCuda` if init fails;
-/// logs a warning and returns `None` on `Auto`/`ForceVaapi` if init fails.
+/// Returns `None` on `CpuOnly` and `ForceVulkan` (the latter routes
+/// kernels through the Vulkan backend instead, see `init_vulkan_backend`);
+/// errors loudly on `ForceCuda` if init fails; logs a warning and returns
+/// `None` on `Auto`/`ForceVaapi` if init fails.
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
 fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
-    if matches!(policy, BackendPolicy::CpuOnly) {
+    if matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceVulkan) {
         return Ok(None);
     }
     match gpu::GpuCtx::init() {

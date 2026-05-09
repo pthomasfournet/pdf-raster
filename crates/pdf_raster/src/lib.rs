@@ -174,8 +174,9 @@ pub enum BackendPolicy {
     ///
     /// Phase 9's image cache is CUDA-only today; under `ForceVulkan` the
     /// session runs without the cache (matches the pre-Phase-9 GPU path).
-    /// The kernels themselves (aa_fill, tile_fill, icc_clut, soft_mask,
-    /// composite, blit_image) all dispatch through `VulkanBackend`.
+    /// The kernels themselves (`aa_fill`, `tile_fill`, `icc_clut`,
+    /// `soft_mask`, `composite`, `blit_image`) all dispatch through
+    /// `VulkanBackend`.
     ForceVulkan,
 }
 
