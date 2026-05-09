@@ -120,10 +120,11 @@ pub fn e4(archive: &Path) -> Result<EventResult, String> {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        // total - 1 fits in u32 because `total` is u32; the modulo result
-        // therefore fits in u32 too.
-        let p = u32::try_from(state % u64::from(total - 1) + 1)
-            .expect("modulo (total-1) fits in u32 by construction");
+        // `state % total` produces [0, total - 1]; +1 maps to the 1-based
+        // [1, total] range covering every page.  An earlier shape used
+        // `% (total - 1) + 1` which off-by-one-skipped the last page.
+        let p = u32::try_from(state % u64::from(total) + 1)
+            .expect("modulo total fits in u32 by construction");
         let _bmp = render_page_rgb(&session, p, scale_at_150_dpi())
             .map_err(|e| format!("render_page_rgb (page {p}): {e}"))?;
         rendered += 1;

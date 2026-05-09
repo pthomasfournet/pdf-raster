@@ -75,16 +75,21 @@ pub fn pdftoppm_render(archive: &Path, page: u32, out_prefix: &Path) -> Competit
         out_prefix.to_str().expect("non-utf8 prefix"),
     ]);
     let result = time_command("pdftoppm", cmd);
-    // pdftoppm appends "-NNNNNN.ppm" to the prefix; clean any matching files.
+    // pdftoppm always emits `<prefix>-NNNNNN.ppm`; clean only files that
+    // match that exact shape so we don't accidentally delete unrelated
+    // `<prefix>_log.txt` etc. that a user happened to leave in /tmp.
     if let Some(parent) = out_prefix.parent()
         && let Some(stem) = out_prefix.file_name().and_then(|s| s.to_str())
         && let Ok(entries) = std::fs::read_dir(parent)
     {
+        let stem_dash = format!("{stem}-");
         for ent in entries.flatten() {
-            if let Some(n) = ent.file_name().to_str()
-                && n.starts_with(stem)
-            {
-                let _ = std::fs::remove_file(ent.path());
+            let path = ent.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.starts_with(&stem_dash) && path.extension().is_some_and(|e| e == "ppm") {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }

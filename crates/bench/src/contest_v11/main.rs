@@ -20,70 +20,101 @@ use std::process::ExitCode;
 
 const DEFAULT_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 
+/// Pull the next positional arg or print `hint` and exit 1.  Avoids the
+/// `.expect()`-with-Rust-panic-style-message UX that was here before
+/// (a CLI tool's missing-arg message should not look like a crash).
+fn next_or_exit(args: &mut impl Iterator<Item = String>, hint: &str) -> Result<String, ExitCode> {
+    if let Some(v) = args.next() {
+        Ok(v)
+    } else {
+        eprintln!("{hint}");
+        Err(ExitCode::from(1))
+    }
+}
+
+/// Parse the next optional positional arg (e.g. page index) as `u32`,
+/// or fall back to `default` when absent.  Exits 1 on parse error.
+fn next_u32_or(
+    args: &mut impl Iterator<Item = String>,
+    default: u32,
+    label: &str,
+) -> Result<u32, ExitCode> {
+    let Some(s) = args.next() else {
+        return Ok(default);
+    };
+    s.parse::<u32>().map_err(|_| {
+        eprintln!("{label}: expected u32, got {s:?}");
+        ExitCode::from(1)
+    })
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         usage();
         return ExitCode::from(1);
     };
-    match cmd.as_str() {
-        "build-archive" => {
-            let Some(out_arg) = args.next() else {
-                eprintln!("usage: contest_v11 build-archive <out> [bytes]");
-                return ExitCode::from(1);
-            };
-            let out: PathBuf = out_arg.into();
-            let target_bytes = args.next().map_or(DEFAULT_ARCHIVE_BYTES, |s| {
-                s.parse::<u64>()
-                    .expect("bytes argument must be a positive integer")
-            });
-            if let Err(e) = archive::build(&out, target_bytes) {
-                eprintln!("build-archive failed: {e}");
-                return ExitCode::from(2);
+
+    let result = (|| -> Result<ExitCode, ExitCode> {
+        match cmd.as_str() {
+            "build-archive" => {
+                let out: PathBuf =
+                    next_or_exit(&mut args, "usage: contest_v11 build-archive <out> [bytes]")?
+                        .into();
+                let target_bytes = match args.next() {
+                    None => DEFAULT_ARCHIVE_BYTES,
+                    Some(s) => s.parse::<u64>().map_err(|_| {
+                        eprintln!("bytes: expected u64, got {s:?}");
+                        ExitCode::from(1)
+                    })?,
+                };
+                if let Err(e) = archive::build(&out, target_bytes) {
+                    eprintln!("build-archive failed: {e}");
+                    return Ok(ExitCode::from(2));
+                }
+                Ok(ExitCode::SUCCESS)
             }
-            ExitCode::SUCCESS
+            "e1" => {
+                let archive: PathBuf =
+                    next_or_exit(&mut args, "usage: e1 <archive> [page]")?.into();
+                let page = next_u32_or(&mut args, 50_000, "page")?;
+                print_event_with_competitors_e1(&archive, page);
+                Ok(ExitCode::SUCCESS)
+            }
+            "e2" => {
+                let archive: PathBuf =
+                    next_or_exit(&mut args, "usage: e2 <archive> [first] [count]")?.into();
+                let first = next_u32_or(&mut args, 50_000, "first")?;
+                let count = next_u32_or(&mut args, 100, "count")?;
+                print_event_only(events::e2(&archive, first, count));
+                Ok(ExitCode::SUCCESS)
+            }
+            "e3" => {
+                let list: PathBuf = next_or_exit(&mut args, "usage: e3 <archives.txt>")?.into();
+                print_event_only(events::e3(&list));
+                Ok(ExitCode::SUCCESS)
+            }
+            "e4" => {
+                let archive: PathBuf = next_or_exit(&mut args, "usage: e4 <archive>")?.into();
+                print_event_only(events::e4(&archive));
+                Ok(ExitCode::SUCCESS)
+            }
+            "all" => {
+                let archive: PathBuf =
+                    next_or_exit(&mut args, "usage: all <archive> <list>")?.into();
+                let list: PathBuf = next_or_exit(&mut args, "usage: all <archive> <list>")?.into();
+                run_all(&archive, &list);
+                Ok(ExitCode::SUCCESS)
+            }
+            other => {
+                eprintln!("unknown subcommand: {other}");
+                usage();
+                Ok(ExitCode::from(1))
+            }
         }
-        "e1" => {
-            let archive: PathBuf = args.next().expect("usage: e1 <archive> [page]").into();
-            let page = args
-                .next()
-                .map_or(50_000, |s| s.parse::<u32>().expect("page must be u32"));
-            print_event_with_competitors_e1(&archive, page);
-            ExitCode::SUCCESS
-        }
-        "e2" => {
-            let archive: PathBuf = args
-                .next()
-                .expect("usage: e2 <archive> [first] [count]")
-                .into();
-            let first = args
-                .next()
-                .map_or(50_000, |s| s.parse::<u32>().expect("u32"));
-            let count = args.next().map_or(100, |s| s.parse::<u32>().expect("u32"));
-            print_event_only(events::e2(&archive, first, count));
-            ExitCode::SUCCESS
-        }
-        "e3" => {
-            let list: PathBuf = args.next().expect("usage: e3 <archives.txt>").into();
-            print_event_only(events::e3(&list));
-            ExitCode::SUCCESS
-        }
-        "e4" => {
-            let archive: PathBuf = args.next().expect("usage: e4 <archive>").into();
-            print_event_only(events::e4(&archive));
-            ExitCode::SUCCESS
-        }
-        "all" => {
-            let archive: PathBuf = args.next().expect("usage: all <archive> <list>").into();
-            let list: PathBuf = args.next().expect("usage: all <archive> <list>").into();
-            run_all(&archive, &list);
-            ExitCode::SUCCESS
-        }
-        other => {
-            eprintln!("unknown subcommand: {other}");
-            usage();
-            ExitCode::from(1)
-        }
+    })();
+    match result {
+        Ok(code) | Err(code) => code,
     }
 }
 
