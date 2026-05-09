@@ -6,21 +6,150 @@
 //! O(log pages) lookups for documents whose page-tree depth is shallow
 //! (typically 4–5 levels for 100k-page docs).
 
-use crate::{document::Document, error::PdfError, object::ObjectId};
+use std::collections::HashSet;
+
+use crate::{
+    dictionary::Dictionary, document::Document, error::PdfError, object::Object, object::ObjectId,
+};
+
+/// Maximum page-tree depth.  Bounds descent against pathological / cyclic PDFs.
+const MAX_DEPTH: usize = 64;
 
 /// Resolve a 0-based page index to its `ObjectId`, walking only the
 /// root-to-leaf path.
 ///
 /// Returns `PdfError::PageOutOfRange { page, total }` if `idx` is
-/// outside `[0, total)` where `total` is the catalog's `/Pages /Count`.
+/// outside `[0, total)` where `total` is the catalog's `/Pages /Count`
+/// (or the eager page count if `/Count` is missing or invalid).
 ///
-/// Falls back to a linear scan via `Document::get_pages()` if any interior
-/// node is missing `/Count` or has `/Kids` shorter than `/Count` claims —
-/// real-world malformed PDFs do this, and silently rendering the wrong
-/// page would be the worst possible failure mode.
-pub fn descend_to_page_index(_doc: &Document, _idx: u32) -> Result<ObjectId, PdfError> {
-    // Implementation pending; see ROADMAP.md.
-    todo!("descend_to_page_index: logarithmic walker not yet implemented")
+/// Cycle protection: tracks visited object numbers in a `HashSet<u32>`.
+/// Depth protection: bounded to `MAX_DEPTH` levels.
+pub fn descend_to_page_index(doc: &Document, idx: u32) -> Result<ObjectId, PdfError> {
+    let catalog = doc.catalog()?;
+    let pages_root = catalog
+        .get(b"Pages")
+        .and_then(Object::as_reference)
+        .ok_or(PdfError::MissingKey("Pages"))?;
+
+    let total = page_count_from_root(doc, pages_root)?;
+    if idx >= total {
+        return Err(PdfError::PageOutOfRange { page: idx, total });
+    }
+
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut current = pages_root;
+    let mut remaining = idx;
+
+    for _ in 0..MAX_DEPTH {
+        if !visited.insert(current.0) {
+            return Err(PdfError::BadObject {
+                id: current.0,
+                detail: "cyclic /Kids reference during descent".into(),
+            });
+        }
+        let dict = doc.get_dict(current)?;
+        let node_type = dict.get(b"Type").and_then(Object::as_name).unwrap_or(b"");
+        if node_type == b"Page" {
+            return Ok(current);
+        }
+
+        // Interior /Pages node — pick the kid whose subtree contains `remaining`.
+        let kids = resolve_kids(doc, current, &dict)?;
+        let mut descended = false;
+        for kid_ref in kids {
+            let kid_dict = doc.get_dict(kid_ref)?;
+            let kid_type = kid_dict
+                .get(b"Type")
+                .and_then(Object::as_name)
+                .unwrap_or(b"");
+            let kid_count: u32 = if kid_type == b"Page" {
+                1
+            } else {
+                kid_dict
+                    .get(b"Count")
+                    .and_then(Object::as_i64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| PdfError::BadObject {
+                        id: kid_ref.0,
+                        detail: "interior page-tree node missing /Count".into(),
+                    })?
+            };
+            if remaining < kid_count {
+                if kid_type == b"Page" {
+                    return Ok(kid_ref);
+                }
+                current = kid_ref;
+                descended = true;
+                break;
+            }
+            remaining -= kid_count;
+        }
+        if !descended {
+            return Err(PdfError::BadObject {
+                id: current.0,
+                detail: "ran out of /Kids before reaching requested page".into(),
+            });
+        }
+    }
+    Err(PdfError::BadObject {
+        id: current.0,
+        detail: "page-tree descent exceeded depth limit".into(),
+    })
+}
+
+/// Read `/Pages /Count` from the root.  Falls back to a full eager walk
+/// if the value is missing, negative, or out of range — malformed PDFs in
+/// the wild ship like this and silently picking the wrong page would be
+/// worse than the linear scan.
+fn page_count_from_root(doc: &Document, pages_root: ObjectId) -> Result<u32, PdfError> {
+    let dict = doc.get_dict(pages_root)?;
+    if let Some(n) = dict.get(b"Count").and_then(Object::as_i64)
+        && (0..=i64::from(u32::MAX)).contains(&n)
+    {
+        return Ok(n as u32);
+    }
+    log::warn!("page_count: /Pages /Count missing or invalid; falling back to eager count");
+    Ok(doc.get_pages().count() as u32)
+}
+
+/// `/Kids` may be either an inline array or an indirect reference to one
+/// (corpus-04 ships the second form).  Resolve both into a `Vec<ObjectId>`.
+fn resolve_kids(
+    doc: &Document,
+    node_id: ObjectId,
+    node_dict: &Dictionary,
+) -> Result<Vec<ObjectId>, PdfError> {
+    let kids_obj = node_dict.get(b"Kids").ok_or(PdfError::MissingKey("Kids"))?;
+    let arr = match kids_obj {
+        Object::Array(a) => a.clone(),
+        Object::Reference(rid) => {
+            let resolved = doc.get_object(*rid)?;
+            match resolved.as_ref() {
+                Object::Array(a) => a.clone(),
+                _ => {
+                    return Err(PdfError::BadObject {
+                        id: rid.0,
+                        detail: "/Kids reference does not resolve to an array".into(),
+                    });
+                }
+            }
+        }
+        _ => {
+            return Err(PdfError::BadObject {
+                id: node_id.0,
+                detail: "/Kids is neither an array nor a reference".into(),
+            });
+        }
+    };
+    let refs: Vec<ObjectId> = arr.iter().filter_map(Object::as_reference).collect();
+    if refs.len() != arr.len() {
+        log::warn!(
+            "resolve_kids: {}/{} /Kids entries were not indirect references; non-refs skipped",
+            arr.len() - refs.len(),
+            arr.len()
+        );
+    }
+    Ok(refs)
 }
 
 #[cfg(test)]
@@ -76,6 +205,18 @@ startxref\n255\n%%EOF"
                 assert_eq!(total, 2);
             }
             other => panic!("expected PageOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// Verify descend_to_page_index agrees with the eager get_pages() iterator
+    /// across the same fixture.
+    #[test]
+    fn descend_agrees_with_eager_walk() {
+        let doc = Document::from_bytes_owned(two_page_pdf()).unwrap();
+        let eager: Vec<ObjectId> = doc.get_pages().map(|(_, id)| id).collect();
+        for (idx, expected_id) in eager.iter().enumerate() {
+            let got = descend_to_page_index(&doc, idx as u32).expect("descend");
+            assert_eq!(got, *expected_id, "mismatch at idx {idx}");
         }
     }
 }

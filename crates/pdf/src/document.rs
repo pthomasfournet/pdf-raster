@@ -216,6 +216,37 @@ impl Document {
         self.get_pages().count() as u32
     }
 
+    /// Return the number of pages without walking the page tree.
+    ///
+    /// Reads `/Pages /Count` directly from the catalog.  Falls back to the
+    /// eager [`Self::page_count`] (full tree walk) if the catalog is malformed.
+    ///
+    /// O(1) on well-formed PDFs; O(pages) on malformed ones.  The caller
+    /// can use this on hot paths without a perf footgun.
+    #[must_use]
+    pub fn page_count_fast(&self) -> u32 {
+        let Ok(catalog) = self.catalog() else {
+            return self.page_count();
+        };
+        let Some(pages_id) = catalog.get(b"Pages").and_then(Object::as_reference) else {
+            return self.page_count();
+        };
+        let Ok(dict) = self.get_dict(pages_id) else {
+            return self.page_count();
+        };
+        match dict.get(b"Count").and_then(Object::as_i64) {
+            Some(n) if (0..=i64::from(u32::MAX)).contains(&n) => n as u32,
+            _ => self.page_count(),
+        }
+    }
+
+    /// Resolve a 0-based page index to its `ObjectId` via logarithmic descent.
+    ///
+    /// See [`crate::descend_to_page_index`] for the full descent contract.
+    pub fn get_page(&self, idx: u32) -> Result<ObjectId, PdfError> {
+        crate::page_tree::descend_to_page_index(self, idx)
+    }
+
     /// Iterate over all pages in document order, yielding `(1-based page number, ObjectId)`.
     pub fn get_pages(&self) -> impl Iterator<Item = (u32, ObjectId)> + '_ {
         PageIter::new(self)
@@ -464,6 +495,13 @@ startxref\n180\n%%EOF"
     fn open_minimal_pdf() {
         let doc = Document::from_bytes_owned(minimal_pdf()).unwrap();
         assert_eq!(doc.page_count(), 1);
+    }
+
+    #[test]
+    fn page_count_fast_matches_eager() {
+        let doc = Document::from_bytes_owned(minimal_pdf()).unwrap();
+        assert_eq!(doc.page_count_fast(), 1);
+        assert_eq!(doc.page_count_fast(), doc.page_count());
     }
 
     #[test]
