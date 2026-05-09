@@ -32,10 +32,6 @@ use super::error::vk_err;
 
 /// Identifier for one of the six compute kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[expect(
-    dead_code,
-    reason = "BlitImage variant is wired once the inv_ctm push-const re-port lands; spec follow-up in record_blit_image"
-)]
 pub(super) enum KernelId {
     Composite,
     ApplySoftMask,
@@ -101,8 +97,8 @@ impl KernelId {
             Self::TileFill => 4,
             // (cmyk, rgb, clut)
             Self::IccClut => 3,
-            // (src, dst_rgba, inv_ctm)
-            Self::BlitImage => 3,
+            // (src, dst_rgba) — inv_ctm and other scalars travel as push constants
+            Self::BlitImage => 2,
         }
     }
 }

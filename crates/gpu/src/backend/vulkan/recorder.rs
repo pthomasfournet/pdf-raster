@@ -316,22 +316,15 @@ impl PageRecorder {
         push[12..16].copy_from_slice(&p.width.to_ne_bytes());
         push[16..20].copy_from_slice(&p.height.to_ne_bytes());
         push[20..24].copy_from_slice(&i32::from(p.fill_rule != 0).to_ne_bytes());
-        // Workgroup = 1 pixel (64 lanes). Grid = total pixel count.
-        // The kernel uses a 1D dispatch over pixels which exceeds Vulkan's
-        // guaranteed `maxComputeWorkGroupCount[0]` (65535) for any image
-        // larger than ~256×256; `dispatch_kernel`'s `check_dispatch_size`
-        // fails the call with a useful message before the driver does.
-        // Spec follow-up: reparametrise as 2D (width × height) workgroups.
-        let total_pixels = p
-            .width
-            .checked_mul(p.height)
-            .ok_or_else(|| BackendError::msg("aa_fill: width * height overflowed u32"))?;
+        // Workgroup = 1 pixel (64 lanes); 2D dispatch so every axis stays
+        // within Vulkan's guaranteed `maxComputeWorkGroupCount[i]` of
+        // 65535 for any image up to ~65k × 65k.
         self.dispatch_kernel(
             KernelId::AaFill,
             &[p.segs.handle(), p.coverage.handle()],
             &[p.segs.size(), p.coverage.size()],
             &push,
-            (total_pixels, 1, 1),
+            (p.width, p.height, 1),
         )
     }
 
@@ -391,25 +384,55 @@ impl PageRecorder {
         )
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "shape-only stub until inv_ctm push-const re-port lands; method signature matches trait"
-    )]
     pub(super) fn record_blit_image(
         &self,
         p: params::BlitParams<'_, super::VulkanBackend>,
     ) -> Result<()> {
-        // The blit kernel takes inv_ctm as a StructuredBuffer<float>; we
-        // need a small buffer holding the 6 floats.  Allocating one per
-        // record_* call here would be wasteful; the preferred design is
-        // to pass inv_ctm via push constants.  Spec follow-up: re-emit
-        // blit_image.slang to read inv_ctm from push constants instead
-        // of a buffer.  For now, error loudly so callers don't think
-        // it's silently working.
-        let _ = p;
-        Err(BackendError::msg(
-            "record_blit_image: Vulkan path needs inv_ctm push-const re-port (spec follow-up)",
-        ))
+        // Push-constant layout (must match blit_image.slang's uniform
+        // order): src_w, src_h, src_layout, dst_w, dst_h, bx0, by0, bx1,
+        // by1 as i32 (9×4 = 36 bytes); page_h as f32 (4 bytes); inv_ctm0..5
+        // as f32 (24 bytes) → 64 bytes total, well under our 128-byte
+        // push-constant range.
+        let mut push = [0u8; 64];
+        let put_int = |buf: &mut [u8; 64], off: usize, v: i32| {
+            buf[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+        };
+        let put_float = |buf: &mut [u8; 64], off: usize, v: f32| {
+            buf[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+        };
+        put_int(&mut push, 0, i32::try_from(p.src_w).unwrap_or(i32::MAX));
+        put_int(&mut push, 4, i32::try_from(p.src_h).unwrap_or(i32::MAX));
+        put_int(
+            &mut push,
+            8,
+            i32::try_from(p.src_layout).expect("validate() proved src_layout is 0 or 1"),
+        );
+        put_int(&mut push, 12, i32::try_from(p.dst_w).unwrap_or(i32::MAX));
+        put_int(&mut push, 16, i32::try_from(p.dst_h).unwrap_or(i32::MAX));
+        put_int(&mut push, 20, p.bbox[0]);
+        put_int(&mut push, 24, p.bbox[1]);
+        put_int(&mut push, 28, p.bbox[2]);
+        put_int(&mut push, 32, p.bbox[3]);
+        put_float(&mut push, 36, p.page_h);
+        for (i, c) in p.inv_ctm.iter().enumerate() {
+            put_float(&mut push, 40 + i * 4, *c);
+        }
+
+        // Dispatch one workgroup per 16×16 bbox tile.  We dispatch over
+        // the bbox extent rather than the full page so blits in a small
+        // region don't waste lanes on out-of-bbox pixels.
+        let bbox_w = u32::try_from((p.bbox[2] - p.bbox[0]).max(0)).unwrap_or(0);
+        let bbox_h = u32::try_from((p.bbox[3] - p.bbox[1]).max(0)).unwrap_or(0);
+        let groups_x = bbox_w.div_ceil(16);
+        let groups_y = bbox_h.div_ceil(16);
+
+        self.dispatch_kernel(
+            KernelId::BlitImage,
+            &[p.src.handle(), p.dst.handle()],
+            &[p.src.size(), p.dst.size()],
+            &push,
+            (groups_x, groups_y, 1),
+        )
     }
 
     /// Bail if `groups` exceeds the device's `maxComputeWorkGroupCount`

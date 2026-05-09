@@ -81,14 +81,18 @@ void aa_fill(
     uniform int eo,
     uniform RWStructuredBuffer<uint8_t> coverage)
 {
-    uint px_idx = wid.x;
-    // One workgroup == one output pixel, so all 64 lanes share `px_idx` and
-    // either all return or none do.  This keeps `WaveActiveSum` below in
-    // uniform control flow (required by the SPIR-V spec).
-    if (px_idx >= width * height) return;
+    // 2D dispatch: one workgroup per output pixel, identified by
+    // (wid.x, wid.y).  Vulkan caps each axis of the dispatch at
+    // `maxComputeWorkGroupCount[i]` (≥ 65535 per spec), so this scheme
+    // supports images up to ~65535×65535 — well past anything we'll
+    // ever raster.
+    uint px_x = wid.x;
+    uint px_y = wid.y;
+    // All 64 lanes of a workgroup share these bounds → uniform control
+    // flow for the WaveActiveSum below (required by the SPIR-V spec).
+    if (px_x >= width || px_y >= height) return;
 
-    uint px_x = px_idx % width;
-    uint px_y = px_idx / width;
+    uint px_idx = px_y * width + px_x;
 
     // Device-space centre of this output pixel.
     float cx = x_min + float(px_x) + 0.5f;

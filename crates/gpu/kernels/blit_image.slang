@@ -11,25 +11,31 @@
 //   inv_ctm[3] =  a * inv_det
 //   inv_ctm[4] =  e   (translation x; subtract from dx)
 //   inv_ctm[5] =  f   (translation y; subtract from page_h - dy)
+//
+// All scalar parameters travel via push constants — `inv_ctm` was a
+// `StructuredBuffer<float>` in an earlier draft, which would force the
+// caller to allocate a 24-byte device buffer per record_blit_image call
+// just to pass 6 floats.  Push constants are the right tool here.
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void blit_image(
     uint3 gid : SV_DispatchThreadID,
     uniform StructuredBuffer<uint8_t> src,
+    uniform RWStructuredBuffer<uint8_t> dst_rgba,
     uniform int src_w,
     uniform int src_h,
     uniform int src_layout,            // 0 = RGB, 1 = Gray
-    uniform RWStructuredBuffer<uint8_t> dst_rgba,
     uniform int dst_w,
     uniform int dst_h,
     uniform int bx0, uniform int by0,
     uniform int bx1, uniform int by1,
-    uniform StructuredBuffer<float> inv_ctm,
-    uniform float page_h)
+    uniform float page_h,
+    uniform float inv_ctm0, uniform float inv_ctm1,
+    uniform float inv_ctm2, uniform float inv_ctm3,
+    uniform float inv_ctm4, uniform float inv_ctm5)
 {
-    // SV_DispatchThreadID is the global lane index (group * groupsize + lane),
-    // so we don't repeat the [numthreads(16,16,1)] tile size as a magic number.
+    // SV_DispatchThreadID is the global lane index (group * groupsize + lane).
     int dx = bx0 + int(gid.x);
     int dy = by0 + int(gid.y);
 
@@ -44,10 +50,10 @@ void blit_image(
     // Inverse-map (dx, dy) device-space → (u, v) image-space in [0, 1].
     // The (1 - v) flip mirrors the CPU path: PDF image y-axis points up,
     // page bitmap y-axis points down.
-    float dx_rel = float(dx) - inv_ctm[4];
-    float dy_rel = (page_h - float(dy)) - inv_ctm[5];
-    float u = inv_ctm[0] * dx_rel + inv_ctm[1] * dy_rel;
-    float v = inv_ctm[2] * dx_rel + inv_ctm[3] * dy_rel;
+    float dx_rel = float(dx) - inv_ctm4;
+    float dy_rel = (page_h - float(dy)) - inv_ctm5;
+    float u = inv_ctm0 * dx_rel + inv_ctm1 * dy_rel;
+    float v = inv_ctm2 * dx_rel + inv_ctm3 * dy_rel;
 
     if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
         return;

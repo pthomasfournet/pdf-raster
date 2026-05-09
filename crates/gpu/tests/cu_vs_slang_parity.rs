@@ -16,7 +16,9 @@
 #![cfg(feature = "vulkan")]
 
 use gpu::backend::GpuBackend;
-use gpu::backend::params::{AaFillParams, CompositeParams, IccClutParams, SoftMaskParams};
+use gpu::backend::params::{
+    AaFillParams, BlitParams, CompositeParams, IccClutParams, SoftMaskParams,
+};
 use gpu::backend::vulkan::VulkanBackend;
 
 /// Run `composite_rgba8` on a representative input via VulkanBackend,
@@ -385,6 +387,183 @@ fn aa_fill_degenerate_segment_zero_coverage() {
         vk.iter().all(|&b| b == 0),
         "degenerate segment must produce zero coverage"
     );
+}
+
+#[test]
+fn aa_fill_512x512_exceeds_old_1d_limit() {
+    // The previous 1D dispatch capped out at maxComputeWorkGroupCount[0]
+    // (≥ 65535 per Vulkan spec), so a 256×256 image (65536 pixels) was
+    // already over the limit.  This test would have failed the old
+    // check_dispatch_size guard; passes under the new 2D dispatch.
+    let w = 512u32;
+    let h = 512u32;
+    let segs: Vec<f32> = vec![
+        // Big square inside the canvas, axis-aligned.
+        64.0, 64.0, 448.0, 64.0, // top
+        448.0, 64.0, 448.0, 448.0, // right
+        448.0, 448.0, 64.0, 448.0, // bottom
+        64.0, 448.0, 64.0, 64.0, // left
+    ];
+    let cpu = gpu::aa_fill_cpu(&segs, 0.0, 0.0, w, h, false);
+    let vk = run_aa_fill_vulkan(&segs, w, h, 0);
+    assert_within_1_lsb(&cpu, &vk, "aa_fill 512×512 square");
+}
+
+// ── blit_image ──────────────────────────────────────────────────────
+
+/// Replicate the kernel's nearest-neighbour sample arithmetic on the CPU
+/// (mirrors the test in `crates/gpu/src/blit.rs`).  Returns the sampled
+/// pixel index or None for out-of-bounds.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::suboptimal_flops,
+    reason = "test reference: arithmetic intentionally mirrors the kernel's f32 math byte-for-byte"
+)]
+fn blit_cpu_reference(
+    page: &mut [u8],
+    page_w: u32,
+    page_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_layout: u32, // 0 = RGB, 1 = Gray
+    bbox: [i32; 4],
+    page_height_f: f32,
+    inv_ctm: [f32; 6],
+) {
+    for dy in bbox[1].max(0)..bbox[3].min(page_h as i32) {
+        for dx in bbox[0].max(0)..bbox[2].min(page_w as i32) {
+            let dx_rel = dx as f32 - inv_ctm[4];
+            let dy_rel = (page_height_f - dy as f32) - inv_ctm[5];
+            let u = inv_ctm[0] * dx_rel + inv_ctm[1] * dy_rel;
+            let v = inv_ctm[2] * dx_rel + inv_ctm[3] * dy_rel;
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let ix = ((u * src_w as f32) as u32).min(src_w - 1);
+            let iy = (((1.0 - v) * src_h as f32) as u32).min(src_h - 1);
+            let dst_off = ((dy as u32) * page_w + dx as u32) as usize * 4;
+            if src_layout == 0 {
+                let src_off = (iy * src_w + ix) as usize * 3;
+                page[dst_off] = src[src_off];
+                page[dst_off + 1] = src[src_off + 1];
+                page[dst_off + 2] = src[src_off + 2];
+                page[dst_off + 3] = 255;
+            } else {
+                let src_off = (iy * src_w + ix) as usize;
+                let g = src[src_off];
+                page[dst_off] = g;
+                page[dst_off + 1] = g;
+                page[dst_off + 2] = g;
+                page[dst_off + 3] = 255;
+            }
+        }
+    }
+}
+
+fn run_blit_vulkan(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_layout: u32,
+    page_w: u32,
+    page_h: u32,
+    bbox: [i32; 4],
+    inv_ctm: [f32; 6],
+) -> Vec<u8> {
+    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+    let dst_bytes = (page_w * page_h * 4) as usize;
+    let d_src = backend.alloc_device(src.len()).expect("alloc src");
+    let d_dst = backend.alloc_device(dst_bytes).expect("alloc dst");
+    backend.upload_sync(&d_src, src).expect("upload src");
+    let zeros = vec![0u8; dst_bytes];
+    backend.upload_sync(&d_dst, &zeros).expect("zero dst");
+
+    backend.begin_page().expect("begin_page");
+    backend
+        .record_blit_image(BlitParams {
+            src: &d_src,
+            dst: &d_dst,
+            src_w,
+            src_h,
+            src_layout,
+            dst_w: page_w,
+            dst_h: page_h,
+            bbox,
+            page_h: page_h as f32,
+            inv_ctm,
+        })
+        .expect("record_blit_image");
+    let fence = backend.submit_page().expect("submit_page");
+    backend.wait_page(fence).expect("wait_page");
+
+    let mut out = vec![0u8; dst_bytes];
+    backend.download_sync(&d_dst, &mut out).expect("download");
+    out
+}
+
+#[test]
+fn blit_identity_rgb() {
+    // Identity-CTM blit of a 4×4 RGB image into a 4×4 page buffer.
+    // inv_ctm = scale 4 (image coords are normalised to [0,1]) with PDF
+    // y-flip baked in: dx_rel/4 = u, dy_rel/4 = v, so u_dx=0.25, v_dy=0.25.
+    let src_w = 4u32;
+    let src_h = 4u32;
+    let page = 4u32;
+    let pixels: Vec<u8> = (0..src_w * src_h * 3)
+        .map(|i| ((i * 7 + 3) % 251) as u8)
+        .collect();
+
+    let inv_ctm = [
+        0.25, 0.0, // u from dx
+        0.0, 0.25, // v from dy_rel (= page_h - dy)
+        0.0, 0.0, // tx, ty
+    ];
+    let bbox = [0, 0, page as i32, page as i32];
+
+    let mut cpu = vec![0u8; (page * page * 4) as usize];
+    blit_cpu_reference(
+        &mut cpu,
+        page,
+        page,
+        &pixels,
+        src_w,
+        src_h,
+        0,
+        bbox,
+        page as f32,
+        inv_ctm,
+    );
+    let vk = run_blit_vulkan(&pixels, src_w, src_h, 0, page, page, bbox, inv_ctm);
+    assert_eq!(cpu, vk, "blit identity-CTM diverges");
+}
+
+#[test]
+fn blit_gray_layout() {
+    let src_w = 4u32;
+    let src_h = 4u32;
+    let page = 4u32;
+    let pixels: Vec<u8> = (0..src_w * src_h).map(|i| (i * 17) as u8).collect();
+    let inv_ctm = [0.25, 0.0, 0.0, 0.25, 0.0, 0.0];
+    let bbox = [0, 0, page as i32, page as i32];
+
+    let mut cpu = vec![0u8; (page * page * 4) as usize];
+    blit_cpu_reference(
+        &mut cpu,
+        page,
+        page,
+        &pixels,
+        src_w,
+        src_h,
+        1,
+        bbox,
+        page as f32,
+        inv_ctm,
+    );
+    let vk = run_blit_vulkan(&pixels, src_w, src_h, 1, page, page, bbox, inv_ctm);
+    assert_eq!(cpu, vk, "blit gray-layout diverges");
 }
 
 fn assert_within_1_lsb(a: &[u8], b: &[u8], what: &str) {
