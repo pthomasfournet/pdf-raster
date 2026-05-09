@@ -32,9 +32,12 @@ pub fn advise_random(file: &File) {
 /// length argument; the kernel's "to EOF" semantics are deliberately not
 /// exposed here, since callers always know the precise byte range).
 #[cfg(unix)]
-#[expect(
-    dead_code,
-    reason = "exposed for the bench harness's content-stream prefetch path; not yet wired"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "exposed for content-stream prefetch; not yet wired in lib builds"
+    )
 )]
 pub fn advise_willneed(file: &File, offset: u64, len: u64) {
     use rustix::fs::{Advice, fadvise};
