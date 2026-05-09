@@ -155,6 +155,26 @@ pub struct GpuCtx {
 impl GpuCtx {
     /// Initialise CUDA device 0 and compile the embedded kernels.
     ///
+    /// # Lazy-loading audit
+    ///
+    /// Both backends already defer all driver work to first dispatch:
+    ///
+    /// - `cudarc` resolves CUDA driver symbols through `libloading` on first
+    ///   call — the `dlopen("libcuda.so")` and `dlsym(...)` happen here, in
+    ///   `init_inner`, not at process startup.
+    /// - `ash::Entry::load` (in `backend::vulkan::device::init`) similarly
+    ///   `dlopen`s `libvulkan.so` only when invoked.
+    /// - `init` is not on any static-init path: it's called from
+    ///   `pdf_raster::render::init_gpu_ctx` during `open_session`, after the
+    ///   CLI has parsed args.
+    /// - The only `OnceLock<GpuCtx>` in this crate lives behind
+    ///   `#[cfg(feature = "gpu-validation")]` test code; runtime contexts are
+    ///   constructed explicitly by callers and shared via `Arc`.
+    ///
+    /// As of 2026-05-09, `pdf-raster --help` (closest proxy for `--version`)
+    /// runs in ~1.0 ms median (hyperfine, 30 runs, prewarmed); the dlopen cost
+    /// would only be paid once a real render starts. No deferral work needed.
+    ///
     /// # Errors
     ///
     /// Returns an error if no CUDA device is present or kernel load fails.
