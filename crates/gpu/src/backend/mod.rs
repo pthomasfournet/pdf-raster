@@ -14,6 +14,8 @@
 
 pub mod cuda;
 pub mod params;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 
 use std::error::Error;
 use std::fmt;
