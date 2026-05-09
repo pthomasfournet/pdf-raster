@@ -69,8 +69,55 @@ pub(crate) fn apply_flate(
 }
 
 /// Maximum decompressed size we will accept, to defeat decompression bombs.
-#[cfg(feature = "libdeflate")]
 const MAX_DECOMPRESSED: usize = 1 << 30; // 1 GiB
+
+/// flate2-backed decompression with partial-output tolerance.
+///
+/// Returns whatever bytes were produced before a mid-stream error if the
+/// decompressor wrote anything at all — real-world malformed PDFs ship
+/// truncated or checksum-corrupt content streams that flate2 emits
+/// usefully up to the failure point.
+///
+/// Bounded at [`MAX_DECOMPRESSED`] via `Read::take`; `read_to_end` would
+/// otherwise grow the output `Vec` without limit.
+fn decompress_zlib_flate2(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use std::io::Read;
+
+    // 3× input is a good initial guess for typical text/PostScript-ish
+    // payloads; capping at 16 MiB avoids reserving gigabytes when called
+    // with a multi-hundred-MB compressed stream.
+    let initial_cap = data.len().saturating_mul(3).min(16 * 1024 * 1024);
+    let mut out = Vec::with_capacity(initial_cap);
+    // +1 so we can detect the case where the decompressor *would* produce
+    // more than the cap; if `read_to_end` consumes exactly the cap+1 byte
+    // we know to error rather than silently truncate.
+    let cap_plus_one = (MAX_DECOMPRESSED as u64).saturating_add(1);
+
+    let mut decoder = ZlibDecoder::new(data).take(cap_plus_one);
+    match decoder.read_to_end(&mut out) {
+        Ok(_) => {}
+        Err(_) if out.is_empty() && data.len() > 2 => {
+            // Retry with raw deflate (skip 2-byte zlib header).
+            out.clear();
+            let mut raw_dec = DeflateDecoder::new(&data[2..]).take(cap_plus_one);
+            raw_dec.read_to_end(&mut out)?;
+        }
+        Err(e) => {
+            if out.is_empty() {
+                return Err(e);
+            }
+            // Partial decompression — use what we have (truncated stream).
+        }
+    }
+    if out.len() > MAX_DECOMPRESSED {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "FlateDecode: decompressed output exceeds 1 GiB cap",
+        ));
+    }
+    Ok(out)
+}
 
 #[cfg(feature = "libdeflate")]
 fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
@@ -113,38 +160,7 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
                 {
                     return Ok(raw);
                 }
-                return decompress_zlib_flate2_fallback(data);
-            }
-        }
-    }
-}
-
-/// Last-ditch flate2-based decompression that mirrors the no-default-features
-/// path's partial-tolerance semantics.  Used when libdeflate's strict mode
-/// rejects a stream that flate2 might decode partially (truncated or
-/// checksum-corrupt content streams seen in real-world PDFs).
-#[cfg(feature = "libdeflate")]
-fn decompress_zlib_flate2_fallback(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::Read;
-
-    let initial_cap = data.len().saturating_mul(3).min(16 * 1024 * 1024);
-    let mut out = Vec::with_capacity(initial_cap);
-    let mut decoder = ZlibDecoder::new(data);
-    match decoder.read_to_end(&mut out) {
-        Ok(_) => Ok(out),
-        Err(_) if out.is_empty() && data.len() > 2 => {
-            out.clear();
-            let mut raw_dec = DeflateDecoder::new(&data[2..]);
-            raw_dec.read_to_end(&mut out)?;
-            Ok(out)
-        }
-        Err(e) => {
-            if out.is_empty() {
-                Err(e)
-            } else {
-                // Partial decompression — use what we have (truncated stream).
-                Ok(out)
+                return decompress_zlib_flate2(data);
             }
         }
     }
@@ -183,31 +199,7 @@ fn decompress_raw_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 
 #[cfg(not(feature = "libdeflate"))]
 fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    use flate2::read::{DeflateDecoder, ZlibDecoder};
-    use std::io::Read;
-
-    // Cap the initial reservation: 3× input is a good guess for the typical
-    // text/PostScript-ish payload, but capping at 16 MiB avoids reserving
-    // gigabytes when called with a multi-hundred-MB compressed stream.
-    let initial_cap = data.len().saturating_mul(3).min(16 * 1024 * 1024);
-    let mut out = Vec::with_capacity(initial_cap);
-    let mut decoder = ZlibDecoder::new(data);
-    match decoder.read_to_end(&mut out) {
-        Ok(_) => {}
-        Err(_) if out.is_empty() && data.len() > 2 => {
-            // Retry with raw deflate (skip 2-byte zlib header).
-            out.clear();
-            let mut raw_dec = DeflateDecoder::new(&data[2..]);
-            raw_dec.read_to_end(&mut out)?;
-        }
-        Err(e) => {
-            if out.is_empty() {
-                return Err(e);
-            }
-            // Partial decompression — use what we have (truncated stream).
-        }
-    }
-    Ok(out)
+    decompress_zlib_flate2(data)
 }
 
 // ── PNG predictor ─────────────────────────────────────────────────────────────
