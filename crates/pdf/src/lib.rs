@@ -18,6 +18,7 @@ mod document;
 mod error;
 mod lexer;
 mod linearization;
+mod madvise;
 mod object;
 mod objstm;
 mod page_tree;

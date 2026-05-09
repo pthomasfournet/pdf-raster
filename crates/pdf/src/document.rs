@@ -60,6 +60,7 @@ impl Document {
     /// are parsed on first access and cached for subsequent calls.
     pub fn open(path: &Path) -> Result<Self, PdfError> {
         let file = std::fs::File::open(path)?;
+        crate::madvise::advise_random(&file);
         // SAFETY: we do not mutate the file while it is mapped.
         let mmap = unsafe { Mmap::map(&file)? };
         let data = Arc::new(MmapOrVec::Mapped(mmap));

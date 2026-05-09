@@ -12,3 +12,9 @@ flate2   = { version = "1" }
 memmap2  = { version = "0.9" }
 weezl    = { version = "0.1" }
 log      = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
