@@ -28,10 +28,7 @@ const SCALE_AT_RENDER_DPI: f64 = RENDER_DPI / 72.0;
 /// Vocabulary matches `pdf_raster::BackendPolicy::from_env`: `auto`,
 /// `cpu`, `cuda`, `vaapi`, `vulkan`.
 fn session_config() -> SessionConfig {
-    SessionConfig {
-        policy: BackendPolicy::from_env_var("CONTEST_BACKEND"),
-        ..SessionConfig::default()
-    }
+    SessionConfig::with_policy(BackendPolicy::from_env_var("CONTEST_BACKEND"))
 }
 
 /// E1 — open archive, render `page_idx`, write PPM to disk.  Times the

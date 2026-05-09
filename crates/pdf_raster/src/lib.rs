@@ -215,18 +215,23 @@ impl BackendPolicy {
     /// developer's personal default doesn't leak into bench runs.
     /// Same value vocabulary and warning semantics as
     /// [`BackendPolicy::from_env`].
+    ///
+    /// Whitespace around the value is trimmed so `PDF_RASTER_BACKEND=" cuda "`
+    /// (e.g. quoted in a shell config that didn't strip) still resolves.
+    /// Matching is case-insensitive.  Unrecognised values emit a
+    /// `log::warn!` (not stderr) so library embedders control the sink.
     #[must_use]
     pub fn from_env_var(name: &str) -> Self {
         let raw = std::env::var(name).unwrap_or_default();
-        match raw.to_ascii_lowercase().as_str() {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Self::Auto,
             "cpu" => Self::CpuOnly,
             "cuda" => Self::ForceCuda,
             "vaapi" => Self::ForceVaapi,
             "vulkan" => Self::ForceVulkan,
             other => {
-                eprintln!(
-                    "warning: {name}={other:?} not recognised; using Auto. \
+                log::warn!(
+                    "{name}={other:?} not recognised; using Auto. \
                      Valid values: auto, cpu, cuda, vaapi, vulkan."
                 );
                 Self::Auto
@@ -266,14 +271,30 @@ pub struct SessionConfig {
     pub prefetch: bool,
 }
 
-impl Default for SessionConfig {
-    fn default() -> Self {
+impl SessionConfig {
+    /// Build a config with the given backend policy and otherwise-default
+    /// fields, **without** consulting `PDF_RASTER_BACKEND`.
+    ///
+    /// Use this when you have already resolved the policy from a more
+    /// specific source (a CLI flag, a different env var, an explicit
+    /// argument) and don't want `Default::default()`'s env-var lookup
+    /// firing — which would emit a spurious warning if the env var were
+    /// set to a malformed value, even though that value is about to be
+    /// overwritten anyway.
+    #[must_use]
+    pub fn with_policy(policy: BackendPolicy) -> Self {
         Self {
-            policy: BackendPolicy::from_env(),
+            policy,
             vaapi_device: DEFAULT_VAAPI_DEVICE.to_owned(),
             #[cfg(feature = "cache")]
             prefetch: false,
         }
+    }
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self::with_policy(BackendPolicy::from_env())
     }
 }
 
@@ -472,6 +493,9 @@ impl RenderedPage {
 /// - [`RasterError::PageOutOfRange`] — requested page exceeds the document.
 /// - [`RasterError::PageDegenerate`] / [`RasterError::PageTooLarge`] — malformed geometry.
 /// - [`RasterError::Deskew`] — deskew rotation failed.
+/// - [`RasterError::BackendUnavailable`] — `PDF_RASTER_BACKEND` requested a
+///   forced backend (e.g. `cuda`, `vulkan`) and that backend's runtime
+///   is unavailable.  Cannot occur if the env var is unset or `auto`.
 pub fn raster_pdf(
     path: &Path,
     opts: &RasterOptions,
@@ -494,6 +518,9 @@ pub fn raster_pdf(
 ///
 /// - Invalid options → `(1, Err(RasterError::InvalidOptions(...)))`, channel closes.
 /// - File open failure → `(1, Err(RasterError::Pdf(...)))`, channel closes.
+/// - Forced backend unavailable (e.g. `PDF_RASTER_BACKEND=cuda` with no
+///   CUDA driver) → `(1, Err(RasterError::BackendUnavailable(...)))`,
+///   channel closes.
 /// - Per-page failures → `(page_num, Err(...))`, rendering of subsequent pages continues.
 #[must_use]
 pub fn render_channel(

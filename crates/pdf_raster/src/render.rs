@@ -152,10 +152,12 @@ pub struct RasterSession {
     pub(crate) vaapi_device: String,
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     pub(crate) gpu_ctx: Option<Arc<gpu::GpuCtx>>,
-    /// Vulkan compute backend.  `Some` only when the `vulkan` feature is
-    /// enabled AND `policy == ForceVulkan` AND `VulkanBackend::new` succeeded.
-    /// Mutually exclusive with `gpu_ctx` in practice — `init_gpu_ctx` skips
-    /// CUDA init under `ForceVulkan`.  Shared across all pages.
+    /// Vulkan compute backend.  `Some` when the `vulkan` feature is
+    /// enabled, the policy resolves to `Auto` or `ForceVulkan`, and
+    /// `VulkanBackend::new` succeeded.  Mutually exclusive with
+    /// `gpu_ctx` in practice — under `Auto` the caller skips CUDA
+    /// init when this is `Some`; under `ForceVulkan` `init_gpu_ctx`
+    /// returns `None` regardless.  Shared across all pages.
     #[cfg(feature = "vulkan")]
     pub(crate) vk_backend: Option<Arc<gpu::backend::vulkan::VulkanBackend>>,
     /// Single-threaded VA-API JPEG decode queue.  One worker thread owns the
@@ -283,24 +285,36 @@ pub fn open_session(
     #[cfg(feature = "vulkan")]
     let vk_backend = init_vk_backend(config.policy)?;
 
-    // Under `Auto`, Vulkan is the preferred backend (faster on init-
-    // dominated workloads and a future cross-vendor home).  When Vulkan
-    // produced a backend, skip CUDA init so we don't pay its cost for a
-    // path we won't use.  Without the `vulkan` feature this is always
-    // `false` and CUDA continues to win `Auto` as it did before.
-    #[cfg(all(
-        feature = "vulkan",
-        any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"),
-    ))]
-    let vk_picked = vk_backend.is_some();
-    #[cfg(all(
-        not(feature = "vulkan"),
-        any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"),
-    ))]
-    let vk_picked = false;
+    // Symmetric reject for `ForceCuda` when no CUDA features are
+    // compiled in.  Without this, the cfg-gated `init_gpu_ctx` call
+    // below silently disappears and `--backend cuda` becomes a CPU
+    // render — exactly the silent-fallback behaviour the `Force*`
+    // variants exist to prevent.
+    #[cfg(not(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache")))]
+    if matches!(config.policy, BackendPolicy::ForceCuda) {
+        return Err(RasterError::BackendUnavailable(
+            "ForceCuda requires at least one of the `gpu-aa`, `gpu-icc`, or \
+             `cache` Cargo features; rebuild with the desired feature set or \
+             pick another --backend."
+                .to_owned(),
+        ));
+    }
 
+    // Under `Auto` Vulkan wins; skip CUDA init when it produced a backend
+    // so we don't pay its ~240 ms cost for a path we won't use.
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
-    let gpu_ctx = init_gpu_ctx(config.policy, vk_picked)?;
+    let gpu_ctx = {
+        #[cfg(feature = "vulkan")]
+        let vk_won_auto = vk_backend.is_some() && matches!(config.policy, BackendPolicy::Auto);
+        #[cfg(not(feature = "vulkan"))]
+        let vk_won_auto = false;
+
+        if vk_won_auto {
+            None
+        } else {
+            init_gpu_ctx(config.policy)?
+        }
+    };
 
     let vaapi_device = config.vaapi_device.clone();
 
@@ -452,14 +466,14 @@ fn init_vk_backend(
 
 /// Initialise the CUDA GPU context for AA fill and ICC colour transforms.
 ///
-/// Returns `None` on `CpuOnly`, `ForceVulkan`, and `Auto` when Vulkan
-/// already produced a backend (signalled by `vk_picked = true`).  Errors
-/// loudly on `ForceCuda` if init fails; logs a warning and returns
-/// `None` on `Auto`/`ForceVaapi` if init fails.
+/// Returns `None` on `CpuOnly` and `ForceVulkan`.  Errors loudly on
+/// `ForceCuda` if init fails; logs a warning and returns `None` on
+/// `Auto` / `ForceVaapi` if init fails.
 ///
-/// `vk_picked` is the load-bearing signal under `Auto`: `init_vk_backend`
-/// runs first and, when it succeeds, this function short-circuits so we
-/// don't pay the CUDA init cost for a CUDA path that won't be used.
+/// The caller is expected to short-circuit *before* calling this when
+/// Vulkan already won under `Auto` (see `open_session`) — keeping that
+/// dispatch decision at the call site lets this function stay
+/// policy-pure.
 ///
 /// The CUDA context, stream, and 7 PTX modules cost ~240 ms warm /
 /// ~1100 ms cold to build, and are process-wide state — there is no
@@ -477,14 +491,8 @@ fn init_vk_backend(
 static GPU_CTX: std::sync::OnceLock<Result<Arc<gpu::GpuCtx>, String>> = std::sync::OnceLock::new();
 
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
-fn init_gpu_ctx(
-    policy: BackendPolicy,
-    vk_picked: bool,
-) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
+fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
     if matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceVulkan) {
-        return Ok(None);
-    }
-    if matches!(policy, BackendPolicy::Auto) && vk_picked {
         return Ok(None);
     }
 

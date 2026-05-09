@@ -173,12 +173,14 @@ E5_MU_OUT="/tmp/p11_${LABEL}_e5_mu.ppm"
 E5_PP_TMPL="/tmp/p11_${LABEL}_e5_pp"
 
 # Map CONTEST_BACKEND value to the CLI's --backend flag value.
+# Use a bash array — a bare string would need word-splitting at the use
+# site, which exposes the args to glob expansion.
+CLI_BACKEND_ARGS=()
 case "$BACKEND" in
-    auto)   CLI_BACKEND_ARG="" ;;
-    cpu)    CLI_BACKEND_ARG="--backend cpu" ;;
-    cuda)   CLI_BACKEND_ARG="--backend cuda" ;;
-    vulkan) CLI_BACKEND_ARG="--backend vulkan" ;;
-    *)      CLI_BACKEND_ARG="" ;;
+    cpu)    CLI_BACKEND_ARGS=(--backend cpu) ;;
+    cuda)   CLI_BACKEND_ARGS=(--backend cuda) ;;
+    vulkan) CLI_BACKEND_ARGS=(--backend vulkan) ;;
+    auto|*) ;;  # empty array — let the CLI default kick in
 esac
 
 time_ms() {
@@ -191,7 +193,7 @@ time_ms() {
 
 for kind in cold warm warm warm warm; do
     rm -f "${E5_OUR_TMPL}-${E5_PAGE}.ppm" "$E5_MU_OUT" "${E5_PP_TMPL}-${E5_PAGE}.ppm"
-    OURS_MS=$(time_ms "$RASTER" $CLI_BACKEND_ARG "$E5_FIXTURE" "$E5_OUR_TMPL" -f $E5_PAGE -l $E5_PAGE -r $E5_DPI)
+    OURS_MS=$(time_ms "$RASTER" "${CLI_BACKEND_ARGS[@]}" "$E5_FIXTURE" "$E5_OUR_TMPL" -f $E5_PAGE -l $E5_PAGE -r $E5_DPI)
     MU_MS=$(time_ms mutool draw -q -P -N -r $E5_DPI -F ppm -o "$E5_MU_OUT" "$E5_FIXTURE" $E5_PAGE)
     PP_MS=$(time_ms pdftoppm -r $E5_DPI -f $E5_PAGE -l $E5_PAGE "$E5_FIXTURE" "$E5_PP_TMPL")
     echo "        $kind: ours=$OURS_MS  mutool=$MU_MS  pdftoppm=$PP_MS"
@@ -247,7 +249,7 @@ cat > "$MD" <<EOF
 **Cross-doc set:** $LIST_COUNT archives at ~300 MB each
 **Methodology:** 1 cold run + 4 warm runs per event; warm median reported.
 **Build features:** \`$PR_FEATURES\` on pdf_raster (no PGO)
-**Backend:** \`CONTEST_BACKEND=$BACKEND\` on the bench, \`$CLI_BACKEND_ARG\` on the standalone CLI for E5
+**Backend:** \`CONTEST_BACKEND=$BACKEND\` on the bench, \`${CLI_BACKEND_ARGS[*]:---backend auto (default)}\` on the standalone CLI for E5
 
 ## E1 — first-pixel (page $E1_PAGE)
 

@@ -4,9 +4,9 @@
 //! Functions are free-standing so `main` can call them without
 //! owning any render state.
 
-use pdf_raster::RasterError;
+use pdf_raster::{BackendPolicy, RasterError};
 
-use crate::args::{Args, BackendArg};
+use crate::args::Args;
 use crate::render::RenderError;
 
 /// Print the `source()` chain of `e` to stderr, one line per level.
@@ -19,52 +19,77 @@ pub fn print_error_chain(e: &dyn std::error::Error) {
 }
 
 /// Print a human-readable error (and actionable hints) when `open_session` fails.
-pub fn report_open_error(e: &RasterError, args: &Args) {
+///
+/// `policy` is the resolved backend (after CLI flag → env var → default
+/// fallback) so a hint can name the source the user actually controls
+/// even when no `--backend` flag was passed.
+pub fn report_open_error(e: &RasterError, args: &Args, policy: BackendPolicy) {
     if matches!(e, RasterError::BackendUnavailable(_)) {
         eprintln!("pdf-raster: {e}");
-        print_backend_hint(args);
+        print_backend_hint(policy, &args.vaapi_device, args.backend.is_none());
     } else {
         eprintln!("pdf-raster: failed to open PDF: {e}");
         print_error_chain(e);
     }
 }
 
-/// Print a backend-specific hint after a `BackendUnavailable` error.
-pub fn print_backend_hint(args: &Args) {
-    match args.backend {
-        Some(BackendArg::Cuda) => {
-            eprintln!("  hint: --backend cuda requires a working CUDA driver and GPU.");
-            eprintln!("        Run `nvidia-smi` to verify the driver is loaded.");
-            eprintln!(
-                "        Use --backend auto to fall back to CPU silently, or \
-                 --backend cpu to skip GPU entirely."
-            );
+/// Print a backend-specific hint for the resolved policy.
+///
+/// `via_env` flags whether the policy came from `PDF_RASTER_BACKEND`
+/// rather than `--backend`, so the hint can name the actual knob the
+/// user reached for.
+fn print_backend_hint(policy: BackendPolicy, vaapi_device: &str, via_env: bool) {
+    let source_hint = |backend: &str| {
+        if via_env {
+            eprintln!("  hint: PDF_RASTER_BACKEND={backend} is set in your environment.");
         }
-        Some(BackendArg::Vaapi) => {
-            eprintln!(
-                "  hint: --backend vaapi could not open the DRM device ({}).",
-                args.vaapi_device
-            );
-            eprintln!("        Verify the device exists and is readable by your user.");
-            eprintln!("        Use --vaapi-device PATH to specify an alternate render node.");
-            eprintln!(
-                "        Use --backend auto to fall back to CPU silently, or \
-                 --backend cpu to skip GPU entirely."
-            );
+    };
+    match policy {
+        BackendPolicy::ForceCuda => {
+            source_hint("cuda");
+            print_cuda_hint();
         }
-        Some(BackendArg::Vulkan) => {
-            eprintln!("  hint: --backend vulkan requires a Vulkan 1.3+ device and the loader.");
-            eprintln!("        Run `vulkaninfo` to verify a usable Vulkan device is present.");
-            eprintln!(
-                "        Use --backend auto to fall back to CUDA / CPU silently, or \
-                 --backend cpu to skip GPU entirely."
-            );
+        BackendPolicy::ForceVaapi => {
+            source_hint("vaapi");
+            print_vaapi_hint(vaapi_device);
         }
-        _ => {
+        BackendPolicy::ForceVulkan => {
+            source_hint("vulkan");
+            print_vulkan_hint();
+        }
+        BackendPolicy::Auto | BackendPolicy::CpuOnly => {
             eprintln!("  hint: use --backend auto to fall back to CPU when GPU is unavailable,");
             eprintln!("        or --backend cpu to force CPU-only mode.");
         }
     }
+}
+
+fn print_cuda_hint() {
+    eprintln!("        --backend cuda requires a working CUDA driver and GPU.");
+    eprintln!("        Run `nvidia-smi` to verify the driver is loaded.");
+    eprintln!(
+        "        Use --backend auto to fall back to Vulkan / CPU silently, \
+         or --backend cpu to skip GPU entirely."
+    );
+}
+
+fn print_vaapi_hint(device: &str) {
+    eprintln!("        --backend vaapi could not open the DRM device ({device}).");
+    eprintln!("        Verify the device exists and is readable by your user.");
+    eprintln!("        Use --vaapi-device PATH to specify an alternate render node.");
+    eprintln!(
+        "        Use --backend auto to fall back to CPU silently, \
+         or --backend cpu to skip GPU entirely."
+    );
+}
+
+fn print_vulkan_hint() {
+    eprintln!("        --backend vulkan requires a Vulkan 1.3+ device and the loader.");
+    eprintln!("        Run `vulkaninfo` to verify a usable Vulkan device is present.");
+    eprintln!(
+        "        Use --backend auto to fall back to CUDA / CPU silently, \
+         or --backend cpu to skip GPU entirely."
+    );
 }
 
 /// Sort errors by page number, print each with its cause chain, then exit 1.

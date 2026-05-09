@@ -20,7 +20,10 @@ static GLOBAL: MiMalloc = MiMalloc;
     reason = "linear startup sequence: arg parse → session open → page list → parallel render"
 )]
 fn main() {
-    let _ = env_logger::try_init();
+    // Default to `warn` so misconfiguration (e.g. PDF_RASTER_BACKEND=cdua,
+    // silent GPU init fallback) is visible without RUST_LOG opt-in.
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 
     let mut args = Args::parse();
 
@@ -59,7 +62,7 @@ fn main() {
 
     let session = pdf_raster::open_session(std::path::Path::new(&args.input), &session_config)
         .unwrap_or_else(|e| {
-            diagnostics::report_open_error(&e, &args);
+            diagnostics::report_open_error(&e, &args, session_config.policy);
             std::process::exit(1);
         });
 
