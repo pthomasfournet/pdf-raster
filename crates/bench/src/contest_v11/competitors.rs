@@ -65,17 +65,16 @@ pub fn mutool_render(archive: &Path, page: u32, out: &Path) -> CompetitorResult 
     let mut cmd = Command::new("mutool");
     cmd.args([
         "draw",
-        // -r resolution, -q quiet (suppress progress noise that goes to
-        // stderr, which would otherwise trip our error-forwarding path),
-        // -P parallel rendering (no-op on un-banded single-page render
-        // but signals "use the fast path you've got"), -N disable ICC
-        // color management (equalises since pdf-raster does not run
-        // Little CMS by default for RGB output either).
+        // Defaults only.  Empirical testing shows -P (parallel banded)
+        // adds ~10 ms of overhead for single-page renders that don't
+        // need banding; -N (disable ICC) is a no-op when mutool is
+        // built without LCMS support; -O 0 (disable overprint) doesn't
+        // help on pages without overprint.  The default config IS
+        // mutool's fast path for this workload — adding flags would
+        // gimp it.  -r resolution and -o output are required for the
+        // PPM-write comparison to work.
         "-r",
         "150",
-        "-q",
-        "-P",
-        "-N",
         "-o",
         out_str,
         archive_str,
