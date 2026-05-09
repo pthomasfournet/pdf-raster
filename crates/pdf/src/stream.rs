@@ -190,7 +190,7 @@ fn decompress_raw_deflate(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
             Err(e) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("libdeflate raw: {e:?}"),
+                    format!("libdeflate raw: {e}"),
                 ));
             }
         }
