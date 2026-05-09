@@ -15,8 +15,7 @@
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void blit_image(
-    uint3 lid : SV_GroupThreadID,
-    uint3 wid : SV_GroupID,
+    uint3 gid : SV_DispatchThreadID,
     uniform StructuredBuffer<uint8_t> src,
     uniform int src_w,
     uniform int src_h,
@@ -29,8 +28,10 @@ void blit_image(
     uniform StructuredBuffer<float> inv_ctm,
     uniform float page_h)
 {
-    int dx = bx0 + int(wid.x * 16u + lid.x);
-    int dy = by0 + int(wid.y * 16u + lid.y);
+    // SV_DispatchThreadID is the global lane index (group * groupsize + lane),
+    // so we don't repeat the [numthreads(16,16,1)] tile size as a magic number.
+    int dx = bx0 + int(gid.x);
+    int dy = by0 + int(gid.y);
 
     // Reject pixels outside the bbox AND outside the page.  Page bounds are
     // load-bearing for memory safety — a rotated image partially off-page

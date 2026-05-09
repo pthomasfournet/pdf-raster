@@ -7,6 +7,11 @@ jobs = 6
 # this lets LLVM auto-vectorise the rest of the code with the host's full
 # vector width.  Override per-machine when building for a different target
 # (e.g. on the i7-8700K testbench: RUSTFLAGS="-C target-cpu=skylake").
+#
+# Cargo precedence note: the RUSTFLAGS env var fully *replaces* this value
+# (it does not append).  If a script needs to add flags (e.g. `-D warnings`),
+# it must include `-C target-cpu=native` itself or auto-vectorisation drops
+# back to the generic-x86_64 baseline.
 rustflags = ["-C", "target-cpu=native"]
 
 [profile.test]

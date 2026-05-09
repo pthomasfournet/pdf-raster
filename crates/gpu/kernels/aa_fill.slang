@@ -70,7 +70,6 @@ groupshared uint sub_count;
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void aa_fill(
-    uint3 gid : SV_DispatchThreadID,
     uint3 lid : SV_GroupThreadID,
     uint3 wid : SV_GroupID,
     uniform StructuredBuffer<float> segs,
@@ -83,6 +82,9 @@ void aa_fill(
     uniform RWStructuredBuffer<uint8_t> coverage)
 {
     uint px_idx = wid.x;
+    // One workgroup == one output pixel, so all 64 lanes share `px_idx` and
+    // either all return or none do.  This keeps `WaveActiveSum` below in
+    // uniform control flow (required by the SPIR-V spec).
     if (px_idx >= width * height) return;
 
     uint px_x = px_idx % width;

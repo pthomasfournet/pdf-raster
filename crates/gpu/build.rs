@@ -1,4 +1,12 @@
-//! Build script: compiles CUDA kernels to PTX via nvcc and places them in `OUT_DIR`.
+//! Build script.
+//!
+//! Compiles compute kernels and emits link directives:
+//! - `.cu` → PTX via `nvcc` for the CUDA backend (when any CUDA feature is on).
+//! - `.slang` → SPIR-V via `slangc` for the Vulkan backend (when `vulkan` is on).
+//! - Emits `cargo:rustc-link-{search,lib}` directives per active GPU feature.
+//!
+//! All artifacts land in `OUT_DIR` and are consumed by `include_str!` /
+//! `include_bytes!` in `src/lib.rs` and the backend modules.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -248,12 +256,19 @@ fn write_placeholder_ptx(out_dir: &Path) {
 /// `aa_fill` (the only kernel using `WaveActiveSum`/`WaveIsFirstLane`);
 /// the remaining five compile against vanilla `spirv_1_5`.
 ///
-/// `slangc` is bundled with the `LunarG` Vulkan SDK; falls back to PATH lookup.
+/// `slangc` is bundled with the `LunarG` Vulkan SDK and ships in the
+/// Ubuntu `slang` package; falls back to PATH lookup.  Override with
+/// the `SLANGC` env var.
 fn compile_slang_kernels(kernels_dir: &Path, out_dir: &Path) {
     let slangc = env::var("SLANGC").unwrap_or_else(|_| "slangc".to_owned());
 
     for kernel in KERNELS {
         let src = kernels_dir.join(format!("{kernel}.slang"));
+        assert!(
+            src.exists(),
+            "slang source missing: {} (did you forget to add it alongside the .cu kernel?)",
+            src.display()
+        );
         let spv = out_dir.join(format!("{kernel}.spv"));
         let profile = slang_profile(kernel);
 
@@ -268,11 +283,13 @@ fn compile_slang_kernels(kernels_dir: &Path, out_dir: &Path) {
                 src.to_str().expect("slang source path contains non-UTF-8"),
             ])
             .status()
-            .unwrap_or_else(|e| panic!("failed to run slangc ({slangc}): {e}"));
+            .unwrap_or_else(|e| {
+                panic!("failed to run slangc ({slangc}): {e} — install the Vulkan SDK or `apt install slang`")
+            });
 
         assert!(
             status.success(),
-            "slangc failed for {kernel}.slang (profile={profile})"
+            "slangc failed for {kernel}.slang (profile={profile}); see stderr above for details"
         );
     }
 }

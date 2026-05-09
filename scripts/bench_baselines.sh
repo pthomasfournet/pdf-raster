@@ -20,6 +20,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# $LABEL ends up in an output filename (`local-<tool>.txt`).  Reject anything
+# outside [A-Za-z0-9_-] so a stray slash or `..` can't escape OUT_DIR.
+if [[ ! "$LABEL" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "ERROR: --label must match [A-Za-z0-9_-]+ (got: $LABEL)" >&2
+  exit 1
+fi
+
 cd "$(dirname "$0")/.."
 OUT_DIR="bench/v07x-baselines"
 mkdir -p "$OUT_DIR"
@@ -28,8 +35,8 @@ mkdir -p "$OUT_DIR"
 # from .cargo/config.toml so AVX-512 paths and host auto-vectorisation are
 # both active — same effective CPU codegen as mode A in bench_v070.sh.
 # Cargo short-circuits if nothing has changed; the always-build is cheap
-# and guarantees we pick up config/source changes.
-BIN="target/release/pdf-raster"
+# and guarantees we pick up config/source changes.  bench_compare.sh looks
+# up target/release/pdf-raster on its own; we just need to ensure it exists.
 echo "Ensuring CPU-only pdf-raster is up to date…"
 cargo build --release -p pdf-raster --no-default-features --bin pdf-raster
 

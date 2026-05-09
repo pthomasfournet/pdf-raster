@@ -30,9 +30,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Tool-specific knobs collected up-front so the rest of the script doesn't
+# re-fan-out per tool.  Adding a new tool means adding one arm here.
 case "$REF_TOOL" in
-  pdftoppm|mutool) ;;
-  *) echo "ERROR: --ref-tool must be pdftoppm or mutool (got: $REF_TOOL)" >&2; exit 1 ;;
+  mutool)
+    REF_NOTE='mutool draw -P is a 2-stage pipeline (~2 cores)' ;;
+  pdftoppm)
+    REF_NOTE='pdftoppm is single-threaded' ;;
+  *)
+    echo "ERROR: --ref-tool must be pdftoppm or mutool (got: $REF_TOOL)" >&2
+    exit 1 ;;
 esac
 
 [[ -x "$BIN" ]]      || { echo "ERROR: binary not found: $BIN" >&2; exit 1; }
@@ -54,6 +61,19 @@ check_disk() {
   if [[ -z "$avail_kb" || "$avail_kb" -lt 1048576 ]]; then
     echo "ERROR: less than 1 GB free on /tmp — aborting" >&2; exit 1
   fi
+}
+
+# mktemp -d wrapper that fails loudly on empty / unset result.  Without this
+# guard, a silent mktemp failure leaves $outdir = "" and the downstream
+# hyperfine command would write to the filesystem root.
+make_outdir() {
+  local d
+  d=$(mktemp -d -p /tmp 2>/dev/null) || true
+  if [[ -z "$d" || ! -d "$d" ]]; then
+    echo "ERROR: mktemp -d -p /tmp failed; can't create scratch dir" >&2
+    exit 1
+  fi
+  printf '%s' "$d"
 }
 
 # hyperfine_mean PREPARE_CMD BENCH_CMD  →  prints mean_ms.
@@ -105,7 +125,7 @@ printf "\nSystem: load=%-5s  cores=%d\n" "$LOAD1" "$NCORES"
 printf "Binary: %s\n"            "$BIN"
 printf "Reference: %s\n"         "$REF_VER"
 printf "Runs:   %d (warmup %d) — hyperfine mean, cold cache\n\n" "$RUNS" "$WARMUP"
-printf "NOTE: %s is single-threaded. Scan corpora (08-09) take several minutes each.\n\n" "$REF_TOOL"
+printf "NOTE: %s. Scan corpora (08-09) take several minutes each.\n\n" "$REF_NOTE"
 
 printf "%-32s  %12s  %12s  %10s\n" "corpus" "pdf-raster" "$REF_TOOL" "speedup"
 printf "%-32s  %12s  %12s  %10s\n" "------" "----------" "----------" "-------"
@@ -122,13 +142,13 @@ for name in "${corpora[@]}"; do
   PREPARE="$(which python3) -c \"import ctypes,os,sys; fd=os.open('$pdf',os.O_RDONLY); ctypes.CDLL(None).posix_fadvise(fd,0,os.fstat(fd).st_size,4); os.close(fd)\""
 
   # pdf-raster
-  outdir=$(mktemp -d -p /tmp)
+  outdir=$(make_outdir)
   raster_ms=$(hyperfine_mean "$PREPARE" "$BIN --backend cpu -r 150 '$pdf' '$outdir/r'") \
     || { rm -rf "$outdir"; exit 1; }
   rm -rf "$outdir"
 
   # reference
-  outdir=$(mktemp -d -p /tmp)
+  outdir=$(make_outdir)
   case "$REF_TOOL" in
     mutool)   ref_cmd="mutool draw -P -r 150 -o '$outdir/m-%d.png' '$pdf'" ;;
     pdftoppm) ref_cmd="pdftoppm -r 150 '$pdf' '$outdir/p'" ;;
