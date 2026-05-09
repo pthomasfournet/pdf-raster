@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.8.0] - 2026-05-09
+## [0.9.0] - 2026-05-09
 
 ### Bug Fixes
 
@@ -15,10 +15,14 @@ All notable changes to this project will be documented in this file.
 - Probe CUDA + nvjpeg2k locations instead of pinning cuda-12.8
 - Hardening pass on Phase 10 task 2
 - Hardening pass on Vulkan backend
+- Scope dead_code expect to non-test builds in madvise.rs
+- Preserve flate2's partial-decompression tolerance under libdeflate
 
 ### Chores
 
 - Drop stale CUDA-12.8 path pins after driver/toolkit bump
+- Audit init paths — already lazy, no change needed
+- Add PGO + BOLT release build script
 
 ### Documentation
 
@@ -27,6 +31,11 @@ All notable changes to this project will be documented in this file.
 - Mark Phase 10 task 1 partial — trait + CudaBackend shipped
 - Phase 10 Task 3 follow-ups + scrub stale comments
 - Phase 10 Task 4 — renderer migration + bench gate
+- Prep v0.8.0 release notes
+- Rewrite Phase 11 around the million-page-archive contest
+- Drop internal-doc paths from public ROADMAP
+- Phase 11 v0.9.0 release notes + contest results
+- Full E1-E4 vs mutool, post-mortem, mutool defaults only
 
 ### Features
 
@@ -41,6 +50,13 @@ All notable changes to this project will be documented in this file.
 - Plumb BackendPolicy::ForceVulkan + --backend vulkan
 - ForceVulkan errors loudly until renderer migration lands
 - Wire VulkanBackend through the renderer + nvcc-probe build fix
+- Add Document::get_page (O(log)) and page_count_fast (O(1))
+- /Linearized detection + LinearizationHints API
+- Posix_fadvise hints on Document mmap
+- Contest_v11 binary skeleton + qpdf-based archive builder
+- Contest_v11 four-event runners + competitor wrappers
+- Apples-to-apples contest harness — disk write, mutool flags, dedup-defeating archive builder
+- Vulkan-default Auto, env-var override, process-static GPU init
 
 ### Other
 
@@ -57,6 +73,25 @@ All notable changes to this project will be documented in this file.
 - Reject Mask layout in BlitParams::validate, use be() helper, drop task ref
 - BackendError::msg constructor, demote StringError to private
 - Phase 10 task 4 step 4 — bench gate, all measurable criteria PASS
+- Collapse path-noise import + add u32::MAX edge-case test
+- Drop dead linearization stub, idiomatic try_from, 3-level test
+- Simplify-skill cleanup pass on page-tree descent
+- Consolidate page-resolve paths, drop dead shading wrapper
+- Drop redundant page-id cache, plumb single resolution
+- Linearization cleanup + Object::{as_u32,as_u64} helpers
+- Tighten as_u32/as_u64, drop xref obj_to_u32, lin fast path
+- Minor tidy on madvise.rs (rustix import, test helper)
+- Fix temp_file_with doc-comment
+- Fix zlib decompression bomb in flate2 paths
+- Libdeflater error uses Display, not Debug
+- Fix E4 off-by-one, polite missing-arg UX, narrow pdftoppm cleanup
+- Drop redundant install probes, tighten cleanup, fix target_bytes UX
+- GPU-features re-bench across CUDA-cache, CUDA-nocache, Vulkan
+- Plumb resolved policy, gate ForceCuda-without-features, tighten warnings
+
+### Performance
+
+- Libdeflate backend for FlateDecode (1.4-2.4x speedup)
 
 ### Refactor
 
@@ -70,6 +105,11 @@ All notable changes to this project will be documented in this file.
 - Simplify pass on Vulkan backend
 - Hardening + simplify pass on the ForceVulkan surface
 - Hardening + simplify pass on Vulkan dispatch and build.rs
+- Lazy page resolution via O(log) descent
+
+### Testing
+
+- Scaffolding for logarithmic page-tree descent
 
 ## [0.7.0] - 2026-05-07
 

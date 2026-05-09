@@ -27,13 +27,13 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
-### Unreleased
+### v0.9.0 (May 2026)
 
-**New since v0.9.0:**
+**Backend selection — Vulkan-default, env-var override, process-static init:**
 
-- **Vulkan is now the preferred backend under `Auto`.**  When both
-  Vulkan and CUDA are compiled in, `BackendPolicy::Auto` resolves to
-  Vulkan first and falls through to CUDA (then CPU) on init failure.
+- **Vulkan is the preferred backend under `Auto`.**  When both Vulkan
+  and CUDA are compiled in, `BackendPolicy::Auto` resolves to Vulkan
+  first, falls through to CUDA on init failure, and finally to CPU.
   Vulkan's per-process init is faster on init-dominated workloads
   (E1, E3, E5 in the Phase 11 contest), and CUDA narrowly wins only
   when the device-resident image cache is firing across many pages
@@ -41,25 +41,48 @@ Phase 5 is complete. The API exists and is integrated.
   explicitly; CUDA stays a first-class backend.
 - **`PDF_RASTER_BACKEND` environment variable.**  Resolves the runtime
   backend without recompiling.  Precedence: CLI `--backend` wins over
-  env var, env var wins over compile-time default.  Valid values:
-  `auto`, `cpu`, `cuda`, `vaapi`, `vulkan`.  Unrecognised values warn
-  on stderr and fall back to `Auto`.  Implemented in
-  `BackendPolicy::from_env`; consumed by `SessionConfig::default()`.
+  env var, env var wins over compile-time default.  Valid values
+  (case-insensitive, whitespace-trimmed): `auto`, `cpu`, `cuda`,
+  `vaapi`, `vulkan`.  Unrecognised values emit `log::warn!` (so library
+  embedders control the sink) and fall back to `Auto`.  The CLI binary
+  defaults `env_logger` to `warn` so a typo is visible without
+  `RUST_LOG` opt-in.  Implemented in `BackendPolicy::from_env` /
+  `from_env_var`; consumed by `SessionConfig::default()`.
 - **Process-static GPU contexts.**  Both `gpu::GpuCtx` (CUDA) and
-  `gpu::backend::vulkan::VulkanBackend` are now memoised in a
-  `OnceLock<_>` inside `pdf_raster::render`, so workloads that open
-  many short-lived sessions (e.g. Phase 11 E3: 100 archives, 1 page
-  each) pay the ~240 ms init cost once instead of 100 times.
-  Phase 11 E3 went from 24 s → 14 s under CUDA + cache; under
-  CUDA-without-cache or Vulkan, E3 collapses to ~370 ms because the
-  remaining cost is just the per-archive BLAKE3 (cache only) /
-  per-archive xref + render path (everywhere else).
+  `gpu::backend::vulkan::VulkanBackend` are memoised in a
+  `OnceLock<Result<Arc<_>, String>>` inside `pdf_raster::render`, so
+  workloads that open many short-lived sessions (Phase 11 E3:
+  100 archives, 1 page each) pay the ~240 ms init cost once per
+  process instead of N times.  Phase 11 E3 went from 24 s → 14 s
+  under CUDA + cache; under CUDA-without-cache or Vulkan, E3
+  collapses to ~370 ms because the remaining cost is just the
+  per-archive BLAKE3 (cache only) / per-archive xref + render path
+  (everywhere else).
+- **`SessionConfig::with_policy(p)` constructor** — builds a config
+  with explicit policy and otherwise-default fields, *without*
+  reading `PDF_RASTER_BACKEND`.  Use when the caller has already
+  resolved the policy (CLI flag, custom env var, explicit arg) and
+  doesn't want `Default::default()`'s env-var lookup firing.
+  `Default for SessionConfig` routes through `with_policy` so field
+  defaults live in one place.
+- **`ForceCuda`-without-features compile-time gate** — symmetric to
+  the existing `ForceVulkan` gate.  Without this, asking for
+  `--backend cuda` in a build that compiled out CUDA features would
+  silently CPU-render — exactly the silent-fallback that `Force*`
+  variants exist to prevent.  Pre-existing bug, fixed in this release.
+- **CLI `Args::backend` is now `Option<BackendArg>`** (no clap default).
+  Distinguishes "user passed `--backend auto`" from "user passed
+  nothing" so the env-var fallback is reachable.  When omitted, the
+  CLI consults `PDF_RASTER_BACKEND`; when set, the flag wins.
+- **Diagnostics carry the resolved policy** — `report_open_error` /
+  `print_backend_hint` take `BackendPolicy` directly (with a `via_env`
+  flag for the source-attribution line) so the hint matches the
+  actually-attempted backend, not a guess from the raw env-var
+  string.  Eliminates the duplicated parser in `diagnostics.rs`.
 
-### v0.9.0 (May 2026)
+**Phase 11 — million-page-archive contest landed.**
 
-**New since v0.8.0:**
-
-- **Phase 11 — million-page-archive contest landed.**  Four-event bench
+- Four-event bench
   harness in `crates/bench/contest_v11`: E1 first-pixel, E2 sustained,
   E3 cross-doc, E4 random-access.  All three engines (pdf-raster,
   mutool draw, pdftoppm) write a PPM file per render — the timed
