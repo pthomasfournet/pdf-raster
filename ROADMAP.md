@@ -770,13 +770,11 @@ The Phase 0 work (`crates/gpu/src/jpeg/`) shipped clean across three commits and
 
 The Weißenberger 2018 self-synchronizing parallel Huffman algorithm is genuinely beautiful CUDA work. Implementing it produces an open, redistributable artifact that demonstrates a non-obvious algorithm. If pdf-raster ever wants to run on a workload where 24 CPU threads aren't available (embedded, single-core, etc.) the GPU decoder becomes relevant. The work has long-term value as a learning project; it's just not the path to faster pdf-raster.
 
-See `docs/superpowers/specs/2026-05-06-gpu-jpeg-pipeline.md` for the full original spec, kept on the local-only `docs/superpowers/` side because it's a research artifact, not an active spec.
+The full original spec is preserved as a developer-side research artifact; it isn't active design.
 
 ---
 
 ## Phase 9 — Device-resident image cache and GPU page buffer (IMPLEMENTATION COMPLETE — bench gate partial)
-
-**Spec:** `docs/superpowers/specs/2026-05-07-phase-9-device-resident-image-cache.md`
 
 **Goal:** decoded image pixels and the page being rendered both live in VRAM for the lifetime of a render session, so the rendering hot path performs zero PCIe round-trips per image and zero decode work on cache hits.
 
@@ -812,8 +810,6 @@ Re-bench result: cold-render regression collapsed from 14× to 1.1–1.9× on lo
 ---
 
 ## Phase 10 — Vulkan compute backend (DONE except cross-vendor proof of life)
-
-**Spec:** `docs/superpowers/specs/2026-05-07-phase-10-vulkan-compute-backend.md`
 
 **Goal:** replace the CUDA-specific kernel launch and device-memory layer with a backend-abstracted layer that has both CUDA and Vulkan compute implementations, so the same algorithmic kernels run on NVIDIA, AMD, Intel, and Apple GPUs from one source tree.
 
@@ -923,10 +919,13 @@ The original Phase-11 draft had three tasks that are still real future work but 
 
 A 2-stage interpretation+render pipeline within a single document.  pdf-raster already parallelises across pages with Rayon, which dominates per-document pipelining on any multi-core machine — confirmed empirically by the May-2026 baseline matrix (3–10 % gain over serial vs. Rayon-per-page's much larger lead).  Network-streaming PDF (HTTP range requests).  Not our user; PDFium's browser use case, not a CLI tool's.  AVX-512 simdjson-style PDF lexer.  Real engineering effort with a real win, but the contest events don't bottleneck on dictionary parsing — deferred to a future phase.
 
-**Spec / plan archives (gitignored, on disk for the implementing developer):**
+**Rejected ideas (kept here so they don't get re-proposed under new names):**
 
-- `docs/superpowers/specs/2026-05-09-phase-11-million-page-archive-contest.md` — full spec including the rejected ideas section ("`io_uring` for general I/O — REJECTED.  mmap *is* streaming on Linux..." etc.).  These rejections are deliberate and documented so future-us doesn't re-propose them under new names.
-- `docs/superpowers/plans/2026-05-09-phase-11-million-page-archive-contest.md` — task-by-task implementation plan with TDD red-light/green-light steps.
+- *`io_uring` for general I/O.*  mmap is already streaming on Linux — the kernel page-faults on access.  `io_uring` only beats mmap+`MAP_POPULATE` on cold-cache reads of *known-up-front* byte ranges, which our parser cannot produce (each phase depends on bytes parsed from the previous).  `posix_fadvise(WILLNEED)` delivers the same kernel hint in a few lines.
+- *`io_uring` for E3's batch open.*  Real win in theory (100 × `open + read tail` is genuinely batchable), but `posix_fadvise` gets us most of it without an async runtime.  Kept the helper file name (`io_uring_open`) for traceability; the implementation is fadvise.
+- *`HttpRangeSource` / network-streaming PDF.*  PDFium's browser use case, not ours.
+- *AVX-512 simdjson-style lexer for PDF dictionaries.*  Real engineering with a real win, but the contest events don't bottleneck on dictionary parsing.  Deferred.
+- *Hugepages for GPU staging buffers.*  1–3% win on E2/E3.  Worth measuring after Task 11; not worth speccing now.
 
 ---
 
