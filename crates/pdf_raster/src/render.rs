@@ -108,9 +108,21 @@ impl From<pdf_interp::InterpError> for RasterError {
 
 /// Direct conversion from `pdf::PdfError` so call sites can write
 /// `e.into()` instead of the two-level `RasterError::from(InterpError::from(e))`.
+///
+/// `PdfError::PageOutOfRange` carries a **0-based** index per the descender's
+/// contract; the surrounding API surface is **1-based**.  Translate to the
+/// 1-based [`RasterError::PageOutOfRange`] variant directly so the chained
+/// conversion does not silently leak 0-based numbering through
+/// `RasterError::Pdf(InterpError::Pdf(...))`.
 impl From<pdf::PdfError> for RasterError {
     fn from(e: pdf::PdfError) -> Self {
-        Self::from(pdf_interp::InterpError::from(e))
+        match e {
+            pdf::PdfError::PageOutOfRange { page, total } => Self::PageOutOfRange {
+                page: page.saturating_add(1),
+                total,
+            },
+            other => Self::from(pdf_interp::InterpError::from(other)),
+        }
     }
 }
 
@@ -127,11 +139,6 @@ impl From<pdf::PdfError> for RasterError {
 /// `mpsc::Sender` is `Send + Sync`).
 pub struct RasterSession {
     pub(crate) doc: Arc<pdf::Document>,
-    /// Lazy page-id cache.  Populated on first access via
-    /// [`pdf::Document::get_page`].  Empty immediately after [`open_session`].
-    /// Wrapped in `RwLock` because `RasterSession` is `Sync` and rayon
-    /// page-render threads will read/write concurrently.
-    pub(crate) page_cache: std::sync::RwLock<std::collections::HashMap<u32, pdf::ObjectId>>,
     pub(crate) total_pages: u32,
     pub(crate) policy: BackendPolicy,
     /// VA-API DRM render node path. Retained in non-vaapi builds for forward
@@ -202,48 +209,33 @@ impl RasterSession {
         self.policy
     }
 
-    /// Number of pages currently cached in the page-id resolver.
+    /// Resolve a 1-based page number to its [`pdf::ObjectId`].
     ///
-    /// Used by integration tests to verify the session's lazy invariants
-    /// (open returns a session with an empty cache; rendering a page
-    /// populates exactly one entry).  Not part of the stable public API.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn cached_page_count(&self) -> usize {
-        self.page_cache.read().map_or(0, |m| m.len())
-    }
-
-    /// Resolve a 1-based page number to its object id, populating the cache
-    /// on first call.  Logarithmic in the document page count.
+    /// Each call performs one logarithmic page-tree descent.  Per-render
+    /// callers should resolve once at the entry point and pass the id into
+    /// `pdf_interp::page_size_pts_by_id` and `pdf_interp::parse_page_by_id`
+    /// so the single descent serves all three uses; an earlier shape with a
+    /// session-side `RwLock<HashMap>` cache turned out to be hot-write
+    /// cold-read on every contest event (each page rendered once) and was
+    /// dropped.
     ///
     /// # Errors
     /// [`RasterError::PageOutOfRange`] when `page_num` is `0` or exceeds
     /// `self.total_pages`; [`RasterError::Pdf`] when the underlying page-tree
     /// descent fails (malformed `/Pages` node).
-    pub(crate) fn resolve_page(&self, page_num: u32) -> Result<pdf::ObjectId, RasterError> {
-        // The upper bound check is duplicated by `Document::get_page` below,
-        // but performing it here lets us return a 1-based `PageOutOfRange`
-        // directly; without it, a too-large `page_num` would surface as
-        // `RasterError::Pdf(... PageOutOfRange { page: 0-based, ... })`,
-        // which is harder to interpret in CLI / API consumers.  The check
-        // for `page_num == 0` is load-bearing — it guards `page_num - 1`
-        // against `u32` underflow.
+    pub fn resolve_page(&self, page_num: u32) -> Result<pdf::ObjectId, RasterError> {
+        // The upper-bound check is structurally duplicated by
+        // `Document::get_page`, but doing it here keeps the user-facing
+        // error 1-based (the descent returns 0-based `PageOutOfRange`).
+        // The `page_num == 0` check is load-bearing: guards `page_num - 1`
+        // from u32 underflow.
         if page_num == 0 || page_num > self.total_pages {
             return Err(RasterError::PageOutOfRange {
                 page: page_num,
                 total: self.total_pages,
             });
         }
-        if let Ok(guard) = self.page_cache.read()
-            && let Some(id) = guard.get(&page_num)
-        {
-            return Ok(*id);
-        }
-        let id = self.doc.get_page(page_num - 1)?;
-        if let Ok(mut guard) = self.page_cache.write() {
-            let _ = guard.insert(page_num, id);
-        }
-        Ok(id)
+        self.doc.get_page(page_num - 1).map_err(RasterError::from)
     }
 }
 
@@ -376,7 +368,6 @@ pub fn open_session(
 
     Ok(RasterSession {
         doc,
-        page_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         total_pages,
         policy: config.policy,
         #[cfg(not(feature = "vaapi"))]
@@ -470,8 +461,9 @@ pub fn render_page_rgb(
     page_num: u32,
     scale: f64,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
-    let geom = pdf_interp::page_size_pts(&session.doc, page_num)?;
-    render_page_rgb_with_geom(session, page_num, scale, geom, session.policy)
+    let page_id = session.resolve_page(page_num)?;
+    let geom = pdf_interp::page_size_pts_by_id(&session.doc, page_id)?;
+    render_page_rgb_with_geom(session, page_num, page_id, scale, geom, session.policy)
         .map(|(bmp, _diag)| bmp)
 }
 
@@ -493,8 +485,9 @@ pub fn render_page_rgb_hinted(
     scale: f64,
     effective_policy: BackendPolicy,
 ) -> Result<Bitmap<Rgb8>, RasterError> {
-    let geom = pdf_interp::page_size_pts(&session.doc, page_num)?;
-    render_page_rgb_with_geom(session, page_num, scale, geom, effective_policy)
+    let page_id = session.resolve_page(page_num)?;
+    let geom = pdf_interp::page_size_pts_by_id(&session.doc, page_id)?;
+    render_page_rgb_with_geom(session, page_num, page_id, scale, geom, effective_policy)
         .map(|(bmp, _diag)| bmp)
 }
 
@@ -505,10 +498,12 @@ pub fn render_page_rgb_hinted(
 fn render_page_rgb_with_geom(
     session: &RasterSession,
     page_num: u32,
+    page_id: pdf::ObjectId,
     scale: f64,
     geom: pdf_interp::PageGeometry,
     effective_policy: BackendPolicy,
 ) -> Result<(Bitmap<Rgb8>, pdf_interp::renderer::PageDiagnostics), RasterError> {
+    let _ = page_num; // kept for diagnostic / future tracing; resolution happens once at the entry point
     if !scale.is_finite() || scale <= 0.0 {
         return Err(RasterError::InvalidOptions(format!(
             "scale must be a positive finite number, got {scale}"
@@ -541,9 +536,7 @@ fn render_page_rgb_with_geom(
         });
     }
 
-    let page_id = session.resolve_page(page_num)?;
-
-    let ops = pdf_interp::parse_page(doc, page_num)?;
+    let ops = pdf_interp::parse_page_by_id(doc, page_id)?;
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -839,10 +832,17 @@ fn render_one(state: &RenderState, page_num: u32) -> Result<RenderedPage, Raster
     let dpi = state.opts.dpi;
     let scale = f64::from(dpi) / 72.0;
 
-    let geom = pdf_interp::page_size_pts(&state.session.doc, page_num)?;
+    let page_id = state.session.resolve_page(page_num)?;
+    let geom = pdf_interp::page_size_pts_by_id(&state.session.doc, page_id)?;
 
-    let (rgb, diagnostics) =
-        render_page_rgb_with_geom(&state.session, page_num, scale, geom, state.session.policy)?;
+    let (rgb, diagnostics) = render_page_rgb_with_geom(
+        &state.session,
+        page_num,
+        page_id,
+        scale,
+        geom,
+        state.session.policy,
+    )?;
     let mut gray = rgb_to_gray(&rgb);
 
     if state.opts.deskew {

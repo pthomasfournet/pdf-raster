@@ -44,7 +44,7 @@ use pdf::{Dictionary, Document, Object, ObjectId};
 use crate::{
     InterpError,
     content::Operator,
-    page_size_pts, parse_page,
+    page_size_pts_by_id, parse_page_by_id,
     renderer::PageDiagnostics,
     resources::{
         image::{IMAGE_FILTER_COUNT, ImageFilter, filter_name, inline::parse_inline_params},
@@ -76,7 +76,12 @@ const MAX_PRESCAN_DEPTH: u32 = 4;
 /// Any per-resource lookup error (corrupt dict, missing filter key) is
 /// silently skipped so that a partial classification is still returned.
 pub fn prescan_page(doc: &Document, page_num: u32) -> Result<PageDiagnostics, InterpError> {
-    let geom = page_size_pts(doc, page_num)?;
+    // Resolve the page id once and reuse it for both the geometry read and
+    // the content-stream parse — the previous shape descended the page tree
+    // three times (page_size_pts, resolve_page_id, parse_page).
+    let page_id = crate::resolve_page_id(doc, page_num)?;
+
+    let geom = page_size_pts_by_id(doc, page_id)?;
     #[expect(
         clippy::cast_possible_truncation,
         reason = "page width in PDF points (≤ ~10 000 pts); f32 is sufficient for PPI routing"
@@ -88,7 +93,6 @@ pub fn prescan_page(doc: &Document, page_num: u32) -> Result<PageDiagnostics, In
     let mut max_ppi: f32 = 0.0;
 
     // 1. Walk XObject resource dictionary (no decoding).
-    let page_id = crate::resolve_page_id(doc, page_num)?;
     scan_xobjects(
         doc,
         page_id,
@@ -101,7 +105,7 @@ pub fn prescan_page(doc: &Document, page_num: u32) -> Result<PageDiagnostics, In
 
     // 2. Walk content stream operators for inline images and text.
     let mut has_vector_text = false;
-    let ops = parse_page(doc, page_num)?;
+    let ops = parse_page_by_id(doc, page_id)?;
     for op in &ops {
         match op {
             Operator::InlineImage { params, .. } => {

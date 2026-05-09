@@ -247,7 +247,22 @@ pub struct PageGeometry {
 /// - [`InterpError::InvalidPageGeometry`] if `UserUnit` is present but outside `[0.1, 10.0]`.
 pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, InterpError> {
     let page_id = resolve_page_id(doc, page_num)?;
+    page_size_pts_by_id(doc, page_id)
+}
 
+/// Like [`page_size_pts`] but takes a pre-resolved page object id.
+///
+/// Skips the page-tree descent.  Use when the caller already resolved the id —
+/// the renderer resolves once at its entry point and reuses the id for both
+/// `page_size_pts_by_id` and [`parse_page_by_id`].
+///
+/// # Errors
+/// [`InterpError::InvalidPageGeometry`] if `UserUnit` is present but outside
+/// `[0.1, 10.0]`.
+pub fn page_size_pts_by_id(
+    doc: &Document,
+    page_id: pdf::ObjectId,
+) -> Result<PageGeometry, InterpError> {
     let fallback = PageGeometry {
         width_pts: 612.0,
         height_pts: 792.0,
@@ -320,7 +335,8 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
                 pdf::Object::Real(_) | pdf::Object::Integer(_) => {}
                 other => {
                     return Err(InterpError::InvalidPageGeometry(format!(
-                        "UserUnit on page {page_num} is not a number (got {})",
+                        "UserUnit on page object {} is not a number (got {})",
+                        page_id.0,
                         other.enum_variant()
                     )));
                 }
@@ -328,7 +344,8 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
             let v = to_f64(obj);
             if !v.is_finite() || !(0.1..=10.0).contains(&v) {
                 return Err(InterpError::InvalidPageGeometry(format!(
-                    "UserUnit {v} on page {page_num} is outside the valid range [0.1, 10.0]"
+                    "UserUnit {v} on page object {} is outside the valid range [0.1, 10.0]",
+                    page_id.0,
                 )));
             }
             v
@@ -360,6 +377,18 @@ pub fn page_size_pts(doc: &Document, page_num: u32) -> Result<PageGeometry, Inte
 /// be read.
 pub fn parse_page(doc: &Document, page_num: u32) -> Result<Vec<content::Operator>, InterpError> {
     let page_id = resolve_page_id(doc, page_num)?;
+    parse_page_by_id(doc, page_id)
+}
+
+/// Like [`parse_page`] but takes a pre-resolved page object id, skipping
+/// the page-tree descent.
+///
+/// # Errors
+/// [`InterpError::Pdf`] if the content stream cannot be read.
+pub fn parse_page_by_id(
+    doc: &Document,
+    page_id: pdf::ObjectId,
+) -> Result<Vec<content::Operator>, InterpError> {
     let content_bytes = doc.get_page_content(page_id)?;
     Ok(content::parse(&content_bytes))
 }
