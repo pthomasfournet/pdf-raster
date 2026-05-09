@@ -38,8 +38,10 @@ gpu-icc = ["dep:gpu"]
 cache = ["dep:gpu", "gpu/cache"]
 # Vulkan compute backend (Phase 10).  When on, the renderer can route
 # kernel call sites through VulkanBackend instead of GpuCtx; selection
-# happens at runtime via `BackendHandle`.
-vulkan = ["dep:gpu", "gpu/vulkan"]
+# happens at runtime via `BackendHandle`.  Implies `gpu-aa` because the
+# Vulkan AA / tile-fill path reuses the segment-flattening helpers in
+# `renderer::page::gpu_ops` (which are gated on `gpu-aa`).
+vulkan = ["dep:gpu", "dep:bytemuck", "gpu/vulkan", "gpu-aa"]
 # Build FreeType from source (cross-compilation, static builds).
 bundled = ["font/bundled"]
 
@@ -58,6 +60,7 @@ zune-core = "0.5.1"
 jpeg2k      = { version = "0.10.1", default-features = false, features = ["image", "openjpeg-sys"] }
 hayro-jbig2 = { version = "0.3.0", default-features = false }
 moxcms = "0.8.1"
+bytemuck    = { workspace = true, optional = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }

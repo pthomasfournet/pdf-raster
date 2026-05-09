@@ -919,6 +919,7 @@ dependencies = [
 name = "pdf_interp"
 version = "0.7.0"
 dependencies = [
+ "bytemuck",
  "color 0.7.0",
  "encode",
  "env_logger",

@@ -64,15 +64,28 @@ pub mod vaapi;
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig};
+
+// The embedded PTX strings are only consumed by `GpuCtx::init_inner`, which
+// is itself gated on `not(ptx_placeholder)`.  Gate the consts (and the
+// imports they need) the same way so a build without NVCC compiles cleanly
+// without dead-code warnings.
+#[cfg(not(ptx_placeholder))]
+use cudarc::driver::{CudaContext, CudaModule};
+#[cfg(not(ptx_placeholder))]
 use cudarc::nvrtc::Ptx;
 
+#[cfg(not(ptx_placeholder))]
 const PTX_COMPOSITE: &str = include_str!(concat!(env!("OUT_DIR"), "/composite_rgba8.ptx"));
+#[cfg(not(ptx_placeholder))]
 const PTX_SOFT_MASK: &str = include_str!(concat!(env!("OUT_DIR"), "/apply_soft_mask.ptx"));
+#[cfg(not(ptx_placeholder))]
 const PTX_AA_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/aa_fill.ptx"));
+#[cfg(not(ptx_placeholder))]
 const PTX_TILE_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/tile_fill.ptx"));
+#[cfg(not(ptx_placeholder))]
 const PTX_ICC_CLUT: &str = include_str!(concat!(env!("OUT_DIR"), "/icc_clut.ptx"));
-#[cfg(feature = "cache")]
+#[cfg(all(not(ptx_placeholder), feature = "cache"))]
 const PTX_BLIT_IMAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/blit_image.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
@@ -145,7 +158,28 @@ impl GpuCtx {
     /// # Errors
     ///
     /// Returns an error if no CUDA device is present or kernel load fails.
+    /// Also returns an error if the `gpu` crate was built without NVCC
+    /// available (placeholder PTX); the message points at the build
+    /// step rather than the driver, which is what's actually wrong.
     pub fn init() -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(ptx_placeholder)]
+        return Err(
+            "GpuCtx::init: PTX kernels are placeholders — the `gpu` crate was \
+             built on a host without NVCC.  Rebuild on a machine with the CUDA \
+             toolkit (`/usr/local/cuda/bin/nvcc`) or set the NVCC env var to \
+             the toolkit's nvcc binary.  CPU paths still work; only `--backend \
+             cuda` and CUDA-feature-gated paths require real PTX."
+                .into(),
+        );
+
+        #[cfg(not(ptx_placeholder))]
+        Self::init_inner()
+    }
+
+    /// Real init body — separate so the `cfg(ptx_placeholder)` early-return
+    /// in `init` doesn't get tangled with the success path's borrow scopes.
+    #[cfg(not(ptx_placeholder))]
+    fn init_inner() -> Result<Self, Box<dyn std::error::Error>> {
         let ctx: Arc<CudaContext> = CudaContext::new(0)?;
         let stream = ctx.default_stream();
 

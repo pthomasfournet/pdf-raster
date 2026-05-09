@@ -134,6 +134,12 @@ pub struct RasterSession {
     pub(crate) vaapi_device: String,
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     pub(crate) gpu_ctx: Option<Arc<gpu::GpuCtx>>,
+    /// Vulkan compute backend.  `Some` only when the `vulkan` feature is
+    /// enabled AND `policy == ForceVulkan` AND `VulkanBackend::new` succeeded.
+    /// Mutually exclusive with `gpu_ctx` in practice — `init_gpu_ctx` skips
+    /// CUDA init under `ForceVulkan`.  Shared across all pages.
+    #[cfg(feature = "vulkan")]
+    pub(crate) vk_backend: Option<Arc<gpu::backend::vulkan::VulkanBackend>>,
     /// Single-threaded VA-API JPEG decode queue.  One worker thread owns the
     /// `VapiJpegDecoder`; all Rayon page-render threads share handles to it.
     /// `None` when the `vaapi` feature is disabled, policy is `CpuOnly` /
@@ -219,16 +225,19 @@ pub fn open_session(
         ))
     })?;
 
-    // Refuse `ForceVulkan` rather than silently falling back to CPU
-    // while the renderer's kernel dispatch is still CUDA-only.
+    // Reject `ForceVulkan` at the policy gate when the `vulkan` feature
+    // wasn't compiled in; otherwise initialise the Vulkan backend up
+    // front so failures surface here rather than mid-render.
+    #[cfg(not(feature = "vulkan"))]
     if matches!(config.policy, BackendPolicy::ForceVulkan) {
         return Err(RasterError::BackendUnavailable(
-            "ForceVulkan: the renderer's kernel dispatch path is not yet wired \
-             through VulkanBackend.  Use `--backend cuda` (or `--backend auto`) \
-             today; see ROADMAP.md for the renderer-migration follow-up."
+            "ForceVulkan requires the `vulkan` Cargo feature; \
+             rebuild with `--features vulkan` or pick another --backend."
                 .to_owned(),
         ));
     }
+    #[cfg(feature = "vulkan")]
+    let vk_backend = init_vk_backend(config.policy)?;
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     let gpu_ctx = init_gpu_ctx(config.policy)?;
@@ -322,6 +331,8 @@ pub fn open_session(
         vaapi_device,
         #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
         gpu_ctx,
+        #[cfg(feature = "vulkan")]
+        vk_backend,
         #[cfg(feature = "vaapi")]
         vaapi_queue,
         #[cfg(feature = "cache")]
@@ -333,11 +344,33 @@ pub fn open_session(
     })
 }
 
+/// Initialise the Vulkan compute backend.
+///
+/// Returns `None` on every policy except `ForceVulkan`; errors loudly on
+/// `ForceVulkan` if init fails (no silent CPU fallback when the user
+/// asked for Vulkan).
+#[cfg(feature = "vulkan")]
+fn init_vk_backend(
+    policy: BackendPolicy,
+) -> Result<Option<Arc<gpu::backend::vulkan::VulkanBackend>>, RasterError> {
+    if !matches!(policy, BackendPolicy::ForceVulkan) {
+        return Ok(None);
+    }
+    match gpu::backend::vulkan::VulkanBackend::new() {
+        Ok(b) => Ok(Some(Arc::new(b))),
+        Err(e) => Err(RasterError::BackendUnavailable(format!(
+            "Vulkan backend required but unavailable: {e}. \
+             Verify with `vulkaninfo` that a Vulkan 1.3+ device is present."
+        ))),
+    }
+}
+
 /// Initialise the CUDA GPU context for AA fill and ICC colour transforms.
 ///
 /// Returns `None` on `CpuOnly` and `ForceVulkan` (those policies don't
-/// want a CUDA context); errors loudly on `ForceCuda` if init fails;
-/// logs a warning and returns `None` on `Auto`/`ForceVaapi` if init fails.
+/// want a CUDA context — Vulkan rendering goes through `vk_backend`
+/// instead); errors loudly on `ForceCuda` if init fails; logs a warning
+/// and returns `None` on `Auto`/`ForceVaapi` if init fails.
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
 fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
     if matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceVulkan) {
@@ -484,6 +517,9 @@ fn render_page_rgb_with_geom(
 
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     renderer.set_gpu_ctx(session.gpu_ctx.as_ref().map(Arc::clone));
+
+    #[cfg(feature = "vulkan")]
+    renderer.set_vk_backend(session.vk_backend.as_ref().map(Arc::clone));
 
     #[cfg(feature = "cache")]
     renderer.set_image_cache(session.image_cache.as_ref().map(Arc::clone), session.doc_id);

@@ -49,6 +49,8 @@ mod operators;
 mod patterns;
 mod text;
 mod text_ops;
+#[cfg(feature = "vulkan")]
+mod vk_ops;
 
 use pdf::{Document, ObjectId};
 
@@ -79,13 +81,20 @@ use crate::resources::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageRes
 use gpu::GpuCtx;
 #[cfg(feature = "vaapi")]
 use gpu::JpegQueueHandle;
+#[cfg(feature = "vulkan")]
+use gpu::backend::vulkan::VulkanBackend;
 #[cfg(feature = "cache")]
 use gpu::cache::{DeviceImageCache, DevicePageBuffer, DocId};
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::NvJpeg2kDecoder;
-#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
+#[cfg(any(
+    feature = "gpu-aa",
+    feature = "gpu-icc",
+    feature = "cache",
+    feature = "vulkan"
+))]
 use std::sync::Arc;
 
 const _: () = assert!(
@@ -229,6 +238,18 @@ pub struct PageRenderer<'doc> {
     /// Present when `gpu-aa` or `gpu-icc` features are enabled.
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     gpu_ctx: Option<Arc<GpuCtx>>,
+    /// Vulkan compute backend, attached when the session was opened with
+    /// [`BackendPolicy::ForceVulkan`].  When set, [`gpu_ops::try_gpu_aa_fill`]
+    /// / `try_gpu_tile_fill` and the ICC CMYK→RGB path prefer the Vulkan
+    /// trait surface (`alloc → upload → record_* → submit → wait → download`)
+    /// over the CUDA `GpuCtx` path.  Mutually exclusive with `gpu_ctx` in
+    /// practice — Phase 9 cache is CUDA-only, so opening a session under
+    /// `ForceVulkan` skips CUDA init entirely (`pdf_raster::render::open_session`).
+    /// The image-blit path (`DevicePageBuffer`) stays CUDA-only and is gated
+    /// behind `gpu_ctx`, so under Vulkan blits silently land on the CPU
+    /// fallback inside the renderer.
+    #[cfg(feature = "vulkan")]
+    vk_backend: Option<Arc<VulkanBackend>>,
     /// Per-page cache of baked ICC CMYK→RGB CLUT tables.  Keyed by a hash of the
     /// raw ICC profile bytes so that repeated images sharing the same profile (the
     /// common case in press PDFs) only pay the bake cost once per page.
@@ -356,6 +377,8 @@ impl<'doc> PageRenderer<'doc> {
             nvjpeg2k: None,
             #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
             gpu_ctx: None,
+            #[cfg(feature = "vulkan")]
+            vk_backend: None,
             #[cfg(feature = "gpu-icc")]
             icc_clut_cache: crate::resources::image::IccClutCache::new(),
             #[cfg(feature = "cache")]
@@ -433,6 +456,23 @@ impl<'doc> PageRenderer<'doc> {
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
     pub fn set_gpu_ctx(&mut self, ctx: Option<Arc<GpuCtx>>) {
         self.gpu_ctx = ctx;
+    }
+
+    /// Attach a Vulkan compute backend for kernel dispatch.
+    ///
+    /// When set, GPU-eligible AA fill, tile fill, and ICC CMYK→RGB calls
+    /// are routed through the [`gpu::backend::GpuBackend`] trait surface
+    /// (`alloc → upload → record_* → submit → wait → download`) on the
+    /// Vulkan recorder rather than the CUDA `GpuCtx`.  The CUDA path is
+    /// not removed; it remains live for sessions opened with
+    /// [`BackendPolicy::Auto`] / [`BackendPolicy::ForceCuda`].
+    ///
+    /// The Phase 9 device-resident image cache (`DeviceImageCache`,
+    /// `DevicePageBuffer`) is CUDA-only — under Vulkan the renderer
+    /// runs uncached, matching Phase 9-pre-2026-05-07 behaviour.
+    #[cfg(feature = "vulkan")]
+    pub fn set_vk_backend(&mut self, backend: Option<Arc<VulkanBackend>>) {
+        self.vk_backend = backend;
     }
 
     /// Attach a Phase 9 device-resident image cache.
@@ -720,8 +760,26 @@ impl<'doc> PageRenderer<'doc> {
         //      but faster for medium-sized fills.
         //   3. CPU scanline AA (always available as final fallback).
         //
-        // The nested ifs keep the pattern guard (tiled.is_none()) separate from
-        // the GPU-availability guard to make each condition readable.
+        // Backend selection: prefer Vulkan when attached, fall back to CUDA
+        // when Vulkan returns false or isn't attached.  In practice the two
+        // are mutually exclusive at session-open time (`pdf_raster::render`
+        // wires one or the other), so the second branch only fires under
+        // BackendPolicy::Auto / ForceCuda; the explicit ordering keeps the
+        // dispatch readable rather than implicit via `else`.
+        //
+        // The nested ifs keep the pattern guard (tiled.is_none()) separate
+        // from the GPU-availability guard to make each condition readable.
+        #[cfg(feature = "vulkan")]
+        if tiled.is_none()
+            && let Some(vk) = self.vk_backend.clone()
+        {
+            if self.try_vk_tile_fill(path, even_odd, &pipe, &src, &vk) {
+                return;
+            }
+            if self.try_vk_aa_fill(path, even_odd, &pipe, &src, &vk) {
+                return;
+            }
+        }
         #[cfg(feature = "gpu-aa")]
         #[expect(
             clippy::collapsible_if,
@@ -799,6 +857,32 @@ impl<'doc> PageRenderer<'doc> {
         ctx: &gpu::GpuCtx,
     ) -> bool {
         gpu_ops::try_gpu_tile_fill(self, path, even_odd, pipe, src, ctx)
+    }
+
+    /// Vulkan twin of [`Self::try_gpu_aa_fill`].  See [`vk_ops::try_vk_aa_fill`].
+    #[cfg(feature = "vulkan")]
+    fn try_vk_aa_fill(
+        &mut self,
+        path: &raster::path::Path,
+        even_odd: bool,
+        pipe: &raster::pipe::PipeState<'_>,
+        src: &raster::pipe::PipeSrc<'_>,
+        backend: &Arc<VulkanBackend>,
+    ) -> bool {
+        vk_ops::try_vk_aa_fill(self, backend, path, even_odd, pipe, src)
+    }
+
+    /// Vulkan twin of [`Self::try_gpu_tile_fill`].  See [`vk_ops::try_vk_tile_fill`].
+    #[cfg(feature = "vulkan")]
+    fn try_vk_tile_fill(
+        &mut self,
+        path: &raster::path::Path,
+        even_odd: bool,
+        pipe: &raster::pipe::PipeState<'_>,
+        src: &raster::pipe::PipeSrc<'_>,
+        backend: &Arc<VulkanBackend>,
+    ) -> bool {
+        vk_ops::try_vk_tile_fill(self, backend, path, even_odd, pipe, src)
     }
 
     fn stroke_path(&mut self, path: &raster::path::Path) {

@@ -188,27 +188,27 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 
-    // PTX kernels are needed whenever any CUDA feature is active.
-    // CARGO_FEATURE_GPU_AA / GPU_ICC are features of pdf_interp, not gpu, so
-    // they are never set in the gpu crate's build script. Use the gpu-crate
-    // features that are actually propagated here instead.
-    let need_ptx = [
-        "CARGO_FEATURE_NVJPEG",
-        "CARGO_FEATURE_NVJPEG2K",
-        "CARGO_FEATURE_GPU_DESKEW",
-        // Phase 9 image cache: ships its own PTX (blit_image) and
-        // also loads the existing kernels via GpuCtx::init.
-        "CARGO_FEATURE_CACHE",
-        // gpu-validation tests touch every kernel, including those
-        // not gated by a specific feature.
-        "CARGO_FEATURE_GPU_VALIDATION",
-    ]
-    .iter()
-    .any(|f| env::var(f).is_ok());
+    // Allow `cfg(ptx_placeholder)` so `GpuCtx::init` can short-circuit
+    // with a clear error when the build had no NVCC available and only
+    // empty placeholders were written.
+    println!("cargo:rustc-check-cfg=cfg(ptx_placeholder)");
 
-    if need_ptx {
+    // PTX policy: compile real kernels whenever NVCC is available; write
+    // empty placeholders only as a last-resort fallback for CPU-only CI
+    // runners that don't have the CUDA toolkit.  Keying on a feature-flag
+    // heuristic is wrong because pdf_interp's `gpu-aa` / `gpu-icc` features
+    // (which cause `GpuCtx::init` to be called at runtime) don't propagate
+    // to the gpu crate's build environment, so a build with `gpu-aa` alone
+    // would emit placeholders and produce a binary that crashes with
+    // `CUDA_ERROR_INVALID_IMAGE` the first time `GpuCtx::init` runs.
+    if nvcc_works(nvcc) {
         compile_cuda_kernels(&kernels_dir, &out_dir, nvcc);
     } else {
+        println!(
+            "cargo:warning=NVCC unavailable ({nvcc}); writing placeholder PTX. \
+             GpuCtx::init() will fail with a clear error if invoked at runtime."
+        );
+        println!("cargo:rustc-cfg=ptx_placeholder");
         write_placeholder_ptx(&out_dir);
     }
 
@@ -219,6 +219,23 @@ fn main() {
     if env::var("CARGO_FEATURE_VULKAN").is_ok() {
         compile_slang_kernels(&kernels_dir, &out_dir);
     }
+}
+
+/// Probe whether `nvcc` is invokable.  Returns `false` when the binary
+/// can't be executed (missing toolkit) so the build can fall back to
+/// placeholder PTX rather than panic.
+///
+/// We intentionally invoke `--version` rather than just checking
+/// existence: a stale symlink, a wrapper that requires unavailable
+/// libraries, or a build-host without CUDA installed should all be
+/// treated as "no NVCC".
+fn nvcc_works(nvcc: &str) -> bool {
+    Command::new(nvcc)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Compile every kernel's `.cu` source to PTX via `nvcc`.

@@ -170,12 +170,15 @@ pub enum BackendPolicy {
     /// be opened rather than falling back to CPU.
     ForceVaapi,
     /// Require the Vulkan compute backend.  Returns
-    /// [`RasterError::BackendUnavailable`] if Vulkan initialisation fails.
+    /// [`RasterError::BackendUnavailable`] if Vulkan initialisation fails
+    /// (or the binary was built without `--features vulkan`).
     ///
-    /// The device-resident image cache is CUDA-only today; under
-    /// `ForceVulkan` the session runs without it.  Kernels (`aa_fill`,
-    /// `tile_fill`, `icc_clut`, `soft_mask`, `composite`, `blit_image`)
-    /// dispatch through `VulkanBackend`.
+    /// AA fill and tile fill kernels dispatch through `VulkanBackend`;
+    /// the device-resident image cache (`DeviceImageCache`,
+    /// `DevicePageBuffer`) is CUDA-only, so under `ForceVulkan` JPEG
+    /// images decode and composite via the CPU path, and ICC CMYK→RGB
+    /// also stays on the CPU AVX-512 fallback.  This matches Phase 9-pre
+    /// behaviour where the cache wasn't yet present.
     ForceVulkan,
 }
 
