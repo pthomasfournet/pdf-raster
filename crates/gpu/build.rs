@@ -26,10 +26,11 @@ fn link_lib_in_dir(dirs: &[&str], lib: &str, warn_context: &str) {
     println!("cargo:rustc-link-lib=dylib={lib}");
 }
 
-/// CUDA compute kernels compiled to PTX by nvcc.
+/// Compute kernels compiled to PTX by nvcc and (optionally) to SPIR-V by slangc.
 ///
-/// Listed once here to ensure the placeholder-write and the nvcc-compile loops
-/// stay in sync — adding a new kernel only requires updating this list.
+/// Listed once here to ensure the placeholder-write loops, the nvcc-compile loop,
+/// and the slangc-compile loop stay in sync — adding a new kernel only requires
+/// updating this list.
 const KERNELS: &[&str] = &[
     "composite_rgba8",
     "apply_soft_mask",
@@ -38,6 +39,16 @@ const KERNELS: &[&str] = &[
     "icc_clut",
     "blit_image",
 ];
+
+/// Slang profile per kernel.  `aa_fill` uses subgroup ops (`WaveActiveSum`,
+/// `WaveIsFirstLane`) so it needs the `GroupNonUniform*` capability strings;
+/// the rest use only baseline `spirv_1_5`.
+fn slang_profile(kernel: &str) -> &'static str {
+    match kernel {
+        "aa_fill" => "spirv_1_5+spvGroupNonUniformBallot+spvGroupNonUniformArithmetic",
+        _ => "spirv_1_5",
+    }
+}
 
 /// Candidate directories for CUDA toolkit libraries, in preference order.
 ///
@@ -62,6 +73,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=NVJPEG2K_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=SLANGC");
 
     let nvcc_path = env::var("NVCC").unwrap_or_else(|_| {
         let candidate = "/usr/local/cuda/bin/nvcc";
@@ -168,24 +180,27 @@ fn main() {
     .iter()
     .any(|f| env::var(f).is_ok());
 
-    if !need_ptx {
-        // Write empty placeholder PTX files so that the unconditional `include_str!`
-        // macros in src/lib.rs compile successfully on CPU-only builds (Intel without
-        // CUDA, ARM, CI runners without a GPU).  The placeholders are never loaded;
-        // GpuCtx::init() fails with a CUDA error before any kernel is invoked.
-        //
-        // Always written (no existence check) because OUT_DIR is fresh on each
-        // clean build and cargo guarantees this script only runs when inputs change.
-        for kernel in KERNELS {
-            let ptx = out_dir.join(format!("{kernel}.ptx"));
-            std::fs::write(&ptx, "")
-                .unwrap_or_else(|e| panic!("failed to write placeholder {kernel}.ptx: {e}"));
-        }
-        return;
+    if need_ptx {
+        compile_cuda_kernels(&kernels_dir, &out_dir, nvcc);
+    } else {
+        write_placeholder_ptx(&out_dir);
     }
 
-    // Allow overriding the PTX target arch (e.g. CUDA_ARCH=sm_75 for Turing,
-    // CUDA_ARCH=sm_120 for Blackwell).  Default sm_80 covers Ampere through Blackwell.
+    // Slang→SPIR-V kernel compile, gated on the `vulkan` feature.  Independent
+    // of the PTX path: a vulkan-only build (no CUDA features) still wants the
+    // .spv artifacts.  Output is one .spv per kernel in OUT_DIR; the Vulkan
+    // backend (Phase 10 Task 3) consumes them via include_bytes!.
+    if env::var("CARGO_FEATURE_VULKAN").is_ok() {
+        compile_slang_kernels(&kernels_dir, &out_dir);
+    }
+}
+
+/// Compile every kernel's `.cu` source to PTX via `nvcc`.
+///
+/// `CUDA_ARCH` env var overrides the target architecture (e.g. `sm_75` for
+/// Turing, `sm_120` for Blackwell).  Default `sm_80` covers Ampere through
+/// Blackwell.
+fn compile_cuda_kernels(kernels_dir: &Path, out_dir: &Path, nvcc: &str) {
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_owned());
 
     for kernel in KERNELS {
@@ -208,6 +223,56 @@ fn main() {
         assert!(
             status.success(),
             "nvcc failed for {kernel}.cu (arch={arch})"
+        );
+    }
+}
+
+/// Write empty placeholder PTX files so the unconditional `include_str!` macros
+/// in `src/lib.rs` compile successfully on CPU-only builds (Intel without CUDA,
+/// ARM, CI runners without a GPU).  The placeholders are never loaded;
+/// `GpuCtx::init()` fails with a CUDA error before any kernel is invoked.
+///
+/// Always overwritten (no existence check) because `OUT_DIR` is fresh on each
+/// clean build and cargo guarantees this script only runs when inputs change.
+fn write_placeholder_ptx(out_dir: &Path) {
+    for kernel in KERNELS {
+        let ptx = out_dir.join(format!("{kernel}.ptx"));
+        std::fs::write(&ptx, "")
+            .unwrap_or_else(|e| panic!("failed to write placeholder {kernel}.ptx: {e}"));
+    }
+}
+
+/// Compile every kernel's `.slang` source to SPIR-V via `slangc`.
+///
+/// Targets `spvGroupNonUniformBallot+spvGroupNonUniformArithmetic` for
+/// `aa_fill` (the only kernel using `WaveActiveSum`/`WaveIsFirstLane`);
+/// the remaining five compile against vanilla `spirv_1_5`.
+///
+/// `slangc` is bundled with the `LunarG` Vulkan SDK; falls back to PATH lookup.
+fn compile_slang_kernels(kernels_dir: &Path, out_dir: &Path) {
+    let slangc = env::var("SLANGC").unwrap_or_else(|_| "slangc".to_owned());
+
+    for kernel in KERNELS {
+        let src = kernels_dir.join(format!("{kernel}.slang"));
+        let spv = out_dir.join(format!("{kernel}.spv"));
+        let profile = slang_profile(kernel);
+
+        let status = Command::new(&slangc)
+            .args([
+                "-target",
+                "spirv",
+                "-profile",
+                profile,
+                "-o",
+                spv.to_str().expect("OUT_DIR path contains non-UTF-8"),
+                src.to_str().expect("slang source path contains non-UTF-8"),
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run slangc ({slangc}): {e}"));
+
+        assert!(
+            status.success(),
+            "slangc failed for {kernel}.slang (profile={profile})"
         );
     }
 }

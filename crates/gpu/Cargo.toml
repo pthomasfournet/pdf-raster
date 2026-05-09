@@ -40,6 +40,11 @@ nvjpeg-hardware = ["nvjpeg"]
 # tiers land in tasks 3 and 5).  Pulls in blake3 (content hashing) and
 # dashmap (concurrent dual-key indexing).
 cache = ["dep:blake3", "dep:dashmap"]
+# Phase 10 Vulkan compute backend.  Compiles `.slang` kernels to SPIR-V
+# at build time via `slangc` (LunarG SDK).  The Vulkan backend itself
+# (Task 3) consumes those `.spv` artifacts; this feature only triggers
+# the kernel compile + validate path.
+vulkan = []
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }

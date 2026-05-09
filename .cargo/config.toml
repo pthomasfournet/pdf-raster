@@ -2,6 +2,12 @@
 # Cap parallel jobs to half the logical CPUs to avoid RAM spikes during
 # debug builds (each codegen unit needs ~300–600 MiB of LLVM working set).
 jobs = 6
+# Compile for the host CPU by default.  The explicit SIMD paths in raster/
+# and gpu/ already use is_x86_feature_detected! for runtime dispatch, but
+# this lets LLVM auto-vectorise the rest of the code with the host's full
+# vector width.  Override per-machine when building for a different target
+# (e.g. on the i7-8700K testbench: RUSTFLAGS="-C target-cpu=skylake").
+rustflags = ["-C", "target-cpu=native"]
 
 [profile.test]
 # Single codegen unit per crate in test builds.  The test binary for

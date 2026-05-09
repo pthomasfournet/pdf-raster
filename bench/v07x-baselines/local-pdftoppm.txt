@@ -1,0 +1,20 @@
+Host:     tom-MS   Kernel: 6.17.0-23-generic
+CPU:      AMD Ryzen 9 9900X3D 12-Core Processor
+Repo SHA: dc7339f
+
+System: load=1.02   cores=24
+Binary: tests/../target/release/pdf-raster
+Reference: pdftoppm version 24.02.0
+Runs:   3 (warmup 1) — hyperfine mean, cold cache
+
+NOTE: pdftoppm is single-threaded. Scan corpora (08-09) take several minutes each.
+
+corpus                              pdf-raster      pdftoppm     speedup
+------                              ----------    ----------     -------
+01-native-text-small                    236ms          274ms       1.16x
+02-native-vector-text                   227ms          291ms       1.28x
+03-native-text-dense                   4368ms         6741ms       1.54x
+04-ebook-mixed                         5299ms         8517ms       1.61x
+05-academic-book                       9569ms        10259ms       1.07x
+06-modern-layout-dct                   2662ms        10348ms       3.89x
+07-journal-dct-heavy                   6969ms         6873ms       0.99x

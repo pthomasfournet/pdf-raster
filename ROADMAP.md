@@ -811,6 +811,7 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
     - **Deliberately deferred:** renderer migration to the trait (the spec's `pdf_interp::renderer::page::gpu_ops` rewrite). The Phase 9 blit path is *already* per-page-batched (no `synchronize` between blits; only `buf.download()` at end-of-page), so migrating shape-only without an upload/download surface on the trait would just shuffle code. `DevicePageBuffer` and `DeviceImageCache` therefore stay un-generified for now; they generify alongside Task 3 once the trait grows the H↔D surface that the Vulkan side will need anyway. See the docstring on `DevicePageBuffer` (`crates/gpu/src/cache/page_buffer.rs`) for the in-tree rationale.
     - **Not yet measured:** the spec's `±5%-of-pre-refactor` per-kernel bench gate. Deferred until Task 3 lands so the bench matrix runs CUDA + Vulkan together.
 - [ ] **Task 2 — Slang port of all kernels** (~1000 LoC). Translate 5 existing `.cu` files + Phase 9's `blit_image.cu` to `.slang`. nvcc compiles Slang→PTX for CUDA; SPIR-V backend used in task 3. **Riskiest task in Phase 10**; rollback plan is to keep `.cu` files alongside `.slang` until bench parity confirmed.
+    - **Sub-task 2a — CPU twin per kernel.** For each kernel, ship a plain-Rust function that produces bit-identical output (or pixel-diff ≤ 1 LSB for floating-point ones) used as a correctness oracle in tests. Lets us validate Slang→SPIR-V codegen *without* a GPU, isolates "is the kernel logic right" from "is the Vulkan dispatch right" when chasing cross-backend divergence. Already partially present (`crates/gpu/src/blit.rs` has a CPU reference for `blit_image`); generalise to all five.
 - [ ] **Task 3 — Vulkan backend implementation** (~1500 LoC). `VulkanBackend` impl via `ash`; pipeline cache; descriptor set management; synchronisation; integrates behind the trait. Cross-vendor smoke test on at least one AMD or Intel GPU.
 
 **Bench gate:** Phase 10 ships if (1) CUDA path performance unchanged within ±5%; (2) Vulkan path functional on RTX 5070 with pixel-diff ≤ 1 LSB vs CUDA; (3) Vulkan timing within 15% of CUDA on RTX 5070; (4) cross-vendor proof of life on AMD or Intel.
@@ -818,6 +819,60 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
 **Total scope:** ~3100 LoC new Rust + ~1000 LoC Slang + ~400 LoC modified. Estimated ~6-8 weeks elapsed (3-4 weeks tasks 1+2; 3-4 weeks task 3).
 
 **Sequencing:** Phase 9 must ship first. Phase 10 task 1 generifies Phase 9's cache; doing them in parallel would mean fighting merge conflicts.
+
+---
+
+## Phase 11 — Memory-frugal rendering and parse caching (NOT STARTED)
+
+**Motivation:** pdf-raster wins on raw throughput for the workload we optimised for, but several design choices common in long-lived PDF renderers haven't been adopted here yet. All are ROI-positive for an archival pipeline that re-renders the same corpus across config iterations and may push very high page resolutions. Items ranked by ROI:
+
+### Task 0 — Incremental-update / xref-chain correctness audit
+
+PDFs that have been re-saved by editors (Acrobat, etc.) accumulate appended xref sections after the original. The full xref *chain* must be walked and merged: later revisions shadow objects in earlier ones. Stopping at the first xref silently renders the *original* revision of an edited document — a correctness bug, not a perf one, and one that hits archival corpora hard since most PDFs in those corpora have been re-saved.
+
+**Approach:** read `pdf_interp` xref handling. Confirm it (a) follows `Prev` entries in trailer dicts back through the chain, (b) handles both xref tables and xref streams (PDF 1.5+) in the same chain, (c) merges revisions with later-wins semantics. Add a regression fixture: a multi-revision PDF where revision 2 overrides a page from revision 1; assert we render revision 2's page. If the parser already does this, the audit is documentation; if not, this becomes a real bug fix.
+
+**Scope:** 0 LoC if already correct (just a fixture + test). 100–300 LoC in `pdf_interp` if not.
+
+### Task 1 — Sidecar parse cache for the parsed page tree
+
+Persist a *minimal* page-index → page-dict-objnum mapping (plus document content hash) to a sidecar file; second-and-later renders skip the page-tree walk and jump straight to the page dict via xref lookup. The mapping is tiny (~8 bytes/page) and survives the document. The expensive *contents* of each page (resource dicts, content streams) still parse lazily on first access — they don't go in the cache. For an archival pipeline that re-renders the same corpus across config iterations (different DPI, different OCR settings, regenerated cache), this is a real win on every re-run.
+
+**Approach:** on open, hash document content with BLAKE3 (already a dep). Look up sidecar at `<cache-root>/<doc-blake3>.idx`. On hit: load the index, skip page-tree traversal. On miss: traverse page tree as today, write the index after. Sidecar format is fixed-size: 32-byte header (magic + page count) + N×8 bytes (objnums). Disable with an opt-out flag for testing.
+
+**Scope:** ~150 LoC in `pdf_interp`. No GPU code touched. Smaller than the original `~300 LoC` estimate because we're caching only the index, not parsed content.
+
+### Task 2 — Banded rendering for memory-pressure escape
+
+Render horizontal bands of a page instead of allocating a full-page framebuffer. For 600 DPI archival book scans (~25 MP/page → ~75 MB framebuffer), full-page allocation pins working set at gigabytes when a Rayon pool spreads across pages. Banding caps per-page peak memory at `band_height × width × 4` bytes regardless of page size.
+
+**Approach:** add `RasterOptions::band_height: Option<u32>`. When set, the rasteriser scanline-sweep iterates bands instead of the full page; each band gets independently flushed to the output encoder. Path commands need clipping to the active band's y-range — reuse the existing scissor-rect plumbing. Banding interacts with the GPU page buffer (Phase 9): a banded render writes bands to host directly, skipping `DevicePageBuffer`.
+
+**Fallback hierarchy (the key design point):** banding is not just an opt-in flag — it's the *escape valve*. On allocation failure during full-page render, retry with progressively smaller band heights before declaring failure. The fallback chain: full-page → band_height=2048 → band_height=1024 → band_height=512 → fail. This is the standard pattern in production banded raster tools (halve band height + thread count under memory pressure before giving up); pages that today crash the renderer would degrade gracefully.
+
+**Scope:** ~500 LoC in `raster/` + `pdf_raster/`. Real engineering effort because the scanline sweep wasn't designed with bands in mind. Pays off only for very large pages — gate on `page_height_px ≥ 6000` or explicit user opt-in or OOM-fallback trigger.
+
+### Task 3 — Multi-resolution image cache
+
+Cache decoded images keyed by `(image_id, l2factor, rect)` rather than just `image_id`. When a render at 150 DPI follows a render at 300 DPI of the same corpus, the second render subsamples the cached high-res pixmap instead of re-decoding the source JPEG. Subsampling RGB is much cheaper than re-running zune-jpeg + colour conversion.
+
+**Approach:** extend the Phase 9 `DeviceImageCache` key from content-hash-only to `(content_hash, l2factor)`. Cache the natural-resolution decode; on lookup, find the smallest-l2factor cached entry and box-filter or area-average down to the target. New cache entries always insert at l2factor=0 (full resolution) so other render passes can reuse.
+
+**Scope:** ~200 LoC in `crates/gpu/src/cache/`. Only pays off when the same corpus is rendered at multiple DPIs — currently nothing does that, so this is real-only-when-needed work. Worth scoping now because the change to the cache key is API-shaped (touches `dual_index`, eviction key comparison, etc.); rather build it once than back-port it.
+
+### Task 4 — Display-list intermediate (deferred until needed)
+
+Flatten content-stream interpretation into a reusable display list once, then replay it to whatever sink. Amortises interpretation cost across multi-DPI output, render-then-extract-text, and multiple band-passes for task 2.
+
+**Data structure (when this lands):** a flat byte buffer with bitfield-packed command headers, not `Vec<DisplayCmd>`. Trivial commands (pop_clip, end_group) take one 32-bit header; complex commands (fill_path with a long path + colour) span 40–200 bytes inline. Avoids per-command heap allocations and stays cache-friendly. Existing C renderers in the field do this for the same reason and it's the right shape regardless of language.
+
+**Defer until:** something actually consumes the same page twice. Right now nothing in the pipeline does. Premature abstraction otherwise — but record the data-structure decision now so future-us doesn't ship `Vec<Box<DisplayCmd>>` and have to rewrite it.
+
+**Sequencing:** task 0 first (correctness — fixture-and-audit, may be a no-op). Task 1 next (highest perf ROI, smallest blast radius). Task 2 only if 600 DPI scans become OOM-prone in practice. Task 3 only when multi-DPI re-rendering becomes a real workload. Task 4 stays deferred.
+
+**Out of scope:** a 2-stage interpretation+render pipeline within a single document. pdf-raster already parallelises across pages with Rayon, which dominates a per-document pipeline on any multi-core machine. Confirmed empirically by the May-2026 baseline matrix — a 2-stage pipeline approach gains only 3–10 % over serial on the same workload, well below what Rayon-per-page already delivers.
+
+**Validation against external designs:** the Phase 9 `DeviceImageCache` eviction policy (refcount-pinned LRU, `Arc::strong_count == 1` as the eviction-eligible check at `crates/gpu/src/cache/eviction.rs:153`) is the canonical pattern in long-lived production renderers — refcount as the in-use flag, not a separate "pinned" boolean. Convergent design with established practice; no change needed.
 
 ---
 

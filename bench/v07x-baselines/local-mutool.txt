@@ -1,0 +1,17 @@
+
+System: load=2.60   cores=24
+Binary: tests/../target/release/pdf-raster
+Reference: mutool version 1.23.10
+Runs:   3 (warmup 1) — hyperfine mean, cold cache
+
+NOTE: mutool is single-threaded. Scan corpora (08-09) take several minutes each.
+
+corpus                              pdf-raster        mutool     speedup
+------                              ----------    ----------     -------
+01-native-text-small                    233ms          340ms       1.46x
+02-native-vector-text                   240ms          327ms       1.36x
+03-native-text-dense                   4484ms         6788ms       1.51x
+04-ebook-mixed                         5323ms         8906ms       1.67x
+05-academic-book                       7829ms        12924ms       1.65x
+06-modern-layout-dct                   2828ms         7005ms       2.48x
+07-journal-dct-heavy                   2732ms        23483ms       8.60x
