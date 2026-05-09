@@ -32,7 +32,7 @@ pub fn report_open_error(e: &RasterError, args: &Args) {
 /// Print a backend-specific hint after a `BackendUnavailable` error.
 pub fn print_backend_hint(args: &Args) {
     match args.backend {
-        BackendArg::Cuda => {
+        Some(BackendArg::Cuda) => {
             eprintln!("  hint: --backend cuda requires a working CUDA driver and GPU.");
             eprintln!("        Run `nvidia-smi` to verify the driver is loaded.");
             eprintln!(
@@ -40,7 +40,7 @@ pub fn print_backend_hint(args: &Args) {
                  --backend cpu to skip GPU entirely."
             );
         }
-        BackendArg::Vaapi => {
+        Some(BackendArg::Vaapi) => {
             eprintln!(
                 "  hint: --backend vaapi could not open the DRM device ({}).",
                 args.vaapi_device
@@ -49,6 +49,14 @@ pub fn print_backend_hint(args: &Args) {
             eprintln!("        Use --vaapi-device PATH to specify an alternate render node.");
             eprintln!(
                 "        Use --backend auto to fall back to CPU silently, or \
+                 --backend cpu to skip GPU entirely."
+            );
+        }
+        Some(BackendArg::Vulkan) => {
+            eprintln!("  hint: --backend vulkan requires a Vulkan 1.3+ device and the loader.");
+            eprintln!("        Run `vulkaninfo` to verify a usable Vulkan device is present.");
+            eprintln!(
+                "        Use --backend auto to fall back to CUDA / CPU silently, or \
                  --backend cpu to skip GPU entirely."
             );
         }

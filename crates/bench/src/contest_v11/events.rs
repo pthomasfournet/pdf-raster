@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use pdf_raster::{SessionConfig, open_session, render_page_rgb};
+use pdf_raster::{BackendPolicy, SessionConfig, open_session, render_page_rgb};
 
 #[derive(Debug)]
 pub struct EventResult {
@@ -21,14 +21,27 @@ pub struct EventResult {
 const RENDER_DPI: f64 = 150.0;
 const SCALE_AT_RENDER_DPI: f64 = RENDER_DPI / 72.0;
 
+/// Resolve the backend policy from the `CONTEST_BACKEND` env var.
+///
+/// Uses a separate env-var name from `PDF_RASTER_BACKEND` so a
+/// developer's personal default doesn't accidentally drive the contest.
+/// Vocabulary matches `pdf_raster::BackendPolicy::from_env`: `auto`,
+/// `cpu`, `cuda`, `vaapi`, `vulkan`.
+fn session_config() -> SessionConfig {
+    SessionConfig {
+        policy: BackendPolicy::from_env_var("CONTEST_BACKEND"),
+        ..SessionConfig::default()
+    }
+}
+
 /// E1 — open archive, render `page_idx`, write PPM to disk.  Times the
 /// full pipeline including the disk write so the comparison against
 /// mutool / pdftoppm (which always write a PPM file) is apples-to-apples.
 /// `page_idx` is clamped to `[1, total_pages]`.
 pub fn e1(archive: &Path, page_idx: u32) -> Result<EventResult, String> {
     let t0 = Instant::now();
-    let session = open_session(archive, &SessionConfig::default())
-        .map_err(|e| format!("open_session: {e}"))?;
+    let session =
+        open_session(archive, &session_config()).map_err(|e| format!("open_session: {e}"))?;
     let total = session.total_pages();
     if total == 0 {
         return Err("archive has zero pages".into());
@@ -53,8 +66,8 @@ pub fn e1(archive: &Path, page_idx: u32) -> Result<EventResult, String> {
 /// E2 — render `count` pages starting from `first_page` (clamped).
 pub fn e2(archive: &Path, first_page: u32, count: u32) -> Result<EventResult, String> {
     let t0 = Instant::now();
-    let session = open_session(archive, &SessionConfig::default())
-        .map_err(|e| format!("open_session: {e}"))?;
+    let session =
+        open_session(archive, &session_config()).map_err(|e| format!("open_session: {e}"))?;
     let total = session.total_pages();
     if total == 0 {
         return Err("archive has zero pages".into());
@@ -93,7 +106,7 @@ pub fn e3(list_path: &Path) -> Result<EventResult, String> {
     let t0 = Instant::now();
     let mut rendered = 0u32;
     for archive in &archives {
-        let session = open_session(archive, &SessionConfig::default())
+        let session = open_session(archive, &session_config())
             .map_err(|e| format!("open_session({}): {e}", archive.display()))?;
         if session.total_pages() == 0 {
             continue;
@@ -113,8 +126,8 @@ pub fn e3(list_path: &Path) -> Result<EventResult, String> {
 /// via a fixed-seed xorshift64 so successive runs touch the same pages.
 pub fn e4(archive: &Path) -> Result<EventResult, String> {
     let t0 = Instant::now();
-    let session = open_session(archive, &SessionConfig::default())
-        .map_err(|e| format!("open_session: {e}"))?;
+    let session =
+        open_session(archive, &session_config()).map_err(|e| format!("open_session: {e}"))?;
     let total = session.total_pages();
     if total < 2 {
         return Err(format!("archive has only {total} pages — E4 needs >=2"));

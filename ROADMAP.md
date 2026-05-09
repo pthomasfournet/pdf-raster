@@ -27,6 +27,34 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### Unreleased
+
+**New since v0.9.0:**
+
+- **Vulkan is now the preferred backend under `Auto`.**  When both
+  Vulkan and CUDA are compiled in, `BackendPolicy::Auto` resolves to
+  Vulkan first and falls through to CUDA (then CPU) on init failure.
+  Vulkan's per-process init is faster on init-dominated workloads
+  (E1, E3, E5 in the Phase 11 contest), and CUDA narrowly wins only
+  when the device-resident image cache is firing across many pages
+  from one session (E2/E4).  `--backend cuda` still opts into CUDA
+  explicitly; CUDA stays a first-class backend.
+- **`PDF_RASTER_BACKEND` environment variable.**  Resolves the runtime
+  backend without recompiling.  Precedence: CLI `--backend` wins over
+  env var, env var wins over compile-time default.  Valid values:
+  `auto`, `cpu`, `cuda`, `vaapi`, `vulkan`.  Unrecognised values warn
+  on stderr and fall back to `Auto`.  Implemented in
+  `BackendPolicy::from_env`; consumed by `SessionConfig::default()`.
+- **Process-static GPU contexts.**  Both `gpu::GpuCtx` (CUDA) and
+  `gpu::backend::vulkan::VulkanBackend` are now memoised in a
+  `OnceLock<_>` inside `pdf_raster::render`, so workloads that open
+  many short-lived sessions (e.g. Phase 11 E3: 100 archives, 1 page
+  each) pay the ~240 ms init cost once instead of 100 times.
+  Phase 11 E3 went from 24 s → 14 s under CUDA + cache; under
+  CUDA-without-cache or Vulkan, E3 collapses to ~370 ms because the
+  remaining cost is just the per-archive BLAKE3 (cache only) /
+  per-archive xref + render path (everywhere else).
+
 ### v0.9.0 (May 2026)
 
 **New since v0.8.0:**

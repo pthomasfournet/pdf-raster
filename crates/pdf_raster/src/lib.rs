@@ -150,13 +150,21 @@ pub fn release_gpu_decoders() {
 
 /// Controls which compute backend is used for image decoding and GPU fills.
 ///
-/// The default is [`Auto`](BackendPolicy::Auto), which matches the behaviour
-/// prior to v0.3.1: GPU is used when available and silently skipped otherwise.
-/// The `Force*` variants turn silent fallbacks into hard errors so you can tell
-/// immediately whether the expected hardware path is actually being taken.
+/// The default is [`Auto`](BackendPolicy::Auto), which prefers Vulkan when
+/// compiled in, falls through to CUDA when Vulkan is unavailable, and finally
+/// to the CPU paths.  The `Force*` variants turn silent fallbacks into hard
+/// errors so you can tell immediately whether the expected hardware path is
+/// actually being taken.
+///
+/// At runtime, [`SessionConfig::default()`] resolves the policy via
+/// [`BackendPolicy::from_env`], so users can switch backends per process by
+/// setting `PDF_RASTER_BACKEND={auto,cpu,cuda,vaapi,vulkan}` without
+/// rebuilding.  Explicit construction (`SessionConfig { policy: ..., .. }`)
+/// bypasses the env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendPolicy {
-    /// GPU if available, CPU otherwise — silent fallback (default).
+    /// Auto: prefer Vulkan when present, fall through to CUDA, then CPU.
+    /// Silent fallback at every step.
     #[default]
     Auto,
     /// CPU only.  All GPU init is skipped; no CUDA or VA-API calls are made.
@@ -182,6 +190,51 @@ pub enum BackendPolicy {
     ForceVulkan,
 }
 
+impl BackendPolicy {
+    /// Resolve a policy from the `PDF_RASTER_BACKEND` environment variable.
+    ///
+    /// Convenience wrapper for [`BackendPolicy::from_env_var`] with the
+    /// canonical name.  Accepted values (case-insensitive): `auto`, `cpu`,
+    /// `cuda`, `vaapi`, `vulkan`.  Unset, empty, or unrecognised values
+    /// fall back to [`BackendPolicy::Auto`] — unrecognised values also
+    /// emit a stderr warning so a typo doesn't silently mis-route.
+    ///
+    /// Precedence: an explicit `--backend` flag (CLI) wins over
+    /// `PDF_RASTER_BACKEND`, which in turn wins over the compile-time
+    /// default.  This lets a binary ship Vulkan-default while users
+    /// override per-process without recompiling.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_env_var("PDF_RASTER_BACKEND")
+    }
+
+    /// Resolve a policy from a named environment variable.
+    ///
+    /// Used by tools (e.g. the contest harness) that want their own
+    /// env-var namespace separate from `PDF_RASTER_BACKEND` so a
+    /// developer's personal default doesn't leak into bench runs.
+    /// Same value vocabulary and warning semantics as
+    /// [`BackendPolicy::from_env`].
+    #[must_use]
+    pub fn from_env_var(name: &str) -> Self {
+        let raw = std::env::var(name).unwrap_or_default();
+        match raw.to_ascii_lowercase().as_str() {
+            "" | "auto" => Self::Auto,
+            "cpu" => Self::CpuOnly,
+            "cuda" => Self::ForceCuda,
+            "vaapi" => Self::ForceVaapi,
+            "vulkan" => Self::ForceVulkan,
+            other => {
+                eprintln!(
+                    "warning: {name}={other:?} not recognised; using Auto. \
+                     Valid values: auto, cpu, cuda, vaapi, vulkan."
+                );
+                Self::Auto
+            }
+        }
+    }
+}
+
 // ── Session configuration ─────────────────────────────────────────────────────
 
 /// Default VA-API DRM render node path used by [`SessionConfig`] and the CLI.
@@ -189,8 +242,9 @@ pub const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 
 /// Configuration for opening a [`RasterSession`].
 ///
-/// Passed to [`open_session`].  Use [`Default::default()`] for the behaviour
-/// that was unconditional before v0.3.1 (GPU auto-detected, default DRM node).
+/// Passed to [`open_session`].  Use [`Default::default()`] for the standard
+/// behaviour: backend resolved from `PDF_RASTER_BACKEND` env var (or `Auto`
+/// if unset), default DRM render node, image-cache prefetch off.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Backend selection policy.
@@ -215,7 +269,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            policy: BackendPolicy::Auto,
+            policy: BackendPolicy::from_env(),
             vaapi_device: DEFAULT_VAAPI_DEVICE.to_owned(),
             #[cfg(feature = "cache")]
             prefetch: false,
@@ -406,9 +460,10 @@ impl RenderedPage {
 /// not abort remaining pages — the caller decides whether to skip or propagate.
 ///
 /// GPU resources are initialised lazily on first use and reused across pages.
-/// Backend selection follows [`BackendPolicy::Auto`] (GPU if available, silent
-/// CPU fallback).  Use [`open_session`] + [`render_page_rgb`] directly when you
-/// need [`SessionConfig`] control.
+/// Backend selection follows [`SessionConfig::default`] — Vulkan when present,
+/// CUDA next, CPU last; the `PDF_RASTER_BACKEND` env var overrides the
+/// default.  Use [`open_session`] + [`render_page_rgb`] directly when you
+/// need explicit [`SessionConfig`] control.
 ///
 /// # Errors
 ///

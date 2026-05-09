@@ -111,6 +111,24 @@ Look up your card's exact Compute Capability at [developer.nvidia.com/cuda-gpus]
 
 All GPU features fall back to CPU automatically when the runtime requirement is missing, except `--backend cuda` / `--backend vulkan` / `--backend vaapi` which fail loudly with a clear error.
 
+### Backend selection
+
+The runtime backend is chosen from three sources, in priority order:
+
+1. The CLI `--backend {auto,cpu,cuda,vaapi,vulkan}` flag.
+2. The `PDF_RASTER_BACKEND` environment variable (same valid values).
+3. The compile-time default — `auto`.
+
+Under `auto`, when both backends are compiled in, **Vulkan is preferred over CUDA**. Vulkan's per-process init is faster and the kernel dispatch is comparable on the workloads that matter; CUDA wins narrowly when the device-resident `cache` feature is firing and amortising across many pages from one session.  Both backends fall through to CPU when their runtime is unavailable; `--backend cuda` / `--backend vulkan` make the failure loud instead.
+
+```bash
+# Ship a Vulkan-default binary, override per-process when you need CUDA:
+PDF_RASTER_BACKEND=cuda pdf-raster input.pdf out
+
+# CLI flag always wins over the env var:
+PDF_RASTER_BACKEND=cuda pdf-raster --backend cpu input.pdf out   # uses CPU
+```
+
 ## Testing
 
 ```bash

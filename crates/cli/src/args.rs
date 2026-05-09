@@ -222,17 +222,17 @@ pub struct Args {
     // ── Backend selection ─────────────────────────────────────────────────────
     /// Compute backend for image decoding and GPU fills.
     ///
-    /// `auto`  — GPU when available, CPU fallback (default).
-    /// `cpu`   — CPU only; all GPU init is skipped.
-    /// `cuda`  — Require CUDA (nvJPEG/AA fill/ICC); exit with error if unavailable.
-    /// `vaapi` — Require VA-API JPEG; exit with error if the DRM device cannot be opened.
-    #[arg(
-        long = "backend",
-        value_name = "BACKEND",
-        default_value = "auto",
-        verbatim_doc_comment
-    )]
-    pub backend: BackendArg,
+    /// `auto`   — GPU when available, CPU fallback (default).
+    /// `cpu`    — CPU only; all GPU init is skipped.
+    /// `cuda`   — Require CUDA (nvJPEG/AA fill/ICC); exit with error if unavailable.
+    /// `vaapi`  — Require VA-API JPEG; exit with error if the DRM device cannot be opened.
+    /// `vulkan` — Require the Vulkan compute backend.
+    ///
+    /// When `--backend` is omitted, the `PDF_RASTER_BACKEND` environment
+    /// variable is consulted (same valid values).  If neither is set,
+    /// the resolved policy is `auto`.
+    #[arg(long = "backend", value_name = "BACKEND", verbatim_doc_comment)]
+    pub backend: Option<BackendArg>,
 
     /// VA-API DRM render node (default: /dev/dri/renderD128).
     ///
@@ -376,7 +376,9 @@ impl OutputFormat {
 /// `--backend` argument value parsed by clap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendArg {
-    /// GPU when available, silent CPU fallback (default).
+    /// Auto-select: Vulkan if compiled in and present, else CUDA, else CPU.
+    /// Silent fallback at every step.  This is the default; when omitted,
+    /// `PDF_RASTER_BACKEND` is also consulted.
     Auto,
     /// Skip all GPU init; use CPU paths only.
     Cpu,
@@ -403,12 +405,19 @@ impl Args {
     /// acceptable trade-off given that clap does not expose an `is_present`
     /// flag for options with defaults.
     pub fn session_config(&self) -> Result<SessionConfig, String> {
+        // Precedence: explicit `--backend <X>` wins; otherwise consult
+        // `PDF_RASTER_BACKEND`; otherwise default to Auto.  Distinguishing
+        // "user passed --backend auto" from "user passed nothing" requires
+        // `Option<BackendArg>` rather than a clap `default_value` — with
+        // a default value the two cases are indistinguishable and the env
+        // var would never get a chance to override.
         let policy = match self.backend {
-            BackendArg::Auto => BackendPolicy::Auto,
-            BackendArg::Cpu => BackendPolicy::CpuOnly,
-            BackendArg::Cuda => BackendPolicy::ForceCuda,
-            BackendArg::Vaapi => BackendPolicy::ForceVaapi,
-            BackendArg::Vulkan => BackendPolicy::ForceVulkan,
+            Some(BackendArg::Auto) => BackendPolicy::Auto,
+            Some(BackendArg::Cpu) => BackendPolicy::CpuOnly,
+            Some(BackendArg::Cuda) => BackendPolicy::ForceCuda,
+            Some(BackendArg::Vaapi) => BackendPolicy::ForceVaapi,
+            Some(BackendArg::Vulkan) => BackendPolicy::ForceVulkan,
+            None => BackendPolicy::from_env(),
         };
 
         if self.vaapi_device != DEFAULT_VAAPI_DEVICE

@@ -283,8 +283,24 @@ pub fn open_session(
     #[cfg(feature = "vulkan")]
     let vk_backend = init_vk_backend(config.policy)?;
 
+    // Under `Auto`, Vulkan is the preferred backend (faster on init-
+    // dominated workloads and a future cross-vendor home).  When Vulkan
+    // produced a backend, skip CUDA init so we don't pay its cost for a
+    // path we won't use.  Without the `vulkan` feature this is always
+    // `false` and CUDA continues to win `Auto` as it did before.
+    #[cfg(all(
+        feature = "vulkan",
+        any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"),
+    ))]
+    let vk_picked = vk_backend.is_some();
+    #[cfg(all(
+        not(feature = "vulkan"),
+        any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"),
+    ))]
+    let vk_picked = false;
+
     #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
-    let gpu_ctx = init_gpu_ctx(config.policy)?;
+    let gpu_ctx = init_gpu_ctx(config.policy, vk_picked)?;
 
     let vaapi_device = config.vaapi_device.clone();
 
@@ -393,34 +409,92 @@ pub fn open_session(
 /// `ForceVulkan` if init fails (no silent CPU fallback when the user
 /// asked for Vulkan).
 #[cfg(feature = "vulkan")]
+static VK_BACKEND: std::sync::OnceLock<Result<Arc<gpu::backend::vulkan::VulkanBackend>, String>> =
+    std::sync::OnceLock::new();
+
+/// Initialise the Vulkan compute backend.
+///
+/// `ForceVulkan` returns the backend or a hard error.  `Auto` returns the
+/// backend on success and `Ok(None)` on failure — the caller falls
+/// through to the CUDA path (and ultimately the CPU path) when Vulkan is
+/// unavailable.  All other policies return `Ok(None)` without attempting
+/// init.
+///
+/// Like [`init_gpu_ctx`], the result is cached in a process-wide
+/// `OnceLock` so successive sessions don't re-create the device + load
+/// shaders.
+#[cfg(feature = "vulkan")]
 fn init_vk_backend(
     policy: BackendPolicy,
 ) -> Result<Option<Arc<gpu::backend::vulkan::VulkanBackend>>, RasterError> {
-    if !matches!(policy, BackendPolicy::ForceVulkan) {
+    if !matches!(policy, BackendPolicy::Auto | BackendPolicy::ForceVulkan) {
         return Ok(None);
     }
-    match gpu::backend::vulkan::VulkanBackend::new() {
-        Ok(b) => Ok(Some(Arc::new(b))),
-        Err(e) => Err(RasterError::BackendUnavailable(format!(
-            "Vulkan backend required but unavailable: {e}. \
-             Verify with `vulkaninfo` that a Vulkan 1.3+ device is present."
-        ))),
+    let cached = VK_BACKEND.get_or_init(|| match gpu::backend::vulkan::VulkanBackend::new() {
+        Ok(b) => Ok(Arc::new(b)),
+        Err(e) => Err(e.to_string()),
+    });
+    match cached {
+        Ok(b) => Ok(Some(Arc::clone(b))),
+        Err(e) => {
+            if matches!(policy, BackendPolicy::ForceVulkan) {
+                Err(RasterError::BackendUnavailable(format!(
+                    "Vulkan backend required but unavailable: {e}. \
+                     Verify with `vulkaninfo` that a Vulkan 1.3+ device is present."
+                )))
+            } else {
+                log::debug!("pdf_raster: Vulkan unavailable under Auto ({e}); trying CUDA next");
+                Ok(None)
+            }
+        }
     }
 }
 
 /// Initialise the CUDA GPU context for AA fill and ICC colour transforms.
 ///
-/// Returns `None` on `CpuOnly` and `ForceVulkan` (those policies don't
-/// want a CUDA context — Vulkan rendering goes through `vk_backend`
-/// instead); errors loudly on `ForceCuda` if init fails; logs a warning
-/// and returns `None` on `Auto`/`ForceVaapi` if init fails.
+/// Returns `None` on `CpuOnly`, `ForceVulkan`, and `Auto` when Vulkan
+/// already produced a backend (signalled by `vk_picked = true`).  Errors
+/// loudly on `ForceCuda` if init fails; logs a warning and returns
+/// `None` on `Auto`/`ForceVaapi` if init fails.
+///
+/// `vk_picked` is the load-bearing signal under `Auto`: `init_vk_backend`
+/// runs first and, when it succeeds, this function short-circuits so we
+/// don't pay the CUDA init cost for a CUDA path that won't be used.
+///
+/// The CUDA context, stream, and 7 PTX modules cost ~240 ms warm /
+/// ~1100 ms cold to build, and are process-wide state — there is no
+/// per-session work hidden inside.  We therefore cache the init result
+/// in a process-wide `OnceLock` so workloads that open many short-lived
+/// sessions (e.g. one page per archive across 100 archives) pay the
+/// cost once instead of once per `open_session` call.
+///
+/// Failures are also cached: on `Auto`/`ForceVaapi` we retain the
+/// fallback `None` so we don't re-attempt CUDA init every session and
+/// log the same warning hundreds of times.  `ForceCuda` still surfaces
+/// the cached error message verbatim because the caller asked us to
+/// fail loud rather than fall back.
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
-fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
+static GPU_CTX: std::sync::OnceLock<Result<Arc<gpu::GpuCtx>, String>> = std::sync::OnceLock::new();
+
+#[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
+fn init_gpu_ctx(
+    policy: BackendPolicy,
+    vk_picked: bool,
+) -> Result<Option<Arc<gpu::GpuCtx>>, RasterError> {
     if matches!(policy, BackendPolicy::CpuOnly | BackendPolicy::ForceVulkan) {
         return Ok(None);
     }
-    match gpu::GpuCtx::init() {
-        Ok(ctx) => Ok(Some(Arc::new(ctx))),
+    if matches!(policy, BackendPolicy::Auto) && vk_picked {
+        return Ok(None);
+    }
+
+    let cached = GPU_CTX.get_or_init(|| match gpu::GpuCtx::init() {
+        Ok(ctx) => Ok(Arc::new(ctx)),
+        Err(e) => Err(e.to_string()),
+    });
+
+    match cached {
+        Ok(ctx) => Ok(Some(Arc::clone(ctx))),
         Err(e) => {
             if matches!(policy, BackendPolicy::ForceCuda) {
                 Err(RasterError::BackendUnavailable(format!(
