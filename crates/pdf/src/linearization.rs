@@ -4,21 +4,19 @@
 //! first indirect object in the file.  This dict + hint streams together
 //! let a reader jump to any page by index without walking the page tree.
 //!
-//! This module supports the detection layer: parse the dict, expose the
-//! `/N`, `/O`, and `/H` (hint stream offsets) values, and stub
-//! `page_offset(idx) -> None` as a placeholder.  The Page Offset Hint
-//! Table contents (PDF § F.4.5, bit-packed) are NOT parsed yet — see
-//! ROADMAP.md for the hint-stream parser follow-up.
-//!
-//! When `page_offset(idx)` returns `None`, callers fall back to the
-//! logarithmic page-tree descent (`descend_to_page_index`).
+//! This module supports the detection layer: parse the dict and expose the
+//! `/N`, `/O`, and `/H` (hint stream offsets) values.  The Page Offset
+//! Hint Table contents (PDF § F.4.5, bit-packed) are NOT parsed yet — see
+//! `ROADMAP.md` for the hint-stream parser follow-up.  Until that ships,
+//! callers detect linearization purely for telemetry / future fast paths
+//! and continue using the logarithmic page-tree descent for all lookups.
 
-use crate::{dictionary::Dictionary, document::Document, error::PdfError, object::Object};
+use crate::{document::Document, error::PdfError, object::Object};
 
-/// Parsed `/Linearized` parameters.  The Page Offset Hint Table is
-/// detected (see `hint_stream_offset` / `hint_stream_length`) but
-/// not yet decoded.
-#[derive(Debug, Clone)]
+/// Parsed `/Linearized` parameters.  All fields are public because the
+/// future hint-stream parser will read `hint_stream_offset` /
+/// `hint_stream_length` directly from the cached struct.
+#[derive(Debug, Clone, Copy)]
 pub struct LinearizationHints {
     /// `/N` — total number of pages.
     pub page_count: u32,
@@ -33,8 +31,9 @@ pub struct LinearizationHints {
 impl LinearizationHints {
     /// Try to load linearization hints from the document.  Returns
     /// `Ok(None)` for non-linearized PDFs or when required fields are
-    /// missing.  Returns `Ok(Some(_))` when a valid `/Linearized` dict
-    /// is present with the minimum mandatory keys.
+    /// missing / malformed.  Returns `Ok(Some(_))` only when a valid
+    /// `/Linearized` dict is present with the minimum mandatory keys
+    /// (`/N`, `/O`, `/H[0]`, `/H[1]`).
     ///
     /// # Errors
     /// Currently never errors — every malformed-or-absent case collapses
@@ -43,75 +42,28 @@ impl LinearizationHints {
     /// stable when the hint-stream parser ships and gains real failure
     /// modes (truncated stream, bad bit-widths, …).
     pub fn try_load(doc: &Document) -> Result<Option<Self>, PdfError> {
-        let Some(lin_dict) = find_linearized_dict(doc)? else {
+        let Some(lin_obj) = find_linearized_object(doc)? else {
             return Ok(None);
         };
-
-        let Some(page_count) = lin_dict
-            .get(b"N")
-            .and_then(Object::as_i64)
-            .and_then(|n| u32::try_from(n).ok())
-        else {
+        let Some(lin_dict) = lin_obj.as_dict() else {
             return Ok(None);
         };
-        let Some(first_page_obj) = lin_dict
-            .get(b"O")
-            .and_then(Object::as_i64)
-            .and_then(|n| u32::try_from(n).ok())
-        else {
-            return Ok(None);
-        };
-
-        // /H is an array of [offset, length, ...].  First pair is mandatory
-        // (Page Offset Hint Table).  Subsequent pairs are optional.
-        let h_array = match lin_dict.get(b"H") {
-            Some(Object::Array(a)) if a.len() >= 2 => a.clone(),
-            _ => return Ok(None),
-        };
-        let Some(hint_stream_offset) = h_array
-            .first()
-            .and_then(Object::as_i64)
-            .and_then(|n| u64::try_from(n).ok())
-        else {
-            return Ok(None);
-        };
-        let Some(hint_stream_length) = h_array
-            .get(1)
-            .and_then(Object::as_i64)
-            .and_then(|n| u64::try_from(n).ok())
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(Self {
-            page_count,
-            first_page_obj,
-            hint_stream_offset,
-            hint_stream_length,
-        }))
-    }
-
-    /// Byte offset of page `idx`'s page object.  Currently always returns
-    /// `None` because the bit-packed Page Offset Hint Table parser is
-    /// pending.  Callers MUST fall back to the logarithmic page-tree
-    /// descent when this returns `None`.
-    ///
-    /// This is a deliberate stub: the spec for the hint-table layout
-    /// (PDF 1.7 § F.4.5) packs fields at variable bit widths, and a
-    /// half-correct parser would silently misdirect page lookups.  See
-    /// ROADMAP.md for the follow-up that wires in a real implementation.
-    #[must_use]
-    pub fn page_offset(&self, _idx: u32) -> Option<u64> {
-        // Hint-stream bit-parser pending; see ROADMAP.md.
-        None
+        let hints = parse_dict(lin_dict);
+        if hints.is_none() {
+            log::debug!(
+                "LinearizationHints: /Linearized dict present but required keys missing; \
+                 falling back to descent",
+            );
+        }
+        Ok(hints)
     }
 }
 
-/// Probe object 1; if its dict has a `/Linearized` key, return the dict.
-/// Any failure to read or destructure object 1 collapses to `Ok(None)` —
-/// non-linearized PDFs reach this code path and we don't want to surface
-/// their (perfectly valid) absence as an error.
-fn find_linearized_dict(doc: &Document) -> Result<Option<Dictionary>, PdfError> {
+/// Object 1 of a linearized PDF is the `/Linearized` dict.  Probe it; any
+/// failure to read or destructure that object collapses to `Ok(None)` —
+/// non-linearized PDFs reach this code path and we don't surface their
+/// (perfectly valid) absence as an error.
+fn find_linearized_object(doc: &Document) -> Result<Option<std::sync::Arc<Object>>, PdfError> {
     let Ok(obj) = doc.get_object((1, 0)) else {
         return Ok(None);
     };
@@ -119,10 +71,31 @@ fn find_linearized_dict(doc: &Document) -> Result<Option<Dictionary>, PdfError> 
         return Ok(None);
     };
     if dict.contains_key(b"Linearized") {
-        Ok(Some(dict.clone()))
+        Ok(Some(obj))
     } else {
         Ok(None)
     }
+}
+
+/// Pure parsing of a `/Linearized` dict into `LinearizationHints`.
+/// Returns `None` if any required key is missing or malformed.
+fn parse_dict(lin_dict: &crate::dictionary::Dictionary) -> Option<LinearizationHints> {
+    let page_count = lin_dict.get(b"N").and_then(Object::as_u32)?;
+    let first_page_obj = lin_dict.get(b"O").and_then(Object::as_u32)?;
+
+    // /H is an array of [offset, length, ...].  First pair is mandatory
+    // (Page Offset Hint Table); subsequent pairs are optional.  Borrow the
+    // array — we only read [0] and [1], no need to clone the Vec.
+    let h_array = lin_dict.get(b"H").and_then(Object::as_array)?;
+    let hint_stream_offset = h_array.first().and_then(Object::as_u64)?;
+    let hint_stream_length = h_array.get(1).and_then(Object::as_u64)?;
+
+    Some(LinearizationHints {
+        page_count,
+        first_page_obj,
+        hint_stream_offset,
+        hint_stream_length,
+    })
 }
 
 #[cfg(test)]
@@ -191,7 +164,36 @@ startxref\n166\n%%EOF"
         assert_eq!(hints.first_page_obj, 5);
         assert_eq!(hints.hint_stream_offset, 12345);
         assert_eq!(hints.hint_stream_length, 678);
-        // page_offset stub always returns None for now.
-        assert_eq!(hints.page_offset(0), None);
+    }
+
+    /// `/Linearized` dict with the marker key present but a required field
+    /// missing.  Detection must collapse to `Ok(None)` rather than producing
+    /// a `LinearizationHints` with garbage values — the contract says
+    /// "minimum mandatory keys present" before returning `Some`.
+    #[test]
+    fn malformed_linearized_dict_returns_none() {
+        // Object 1 has /Linearized 1 but no /N, /O, or /H.
+        // "%PDF-1.4\n" = 9 bytes  → obj1 at 9
+        // "1 0 obj\n<</Linearized 1>>\nendobj\n" = 33 bytes → obj2 at 42
+        // "2 0 obj\n<</Type /Catalog /Pages 3 0 R>>\nendobj\n" = 47 bytes → obj3 at 89
+        // "3 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n" = 50 bytes → xref at 139
+        let bytes = b"%PDF-1.4\n\
+1 0 obj\n<</Linearized 1>>\nendobj\n\
+2 0 obj\n<</Type /Catalog /Pages 3 0 R>>\nendobj\n\
+3 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n\
+xref\n0 4\n\
+0000000000 65535 f\r\n\
+0000000009 00000 n\r\n\
+0000000042 00000 n\r\n\
+0000000089 00000 n\r\n\
+trailer\n<</Size 4 /Root 2 0 R>>\n\
+startxref\n139\n%%EOF"
+            .to_vec();
+        let doc = Document::from_bytes_owned(bytes).unwrap();
+        let hints = LinearizationHints::try_load(&doc).expect("ok");
+        assert!(
+            hints.is_none(),
+            "malformed /Linearized dict should return None"
+        );
     }
 }

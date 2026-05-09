@@ -87,6 +87,20 @@ impl Object {
         }
     }
 
+    /// Numeric accessor that rejects negatives and `> u32::MAX`.  Convenient
+    /// for PDF dict keys whose spec'd domain is non-negative `Integer`
+    /// (`/Count`, `/N`, `/O`, page numbers, …).  Returns `None` for any
+    /// non-numeric or out-of-range value.
+    pub fn as_u32(&self) -> Option<u32> {
+        u32::try_from(self.as_i64()?).ok()
+    }
+
+    /// Same as [`Self::as_u32`] but for byte offsets and lengths that
+    /// genuinely need the full `u64` range.
+    pub fn as_u64(&self) -> Option<u64> {
+        u64::try_from(self.as_i64()?).ok()
+    }
+
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             Self::Real(r) => Some(*r),

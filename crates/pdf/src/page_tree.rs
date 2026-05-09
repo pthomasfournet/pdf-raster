@@ -67,10 +67,7 @@ pub fn descend_to_page_index(doc: &Document, idx: u32) -> Result<ObjectId, PdfEr
         // kid is implicitly a leaf with count 1.  Skip the per-kid /Type +
         // /Count probes and index directly.  This is the common case for
         // shallow PDFs (catalog → /Pages with all leaves directly attached).
-        let parent_count = node_dict
-            .get(b"Count")
-            .and_then(Object::as_i64)
-            .and_then(|n| u32::try_from(n).ok());
+        let parent_count = node_dict.get(b"Count").and_then(Object::as_u32);
         if parent_count == Some(u32::try_from(kids.len()).unwrap_or(u32::MAX)) {
             // Bounds: idx < total ≤ Σ /Count along the descent path, and
             // here parent /Count == kids.len(), so `remaining` is a valid
@@ -132,8 +129,7 @@ fn kid_subtree_count(kid_id: ObjectId, kid_dict: &Dictionary) -> Result<u32, Pdf
     }
     kid_dict
         .get(b"Count")
-        .and_then(Object::as_i64)
-        .and_then(|n| u32::try_from(n).ok())
+        .and_then(Object::as_u32)
         .ok_or_else(|| PdfError::BadObject {
             id: kid_id.0,
             detail: "interior page-tree node missing /Count".into(),

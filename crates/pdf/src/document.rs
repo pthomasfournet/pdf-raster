@@ -298,8 +298,7 @@ impl Document {
             return self.page_count();
         };
         dict.get(b"Count")
-            .and_then(Object::as_i64)
-            .and_then(|n| u32::try_from(n).ok())
+            .and_then(Object::as_u32)
             .unwrap_or_else(|| self.page_count())
     }
 
