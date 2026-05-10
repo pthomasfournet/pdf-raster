@@ -108,6 +108,55 @@ fn vulkan_backend_alloc_device_zeroed_concurrent() {
 }
 
 #[test]
+fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
+    // Recorder caps descriptor sets per page at MAX_DESC_SETS_PER_PAGE (64).
+    // Verify the boundary: 64 record_composite calls succeed, the 65th
+    // returns Err with "descriptor pool exhausted".  Pre-existing guard
+    // had zero coverage; a refactor that reordered guard / allocate /
+    // increment could silently regress.
+    use gpu::backend::params::CompositeParams;
+
+    const PER_PAGE_MAX: usize = 64;
+
+    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+    // 4 RGBA pixels (16 bytes) — minimum valid composite buffer.
+    let src = backend.alloc_device_zeroed(16).expect("alloc src");
+    let dst = backend.alloc_device_zeroed(16).expect("alloc dst");
+
+    backend.begin_page().expect("begin_page");
+    for i in 0..PER_PAGE_MAX {
+        backend
+            .record_composite(CompositeParams {
+                src: &src,
+                dst: &dst,
+                n_pixels: 4,
+            })
+            .unwrap_or_else(|e| panic!("record_composite #{i} of {PER_PAGE_MAX} failed: {e}"));
+    }
+    let err = backend
+        .record_composite(CompositeParams {
+            src: &src,
+            dst: &dst,
+            n_pixels: 4,
+        })
+        .expect_err("65th record_composite must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("descriptor pool exhausted"),
+        "expected exhaustion error, got: {msg}"
+    );
+
+    // Recorder state stayed Recording (the rejected call exited before
+    // touching the cmd buffer); finish the page cleanly so VulkanBackend's
+    // Drop doesn't see in-flight work on device_wait_idle.
+    let fence = backend.submit_page().expect("submit_page");
+    backend.wait_page(fence).expect("wait_page");
+
+    backend.free_device(src);
+    backend.free_device(dst);
+}
+
+#[test]
 fn vulkan_backend_immediate_fence_round_trips() {
     // submit_transfer returns PageFence::immediate() (a structural None
     // sentinel); wait_transfer must return Ok without driving a Vulkan
