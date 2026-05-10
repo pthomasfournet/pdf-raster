@@ -547,7 +547,7 @@ mod tests {
     /// Baseline (Apr 2026, Ryzen 9 9900X3D, release build): ~0.6 ms.
     /// Target for Intel i7-8700K (Coffee Lake): < 5 ms.
     #[test]
-    #[ignore]
+    #[ignore = "manual perf smoke test; run with `--ignored --nocapture` for timing"]
     fn rotate_cpu_8mp_timing() {
         let w = 2900u32;
         let h = 2900u32;
