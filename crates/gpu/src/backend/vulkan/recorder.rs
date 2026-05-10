@@ -111,10 +111,12 @@ const MAX_DESC_SETS_PER_PAGE: u32 = 64;
 
 /// Initial timeline-semaphore signal value.  Must be > 0 so
 /// `submit_page`'s `NonZeroU64::new(signal_value)` is `Some` by
-/// construction.  The semaphore itself is created with `initial_value(0)`
-/// so any `wait_semaphores(value=0)` call is also a no-op (defensive
-/// double-belt with the `wait_timeline(None)` short-circuit).
+/// construction.  Enforced at compile time by the `const _` below.
 const INITIAL_TIMELINE_VALUE: u64 = 1;
+const _: () = assert!(
+    NonZeroU64::new(INITIAL_TIMELINE_VALUE).is_some(),
+    "INITIAL_TIMELINE_VALUE must be > 0 for submit_page's NonZeroU64 invariant",
+);
 
 impl PageRecorder {
     pub(super) fn new(device: Arc<DeviceCtx>, pipelines: Arc<PipelineCache>) -> Result<Self> {
@@ -231,10 +233,8 @@ impl PageRecorder {
             .next_value
             .checked_add(1)
             .ok_or_else(|| BackendError::msg("timeline semaphore overflowed u64"))?;
-        // Mint the fence *before* the submit so a hypothetical conversion
-        // failure doesn't strand GPU work without a handle to wait on.
-        // Today this expect is unreachable (next_value starts at 1 and
-        // checked_add never wraps to 0), but the ordering is defensive.
+        // Mint the fence before the submit so a hypothetical conversion
+        // failure can't strand GPU work without a handle to wait on.
         let value = NonZeroU64::new(signal_value)
             .expect("submit_page invariant: timeline values start at 1");
 
@@ -652,14 +652,5 @@ mod tests {
     fn page_fence_niche_packs_to_eight_bytes() {
         // PageFence stays 8 bytes via Option<NonZeroU64> niche optimisation.
         assert_eq!(std::mem::size_of::<PageFence>(), 8);
-    }
-
-    #[test]
-    fn initial_timeline_value_is_nonzero() {
-        // submit_page's NonZeroU64::new(signal_value).expect(...) rests on
-        // INITIAL_TIMELINE_VALUE > 0 plus monotonic checked_add.  If
-        // someone changes the constant to 0, this trips before they hit
-        // the panic at runtime.
-        assert!(NonZeroU64::new(INITIAL_TIMELINE_VALUE).is_some());
     }
 }
