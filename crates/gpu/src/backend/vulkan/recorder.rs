@@ -34,6 +34,7 @@
     reason = "the inner Mutex<RecorderState> is held across Vulkan calls intentionally — single-page-in-flight design serialises every record_* through the same lock"
 )]
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -46,20 +47,27 @@ use super::device::DeviceCtx;
 use super::error::vk_err;
 use super::pipeline::{KernelId, PipelineCache};
 
-/// Synchronisation token returned by `submit_page`.  Holds the timeline
-/// value the caller must wait on.
+/// Synchronisation token returned by `submit_page` /
+/// `submit_transfer` / `upload_async`.
+///
+/// `Some(v)` carries the timeline-semaphore value to wait on; `None`
+/// is the "no work to wait on" sentinel returned by paths that
+/// completed synchronously (today: `submit_transfer`, `upload_async`,
+/// the sync-`download_async` shape).  Encoding the sentinel as `None`
+/// rather than the magic value `0` makes "real submission ⇒ real
+/// fence" a type-system invariant: `submit_page`'s monotonic
+/// `next_value` starts at 1, so its returned `NonZeroU64` is
+/// guaranteed by construction, not by convention.
+///
+/// `Option<NonZeroU64>` niche-packs to 8 bytes (same as the old `u64`).
 #[derive(Debug, Clone, Copy)]
-pub struct PageFence {
-    value: u64,
-}
+pub struct PageFence(Option<NonZeroU64>);
 
 impl PageFence {
-    /// A fence that has already signalled.  Used by upload paths that
-    /// completed synchronously and have nothing for the caller to wait
-    /// on; `wait_page(immediate)` returns immediately because the
-    /// timeline semaphore's initial value is 0 ≥ 0.
+    /// A fence that has already signalled — caller has nothing to wait
+    /// on.  Returned by sync paths that completed inline.
     pub(super) const fn immediate() -> Self {
-        Self { value: 0 }
+        Self(None)
     }
 }
 
@@ -243,9 +251,11 @@ impl PageRecorder {
             }
         })?;
         s.state = State::Submitted;
-        Ok(PageFence {
-            value: signal_value,
-        })
+        // next_value started at 1 and is monotonic, so signal_value
+        // is always nonzero — the unwrap is by construction.
+        let value = NonZeroU64::new(signal_value)
+            .expect("submit_page invariant: timeline values start at 1");
+        Ok(PageFence(Some(value)))
     }
 
     pub(super) fn wait_page(&self, fence: PageFence) -> Result<()> {
@@ -258,7 +268,7 @@ impl PageRecorder {
                 s.state
             )));
         }
-        self.wait_timeline(fence.value)?;
+        self.wait_timeline(fence.0)?;
         s.state = State::Idle;
         Ok(())
     }
@@ -273,14 +283,19 @@ impl PageRecorder {
     /// not transition the recorder.  Use this method to wait on those
     /// fences without tripping the state check.
     pub(super) fn wait_transfer_fence(&self, fence: PageFence) -> Result<()> {
-        self.wait_timeline(fence.value)
+        self.wait_timeline(fence.0)
     }
 
-    /// `vkWaitSemaphores` with `u64::MAX` timeout.  See
-    /// [`Self::wait_transfer_fence`] for the wait_page-vs-transfer split.
-    fn wait_timeline(&self, value: u64) -> Result<()> {
+    /// `vkWaitSemaphores` with `u64::MAX` timeout.  `None` short-
+    /// circuits without an FFI call (the immediate-fence sentinel).
+    /// See [`Self::wait_transfer_fence`] for the wait_page-vs-transfer
+    /// split.
+    fn wait_timeline(&self, value: Option<NonZeroU64>) -> Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
         let semaphores = [self.timeline];
-        let values = [value];
+        let values = [value.get()];
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
@@ -623,5 +638,28 @@ impl Drop for PageRecorder {
             self.device.device.destroy_command_pool(self.cmd_pool, None);
             self.device.device.destroy_semaphore(self.timeline, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_fence_niche_packs_to_eight_bytes() {
+        // Value claim of the Option<NonZeroU64> rework: niche packing
+        // means PageFence is the same size as the old `u64` shape.
+        // If this ever fails, the Cargo.lock has rolled rustc back to
+        // a version that lost niche optimisation — investigate.
+        assert_eq!(std::mem::size_of::<PageFence>(), 8);
+    }
+
+    #[test]
+    fn page_fence_immediate_is_none() {
+        // Structural invariant: `immediate()` is the only way to mint a
+        // None fence; submit_page always returns Some.  wait_timeline
+        // short-circuits on None without an FFI call.
+        let f = PageFence::immediate();
+        assert!(f.0.is_none());
     }
 }
