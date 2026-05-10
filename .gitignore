@@ -89,3 +89,8 @@ tests/bench/bench-features-results.json
 *.orig
 *.log
 ROADMAP_INTEL.md
+
+# ── Local audit reports (deferred-finding tracker) ────────────────────────────
+# /audit/ holds review findings whose fix is too large for the commit at hand
+# but worth not losing.  Stays local; not part of the project's published docs.
+/audit/
