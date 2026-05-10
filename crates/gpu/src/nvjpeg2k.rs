@@ -9,9 +9,9 @@
 //! container files; `nvjpeg2kStreamParse` auto-detects both.
 //!
 //! The CPU JPEG 2000 decoder is used as fallback for small images (below
-//! [`GPU_JPEG2K_THRESHOLD_PX`]), when no GPU is available, and always for
-//! inline images in the content stream (which are typically small thumbnails
-//! not worth the `PCIe` dispatch overhead).
+//! the per-call dispatch threshold), when no GPU is available, and always
+//! for inline images in the content stream (which are typically small
+//! thumbnails not worth the `PCIe` dispatch overhead).
 //!
 //! # Key differences from nvJPEG (baseline JPEG)
 //!

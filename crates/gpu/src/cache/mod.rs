@@ -10,14 +10,14 @@
 //! - Disk tier (Task 5): `<root>/<doc>/<hash>.bin` sidecar files for
 //!   cross-process persistence; opt-in via [`DeviceImageCache::with_disk`].
 //!
-//! # Module layout
+//! # Module layout (private; named for orientation only)
 //!
-//! - [`budget`] — VRAM cap struct; auto-detect from `cudaMemGetInfo`.
-//! - [`eviction`] — LRU scan, demote-to-host, monotonic LRU clock.
-//! - [`promotion`] — host-tier and disk-tier promote-on-hit paths.
-//! - [`host_tier`] — pinned-memory tier (`pub(crate)`).
-//! - [`disk_tier`] — sidecar-file tier (`pub`).
-//! - [`page_buffer`] — per-page composition target ([`DevicePageBuffer`]).
+//! - `budget` — VRAM cap struct; auto-detect from `cudaMemGetInfo`.
+//! - `eviction` — LRU scan, demote-to-host, monotonic LRU clock.
+//! - `promotion` — host-tier and disk-tier promote-on-hit paths.
+//! - `host_tier` — pinned-memory tier.
+//! - `disk_tier` — sidecar-file tier (re-exported via [`DiskTier`]).
+//! - `page_buffer` — per-page composition target ([`DevicePageBuffer`]).
 //!
 //! # Concurrency model
 //!

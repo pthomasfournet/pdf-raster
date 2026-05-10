@@ -290,8 +290,8 @@ impl DiskTier {
     /// Probe the disk tier for `(doc, hash)` and stream the pixel
     /// payload through a caller-supplied callback.  On hit, opens
     /// the file, validates the header, then calls `fill` with the
-    /// parsed [`DiskHeaderInfo`] and a reader positioned at the
-    /// pixel bytes.  The callback reads exactly
+    /// parsed disk-header info (a private `DiskHeaderInfo` struct)
+    /// and a reader positioned at the pixel bytes.  The callback reads exactly
     /// `header.expected_pixel_bytes` (typically via `read_exact`
     /// into a pinned-host slab) and tags failures with
     /// [`LookupCallbackError::Read`] for file-side problems or

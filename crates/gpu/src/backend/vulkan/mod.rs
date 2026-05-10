@@ -6,13 +6,13 @@
 //! into a per-page command buffer; submission uses a timeline semaphore
 //! so the host waits exactly once per page.
 //!
-//! Module split:
-//! - [`device`] — loader, physical-device pick, logical device + queue.
-//! - [`error`] — `vk::Result → BackendError` adaptor.
-//! - [`memory`] — slab sub-allocator, host-visible staging pool.
-//! - [`pipeline`] — descriptor set layouts + pipeline cache (lazy SPIR-V compile).
-//! - [`recorder`] — per-page command buffer + timeline-semaphore fence.
-//! - [`transfer`] — `upload_async` helper (probes for dedicated transfer queue).
+//! Module split (all private; named here for orientation only):
+//! - `device` — loader, physical-device pick, logical device + queue.
+//! - `error` — `vk::Result → BackendError` adaptor.
+//! - `memory` — slab sub-allocator, host-visible staging pool.
+//! - `pipeline` — descriptor set layouts + pipeline cache (lazy SPIR-V compile).
+//! - `recorder` — per-page command buffer + timeline-semaphore fence.
+//! - `transfer` — `upload_async` helper (probes for dedicated transfer queue).
 
 mod device;
 mod error;

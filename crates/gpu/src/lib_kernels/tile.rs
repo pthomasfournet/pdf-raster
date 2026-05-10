@@ -11,12 +11,12 @@ impl GpuCtx {
     /// per-pixel coverage (analytical trapezoid integrals) rather than sampling.
     ///
     /// All coordinates in `records` are already tile-local (produced by
-    /// [`build_tile_records`]); no origin offset is applied in the kernel.
+    /// [`crate::build_tile_records`]); no origin offset is applied in the kernel.
     ///
     /// # Arguments
     ///
     /// - `records` — tile records sorted by `(tile_y << 16 | tile_x)`, one per
-    ///   (segment, tile-row) crossing.  Build with [`build_tile_records`].
+    ///   (segment, tile-row) crossing.  Build with [`crate::build_tile_records`].
     /// - `tile_starts` / `tile_counts` — prefix-sum index into `records` per flat
     ///   tile index `tile_y * grid_w + tile_x`.  Both have length `grid_w * grid_h`.
     /// - `grid_w` — number of tiles in the x direction (`width.div_ceil(TILE_W)`).

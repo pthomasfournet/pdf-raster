@@ -340,7 +340,7 @@ pub type Result<T> = std::result::Result<T, NvJpegError>;
 
 // ── Colour space ──────────────────────────────────────────────────────────────
 
-/// Colour space of the pixels returned by [`NvJpeg::decode`].
+/// Colour space of the pixels returned by [`NvJpegDecoder::decode_sync`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JpegColorSpace {
     /// One byte per pixel (luma / grayscale).
