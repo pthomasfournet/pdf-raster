@@ -460,18 +460,6 @@ pub struct RenderedPage {
     pub diagnostics: PageDiagnostics,
 }
 
-impl RenderedPage {
-    /// Suggest a render DPI for re-rendering this page at its native image resolution.
-    ///
-    /// Delegates to [`PageDiagnostics::suggested_dpi`].  Returns `None` for pages
-    /// with no raster images (vector/text-only pages should just use the caller's
-    /// default DPI).
-    #[must_use]
-    pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32> {
-        self.diagnostics.suggested_dpi(min_dpi, max_dpi)
-    }
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Render a range of pages from a PDF file.
