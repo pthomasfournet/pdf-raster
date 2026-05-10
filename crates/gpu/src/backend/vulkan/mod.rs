@@ -119,12 +119,8 @@ impl GpuBackend for VulkanBackend {
 
     fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer> {
         reject_zero_size(size, "alloc_device_zeroed")?;
-        // Today: allocate then sync-zero via a host-side memcpy through
-        // upload_sync.  A future commit replaces this with vkCmdFillBuffer
-        // recorded on the transfer queue (faster, and lets the caller
-        // overlap zero-init with other transfers).  The trait contract
-        // says "eventually zero by next wait_transfer/wait_page" — the
-        // sync path over-delivers, same as CudaBackend.
+        // Sync host-memcpy zero today; vkCmdFillBuffer follow-up
+        // tracked in ROADMAP under Phase 10 Vulkan async transfers.
         let buf = self.memory.alloc_device(size)?;
         let zeros = vec![0u8; size];
         self.transfer.upload_sync(&self.memory, &buf, &zeros)?;
@@ -191,10 +187,7 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn upload_async(&self, dst: &Self::DeviceBuffer, src: &[u8]) -> Result<Self::PageFence> {
-        // Today's path is sync (vkQueueWaitIdle inside `upload_sync`);
-        // we hand back an already-signalled fence so callers writing
-        // `upload_async(...).and_then(|f| wait_page(f))` keep working
-        // unchanged once the dedicated transfer queue lands.
+        // Sync today; ROADMAP tracks the async transfer-queue follow-up.
         self.transfer.upload_sync(&self.memory, dst, src)?;
         Ok(PageFence::immediate())
     }
@@ -204,12 +197,7 @@ impl GpuBackend for VulkanBackend {
         src: &'a Self::DeviceBuffer,
         dst: &'a mut [u8],
     ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
-        // Sync path today, mirroring upload_async.  The async path
-        // will record vkCmdCopyBuffer onto the transfer queue and
-        // defer the staging→dst memcpy to wait_download via
-        // DownloadInner::finish.  Until then we fulfil the contract
-        // by completing the work eagerly and returning a handle whose
-        // finish() is a no-op.
+        // Sync today; ROADMAP tracks the async transfer-queue follow-up.
         self.transfer.download_sync(&self.memory, src, dst)?;
         Ok(crate::backend::DownloadHandle {
             inner: Box::new(NoopDownloadInner),
@@ -219,16 +207,21 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn wait_download(&self, mut handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
-        handle.inner.finish()
+        let result = handle.inner.finish();
+        // Swap in a no-op so the upcoming `Drop` doesn't re-run finish()
+        // on a Vulkan staging path that's been consumed.  Future async
+        // impls hold real fence + staging state inside their inner;
+        // letting Drop call finish() again would either re-memcpy
+        // (wasteful) or hit a one-shot panic.  This makes "safe to call
+        // twice" a structural invariant rather than a documented one.
+        handle.inner = Box::new(NoopDownloadInner);
+        result
     }
 
     fn submit_transfer(&self) -> Result<Self::PageFence> {
-        // Sync transfer path today: there's nothing to flush because
-        // upload_sync / download_sync block inside their call.
-        // Returning `immediate` keeps the trait contract — wait_transfer
-        // on this fence returns immediately.  The async-transfer-queue
-        // commit will end the accumulated transfer command buffer here
-        // and return a real fence.
+        // Nothing to flush while transfers are sync; `immediate` keeps
+        // the trait contract (wait_transfer on it returns at once).
+        // ROADMAP tracks the async transfer-queue follow-up.
         Ok(PageFence::immediate())
     }
 

@@ -12,26 +12,14 @@ use cudarc::driver::{CudaSlice, PinnedHostSlice};
 use crate::GpuCtx;
 use crate::backend::{BackendError, GpuBackend, Result, VramBudget, params, reject_zero_size};
 
-/// CUDA error adaptor.
+/// Convert any `Display` error to a `BackendError`.
 ///
-/// `GpuCtx::init` returns `Box<dyn Error>` (not Send+Sync), so we wrap the
-/// stringified message in a type that is `Send + Sync + Error`. Used only
-/// inside [`be`]; non-driver-error callsites should use
-/// [`BackendError::msg`] directly.
-#[derive(Debug)]
-struct StringError(String);
-
-impl std::fmt::Display for StringError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for StringError {}
-
-/// Convert any `Display` error to a `BackendError` via `StringError`.
+/// `GpuCtx::init` returns `Box<dyn Error>` (not `Send + Sync`), so we
+/// stringify and route through [`BackendError::msg`].  The source chain
+/// is lost but the message survives — sufficient for the init paths
+/// this is used on (driver missing, device missing, kernel-load failure).
 pub(super) fn be(e: impl std::fmt::Display) -> BackendError {
-    BackendError::new(StringError(e.to_string()))
+    BackendError::msg(e.to_string())
 }
 
 /// A CUDA backend that wraps `GpuCtx`.
@@ -136,27 +124,15 @@ impl GpuBackend for CudaBackend {
         self.recorder.wait_page(fence)
     }
 
-    // ── Async transfer stubs ─────────────────────────────────────────
-    //
-    // These three methods panic at runtime via `unimplemented!`.  They
-    // exist on the trait surface for cross-backend parity, but the
-    // CUDA backend reaches host-to-device / device-to-host transfers
-    // through cudarc's `clone_htod` / `memcpy_dtoh` directly inside
-    // the cache today.  The trait-routed path lands alongside the
-    // dedicated copy-engine stream + event signalling.
-    //
-    // We intentionally don't `#[deprecated]` these: the attribute on
-    // a trait-method impl is a no-op (rustc rejects it), and putting
-    // it on the trait method itself would warn every backend's impl
-    // including the Vulkan one which is correct.  The compile-time
-    // signal is the doc-comment + `unimplemented!`.  Future callers
-    // grepping the trait surface get the contract; runtime callers
-    // get a panic with a clear message.
+    // Async transfer stubs.  CUDA's cache uses cudarc clone_htod /
+    // memcpy_dtoh directly today; trait-routed transfers wait for the
+    // dedicated copy-engine stream to land.  Each `unimplemented!`
+    // names the cudarc primitive callers should reach for instead.
 
     fn upload_async(&self, _dst: &Self::DeviceBuffer, _src: &[u8]) -> Result<Self::PageFence> {
         unimplemented!(
-            "CudaBackend::upload_async is not implemented yet; \
-             cache callers should use cudarc clone_htod via gpu::cache instead"
+            "CudaBackend::upload_async unimplemented; \
+             cache path uses cudarc `clone_htod` via gpu::cache"
         )
     }
 
@@ -166,13 +142,16 @@ impl GpuBackend for CudaBackend {
         _dst: &'a mut [u8],
     ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
         unimplemented!(
-            "CudaBackend::download_async is not implemented yet; \
-             cache callers should use cudarc memcpy_dtoh via gpu::cache instead"
+            "CudaBackend::download_async unimplemented; \
+             cache path uses cudarc `memcpy_dtoh` via gpu::cache"
         )
     }
 
     fn wait_download(&self, _handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
-        unimplemented!("CudaBackend::wait_download is not implemented yet")
+        unimplemented!(
+            "CudaBackend::wait_download unimplemented; \
+             cache path syncs via the recorded `CudaEvent`"
+        )
     }
 
     fn submit_transfer(&self) -> Result<Self::PageFence> {

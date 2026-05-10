@@ -155,6 +155,17 @@ impl VramBudget {
 /// incorrect results. Single-threaded usage is the supported pattern; cross-
 /// thread interleaving requires external synchronisation even though the trait
 /// is `Send + Sync`.
+///
+/// # Stability — closed implementation set
+///
+/// The trait is `pub` for callers (`pdf_raster`, `pdf_interp`) but the
+/// implementation set is closed to in-tree backends (`CudaBackend`,
+/// `VulkanBackend`).  The associated `DownloadHandle` carries
+/// `pub(crate)` fields and an internal `DownloadInner` trait; external
+/// crates cannot construct one and therefore cannot satisfy
+/// `download_async` / `wait_download`.  This is deliberate — the
+/// trait surface co-evolves with the in-tree backends and there is no
+/// API stability commitment for external implementors.
 pub trait GpuBackend: Send + Sync {
     /// An opaque device-resident buffer handle.
     type DeviceBuffer: Send + Sync;
@@ -402,9 +413,12 @@ pub struct DownloadHandle<'a, B: GpuBackend + ?Sized> {
     /// `Drop::drop` (block-and-discard), so it's never dead code even
     /// when the CUDA `download_async` stub is the only impl in scope.
     pub(crate) inner: Box<dyn DownloadInner + Send + Sync + 'a>,
-    /// `&'a mut [u8]` borrow witness — keeps the destination slice
-    /// borrowed for the handle's lifetime so the caller can't free or
-    /// reuse it while the DMA is in flight.
+    /// `&'a mut [u8]` borrow witness.  Two roles: (a) keeps the
+    /// destination slice borrowed for the handle's lifetime so the
+    /// caller can't free or reuse it while the DMA is in flight, and
+    /// (b) pins variance — `Box<dyn Trait + 'a>` is covariant in `'a`,
+    /// but `&mut [u8]` is invariant, and we need invariance so the
+    /// borrow checker enforces unique-write semantics on `dst`.
     pub(crate) _borrow: std::marker::PhantomData<&'a mut [u8]>,
     /// The fence the caller can stash to gate other operations.
     /// Cloned out by `wait_download`; until then the handle owns a
@@ -449,10 +463,13 @@ impl<B: GpuBackend + ?Sized> Drop for DownloadHandle<'_, B> {
 /// across backends without exposing the staging buffer type.
 pub(crate) trait DownloadInner {
     /// Block until the underlying transfer signals, then perform any
-    /// staging→dst memcpy the backend deferred. Must be safe to call
-    /// twice — `Drop` always calls it; `wait_download` may have called
-    /// it first.  Subsequent calls after the first successful return
-    /// should be `Ok(())` no-ops.
+    /// staging→dst memcpy the backend deferred.
+    ///
+    /// Called either by `wait_download` (caller path) or by `Drop`
+    /// (block-and-discard path).  `wait_download` swaps in a no-op
+    /// `DownloadInner` after a successful call so `Drop` doesn't
+    /// re-enter — implementations therefore only need to be correct
+    /// for a single invocation per logical handle.
     fn finish(&mut self) -> Result<()>;
 }
 
