@@ -1,3 +1,7 @@
+//! Scan every page of a PDF for non-trivial fill colours and report.
+//!
+//! Usage: `cargo run -p pdf_interp --example scan_fills -- <pdf>`
+
 fn main() {
     let path = std::env::args()
         .nth(1)

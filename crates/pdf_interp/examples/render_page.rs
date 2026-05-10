@@ -21,14 +21,14 @@ fn main() {
     let total = pdf_interp::page_count(&doc);
     println!("Opened {pdf}: {total} pages");
 
-    let pages = doc.get_pages();
-    let page_id = match pages.get(&page) {
-        Some(id) => *id,
-        None => {
-            eprintln!("error: page {page} out of range (document has {total} pages)");
-            std::process::exit(1);
-        }
-    };
+    if page == 0 || page > total {
+        eprintln!("error: page {page} out of range (document has {total} pages)");
+        std::process::exit(1);
+    }
+    let page_id = doc.get_page(page - 1).unwrap_or_else(|e| {
+        eprintln!("error: could not resolve page {page}: {e}");
+        std::process::exit(1);
+    });
 
     let geom = pdf_interp::page_size_pts(&doc, page).unwrap_or_else(|e| {
         eprintln!("error: could not determine size of page {page}: {e}");

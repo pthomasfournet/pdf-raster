@@ -52,9 +52,9 @@ pub struct StrokeParams<'a> {
 /// Mirrors `Splash::stroke`.
 ///
 /// Steps:
-/// 1. Flatten curves via [`flatten_path`].
-/// 2. Apply dashing via [`make_dashed_path`] if a dash array is set.
-/// 3. Choose hairline ([`stroke_narrow`]) or wide ([`stroke_wide`]) rendering.
+/// 1. Flatten curves.
+/// 2. Apply dashing if a dash array is set.
+/// 3. Choose hairline (zero line-width) or wide rendering.
 pub fn stroke<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,

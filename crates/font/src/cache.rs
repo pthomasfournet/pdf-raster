@@ -19,7 +19,7 @@
 //!
 //! # TODO: redesign when a second glyph generator lands
 //!
-//! Today this cache is FreeType-only.  When a second source appears
+//! Today this cache is `FreeType`-only.  When a second source appears
 //! (Type 3 `CharProcs`, `COLRv1`, SVG `OpenType`), don't add a sibling cache —
 //! the [`GlyphKey`] shape and the entry-count budget below are both
 //! Splash-era artifacts and will start to leak:

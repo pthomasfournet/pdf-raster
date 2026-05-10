@@ -206,8 +206,7 @@ impl PageRenderer<'_> {
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
                     push_glyph(u32::from(byte), u32::from(byte), pen_x, pen_y);
 
-                    // Advance regardless of whether the glyph rendered — PDF §9.4.4
-                    // requires the pen to advance even for missing/invisible glyphs.
+                    // PDF §9.4.4: pen advances even for missing/invisible glyphs.
                     let advance_glyph = face.glyph_advance(u32::from(byte)).unwrap_or(0.0);
                     let extra = if byte == b' ' { word_spacing } else { 0.0 };
                     let tx_adv = (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;

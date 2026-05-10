@@ -244,9 +244,12 @@ impl FontFace {
         decompose_outline(&outline, self.text_scale)
     }
 
-    /// Return the advance width for `char_code`, in font-size-normalised units.
+    /// Return the advance width for `char_code` in font-size-normalised units
+    /// (multiply by `font_size` to get device-space pixels).
     ///
-    /// Returns `None` if `FreeType` fails to load the glyph.
+    /// Returns `None` if `FreeType` fails to load the glyph.  For valid fonts
+    /// the result is non-negative; adversarial fonts with negative
+    /// `horiAdvance` metrics propagate through.
     #[must_use]
     pub fn glyph_advance(&self, char_code: u32) -> Option<f64> {
         let glyph_id = self.resolve_gid(char_code);

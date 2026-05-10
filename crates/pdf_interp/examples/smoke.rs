@@ -1,3 +1,7 @@
+//! Sanity check: parse page 1 of a PDF and report any unknown operators.
+//!
+//! Usage: `cargo run -p pdf_interp --example smoke -- <pdf>`
+
 fn main() {
     let path = std::env::args()
         .nth(1)
