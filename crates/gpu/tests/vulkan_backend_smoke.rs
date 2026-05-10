@@ -116,12 +116,19 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
     // increment could silently regress.
     use gpu::backend::params::CompositeParams;
 
+    // Keep in sync with `MAX_DESC_SETS_PER_PAGE` in
+    // crates/gpu/src/backend/vulkan/recorder.rs (private constant).
+    // The test parses the production error message below and asserts
+    // the embedded `max` value equals this — so a production bump
+    // without updating PER_PAGE_MAX fails loudly instead of silently
+    // passing through the loop.
     const PER_PAGE_MAX: usize = 64;
+    const N_PIXELS: u32 = 4;
+    const BUF_BYTES: usize = (N_PIXELS as usize) * 4;
 
     let backend = VulkanBackend::new().expect("VulkanBackend::new");
-    // 4 RGBA pixels (16 bytes) — minimum valid composite buffer.
-    let src = backend.alloc_device_zeroed(16).expect("alloc src");
-    let dst = backend.alloc_device_zeroed(16).expect("alloc dst");
+    let src = backend.alloc_device_zeroed(BUF_BYTES).expect("alloc src");
+    let dst = backend.alloc_device_zeroed(BUF_BYTES).expect("alloc dst");
 
     backend.begin_page().expect("begin_page");
     for i in 0..PER_PAGE_MAX {
@@ -129,7 +136,7 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
             .record_composite(CompositeParams {
                 src: &src,
                 dst: &dst,
-                n_pixels: 4,
+                n_pixels: N_PIXELS,
             })
             .unwrap_or_else(|e| panic!("record_composite #{i} of {PER_PAGE_MAX} failed: {e}"));
     }
@@ -137,13 +144,31 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
         .record_composite(CompositeParams {
             src: &src,
             dst: &dst,
-            n_pixels: 4,
+            n_pixels: N_PIXELS,
         })
         .expect_err("65th record_composite must be rejected");
     let msg = err.to_string();
     assert!(
         msg.contains("descriptor pool exhausted"),
         "expected exhaustion error, got: {msg}"
+    );
+    // Self-check the test's PER_PAGE_MAX against production's actual
+    // limit by parsing it out of the error message:
+    //   "descriptor pool exhausted: 64 sets allocated this page (max 64)"
+    // If production bumps MAX_DESC_SETS_PER_PAGE without this test
+    // tracking it, the loop above still completes (more headroom) and
+    // the post-loop call wouldn't error — but we'd never reach this
+    // assertion.  The branch we *do* care about: production drops the
+    // limit without updating PER_PAGE_MAX, in which case the loop
+    // panics early.  Both directions surface loudly.
+    let production_max: usize = msg
+        .rsplit_once("(max ")
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .and_then(|(num, _)| num.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse production max from error: {msg}"));
+    assert_eq!(
+        production_max, PER_PAGE_MAX,
+        "test PER_PAGE_MAX is out of sync with production MAX_DESC_SETS_PER_PAGE"
     );
 
     // Recorder state stayed Recording (the rejected call exited before
