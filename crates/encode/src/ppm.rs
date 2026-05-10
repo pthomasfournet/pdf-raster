@@ -281,4 +281,75 @@ mod tests {
         assert_eq!(g, 155, "magenta=0, k=100: 255-0-100=155");
         assert_eq!(b, 155, "yellow=0, k=100: 255-0-100=155");
     }
+
+    #[test]
+    fn cmyk_to_rgb_asymmetric_channels() {
+        // Distinct non-zero values per ink so each channel's `255 - chan - k`
+        // formula is independently constrained.  K=0 isolates the C/M/Y math.
+        let [r, g, b] = cmyk_to_rgb(10, 50, 200, 0);
+        assert_eq!(r, 245, "cyan=10, k=0: 255-10=245");
+        assert_eq!(g, 205, "magenta=50, k=0: 255-50=205");
+        assert_eq!(b, 55, "yellow=200, k=0: 255-200=55");
+
+        // Non-zero K with all four channels distinct.
+        let [r, g, b] = cmyk_to_rgb(40, 80, 120, 30);
+        assert_eq!(r, 185, "255-40-30=185");
+        assert_eq!(g, 145, "255-80-30=145");
+        assert_eq!(b, 105, "255-120-30=105");
+    }
+
+    #[test]
+    fn cmyk_ppm_multi_pixel_constrains_dst_stride() {
+        // 2×2 with four distinct CMYK pixels — each pixel hits a different
+        // (i*3, i*3+1, i*3+2) destination triple, so mutations on the dst
+        // index arithmetic in the Cmyk8 branch can no longer hide behind w=1.
+        let mut bmp: Bitmap<Cmyk8> = Bitmap::new(2, 2, 1, false);
+        // Row 0: [(10, 0, 0, 0), (0, 20, 0, 0)] → [(245,255,255), (255,235,255)]
+        bmp.row_bytes_mut(0)
+            .copy_from_slice(&[10, 0, 0, 0, 0, 20, 0, 0]);
+        // Row 1: [(0, 0, 30, 0), (40, 50, 60, 0)] → [(255,255,225), (215,205,195)]
+        bmp.row_bytes_mut(1)
+            .copy_from_slice(&[0, 0, 30, 0, 40, 50, 60, 0]);
+        let mut out = Vec::new();
+        write_ppm::<Cmyk8, _>(&bmp, &mut out).unwrap();
+        let hlen = header_len(&out);
+        let pixels = &out[hlen..];
+        assert_eq!(pixels.len(), 12, "2×2 × 3 RGB bytes");
+        assert_eq!(&pixels[0..3], &[245, 255, 255], "row 0 px 0");
+        assert_eq!(&pixels[3..6], &[255, 235, 255], "row 0 px 1");
+        assert_eq!(&pixels[6..9], &[255, 255, 225], "row 1 px 0");
+        assert_eq!(&pixels[9..12], &[215, 205, 195], "row 1 px 1");
+    }
+
+    #[test]
+    fn rgba8_xbgr_ppm_multi_pixel_constrains_stride() {
+        // The single-pixel Xbgr8 test can't see mutations on `i * 4` or
+        // `i * 3` because i is always 0.  Use 2×1 with distinct pixels.
+        let mut bmp: Bitmap<Rgba8> = Bitmap::new(2, 1, 1, false);
+        // [A=255, B=10, G=20, R=30]  [A=240, B=11, G=22, R=33]
+        bmp.row_bytes_mut(0)
+            .copy_from_slice(&[255, 10, 20, 30, 240, 11, 22, 33]);
+        let mut out = Vec::new();
+        write_ppm::<Rgba8, _>(&bmp, &mut out).unwrap();
+        let hlen = header_len(&out);
+        assert_eq!(&out[hlen..], &[30, 20, 10, 33, 22, 11], "two pixels RGB");
+    }
+
+    #[test]
+    fn devicen_multi_pixel_constrains_dst_stride() {
+        // 2×1 DeviceN8 with two distinct CMYK portions.  Spot bytes ignored.
+        let mut bmp: Bitmap<DeviceN8> = Bitmap::new(2, 1, 1, false);
+        // px0 CMYK=(10, 0, 0, 0) → (245, 255, 255); spot=99..
+        // px1 CMYK=(0, 40, 80, 0) → (255, 215, 175); spot=88..
+        bmp.row_bytes_mut(0)
+            .copy_from_slice(&[10, 0, 0, 0, 99, 99, 99, 99, 0, 40, 80, 0, 88, 88, 88, 88]);
+        let mut out = Vec::new();
+        write_ppm::<DeviceN8, _>(&bmp, &mut out).unwrap();
+        let hlen = header_len(&out);
+        assert_eq!(
+            &out[hlen..],
+            &[245, 255, 255, 255, 215, 175],
+            "two-pixel DeviceN must constrain i*3 dst stride and ignore spots",
+        );
+    }
 }

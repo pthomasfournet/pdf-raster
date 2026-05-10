@@ -244,11 +244,11 @@ impl FontFace {
         decompose_outline(&outline, self.text_scale)
     }
 
-    /// Return the advance width for `char_code`, normalised to `[0, ∞)`.
+    /// Return the advance width for `char_code`, in font-size-normalised units.
     ///
-    /// Returns `-1.0` on failure (matching `SplashFTFont::getGlyphAdvance`).
+    /// Returns `None` if `FreeType` fails to load the glyph.
     #[must_use]
-    pub fn glyph_advance(&self, char_code: u32) -> f64 {
+    pub fn glyph_advance(&self, char_code: u32) -> Option<f64> {
         let glyph_id = self.resolve_gid(char_code);
 
         // Identity matrix + zero offset for advance measurement.
@@ -262,9 +262,7 @@ impl FontFace {
         self.face.set_transform(&mut matrix, &mut delta);
 
         let flags = load_flags(self.kind, self.aa, self.ft_hinting, self.slight_hinting);
-        if self.face.load_glyph(glyph_id, flags).is_err() {
-            return -1.0;
-        }
+        self.face.load_glyph(glyph_id, flags).ok()?;
 
         // `horiAdvance` is in 26.6 fixed-point; divide by 64 for pixels, then by size.
         #[expect(
@@ -272,7 +270,7 @@ impl FontFace {
             reason = "horiAdvance is FT_Pos (i64); typical advance values fit in f64 mantissa"
         )]
         let advance = self.face.glyph().metrics().horiAdvance as f64;
-        advance / 64.0 / f64::from(self.size_px)
+        Some(advance / 64.0 / f64::from(self.size_px))
     }
 
     /// Look up a Unicode codepoint in `FreeType`'s active charmap and return

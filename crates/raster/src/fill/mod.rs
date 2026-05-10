@@ -23,7 +23,7 @@
 //! feature is enabled.
 //!
 //! # C++ equivalent
-//! `Splash::fillWithPattern` (Splash.cc ~line 2382).
+//! `Splash::fillWithPattern`.
 
 #[cfg(feature = "rayon")]
 mod parallel;

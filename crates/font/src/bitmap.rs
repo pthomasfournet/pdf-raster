@@ -50,12 +50,6 @@ impl GlyphBitmap {
         self.row_bytes().saturating_mul(self.height as usize)
     }
 
-    /// Returns `true` if the bitmap contains no pixels (zero width or height).
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.width == 0 || self.height == 0
-    }
-
     /// Return the slice for row `y` (0-indexed from the top).
     ///
     /// # Panics
@@ -117,16 +111,6 @@ mod tests {
     fn data_len_matches_row_bytes_times_height() {
         let bmp = make_aa(4, 6);
         assert_eq!(bmp.data_len(), 24);
-    }
-
-    #[test]
-    fn is_empty_zero_width() {
-        assert!(make_aa(0, 5).is_empty());
-    }
-
-    #[test]
-    fn is_empty_zero_height() {
-        assert!(make_aa(5, 0).is_empty());
     }
 
     #[test]

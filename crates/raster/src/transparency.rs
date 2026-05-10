@@ -31,9 +31,9 @@
 //!
 //! # C++ equivalents
 //!
-//! - `Splash::beginTransparencyGroup`  (~line 4954)
-//! - `Splash::endTransparencyGroup`    (~line 5003)
-//! - `Splash::paintTransparencyGroup`  (~line 5041)
+//! - `Splash::beginTransparencyGroup`
+//! - `Splash::endTransparencyGroup`
+//! - `Splash::paintTransparencyGroup`
 
 use std::sync::Arc;
 

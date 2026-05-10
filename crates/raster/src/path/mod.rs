@@ -1,6 +1,12 @@
 //! PDF path geometry: points, flags, subpath state machine, and builder API.
 //!
-//! Mirrors `SplashPath` from `splash/SplashPath.h` and `splash/SplashPath.cc`.
+//! The `pts` and `flags` arrays are parallel `SoA` (one entry per index).  This
+//! layout originates in `SplashPath` from `splash/SplashPath.{h,cc}`, but is
+//! preserved deliberately rather than ported: `xpath::XPath::new` transforms
+//! the entire `pts` array under a CTM in one pass before anything reads
+//! `flags`, and the contiguous f64-pair layout keeps that pre-pass tight.
+//! Walkers that read both arrays together (`xpath.rs`, `stroke/path.rs`)
+//! pay one extra L1-resident byte per index, which is negligible.
 //!
 //! ## Subpath state machine
 //!

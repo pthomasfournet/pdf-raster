@@ -208,7 +208,7 @@ impl PageRenderer<'_> {
 
                     // Advance regardless of whether the glyph rendered — PDF §9.4.4
                     // requires the pen to advance even for missing/invisible glyphs.
-                    let advance_glyph = face.glyph_advance(u32::from(byte)).max(0.0);
+                    let advance_glyph = face.glyph_advance(u32::from(byte)).unwrap_or(0.0);
                     let extra = if byte == b' ' { word_spacing } else { 0.0 };
                     let tx_adv = (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
                     let [a, b_m, c, d, e, f] = tm;
@@ -288,6 +288,11 @@ impl PageRenderer<'_> {
     ///
     /// The `CharProc` coordinate system (glyph space) maps to device space via:
     /// `charproc_ctm = CTM × Tm_at_glyph × scale(font_size) × FontMatrix`
+    ///
+    /// `CharProcs` are re-rasterised on every call.  If Type 3 perf becomes a
+    /// hot path, the right fix is to extend `font::GlyphCache` to key on Type
+    /// 3 font instances and add an off-screen bitmap path here, not to
+    /// reintroduce a separate Type-3-only cache.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors show_text() parameter set; all values are needed for glyph placement"

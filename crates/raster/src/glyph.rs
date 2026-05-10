@@ -7,7 +7,7 @@
 //! The blit clips to the destination bitmap bounds and optionally to the `Clip` region.
 //!
 //! # C++ equivalent
-//! `Splash::fillGlyph2` (Splash.cc ~line 2643).
+//! `Splash::fillGlyph2`.
 
 use crate::bitmap::Bitmap;
 use crate::clip::{Clip, ClipResult};

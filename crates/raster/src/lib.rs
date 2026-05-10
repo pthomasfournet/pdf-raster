@@ -71,10 +71,7 @@ pub use simd::{
     blend_solid_gray8, blend_solid_rgb8, composite_aa_rgb8_opaque, popcnt_aa_row, unpack_mono_row,
 };
 pub use state::{GraphicsState, StateStack, TransferSet};
-pub use stroke::{
-    StrokeParams, flatten_path, make_dashed_path, make_stroke_path, stroke, stroke_narrow,
-    stroke_wide,
-};
+pub use stroke::{StrokeParams, stroke};
 pub use tiling::TiledPattern;
 pub use types::*;
 pub use xpath::{XPath, XPathFlags, XPathSeg};

@@ -16,6 +16,25 @@
 //! The cache holds at most [`GLOBAL_CAPACITY`] entries total.  Eviction is
 //! LRU.  Entries are `Arc<GlyphBitmap>`, so eviction drops the `Arc` without
 //! freeing the bitmap data if the renderer still holds a reference.
+//!
+//! # TODO: redesign when a second glyph generator lands
+//!
+//! Today this cache is FreeType-only.  When a second source appears
+//! (Type 3 `CharProcs`, `COLRv1`, SVG `OpenType`), don't add a sibling cache —
+//! the [`GlyphKey`] shape and the entry-count budget below are both
+//! Splash-era artifacts and will start to leak:
+//!
+//! - [`GlyphKey`] hardcodes `(face_id, glyph_id, size_px, x_frac, aa)` —
+//!   a Type 3 glyph is `(font instance, char_code, CTM)` and has no
+//!   `size_px` or `FreeType` `face_id`.
+//! - [`GLOBAL_CAPACITY`] = `256 × 4_096` is a port of the C++ two-level
+//!   budget; with a single global LRU it's just an entry count rounded for
+//!   nostalgia.  A bytes-budget weighter would treat 1024×1024 Type 3
+//!   glyphs and 8×8 ASCII glyphs honestly.
+//!
+//! The right shape is a `GlyphSpec` trait keyed by hash, an opaque
+//! `RenderedGlyph` value type, and a `quick_cache` weighter sized in bytes.
+//! Don't speculate — design under load when the second consumer is real.
 
 use std::sync::Arc;
 

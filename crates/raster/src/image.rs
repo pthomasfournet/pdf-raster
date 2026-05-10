@@ -29,11 +29,11 @@
 //!
 //! # C++ equivalents
 //!
-//! - `Splash::fillImageMask` (~line 2765)
-//! - `Splash::drawImage` (~line 3528)
-//! - `Splash::scaleMask{YdownXdown,YdownXup,YupXdown,YupXup}` (~lines 3128–3472)
-//! - `Splash::scaleImage{YdownXdown,YdownXup,YupXdown,YupXup}` (~lines 4033–4782)
-//! - `Splash::blitMask` (~line 3475)
+//! - `Splash::fillImageMask`
+//! - `Splash::drawImage`
+//! - `Splash::scaleMask{YdownXdown,YdownXup,YupXdown,YupXup}`
+//! - `Splash::scaleImage{YdownXdown,YdownXup,YupXdown,YupXup}`
+//! - `Splash::blitMask`
 
 use crate::bitmap::Bitmap;
 use crate::clip::{Clip, ClipResult};
@@ -1239,7 +1239,7 @@ fn blit_image<P: Pixel>(
 ///
 /// # C++ equivalent
 ///
-/// `Splash::fillImageMask` (~line 2765).
+/// `Splash::fillImageMask`.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors Splash::fillImageMask API; all params necessary"
@@ -1338,7 +1338,7 @@ pub fn fill_image_mask<P: Pixel>(
 ///
 /// # C++ equivalent
 ///
-/// `Splash::drawImage` (~line 3528).
+/// `Splash::drawImage`.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors Splash::drawImage API; all params necessary"

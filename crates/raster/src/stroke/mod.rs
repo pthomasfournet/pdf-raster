@@ -1,32 +1,16 @@
-//! Stroke rasterization — replaces `Splash::stroke`, `Splash::strokeNarrow`,
-//! `Splash::strokeWide`, `Splash::flattenPath`, `Splash::makeDashedPath`, and
-//! `Splash::makeStrokePath` from `splash/Splash.cc`.
+//! Stroke rasterization.
 //!
-//! # Entry point
+//! Public entry point is [`stroke`]; the helpers (`stroke_narrow`,
+//! `stroke_wide`, and the path-shaping functions in the private `path`
+//! submodule) are crate-internal implementation details.
 //!
-//! [`stroke`] is the top-level function. It flattens curves, applies dashing if
-//! needed, then either draws hairlines with [`stroke_narrow`] (zero-width) or
-//! expands the stroke outline with [`make_stroke_path`] and fills it
-//! ([`stroke_wide`]).
-//!
-//! # Sub-modules
-//!
-//! Path-level helpers (flattening, dashing, outline expansion) live in
-//! the private `path` submodule and are re-exported here for a flat public API.
-//!
-//! # C++ correspondence
-//!
-//! | Rust function          | C++ function            | Approx. line |
-//! |------------------------|-------------------------|-------------|
-//! | [`stroke`]             | `Splash::stroke`        | ~1950        |
-//! | [`stroke_narrow`]      | `Splash::strokeNarrow`  | ~2005        |
-//! | [`stroke_wide`]        | `Splash::strokeWide`    | ~2094        |
-//! | [`flatten_path`]       | `Splash::flattenPath`   | ~2100        |
-//! | [`make_dashed_path`]   | `Splash::makeDashedPath`| ~2221        |
-//! | [`make_stroke_path`]   | `Splash::makeStrokePath`| ~6091        |
+//! Algorithmic provenance: the splitting of stroking into flatten → dash →
+//! narrow/wide → outline-expansion mirrors `Splash::stroke` and friends in
+//! `splash/Splash.cc`; refer there for the spec interpretation if a stroke
+//! edge case looks wrong.
 
 mod path;
-pub use path::{flatten_path, make_dashed_path, make_stroke_path};
+use path::{flatten_path, make_dashed_path, make_stroke_path};
 
 use crate::bitmap::Bitmap;
 use crate::clip::{Clip, ClipResult};
@@ -65,7 +49,7 @@ pub struct StrokeParams<'a> {
 
 /// Top-level stroke entry point.
 ///
-/// Mirrors `Splash::stroke` (~line 1950 of `Splash.cc`).
+/// Mirrors `Splash::stroke`.
 ///
 /// Steps:
 /// 1. Flatten curves via [`flatten_path`].
@@ -106,11 +90,9 @@ pub fn stroke<P: Pixel>(
 
 /// Draw zero-width (hairline) strokes: one pixel per scanline intersection.
 ///
-/// Mirrors `Splash::strokeNarrow` (~line 2005 of `Splash.cc`).
-///
 /// Each segment of the flattened [`XPath`] is walked scanline-by-scanline,
 /// drawing a single span (possibly one pixel wide) per row.
-pub fn stroke_narrow<P: Pixel>(
+fn stroke_narrow<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
     path: &Path,
@@ -188,9 +170,7 @@ pub fn stroke_narrow<P: Pixel>(
 }
 
 /// Wide stroke: expand the path into a filled outline and fill it.
-///
-/// Mirrors `Splash::strokeWide` (~line 2094 of `Splash.cc`).
-pub fn stroke_wide<P: Pixel>(
+fn stroke_wide<P: Pixel>(
     bitmap: &mut Bitmap<P>,
     clip: &Clip,
     path: &Path,

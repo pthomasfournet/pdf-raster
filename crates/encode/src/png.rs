@@ -200,7 +200,7 @@ fn write_png_rgba<P: Pixel, W: Write>(bitmap: &Bitmap<P>, out: W) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use color::{Cmyk8, Gray8, Rgb8};
+    use color::{Cmyk8, Gray8, Rgb8, Rgba8};
     use raster::Bitmap;
 
     fn make_rgb_bitmap(w: u32, h: u32, fill: [u8; 3]) -> Bitmap<Rgb8> {
@@ -290,6 +290,57 @@ mod tests {
             3,
             "stride padding must not appear in PNG output"
         );
+    }
+
+    #[test]
+    fn rgba8_png_roundtrip_asymmetric_2x2() {
+        // 2×2 with four distinct pixels so every byte position is constrained.
+        // Rgba8 stores as Xbgr8 in memory: [X/A, B, G, R] per pixel.
+        let mut bmp: Bitmap<Rgba8> = Bitmap::new(2, 2, 1, false);
+        // (R, G, B, A) per pixel, written into memory as [A, B, G, R]:
+        // p00 = (10, 20, 30, 200), p01 = (40, 50, 60, 210),
+        // p10 = (70, 80, 90, 220), p11 = (100, 110, 120, 230).
+        bmp.row_bytes_mut(0)
+            .copy_from_slice(&[200, 30, 20, 10, 210, 60, 50, 40]);
+        bmp.row_bytes_mut(1)
+            .copy_from_slice(&[220, 90, 80, 70, 230, 120, 110, 100]);
+
+        let mut out = Vec::new();
+        write_png::<Rgba8, _>(&bmp, &mut out).unwrap();
+
+        let (w, h, pixels) = decode_png(&out);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(pixels.len(), 16, "2×2 pixels × 4 bytes (RGBA)");
+        // Decoded PNG is RGBA in row-major order.
+        assert_eq!(&pixels[0..4], &[10, 20, 30, 200], "row 0 px 0");
+        assert_eq!(&pixels[4..8], &[40, 50, 60, 210], "row 0 px 1");
+        assert_eq!(&pixels[8..12], &[70, 80, 90, 220], "row 1 px 0");
+        assert_eq!(&pixels[12..16], &[100, 110, 120, 230], "row 1 px 1");
+    }
+
+    #[test]
+    fn rgb_with_alpha_2x2_pins_row_offset() {
+        // Multi-row RGB+alpha bitmap to constrain the row_off = y * w * 4 math
+        // in write_png_rgb's alpha-promotion branch (the existing 2×1 test
+        // can't see mutations on `* w` or `* 4` because y=0 and w=2).
+        let mut bmp: Bitmap<Rgb8> = Bitmap::new(2, 2, 1, true);
+        // Row 0 RGB: [10, 20, 30, 40, 50, 60]; Row 1 RGB: [70, 80, 90, 100, 110, 120].
+        bmp.row_bytes_mut(0)
+            .copy_from_slice(&[10, 20, 30, 40, 50, 60]);
+        bmp.row_bytes_mut(1)
+            .copy_from_slice(&[70, 80, 90, 100, 110, 120]);
+        let alpha = bmp.alpha_plane_mut().expect("alpha plane present");
+        alpha.copy_from_slice(&[200, 210, 220, 230]);
+
+        let mut out = Vec::new();
+        write_png::<Rgb8, _>(&bmp, &mut out).unwrap();
+        let (w, h, pixels) = decode_png(&out);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(pixels.len(), 16);
+        assert_eq!(&pixels[0..4], &[10, 20, 30, 200]);
+        assert_eq!(&pixels[4..8], &[40, 50, 60, 210]);
+        assert_eq!(&pixels[8..12], &[70, 80, 90, 220]);
+        assert_eq!(&pixels[12..16], &[100, 110, 120, 230]);
     }
 
     #[test]

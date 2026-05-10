@@ -9,7 +9,6 @@
 //! | [`hinting`] | [`hinting::load_flags`] — `FreeType` load-flag policy |
 //! | [`outline`] | [`outline::decompose_outline`] — FT outline → `raster::Path` |
 //! | [`cache`] | [`cache::GlyphCache`] — global concurrent glyph cache |
-//! | [`t3_cache`] | [`t3_cache::Type3Cache`] — per-instance Type 3 glyph cache |
 //! | [`face`] | [`face::FontFace`] — scaled font face, renders glyphs |
 //! | [`engine`] | [`engine::FontEngine`] — owns FT library, loads faces |
 //!
@@ -58,4 +57,3 @@ pub mod face;
 pub mod hinting;
 pub mod key;
 pub mod outline;
-pub mod t3_cache;

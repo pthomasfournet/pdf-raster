@@ -23,7 +23,7 @@ const MITER_NEARLY_STRAIGHT: f64 = 0.999_9;
 
 /// Flatten all Bezier curves in `path` to straight-line segments.
 ///
-/// Mirrors `Splash::flattenPath` (~line 2100 of `Splash.cc`).
+/// Mirrors `Splash::flattenPath`.
 ///
 /// Control-point triples (flagged [`crate::PathFlags::CURVE`]) are replaced by
 /// a sequence of straight-line endpoints computed by adaptive De Casteljau
@@ -37,7 +37,7 @@ const MITER_NEARLY_STRAIGHT: f64 = 0.999_9;
 /// subdivision in **user space** against `flatness²` without a matrix transform.
 /// We match that behaviour: the flatness is passed through unchanged.
 #[must_use]
-pub fn flatten_path(path: &Path, _matrix: &[f64; 6], flatness: f64) -> Path {
+pub(super) fn flatten_path(path: &Path, _matrix: &[f64; 6], flatness: f64) -> Path {
     use crate::path::flatten::{CurveData, flatten_curve};
 
     let flatness_sq = flatness * flatness;
@@ -87,7 +87,7 @@ pub fn flatten_path(path: &Path, _matrix: &[f64; 6], flatness: f64) -> Path {
 
 /// Convert a solid-line path into a dashed path.
 ///
-/// Mirrors `Splash::makeDashedPath` (~line 2221 of `Splash.cc`).
+/// Mirrors `Splash::makeDashedPath`.
 ///
 /// Each subpath is broken at dash boundaries. A dash phase offset
 /// (`line_dash_phase`) shifts the start of the dash pattern.
@@ -104,7 +104,7 @@ pub fn flatten_path(path: &Path, _matrix: &[f64; 6], flatness: f64) -> Path {
     clippy::while_float,
     reason = "direct port of Splash::makeDashedPath; seg_len is decremented toward 0 each iteration"
 )]
-pub fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) -> Path {
+pub(super) fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) -> Path {
     // Sum the dash array.  Guard against zero or subnormal totals: a very small
     // but non-zero total would cause phase / line_dash_total to overflow i32 in
     // splash_floor, producing garbage phase values.
@@ -221,7 +221,7 @@ pub fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) ->
 
 /// Expand a stroked path into a filled outline path.
 ///
-/// Mirrors `Splash::makeStrokePath` (~line 6091 of `Splash.cc`).
+/// Mirrors `Splash::makeStrokePath`.
 ///
 /// For each segment in the (already-flattened) input path, this function builds
 /// a rectangular stroke outline with the correct cap and join geometry:
@@ -247,7 +247,7 @@ pub fn make_dashed_path(path: &Path, line_dash: &[f64], line_dash_phase: f64) ->
     clippy::suboptimal_flops,
     reason = "a + b*c expressions match the C++ source exactly; mul_add would obscure the 1:1 correspondence"
 )]
-pub fn make_stroke_path(path: &Path, w: f64, params: &super::StrokeParams<'_>) -> Path {
+pub(super) fn make_stroke_path(path: &Path, w: f64, params: &super::StrokeParams<'_>) -> Path {
     if path.pts.is_empty() {
         return Path::new();
     }
