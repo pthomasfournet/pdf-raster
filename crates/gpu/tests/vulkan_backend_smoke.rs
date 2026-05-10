@@ -108,6 +108,19 @@ fn vulkan_backend_alloc_device_zeroed_concurrent() {
 }
 
 #[test]
+fn vulkan_backend_immediate_fence_round_trips() {
+    // submit_transfer returns PageFence::immediate() (a structural None
+    // sentinel); wait_transfer must return Ok without driving a Vulkan
+    // FFI call.  Exercises the wait_timeline(None) short-circuit added
+    // in the Option<NonZeroU64> rework.
+    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+    let fence = backend.submit_transfer().expect("submit_transfer");
+    backend
+        .wait_transfer(fence)
+        .expect("wait_transfer on immediate fence should succeed");
+}
+
+#[test]
 fn vulkan_backend_alloc_device_zeroed_rejects_unaligned_size() {
     // vkCmdFillBuffer requires 4-byte-aligned size; alloc_device_zeroed
     // must surface this loudly rather than silently downgrading.
