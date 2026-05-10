@@ -39,29 +39,33 @@ fn check_len(len: usize, capacity: u64, op_label: &str, cap_label: &str) -> Resu
 
 pub(super) struct TransferContext {
     device: Arc<DeviceCtx>,
-    /// Reusable command pool for transient one-shot transfer command
-    /// buffers.  A separate pool from the recorder's so resets don't
-    /// interleave; matches the canonical "one pool per logical stream
-    /// of submissions" pattern.
+    /// Reusable command pool + cached primary command buffer for
+    /// transient one-shot transfers.  A separate pool from the
+    /// recorder's so resets don't interleave; matches the canonical
+    /// "one pool per logical stream of submissions" pattern.
     ///
-    /// Vulkan requires `VkCommandPool` to be externally synchronized
-    /// (spec "Threading Behavior" table; VUID-vkResetCommandPool-
-    /// commandPool-00040 forbids reset while any buffer from the pool
-    /// is recording or pending).  `cmd_pool_lock` covers `cmd_pool`'s
-    /// reset / `vkAllocateCommandBuffers` / record / `vkEndCommandBuffer`
-    /// window inside `run_one_shot`.
-    cmd_pool: vk::CommandPool,
-    /// Pool-level external-synchronization lock for `cmd_pool`.
-    /// See the field doc on `cmd_pool` for why this is required.
-    cmd_pool_lock: Mutex<()>,
+    /// `VkCommandPool` requires external sync (spec "Threading
+    /// Behavior" table; VUID-vkResetCommandPool-commandPool-00040
+    /// forbids reset while any buffer from the pool is recording or
+    /// pending) — the `Mutex` is the only access path.  The cached
+    /// `vk::CommandBuffer` is reused across calls: pool reset
+    /// transitions it back to Initial state without freeing it,
+    /// avoiding a `vkAllocateCommandBuffers` round-trip per transfer.
+    cmd_pool: Mutex<TransferPool>,
     /// Reusable staging buffer, grown to the high-water-mark of any
     /// upload/download seen so far.  `None` until the first transfer;
     /// reallocated only when a request exceeds the current capacity.
-    /// The `Mutex` guards the staging payload itself: a concurrent
+    /// The `Mutex` guards the staging payload: a concurrent
     /// `upload_sync` would otherwise observe the same staging buffer
-    /// mid-DMA.  Queue / command-pool external-sync are NOT this
-    /// lock's job — see `cmd_pool_lock` and `DeviceCtx::submit_lock`.
+    /// mid-DMA.  Command-pool / queue external-sync are NOT this
+    /// lock's job — see `cmd_pool` and `DeviceCtx::with_queue`.
     staging: Mutex<Option<HostBuffer>>,
+}
+
+/// Pool + cached cmd buffer pair guarded together by `cmd_pool`'s mutex.
+struct TransferPool {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
 }
 
 impl TransferContext {
@@ -70,12 +74,22 @@ impl TransferContext {
             .flags(vk::CommandPoolCreateFlags::TRANSIENT)
             .queue_family_index(device.compute_queue_family);
         // Safety: device is live; create_command_pool returns Result on failure.
-        let cmd_pool = unsafe { device.device.create_command_pool(&pool_info, None) }
+        let pool = unsafe { device.device.create_command_pool(&pool_info, None) }
             .map_err(vk_err("vkCreateCommandPool (transfer)"))?;
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // Safety: pool is live; allocate_command_buffers returns Result on failure.
+        let buffers = unsafe { device.device.allocate_command_buffers(&alloc_info) }
+            .map_err(vk_err("vkAllocateCommandBuffers (transfer init)"))
+            .inspect_err(|_| unsafe { device.device.destroy_command_pool(pool, None) })?;
+        let cmd = buffers[0];
+
         Ok(Self {
             device,
-            cmd_pool,
-            cmd_pool_lock: Mutex::new(()),
+            cmd_pool: Mutex::new(TransferPool { pool, cmd }),
             staging: Mutex::new(None),
         })
     }
@@ -152,18 +166,10 @@ impl TransferContext {
 
     /// Zero-fill `dst[0..dst.size()]` on the GPU via `vkCmdFillBuffer`.
     ///
-    /// Skips the host vec + staging round-trip used by the
-    /// `upload_sync(zeros)` shape: the GPU writes zeros to its own
-    /// memory directly.  For an RGBA8 page buffer (≥ 8 MB at 1280×1664,
-    /// up to ~33 MB at 4K) that eliminates both the host allocation and
-    /// the `PCIe` transfer, leaving only a queue submit + wait.
-    ///
-    /// `vkCmdFillBuffer` requires `dst.size()` to be a multiple of 4
-    /// (the spec rounds `VK_WHOLE_SIZE` *down* to a multiple of 4 from
-    /// the buffer extent, which would leave the trailing 1–3 bytes
-    /// non-zero and silently break the `alloc_device_zeroed` contract).
-    /// Returns an error for non-multiple-of-4 sizes; every realistic
-    /// caller (RGBA8 pages, `u32`-indexed scratch) is naturally aligned.
+    /// `vkCmdFillBuffer` requires `dst.size()` to be a multiple of 4 —
+    /// non-multiple-of-4 sizes return an error rather than silently
+    /// rounding down (which would leave the trailing 1–3 bytes
+    /// non-zero).
     pub(super) fn fill_zero(&self, dst: &DeviceBuffer) -> Result<()> {
         let size = dst.size();
         if size == 0 {
@@ -176,9 +182,9 @@ impl TransferContext {
         }
         let dst_handle = dst.handle();
         self.run_one_shot(|cmd| {
-            // Safety: cmd is in Recording state per run_one_shot's
-            // contract; dst_handle was created with TRANSFER_DST usage
-            // (see DEVICE_USAGE in memory.rs); size is a multiple of 4.
+            // Safety: run_one_shot has cmd in Recording state; dst_handle
+            // was created with TRANSFER_DST usage (DEVICE_USAGE in
+            // memory.rs); size is a checked multiple of 4.
             unsafe {
                 self.device
                     .device
@@ -187,94 +193,55 @@ impl TransferContext {
         })
     }
 
-    /// Allocate a one-shot command buffer, run `f` to record into it,
-    /// submit it, wait for the queue to idle.  Slow but correct.
-    ///
-    /// Resets the pool at the start of each call so a prior failed run
-    /// can't leak its command buffer; this is leak-safe in all error
-    /// paths below.
-    ///
-    /// ## Synchronization
-    /// Takes `cmd_pool_lock` for the entire body so concurrent callers
-    /// can't race on `vkResetCommandPool` / `vkAllocateCommandBuffers`
-    /// / record / `vkEndCommandBuffer` (Vulkan requires external sync
-    /// on `VkCommandPool`).  Takes `device.submit_lock` for just the
-    /// queue ops at the end so concurrent submitters (the per-page
-    /// recorder, other `run_one_shot` calls) don't race on `VkQueue`.
-    /// Two locks because `cmd_pool_lock` is per-`TransferContext` while
-    /// `submit_lock` lives on the shared `DeviceCtx` (the recorder
-    /// reaches for the same queue with its own command pool).
+    /// Reset the pool, record `f` into the cached cmd buffer, submit,
+    /// wait idle.  Holds the `cmd_pool` mutex for the whole body so
+    /// the buffer can't be reused before `vkQueueWaitIdle` returns
+    /// (cmd buffers in Pending state must not be reset).
     fn run_one_shot<F: FnOnce(vk::CommandBuffer)>(&self, f: F) -> Result<()> {
-        let _pool_guard = self
-            .cmd_pool_lock
-            .lock()
-            .expect("transfer cmd_pool_lock poisoned");
-        unsafe {
-            self.device
-                .device
-                .reset_command_pool(self.cmd_pool, vk::CommandPoolResetFlags::empty())
-                .map_err(vk_err("vkResetCommandPool (transfer)"))?;
-        }
-
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.cmd_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        // Safety: cmd_pool live; struct outlives call; cmd_pool_lock
-        // held so no concurrent thread can reset or allocate from it.
-        let buffers = unsafe { self.device.device.allocate_command_buffers(&alloc_info) }
-            .map_err(vk_err("vkAllocateCommandBuffers (transfer)"))?;
-        let cmd = buffers[0];
-
+        let pool = self.cmd_pool.lock().expect("transfer cmd_pool poisoned");
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // Safety: cmd is freshly allocated, in InitialState; cmd_pool_lock
-        // held so no concurrent record can touch the same buffer.
+        // Safety: pool mutex held throughout; cmd buffer was allocated
+        // from this pool at TransferContext::new and is reused across
+        // calls.  reset_command_pool transitions it back to Initial.
         unsafe {
             self.device
                 .device
-                .begin_command_buffer(cmd, &begin_info)
+                .reset_command_pool(pool.pool, vk::CommandPoolResetFlags::empty())
+                .map_err(vk_err("vkResetCommandPool (transfer)"))?;
+            self.device
+                .device
+                .begin_command_buffer(pool.cmd, &begin_info)
                 .map_err(vk_err("vkBeginCommandBuffer (transfer)"))?;
         }
 
-        f(cmd);
+        f(pool.cmd);
 
-        // Safety: cmd is in Recording state; cmd_pool_lock held.
+        // Safety: cmd is in Recording state; pool mutex still held.
         unsafe {
             self.device
                 .device
-                .end_command_buffer(cmd)
+                .end_command_buffer(pool.cmd)
                 .map_err(vk_err("vkEndCommandBuffer (transfer)"))?;
         }
 
-        let submit_buffers = [cmd];
+        let submit_buffers = [pool.cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&submit_buffers);
-        // VkQueue is externally synchronized — take submit_lock for the
-        // submit + wait window only.  Holding cmd_pool_lock across the
-        // wait is also intentional: the cmd buffer must not be reused
-        // (next call's reset_command_pool) while still in pending state.
-        {
-            let _submit_guard = self
-                .device
-                .submit_lock
-                .lock()
-                .expect("device submit_lock poisoned");
-            // Safety: queue + submit_info live for this call; submit_lock
-            // held so no other thread can touch the queue.
+        self.device.with_queue(|q| {
+            // Safety: queue exclusively held via with_queue; submit
+            // outlives the call.
             unsafe {
                 self.device
                     .device
-                    .queue_submit(self.device.compute_queue, &[submit], vk::Fence::null())
+                    .queue_submit(q, &[submit], vk::Fence::null())
                     .map_err(vk_err("vkQueueSubmit (transfer)"))?;
                 self.device
                     .device
-                    .queue_wait_idle(self.device.compute_queue)
+                    .queue_wait_idle(q)
                     .map_err(vk_err("vkQueueWaitIdle (transfer)"))?;
             }
-        }
-        // No explicit free: the next call's reset_command_pool reclaims
-        // the buffer.  This mirrors the recorder's pool-reset idiom.
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -304,18 +271,13 @@ fn ensure_staging<'a>(
 
 impl Drop for TransferContext {
     fn drop(&mut self) {
-        // The cached staging buffer is dropped via the `Mutex<Option<...>>`
-        // field's normal drop.  Order matters: the HostBuffer's Drop
-        // calls into its Arc<Inner> (the SlabAllocator) and ultimately
-        // vkDestroyBuffer on the device.  The device is kept alive by
-        // our own Arc<DeviceCtx>; the SlabAllocator is kept alive by
-        // the HostBuffer's parent Arc.  Field declaration order means
-        // staging drops *before* cmd_pool, which is fine — they're
-        // independent.
-        // Safety: VulkanBackend::drop calls device_wait_idle before any
-        // module Drop runs, so no command buffers are in flight.
+        // VulkanBackend::drop calls device_wait_idle before module Drops
+        // run, so the cached cmd buffer is not in flight.  Destroying
+        // the pool also frees its allocated buffers.
+        let pool = self.cmd_pool.lock().expect("transfer cmd_pool poisoned");
+        // Safety: pool is owned by us; no in-flight references.
         unsafe {
-            self.device.device.destroy_command_pool(self.cmd_pool, None);
+            self.device.device.destroy_command_pool(pool.pool, None);
         }
     }
 }

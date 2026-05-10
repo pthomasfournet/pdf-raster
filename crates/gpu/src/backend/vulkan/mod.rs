@@ -120,16 +120,11 @@ impl GpuBackend for VulkanBackend {
     fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer> {
         reject_zero_size(size, "alloc_device_zeroed")?;
         let buf = self.memory.alloc_device(size)?;
-        // GPU-internal vkCmdFillBuffer when the size is 4-byte-aligned
-        // (the realistic shape — RGBA8 pages, u32 indices); fall back to
-        // a host-vec staging upload for the rare unaligned case so the
-        // contract holds across every input.
-        if size.is_multiple_of(4) {
-            self.transfer.fill_zero(&buf)?;
-        } else {
-            let zeros = vec![0u8; size];
-            self.transfer.upload_sync(&self.memory, &buf, &zeros)?;
-        }
+        // vkCmdFillBuffer requires 4-byte-aligned size; every realistic
+        // caller (RGBA8 pages, u32 indices) is naturally aligned.
+        // Mis-aligned sizes fail loudly rather than silently downgrading
+        // to a 33 MB host-vec staging path.
+        self.transfer.fill_zero(&buf)?;
         Ok(buf)
     }
 
@@ -213,15 +208,11 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn wait_download(&self, mut handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
-        let result = handle.inner.finish();
-        // Swap in a no-op so the upcoming `Drop` doesn't re-run finish()
-        // on a Vulkan staging path that's been consumed.  Future async
-        // impls hold real fence + staging state inside their inner;
-        // letting Drop call finish() again would either re-memcpy
-        // (wasteful) or hit a one-shot panic.  This makes "safe to call
-        // twice" a structural invariant rather than a documented one.
-        handle.inner = Box::new(NoopDownloadInner);
-        result
+        // NoopDownloadInner::finish is idempotent (returns Ok(())), so
+        // the post-finish Drop calling finish() again is a no-op.  When
+        // the async impl lands and finish() is no longer idempotent,
+        // disarm the handle here.
+        handle.inner.finish()
     }
 
     fn submit_transfer(&self) -> Result<Self::PageFence> {
@@ -238,7 +229,7 @@ impl GpuBackend for VulkanBackend {
         // `submit_transfer` doesn't transition the recorder out of
         // Idle, so going through `wait_page` would trip its state
         // assertion every time.
-        self.recorder.wait_transfer_value(fence)
+        self.recorder.wait_transfer_fence(fence)
     }
 
     fn detect_vram_budget(&self) -> Result<VramBudget> {

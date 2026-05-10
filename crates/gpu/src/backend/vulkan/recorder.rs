@@ -232,25 +232,16 @@ impl PageRecorder {
             .signal_semaphores(&signal_semaphores)
             .push_next(&mut tl_submit);
 
-        // VkQueue is externally synchronized (spec "Threading Behavior"
-        // table) — take the device's submit_lock so this submission
-        // can't race with TransferContext's run_one_shot or another
-        // recorder thread.  Scoped block releases the lock as soon as
-        // the FFI call returns; the rest of the state-machine
-        // bookkeeping doesn't need queue exclusivity.
-        {
-            let _submit_guard = self
-                .device
-                .submit_lock
-                .lock()
-                .expect("device submit_lock poisoned");
+        self.device.with_queue(|q| {
+            // Safety: queue is exclusively held via with_queue; submit
+            // outlives the call.
             unsafe {
                 self.device
                     .device
-                    .queue_submit(self.device.compute_queue, &[submit], vk::Fence::null())
-                    .map_err(vk_err("vkQueueSubmit"))?;
+                    .queue_submit(q, &[submit], vk::Fence::null())
+                    .map_err(vk_err("vkQueueSubmit"))
             }
-        }
+        })?;
         s.state = State::Submitted;
         Ok(PageFence {
             value: signal_value,
@@ -272,7 +263,7 @@ impl PageRecorder {
         Ok(())
     }
 
-    /// Wait on the timeline semaphore without the page state-machine check.
+    /// Wait on a transfer fence without the page state-machine check.
     ///
     /// `wait_page` enforces `state == Submitted` because page rendering
     /// is a strict begin/record/submit/wait cycle.  Transfer-queue
@@ -281,12 +272,12 @@ impl PageRecorder {
     /// participate in the page state machine — `submit_transfer` does
     /// not transition the recorder.  Use this method to wait on those
     /// fences without tripping the state check.
-    pub(super) fn wait_transfer_value(&self, fence: PageFence) -> Result<()> {
+    pub(super) fn wait_transfer_fence(&self, fence: PageFence) -> Result<()> {
         self.wait_timeline(fence.value)
     }
 
     /// `vkWaitSemaphores` with `u64::MAX` timeout.  See
-    /// [`Self::wait_transfer_value`] for the wait_page-vs-transfer split.
+    /// [`Self::wait_transfer_fence`] for the wait_page-vs-transfer split.
     fn wait_timeline(&self, value: u64) -> Result<()> {
         let semaphores = [self.timeline];
         let values = [value];

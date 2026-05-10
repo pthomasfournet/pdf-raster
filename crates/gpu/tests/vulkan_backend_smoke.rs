@@ -49,37 +49,39 @@ fn vulkan_backend_alloc_zero_size_rejected() {
     assert!(msg.contains("size = 0"), "unexpected error message: {msg}");
 }
 
-#[test]
-fn vulkan_backend_alloc_device_zeroed_returns_zero_bytes() {
-    // 4 KB is comfortably above the alignment/page granularity and
-    // small enough to round-trip back through download_sync without
-    // grow-the-staging churn.  Multiple-of-4 size exercises the
-    // vkCmdFillBuffer fast path in alloc_device_zeroed.
-    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+/// Allocate a zeroed device buffer, download into a sentinel-filled
+/// host vec, assert every byte is zero, free.  `tag` is included in
+/// failure messages so concurrent / parameterised callers can
+/// pinpoint which invocation broke.
+fn assert_zeroed_round_trip(backend: &VulkanBackend, size: usize, tag: &str) {
     let buf = backend
-        .alloc_device_zeroed(4096)
-        .expect("alloc_device_zeroed(4096)");
-    let mut readback = vec![0xAAu8; 4096];
+        .alloc_device_zeroed(size)
+        .unwrap_or_else(|e| panic!("{tag}: alloc_device_zeroed({size}) failed: {e}"));
+    let mut readback = vec![0xAAu8; size];
     backend
         .download_sync(&buf, &mut readback)
-        .expect("download_sync");
-    assert!(
-        readback.iter().all(|&b| b == 0),
-        "alloc_device_zeroed returned non-zero bytes: first non-zero index = {:?}",
-        readback.iter().position(|&b| b != 0)
-    );
+        .unwrap_or_else(|e| panic!("{tag}: download_sync failed: {e}"));
+    if let Some(bad) = readback.iter().position(|&b| b != 0) {
+        panic!(
+            "{tag}: alloc_device_zeroed({size}) leaked non-zero byte 0x{:02x} at index {bad}",
+            readback[bad]
+        );
+    }
     backend.free_device(buf);
 }
 
 #[test]
+fn vulkan_backend_alloc_device_zeroed_returns_zero_bytes() {
+    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+    assert_zeroed_round_trip(&backend, 4096, "single");
+}
+
+#[test]
 fn vulkan_backend_alloc_device_zeroed_concurrent() {
-    // Regression: prior to the queue/cmd-pool locks on DeviceCtx +
-    // TransferContext, concurrent callers of run_one_shot raced on
-    // VkCommandPool reset and VkQueue submit (both require external
-    // sync per the Vulkan "Threading Behavior" table).  Spawn N
-    // threads each running the alloc-zero / readback / free cycle in
-    // a tight loop; if synchronization is missing, this either
-    // crashes the driver or produces non-zero readbacks.
+    // Regression: VkCommandPool + VkQueue both require external sync
+    // (Vulkan "Threading Behavior" table).  Without the locks on
+    // DeviceCtx + TransferContext, concurrent callers race in
+    // run_one_shot — either driver crash or non-zero readbacks.
     use std::sync::Arc;
     use std::thread;
 
@@ -88,22 +90,15 @@ fn vulkan_backend_alloc_device_zeroed_concurrent() {
 
     let backend = Arc::new(VulkanBackend::new().expect("VulkanBackend::new"));
     let mut handles = Vec::with_capacity(THREADS);
-    for _ in 0..THREADS {
+    for thread_idx in 0..THREADS {
         let backend = Arc::clone(&backend);
         handles.push(thread::spawn(move || {
-            for _ in 0..ITERS_PER_THREAD {
-                let buf = backend
-                    .alloc_device_zeroed(4096)
-                    .expect("alloc_device_zeroed");
-                let mut readback = vec![0xAAu8; 4096];
-                backend
-                    .download_sync(&buf, &mut readback)
-                    .expect("download_sync");
-                assert!(
-                    readback.iter().all(|&b| b == 0),
-                    "concurrent alloc_device_zeroed produced non-zero bytes"
+            for iter in 0..ITERS_PER_THREAD {
+                assert_zeroed_round_trip(
+                    &backend,
+                    4096,
+                    &format!("thread {thread_idx} iter {iter}"),
                 );
-                backend.free_device(buf);
             }
         }));
     }
@@ -113,23 +108,18 @@ fn vulkan_backend_alloc_device_zeroed_concurrent() {
 }
 
 #[test]
-fn vulkan_backend_alloc_device_zeroed_unaligned_size() {
-    // Size 17 is not a multiple of 4; alloc_device_zeroed must still
-    // return all-zero bytes via the host-vec fallback path.  Guards the
-    // contract for callers that don't (or can't) round their alloc up.
+fn vulkan_backend_alloc_device_zeroed_rejects_unaligned_size() {
+    // vkCmdFillBuffer requires 4-byte-aligned size; alloc_device_zeroed
+    // must surface this loudly rather than silently downgrading.
     let backend = VulkanBackend::new().expect("VulkanBackend::new");
-    let buf = backend
+    let err = backend
         .alloc_device_zeroed(17)
-        .expect("alloc_device_zeroed(17)");
-    let mut readback = vec![0xAAu8; 17];
-    backend
-        .download_sync(&buf, &mut readback)
-        .expect("download_sync");
+        .expect_err("alloc_device_zeroed(17) must be rejected (size not multiple of 4)");
+    let msg = err.to_string();
     assert!(
-        readback.iter().all(|&b| b == 0),
-        "alloc_device_zeroed(17) returned non-zero bytes: {readback:?}"
+        msg.contains("multiple of 4"),
+        "expected alignment error, got: {msg}"
     );
-    backend.free_device(buf);
 }
 
 #[test]
