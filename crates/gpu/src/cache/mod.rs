@@ -42,11 +42,12 @@ mod host_tier;
 mod page_buffer;
 mod promotion;
 
+pub use crate::RGBA_BPP;
 pub use budget::VramBudget;
 pub use disk_tier::{DiskTier, LookupCallbackError};
 pub use host_tier::HostBudget;
 pub(crate) use host_tier::HostTier;
-pub use page_buffer::{DevicePageBuffer, RGBA_BPP};
+pub use page_buffer::DevicePageBuffer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -113,6 +113,13 @@ pub const GPU_TILE_FILL_THRESHOLD: usize = 256;
 pub const TILE_W: u32 = 16;
 /// Tile height in pixels (must match `TILE_H` in `tile_fill.cu`).
 pub const TILE_H: u32 = 16;
+/// Bytes per pixel for the RGBA8 pixel format the renderer composites in.
+///
+/// Lives at the crate root rather than under `cache::` because every
+/// path that touches pixel buffers (renderer, kernels, blit, tests) needs
+/// it; gating it behind the `cache` feature was an accident of where it
+/// was first defined.  `cache::RGBA_BPP` is re-exported for back-compat.
+pub const RGBA_BPP: usize = 4;
 /// Minimum pixel count for GPU ICC CMYK→RGB CLUT transform to beat CPU + `PCIe` overhead.
 ///
 /// Applies only when a full ICC CLUT is available (clut=Some).  The matrix path

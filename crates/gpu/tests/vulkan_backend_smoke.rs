@@ -124,7 +124,7 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
     // passing through the loop.
     const PER_PAGE_MAX: usize = 64;
     const N_PIXELS: u32 = 4;
-    const BUF_BYTES: usize = (N_PIXELS as usize) * 4;
+    const BUF_BYTES: usize = (N_PIXELS as usize) * gpu::RGBA_BPP;
 
     let backend = VulkanBackend::new().expect("VulkanBackend::new");
     let src = backend.alloc_device_zeroed(BUF_BYTES).expect("alloc src");
@@ -152,15 +152,9 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
         msg.contains("descriptor pool exhausted"),
         "expected exhaustion error, got: {msg}"
     );
-    // Self-check the test's PER_PAGE_MAX against production's actual
-    // limit by parsing it out of the error message:
+    // Self-check PER_PAGE_MAX against production's actual limit, parsed
+    // from the error format:
     //   "descriptor pool exhausted: 64 sets allocated this page (max 64)"
-    // If production bumps MAX_DESC_SETS_PER_PAGE without this test
-    // tracking it, the loop above still completes (more headroom) and
-    // the post-loop call wouldn't error — but we'd never reach this
-    // assertion.  The branch we *do* care about: production drops the
-    // limit without updating PER_PAGE_MAX, in which case the loop
-    // panics early.  Both directions surface loudly.
     let production_max: usize = msg
         .rsplit_once("(max ")
         .and_then(|(_, tail)| tail.split_once(')'))

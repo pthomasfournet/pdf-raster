@@ -26,12 +26,10 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DriverError};
 
-/// Bytes per pixel for the RGBA layout.
-///
-/// Re-exported from `gpu::cache` so the renderer compositor knows
-/// how many bytes per pixel to read when alpha-compositing the
-/// downloaded buffer onto the host bitmap.
-pub const RGBA_BPP: usize = 4;
+// `crate::RGBA_BPP` lives at the crate root (`crate::crate::RGBA_BPP`); the `cache`
+// module re-exports it for back-compat via `pub use crate::crate::RGBA_BPP`
+// in `cache/mod.rs`.  Local references inside this file go through the
+// crate-root path.
 
 /// Device-side composition target for one rendered page.
 ///
@@ -80,7 +78,7 @@ impl DevicePageBuffer {
     pub fn new(stream: Arc<CudaStream>, width: u32, height: u32) -> Result<Self, DriverError> {
         let len = (width as usize)
             .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(RGBA_BPP))
+            .and_then(|n| n.checked_mul(crate::RGBA_BPP))
             .ok_or(DriverError(
                 cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
             ))?;
@@ -97,7 +95,7 @@ impl DevicePageBuffer {
     /// and the host buffer [`Self::download`] writes into.
     #[must_use]
     pub const fn byte_len(&self) -> usize {
-        (self.width as usize) * (self.height as usize) * RGBA_BPP
+        (self.width as usize) * (self.height as usize) * crate::RGBA_BPP
     }
 
     /// The CUDA stream this buffer is bound to.
@@ -146,11 +144,12 @@ impl std::fmt::Debug for DevicePageBuffer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "gpu-validation")]
     use super::*;
 
     #[test]
     fn rgba_bpp_is_four() {
-        assert_eq!(RGBA_BPP, 4);
+        assert_eq!(crate::RGBA_BPP, 4);
     }
 
     #[cfg(feature = "gpu-validation")]
