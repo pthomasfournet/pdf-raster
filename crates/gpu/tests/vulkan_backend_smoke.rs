@@ -50,6 +50,48 @@ fn vulkan_backend_alloc_zero_size_rejected() {
 }
 
 #[test]
+fn vulkan_backend_alloc_device_zeroed_returns_zero_bytes() {
+    // 4 KB is comfortably above the alignment/page granularity and
+    // small enough to round-trip back through download_sync without
+    // grow-the-staging churn.  Multiple-of-4 size exercises the
+    // vkCmdFillBuffer fast path in alloc_device_zeroed.
+    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+    let buf = backend
+        .alloc_device_zeroed(4096)
+        .expect("alloc_device_zeroed(4096)");
+    let mut readback = vec![0xAAu8; 4096];
+    backend
+        .download_sync(&buf, &mut readback)
+        .expect("download_sync");
+    assert!(
+        readback.iter().all(|&b| b == 0),
+        "alloc_device_zeroed returned non-zero bytes: first non-zero index = {:?}",
+        readback.iter().position(|&b| b != 0)
+    );
+    backend.free_device(buf);
+}
+
+#[test]
+fn vulkan_backend_alloc_device_zeroed_unaligned_size() {
+    // Size 17 is not a multiple of 4; alloc_device_zeroed must still
+    // return all-zero bytes via the host-vec fallback path.  Guards the
+    // contract for callers that don't (or can't) round their alloc up.
+    let backend = VulkanBackend::new().expect("VulkanBackend::new");
+    let buf = backend
+        .alloc_device_zeroed(17)
+        .expect("alloc_device_zeroed(17)");
+    let mut readback = vec![0xAAu8; 17];
+    backend
+        .download_sync(&buf, &mut readback)
+        .expect("download_sync");
+    assert!(
+        readback.iter().all(|&b| b == 0),
+        "alloc_device_zeroed(17) returned non-zero bytes: {readback:?}"
+    );
+    backend.free_device(buf);
+}
+
+#[test]
 fn vulkan_backend_host_buffer_round_trip() {
     let backend = VulkanBackend::new().expect("VulkanBackend::new");
     let mut buf = backend

@@ -138,6 +138,43 @@ impl TransferContext {
         })
     }
 
+    /// Zero-fill `dst[0..dst.size()]` on the GPU via `vkCmdFillBuffer`.
+    ///
+    /// Skips the host vec + staging round-trip used by the
+    /// `upload_sync(zeros)` shape: the GPU writes zeros to its own
+    /// memory directly.  For an RGBA8 page buffer (≥ 8 MB at 1280×1664,
+    /// up to ~33 MB at 4K) that eliminates both the host allocation and
+    /// the `PCIe` transfer, leaving only a queue submit + wait.
+    ///
+    /// `vkCmdFillBuffer` requires `dst.size()` to be a multiple of 4
+    /// (the spec rounds `VK_WHOLE_SIZE` *down* to a multiple of 4 from
+    /// the buffer extent, which would leave the trailing 1–3 bytes
+    /// non-zero and silently break the `alloc_device_zeroed` contract).
+    /// Returns an error for non-multiple-of-4 sizes; every realistic
+    /// caller (RGBA8 pages, `u32`-indexed scratch) is naturally aligned.
+    pub(super) fn fill_zero(&self, dst: &DeviceBuffer) -> Result<()> {
+        let size = dst.size();
+        if size == 0 {
+            return Ok(());
+        }
+        if !size.is_multiple_of(4) {
+            return Err(BackendError::msg(format!(
+                "fill_zero: buffer size ({size}) must be a multiple of 4 for vkCmdFillBuffer"
+            )));
+        }
+        let dst_handle = dst.handle();
+        self.run_one_shot(|cmd| {
+            // Safety: cmd is in Recording state per run_one_shot's
+            // contract; dst_handle was created with TRANSFER_DST usage
+            // (see DEVICE_USAGE in memory.rs); size is a multiple of 4.
+            unsafe {
+                self.device
+                    .device
+                    .cmd_fill_buffer(cmd, dst_handle, 0, size, 0);
+            }
+        })
+    }
+
     /// Allocate a one-shot command buffer, run `f` to record into it,
     /// submit it, wait for the queue to idle.  Slow but correct.
     ///

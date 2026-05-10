@@ -119,11 +119,17 @@ impl GpuBackend for VulkanBackend {
 
     fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer> {
         reject_zero_size(size, "alloc_device_zeroed")?;
-        // Sync host-memcpy zero today; vkCmdFillBuffer follow-up
-        // tracked in ROADMAP under Phase 10 Vulkan async transfers.
         let buf = self.memory.alloc_device(size)?;
-        let zeros = vec![0u8; size];
-        self.transfer.upload_sync(&self.memory, &buf, &zeros)?;
+        // GPU-internal vkCmdFillBuffer when the size is 4-byte-aligned
+        // (the realistic shape — RGBA8 pages, u32 indices); fall back to
+        // a host-vec staging upload for the rare unaligned case so the
+        // contract holds across every input.
+        if size.is_multiple_of(4) {
+            self.transfer.fill_zero(&buf)?;
+        } else {
+            let zeros = vec![0u8; size];
+            self.transfer.upload_sync(&self.memory, &buf, &zeros)?;
+        }
         Ok(buf)
     }
 
