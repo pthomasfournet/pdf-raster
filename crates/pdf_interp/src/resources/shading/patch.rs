@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(left.xy[0][0], p.xy[0][0]);
         assert_eq!(right.xy[3][0], p.xy[3][0]);
         // Split point on left side should be at midpoint in y.
-        let mid_y = (p.xy[0][0][1] + p.xy[3][0][1]) / 2.0;
+        let mid_y = f64::midpoint(p.xy[0][0][1], p.xy[3][0][1]);
         assert!(
             (left.xy[3][0][1] - mid_y).abs() < 1e-9,
             "left bottom y={} expected={}",
@@ -765,7 +765,8 @@ mod tests {
         );
         // Colors: left's u=1 edge should be midpoint of original u edges.
         for ch in 0..3 {
-            let expected = ((p.color[0][0][ch] as u16 + p.color[1][0][ch] as u16) / 2) as u8;
+            let expected =
+                u16::midpoint(u16::from(p.color[0][0][ch]), u16::from(p.color[1][0][ch])) as u8;
             assert!(
                 (left.color[1][0][ch] as i16 - expected as i16).abs() <= 1,
                 "color mismatch ch={ch}"
@@ -788,7 +789,7 @@ mod tests {
         let (left, right) = split_patch_v(&p);
         assert_eq!(left.xy[0][0], p.xy[0][0]);
         assert_eq!(right.xy[0][3], p.xy[0][3]);
-        let mid_x = (p.xy[0][0][0] + p.xy[0][3][0]) / 2.0;
+        let mid_x = f64::midpoint(p.xy[0][0][0], p.xy[0][3][0]);
         assert!((left.xy[0][3][0] - mid_x).abs() < 1e-9);
         assert!((right.xy[0][0][0] - mid_x).abs() < 1e-9);
     }
