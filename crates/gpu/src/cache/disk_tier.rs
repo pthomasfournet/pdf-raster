@@ -1164,7 +1164,10 @@ mod tests {
         let pixels = vec![0xEEu8; 1024];
         let hash = ContentHash([0x11; 32]);
         for i in 0..(WRITE_QUEUE_DEPTH * 4) {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "DocId byte fill for a queue-saturation stress test; uniqueness across i doesn't matter"
+            )]
             let doc = DocId([i as u8; 32]);
             tier.insert(doc, hash, 32, 32, ImageLayout::Gray, &pixels);
         }
