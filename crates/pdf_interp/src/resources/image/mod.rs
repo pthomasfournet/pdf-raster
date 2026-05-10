@@ -28,16 +28,17 @@
 //! # nvJPEG acceleration (`nvjpeg` feature)
 //!
 //! When the crate is built with `--features nvjpeg`, `DCTDecode` streams with
-//! pixel area ≥ [`GPU_JPEG_THRESHOLD_PX`] are decoded on the GPU via NVIDIA
-//! nvJPEG instead of the CPU JPEG decoder.  Pass an [`NvJpegDecoder`] to
-//! [`resolve_image`] to enable this path; pass `None` for CPU-only behaviour.
+//! pixel area ≥ `GPU_JPEG_THRESHOLD_PX` are decoded on the GPU via NVIDIA
+//! nvJPEG instead of the CPU JPEG decoder.  Pass an `NvJpegDecoder` (from
+//! `gpu::nvjpeg`) to [`resolve_image`] to enable this path; pass `None` for
+//! CPU-only behaviour.
 //!
 //! # nvJPEG2000 acceleration (`nvjpeg2k` feature)
 //!
 //! When the crate is built with `--features nvjpeg2k`, `JPXDecode` streams
-//! with pixel area ≥ [`GPU_JPEG2K_THRESHOLD_PX`] are decoded on the GPU via
+//! with pixel area ≥ `GPU_JPEG2K_THRESHOLD_PX` are decoded on the GPU via
 //! NVIDIA nvJPEG2000 instead of the CPU JPEG 2000 decoder.  Pass an
-//! [`NvJpeg2kDecoder`] to [`resolve_image`] to enable this path; pass `None`
+//! `NvJpeg2kDecoder` (from `gpu::nvjpeg2k`) to [`resolve_image`] to enable this path; pass `None`
 //! for CPU-only behaviour.  Only 1- and 3-component images are accelerated;
 //! CMYK and other multi-channel images always fall through to the CPU path.
 
@@ -233,8 +234,8 @@ pub const IMAGE_FILTER_COUNT: usize = 6;
 ///
 /// - [`ImageData::Cpu`] always available; produced by every CPU
 ///   decode path (CCITT, JBIG2, raw, JPEG fallback).
-/// - [`ImageData::Gpu`] (feature `cache`) — `Arc<CachedDeviceImage>`
-///   handed back from the Phase 9 device image cache.  Produced by
+/// - `ImageData::Gpu` (feature `cache`) — `Arc<CachedDeviceImage>`
+///   handed back from the device image cache.  Produced by
 ///   `decode_dct` when a cache is wired in; consumed by the GPU
 ///   blit kernel which writes transformed pixels into the page's
 ///   `DevicePageBuffer` without a `PCIe` round-trip.

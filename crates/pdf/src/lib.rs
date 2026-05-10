@@ -4,8 +4,9 @@
 //!
 //! * [`Document::open`] parses only the xref table — no objects are loaded.
 //! * Objects are resolved on first access and cached (`Arc`-wrapped) for reuse.
-//! * All byte scanning uses hand-rolled primitives in [`lexer`]; no nom/nom_locate.
-//! * Shared parsing primitives live in [`lexer`] — `pdf_interp`'s content
+//! * All byte scanning uses hand-rolled primitives in the private `lexer`
+//!   submodule; no nom/nom_locate.
+//! * Shared parsing primitives live in `lexer` — `pdf_interp`'s content
 //!   tokenizer will import from here in a follow-up refactor.
 //!
 //! # Compatibility

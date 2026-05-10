@@ -290,8 +290,8 @@ impl DiskTier {
     /// Probe the disk tier for `(doc, hash)` and stream the pixel
     /// payload through a caller-supplied callback.  On hit, opens
     /// the file, validates the header, then calls `fill` with the
-    /// parsed [`DiskHeaderInfo`] and a reader positioned at the
-    /// pixel bytes.  The callback reads exactly
+    /// parsed disk-header info (a private `DiskHeaderInfo` struct)
+    /// and a reader positioned at the pixel bytes.  The callback reads exactly
     /// `header.expected_pixel_bytes` (typically via `read_exact`
     /// into a pinned-host slab) and tags failures with
     /// [`LookupCallbackError::Read`] for file-side problems or
@@ -570,8 +570,19 @@ impl std::fmt::Debug for DiskTier {
 }
 
 /// Test-only allocating variant of a disk cache hit.
+///
+/// `pub(crate)` so test-only `DiskTier::lookup` can return it without
+/// privacy mismatches.  The `redundant-pub-crate` lint flags this
+/// because the enclosing module is private to the crate root, but
+/// narrowing to `pub(super)` would force the return type of `lookup`
+/// (also `pub(crate)`) to either narrow with it or expose it more
+/// widely — both worse than the lint suppression.
 #[cfg(test)]
 #[derive(Debug)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "matches DiskTier::lookup's pub(crate) signature; narrowing to pub(super) creates a privacy mismatch"
+)]
 pub(crate) struct DiskEntry {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -1153,7 +1164,10 @@ mod tests {
         let pixels = vec![0xEEu8; 1024];
         let hash = ContentHash([0x11; 32]);
         for i in 0..(WRITE_QUEUE_DEPTH * 4) {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "DocId byte fill for a queue-saturation stress test; uniqueness across i doesn't matter"
+            )]
             let doc = DocId([i as u8; 32]);
             tier.insert(doc, hash, 32, 32, ImageLayout::Gray, &pixels);
         }

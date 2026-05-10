@@ -9,9 +9,9 @@
 //! container files; `nvjpeg2kStreamParse` auto-detects both.
 //!
 //! The CPU JPEG 2000 decoder is used as fallback for small images (below
-//! [`GPU_JPEG2K_THRESHOLD_PX`]), when no GPU is available, and always for
-//! inline images in the content stream (which are typically small thumbnails
-//! not worth the `PCIe` dispatch overhead).
+//! the per-call dispatch threshold), when no GPU is available, and always
+//! for inline images in the content stream (which are typically small
+//! thumbnails not worth the `PCIe` dispatch overhead).
 //!
 //! # Key differences from nvJPEG (baseline JPEG)
 //!
@@ -622,11 +622,12 @@ impl NvJpeg2k {
         let sync_code = unsafe { cuStreamSynchronize(cu_stream) };
 
         if status != NVJPEG2K_STATUS_SUCCESS {
-            // Decode failed.  Report any additional stream sync failure to stderr
-            // so it is visible for debugging, but return the decode error — it is
-            // the root cause, and the type does not support carrying two errors.
+            // Decode failed.  Report any additional stream sync failure via the
+            // log facade so it is visible for debugging, but return the decode
+            // error — it is the root cause, and the type does not support
+            // carrying two errors.
             if sync_code != 0 {
-                eprintln!(
+                log::error!(
                     "nvjpeg2k: cuStreamSynchronize failed (code {sync_code}) \
                      while handling decode error (status {status})"
                 );

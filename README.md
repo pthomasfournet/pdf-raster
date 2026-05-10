@@ -129,6 +129,17 @@ PDF_RASTER_BACKEND=cuda pdf-raster input.pdf out
 PDF_RASTER_BACKEND=cuda pdf-raster --backend cpu input.pdf out   # uses CPU
 ```
 
+### Compile cache (`sccache`) — optional
+
+`.cargo/config.toml` sets `SCCACHE_CACHE_MULTIARCH=1` so `-C target-cpu=native` builds *can* be cached, but the wrapper itself is opt-in: plain `cargo build` works without sccache.  To enable:
+
+```bash
+cargo install sccache       # one-time install
+export RUSTC_WRAPPER=sccache # add to ~/.bashrc to make it permanent
+```
+
+Shared with any other Rust project on the same machine that opts in — cross-project cache keys don't collide (sccache hashes the full compiler args).  Verify with `sccache --show-stats` (a healthy hit-rate after the first build is ≥ 70%).  Do not `rsync ~/.cache/sccache` between machines with different CPUs — `target-cpu=native` resolves differently per arch.
+
 ## Testing
 
 ```bash

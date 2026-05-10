@@ -108,8 +108,9 @@ pub enum DcChainError {
     /// SOF declared a quantiser/sampling combination we don't support yet
     /// (e.g. interleaved scan with > 4 components, or `v_sampling` > 4).
     UnsupportedScanShape,
-    /// Image dimensions × sampling factors yield more MCUs than [`MAX_SAFE_MCUS`].
-    /// Refuses the image rather than allocating an adversarial output buffer.
+    /// Image dimensions × sampling factors yield more MCUs than the
+    /// crate's internal `MAX_SAFE_MCUS` cap.  Refuses the image rather
+    /// than allocating an adversarial output buffer.
     TooManyMcus {
         /// MCU count requested.
         requested: u64,

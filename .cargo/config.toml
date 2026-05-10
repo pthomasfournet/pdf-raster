@@ -14,6 +14,15 @@ jobs = 6
 # back to the generic-x86_64 baseline.
 rustflags = ["-C", "target-cpu=native"]
 
+[env]
+# Permit `sccache` (if a contributor opts in via RUSTC_WRAPPER=sccache)
+# to cache builds whose RUSTFLAGS include `-C target-cpu=native`.
+# Without this env var, sccache rejects `target-cpu=native` builds as
+# non-portable cache keys.  Setting it project-locally is a no-op when
+# sccache is not in use, so no contributor pays for it.  Do NOT rsync
+# the resulting cache to a different CPU arch.
+SCCACHE_CACHE_MULTIARCH = "1"
+
 [profile.test]
 # Single codegen unit per crate in test builds.  The test binary for
 # pdf_interp grows to ~96 MiB with the default split; one CGU halves that.

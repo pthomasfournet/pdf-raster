@@ -11,7 +11,7 @@
 use ash::ext::memory_budget;
 use ash::vk;
 use std::ffi::{CStr, c_char};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::backend::{BackendError, Result};
 
@@ -26,8 +26,15 @@ pub(super) struct DeviceCtx {
     pub(super) device: ash::Device,
     /// Index into the device's queue-family list — used at command pool create time.
     pub(super) compute_queue_family: u32,
-    /// The compute queue handle (queue itself is owned by the device).
-    pub(super) compute_queue: vk::Queue,
+    /// The compute queue handle, wrapped in a `Mutex` to enforce the
+    /// Vulkan "Threading Behavior" external-synchronization requirement
+    /// (`vkQueueSubmit` / `vkQueueWaitIdle` / present-class calls on
+    /// the same queue must not run concurrently from multiple threads).
+    /// The mutex *is* the access path — there is no way to reach the
+    /// raw `vk::Queue` without holding the lock.  Both submitters (the
+    /// per-page recorder and the transfer context) call
+    /// [`Self::with_queue`] for the queue-touching FFI window only.
+    compute_queue: Mutex<vk::Queue>,
     /// Cached physical-device handle for memory-property + budget queries.
     pub(super) phys: vk::PhysicalDevice,
     /// Cached memory properties (memoryTypeBits → `MemoryType` lookup).
@@ -95,7 +102,7 @@ pub(super) fn init() -> Result<Arc<DeviceCtx>> {
     Ok(Arc::new(DeviceCtx {
         device,
         compute_queue_family,
-        compute_queue,
+        compute_queue: Mutex::new(compute_queue),
         phys,
         mem_props,
         max_workgroup_count,
@@ -104,6 +111,19 @@ pub(super) fn init() -> Result<Arc<DeviceCtx>> {
         instance,
         entry,
     }))
+}
+
+impl DeviceCtx {
+    /// Run `f` with the externally-synchronized compute queue.
+    ///
+    /// The queue handle is only reachable through this method; callers
+    /// can't bypass the mutex.  Hold the closure scope as small as
+    /// possible — every other submitter (transfer context, recorder)
+    /// is blocked while this call runs.
+    pub(super) fn with_queue<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+        let queue = self.compute_queue.lock().expect("compute_queue poisoned");
+        f(*queue)
+    }
 }
 
 fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {

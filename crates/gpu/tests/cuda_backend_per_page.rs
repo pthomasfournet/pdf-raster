@@ -2,7 +2,7 @@
 //!
 //! Gated on `gpu-validation` so CI without a CUDA device skips it.
 //! Run with:
-//!   cargo test -p gpu --features gpu-validation --test cuda_backend_per_page
+//!   `cargo test -p gpu --features gpu-validation --test cuda_backend_per_page`
 
 #[cfg(feature = "gpu-validation")]
 #[test]

@@ -34,6 +34,7 @@
     reason = "the inner Mutex<RecorderState> is held across Vulkan calls intentionally — single-page-in-flight design serialises every record_* through the same lock"
 )]
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -46,20 +47,21 @@ use super::device::DeviceCtx;
 use super::error::vk_err;
 use super::pipeline::{KernelId, PipelineCache};
 
-/// Synchronisation token returned by `submit_page`.  Holds the timeline
-/// value the caller must wait on.
+/// Synchronisation token for a queue submission.
+///
+/// `Some(v)` carries the timeline-semaphore value to wait on; `None`
+/// is the "no work to wait on" sentinel returned by paths that
+/// completed synchronously.  Encoding the sentinel as `None` makes
+/// "real submission ⇒ real fence" a type-system invariant rather
+/// than the previous "value 0 means already-signalled" convention.
 #[derive(Debug, Clone, Copy)]
-pub struct PageFence {
-    value: u64,
-}
+pub struct PageFence(Option<NonZeroU64>);
 
 impl PageFence {
-    /// A fence that has already signalled.  Used by upload paths that
-    /// completed synchronously and have nothing for the caller to wait
-    /// on; `wait_page(immediate)` returns immediately because the
-    /// timeline semaphore's initial value is 0 ≥ 0.
+    /// A fence that has already signalled — caller has nothing to wait
+    /// on.  Returned by sync paths that completed inline.
     pub(super) const fn immediate() -> Self {
-        Self { value: 0 }
+        Self(None)
     }
 }
 
@@ -106,6 +108,15 @@ pub(super) struct PageRecorder {
 /// Maximum descriptor sets allocated per page.  One per `record_*` call;
 /// real renderers do tens, not hundreds — 64 is generous.
 const MAX_DESC_SETS_PER_PAGE: u32 = 64;
+
+/// Initial timeline-semaphore signal value.  Must be > 0 so
+/// `submit_page`'s `NonZeroU64::new(signal_value)` is `Some` by
+/// construction.  Enforced at compile time by the `const _` below.
+const INITIAL_TIMELINE_VALUE: u64 = 1;
+const _: () = assert!(
+    NonZeroU64::new(INITIAL_TIMELINE_VALUE).is_some(),
+    "INITIAL_TIMELINE_VALUE must be > 0 for submit_page's NonZeroU64 invariant",
+);
 
 impl PageRecorder {
     pub(super) fn new(device: Arc<DeviceCtx>, pipelines: Arc<PipelineCache>) -> Result<Self> {
@@ -161,7 +172,7 @@ impl PageRecorder {
             cmd_pool,
             inner: Mutex::new(RecorderState {
                 state: State::Idle,
-                next_value: 1,
+                next_value: INITIAL_TIMELINE_VALUE,
                 cmd,
                 desc_pool,
                 desc_sets_in_flight: 0,
@@ -222,6 +233,10 @@ impl PageRecorder {
             .next_value
             .checked_add(1)
             .ok_or_else(|| BackendError::msg("timeline semaphore overflowed u64"))?;
+        // Mint the fence before the submit so a hypothetical conversion
+        // failure can't strand GPU work without a handle to wait on.
+        let value = NonZeroU64::new(signal_value)
+            .expect("submit_page invariant: timeline values start at 1");
 
         let mut tl_submit = vk::TimelineSemaphoreSubmitInfo::default()
             .signal_semaphore_values(std::slice::from_ref(&signal_value));
@@ -232,16 +247,18 @@ impl PageRecorder {
             .signal_semaphores(&signal_semaphores)
             .push_next(&mut tl_submit);
 
-        unsafe {
-            self.device
-                .device
-                .queue_submit(self.device.compute_queue, &[submit], vk::Fence::null())
-                .map_err(vk_err("vkQueueSubmit"))?;
-        }
+        self.device.with_queue(|q| {
+            // Safety: queue is exclusively held via with_queue; submit
+            // outlives the call.
+            unsafe {
+                self.device
+                    .device
+                    .queue_submit(q, &[submit], vk::Fence::null())
+                    .map_err(vk_err("vkQueueSubmit"))
+            }
+        })?;
         s.state = State::Submitted;
-        Ok(PageFence {
-            value: signal_value,
-        })
+        Ok(PageFence(Some(value)))
     }
 
     pub(super) fn wait_page(&self, fence: PageFence) -> Result<()> {
@@ -254,19 +271,43 @@ impl PageRecorder {
                 s.state
             )));
         }
+        self.wait_timeline(fence.0)?;
+        s.state = State::Idle;
+        Ok(())
+    }
+
+    /// Wait on a transfer fence without the page state-machine check.
+    ///
+    /// `wait_page` enforces `state == Submitted` because page rendering
+    /// is a strict begin/record/submit/wait cycle.  Transfer-queue
+    /// fences (returned by `submit_transfer`, `upload_async`,
+    /// `download_async`) ride the same timeline semaphore but DON'T
+    /// participate in the page state machine — `submit_transfer` does
+    /// not transition the recorder.  Use this method to wait on those
+    /// fences without tripping the state check.
+    pub(super) fn wait_transfer_fence(&self, fence: PageFence) -> Result<()> {
+        self.wait_timeline(fence.0)
+    }
+
+    /// `vkWaitSemaphores` with `u64::MAX` timeout.  `None` short-
+    /// circuits without an FFI call (the immediate-fence sentinel).
+    /// See [`Self::wait_transfer_fence`] for the wait_page-vs-transfer
+    /// split.
+    fn wait_timeline(&self, value: Option<NonZeroU64>) -> Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
         let semaphores = [self.timeline];
-        let values = [fence.value];
+        let values = [value.get()];
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        // u64::MAX = wait forever.
         unsafe {
             self.device
                 .device
                 .wait_semaphores(&wait_info, u64::MAX)
                 .map_err(vk_err("vkWaitSemaphores"))?;
         }
-        s.state = State::Idle;
         Ok(())
     }
 
@@ -479,10 +520,10 @@ impl PageRecorder {
             )));
         }
         if s.desc_sets_in_flight >= MAX_DESC_SETS_PER_PAGE {
-            return Err(BackendError::msg(format!(
-                "descriptor pool exhausted: {} sets allocated this page (max {})",
-                s.desc_sets_in_flight, MAX_DESC_SETS_PER_PAGE
-            )));
+            return Err(BackendError::DescriptorPoolExhausted {
+                allocated: s.desc_sets_in_flight,
+                max: MAX_DESC_SETS_PER_PAGE,
+            });
         }
 
         // Allocate one descriptor set from the per-page pool.
@@ -600,5 +641,16 @@ impl Drop for PageRecorder {
             self.device.device.destroy_command_pool(self.cmd_pool, None);
             self.device.device.destroy_semaphore(self.timeline, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_fence_niche_packs_to_eight_bytes() {
+        // PageFence stays 8 bytes via Option<NonZeroU64> niche optimisation.
+        assert_eq!(std::mem::size_of::<PageFence>(), 8);
     }
 }

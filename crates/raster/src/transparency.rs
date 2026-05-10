@@ -27,7 +27,7 @@
 //! When `soft_mask_type != SoftMaskType::None`, the group is later used as a
 //! luminosity or alpha soft mask rather than being composited directly.  Call
 //! [`extract_soft_mask`] on the finished [`GroupBitmap`] to obtain the mask bytes,
-//! then store them in [`GraphicsState::soft_mask`] after wrapping in `AnyBitmap`.
+//! then store them in [`crate::GraphicsState::soft_mask`] after wrapping in `AnyBitmap`.
 //!
 //! # C++ equivalents
 //!

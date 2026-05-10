@@ -1,5 +1,5 @@
-//! Parity tests: same kernel via CUDA (`.cu`-via-nvcc) and Vulkan
-//! (`.slang`-via-slangc) must agree to ≤ 1 LSB per channel.
+//! Parity tests: same kernel via CUDA (`.cu`-via-`nvcc`) and Vulkan
+//! (`.slang`-via-`slangc`) must agree to ≤ 1 LSB per channel.
 //!
 //! Each test composes a small representative input, runs it through
 //! both backends, and asserts byte-equal output (or ≤ 1 LSB delta for
@@ -10,10 +10,21 @@
 //! run the Vulkan side and validate against a CPU reference.
 //!
 //! Run with:
-//!   cargo test -p gpu --features vulkan --test cu_vs_slang_parity
-//!   cargo test -p gpu --features 'vulkan,gpu-validation' --test cu_vs_slang_parity
+//!   `cargo test -p gpu --features vulkan --test cu_vs_slang_parity`
+//!   `cargo test -p gpu --features 'vulkan,gpu-validation' --test cu_vs_slang_parity`
 
 #![cfg(feature = "vulkan")]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::unreadable_literal,
+    reason = "test fixture: u32 LCG constants, paired (dx, dy) / (dx_rel, dy_rel) coordinates, \
+              bounded `i & 0xff` masks, 8-10 arg CPU-reference helpers, and u32→f32 sample \
+              indices intentionally mirror the kernel-side math byte-for-byte"
+)]
 
 use gpu::backend::GpuBackend;
 use gpu::backend::params::{
@@ -21,7 +32,7 @@ use gpu::backend::params::{
 };
 use gpu::backend::vulkan::VulkanBackend;
 
-/// Run `composite_rgba8` on a representative input via VulkanBackend,
+/// Run `composite_rgba8` on a representative input via `VulkanBackend`,
 /// returning the result as a `Vec<u8>`.
 fn run_composite_vulkan(src: &[u8], dst_in: &[u8]) -> Vec<u8> {
     assert_eq!(src.len(), dst_in.len());
@@ -50,7 +61,7 @@ fn run_composite_vulkan(src: &[u8], dst_in: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reference: CPU implementation from gpu::composite::composite_rgba8_cpu.
+/// Reference: CPU implementation from `gpu::composite::composite_rgba8_cpu`.
 fn run_composite_cpu(src: &[u8], dst_in: &[u8]) -> Vec<u8> {
     let mut dst = dst_in.to_vec();
     gpu::composite_rgba8_cpu(src, &mut dst);
@@ -307,7 +318,7 @@ fn icc_clut_random_inputs() {
     let n = 2048;
     let mut cmyk = vec![0u8; n * 4];
     let mut rng = 0x1234_5678_u32;
-    for b in cmyk.iter_mut() {
+    for b in &mut cmyk {
         rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
         *b = (rng >> 24) as u8;
     }
@@ -445,6 +456,11 @@ fn blit_cpu_reference(
             let ix = ((u * src_w as f32) as u32).min(src_w - 1);
             let iy = (((1.0 - v) * src_h as f32) as u32).min(src_h - 1);
             let dst_off = ((dy as u32) * page_w + dx as u32) as usize * 4;
+            #[expect(
+                clippy::branches_sharing_code,
+                reason = "shared trailing alpha=255 mirrors the kernel branch shape; \
+                          factoring out the assignment would obscure the per-branch RGB pulls"
+            )]
             if src_layout == 0 {
                 let src_off = (iy * src_w + ix) as usize * 3;
                 page[dst_off] = src[src_off];
@@ -572,9 +588,10 @@ fn assert_within_1_lsb(a: &[u8], b: &[u8], what: &str) {
     let mut delta_sites = 0;
     for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
         let delta = x.abs_diff(y);
-        if delta > 1 {
-            panic!("{what}: byte {i} differs by {delta} ({x} vs {y}); requires ≤ 1 LSB");
-        }
+        assert!(
+            delta <= 1,
+            "{what}: byte {i} differs by {delta} ({x} vs {y}); requires ≤ 1 LSB"
+        );
         if delta != 0 {
             delta_sites += 1;
             max_delta = max_delta.max(delta);

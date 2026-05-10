@@ -12,14 +12,14 @@
 //!
 //! # Feature flags
 //!
-//! - `nvjpeg` — enables [`nvjpeg`] module for GPU-accelerated JPEG decoding
+//! - `nvjpeg` — enables the `nvjpeg` module for GPU-accelerated JPEG decoding
 //!   via NVIDIA nvJPEG.  Requires `libnvjpeg.so` at link time.
-//! - `nvjpeg2k` — enables [`nvjpeg2k`] module for GPU-accelerated JPEG 2000
+//! - `nvjpeg2k` — enables the `nvjpeg2k` module for GPU-accelerated JPEG 2000
 //!   decoding via NVIDIA nvJPEG2000.  Requires `libnvjpeg2k.so` at link time.
-//! - `gpu-deskew` — enables [`npp_rotate`] module for GPU rotation via CUDA NPP
+//! - `gpu-deskew` — enables the `npp_rotate` module for GPU rotation via CUDA NPP
 //!   (`nppiRotate_8u_C1R_Ctx`).  Requires `libnppig.so`, `libnppc.so`, and
 //!   `libcudart.so` at link time.
-//! - `vaapi` — enables [`vaapi`] module for VA-API hardware JPEG decoding on AMD
+//! - `vaapi` — enables the `vaapi` module for VA-API hardware JPEG decoding on AMD
 //!   and Intel iGPU/discrete hardware.  Requires `libva.so.2` and `libva-drm.so.2`
 //!   at link time.
 
@@ -113,6 +113,13 @@ pub const GPU_TILE_FILL_THRESHOLD: usize = 256;
 pub const TILE_W: u32 = 16;
 /// Tile height in pixels (must match `TILE_H` in `tile_fill.cu`).
 pub const TILE_H: u32 = 16;
+/// Bytes per pixel for the RGBA8 pixel format the renderer composites in.
+///
+/// Lives at the crate root rather than under `cache::` because every
+/// path that touches pixel buffers (renderer, kernels, blit, tests) needs
+/// it; gating it behind the `cache` feature was an accident of where it
+/// was first defined.  `cache::RGBA_BPP` is re-exported for back-compat.
+pub const RGBA_BPP: usize = 4;
 /// Minimum pixel count for GPU ICC CMYK→RGB CLUT transform to beat CPU + `PCIe` overhead.
 ///
 /// Applies only when a full ICC CLUT is available (clut=Some).  The matrix path

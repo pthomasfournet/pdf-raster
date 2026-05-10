@@ -6,13 +6,13 @@
 //! into a per-page command buffer; submission uses a timeline semaphore
 //! so the host waits exactly once per page.
 //!
-//! Module split:
-//! - [`device`] — loader, physical-device pick, logical device + queue.
-//! - [`error`] — `vk::Result → BackendError` adaptor.
-//! - [`memory`] — slab sub-allocator, host-visible staging pool.
-//! - [`pipeline`] — descriptor set layouts + pipeline cache (lazy SPIR-V compile).
-//! - [`recorder`] — per-page command buffer + timeline-semaphore fence.
-//! - [`transfer`] — `upload_async` helper (probes for dedicated transfer queue).
+//! Module split (all private; named here for orientation only):
+//! - `device` — loader, physical-device pick, logical device + queue.
+//! - `error` — `vk::Result → BackendError` adaptor.
+//! - `memory` — slab sub-allocator, host-visible staging pool.
+//! - `pipeline` — descriptor set layouts + pipeline cache (lazy SPIR-V compile).
+//! - `recorder` — per-page command buffer + timeline-semaphore fence.
+//! - `transfer` — `upload_async` helper (probes for dedicated transfer queue).
 
 mod device;
 mod error;
@@ -117,6 +117,26 @@ impl GpuBackend for VulkanBackend {
         self.memory.alloc_device(size)
     }
 
+    fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer> {
+        reject_zero_size(size, "alloc_device_zeroed")?;
+        let buf = self.memory.alloc_device(size)?;
+        // vkCmdFillBuffer requires 4-byte-aligned size; every realistic
+        // caller (RGBA8 pages, u32 indices) is naturally aligned.
+        // Mis-aligned sizes fail loudly rather than silently downgrading
+        // to a 33 MB host-vec staging path.
+        self.transfer.fill_zero(&buf)?;
+        Ok(buf)
+    }
+
+    fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize {
+        // Vulkan stores sizes as u64 (vk::DeviceSize); the trait
+        // returns usize.  pdf-raster targets 64-bit only, so the
+        // conversion is total — failing loudly is correct because
+        // a saturating fallback (e.g. usize::MAX) would silently
+        // poison cache size accounting.
+        usize::try_from(buf.size()).expect("DeviceBuffer size fits usize on 64-bit targets")
+    }
+
     fn free_device(&self, buf: Self::DeviceBuffer) {
         self.memory.free_device(buf);
     }
@@ -168,12 +188,48 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn upload_async(&self, dst: &Self::DeviceBuffer, src: &[u8]) -> Result<Self::PageFence> {
-        // Today's path is sync (vkQueueWaitIdle inside `upload_sync`);
-        // we hand back an already-signalled fence so callers writing
-        // `upload_async(...).and_then(|f| wait_page(f))` keep working
-        // unchanged once the dedicated transfer queue lands.
+        // Sync today; ROADMAP tracks the async transfer-queue follow-up.
         self.transfer.upload_sync(&self.memory, dst, src)?;
         Ok(PageFence::immediate())
+    }
+
+    fn download_async<'a>(
+        &self,
+        src: &'a Self::DeviceBuffer,
+        dst: &'a mut [u8],
+    ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
+        // Sync today; ROADMAP tracks the async transfer-queue follow-up.
+        self.transfer.download_sync(&self.memory, src, dst)?;
+        Ok(crate::backend::DownloadHandle {
+            inner: Box::new(NoopDownloadInner),
+            _borrow: std::marker::PhantomData,
+            fence: PageFence::immediate(),
+        })
+    }
+
+    fn wait_download(&self, mut handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
+        // NoopDownloadInner::finish is idempotent (returns Ok(())), so
+        // the post-finish Drop calling finish() again is a no-op.  When
+        // the async impl lands and finish() is no longer idempotent,
+        // disarm the handle here.
+        handle.inner.finish()
+    }
+
+    fn submit_transfer(&self) -> Result<Self::PageFence> {
+        // Nothing to flush while transfers are sync; `immediate` keeps
+        // the trait contract (wait_transfer on it returns at once).
+        // ROADMAP tracks the async transfer-queue follow-up.
+        Ok(PageFence::immediate())
+    }
+
+    fn wait_transfer(&self, fence: Self::PageFence) -> Result<()> {
+        // Transfers ride the same timeline-semaphore wait path as
+        // page submissions today; future split-queue work may add a
+        // second timeline.  Use the recorder's no-state-check variant:
+        // `submit_transfer` doesn't transition the recorder out of
+        // Idle, so going through `wait_page` would trip its state
+        // assertion every time.
+        self.recorder.wait_transfer_fence(fence)
     }
 
     fn detect_vram_budget(&self) -> Result<VramBudget> {
@@ -185,5 +241,18 @@ impl GpuBackend for VulkanBackend {
         // so this holds; clamp anyway in case a driver reports an
         // inconsistent budget.
         Ok(VramBudget::new(total, usable.min(total)))
+    }
+}
+
+/// No-op `DownloadInner` for the sync-download path — the
+/// device→host copy already happened inside `download_sync`, so the
+/// handle's `finish` has nothing to do.  Replaced by a real impl
+/// (staging→dst memcpy under fence wait) when the async transfer
+/// queue lands.
+struct NoopDownloadInner;
+
+impl crate::backend::DownloadInner for NoopDownloadInner {
+    fn finish(&mut self) -> crate::backend::Result<()> {
+        Ok(())
     }
 }

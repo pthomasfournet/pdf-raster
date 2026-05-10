@@ -14,11 +14,11 @@
 //!
 //! # Thread safety
 //!
-//! [`NppRotator`] is `Send` but not `Sync`.  The recommended entry point is
-//! [`rotate_gray8`], which manages a per-thread instance via `thread_local!`.
-//! Constructing [`NppRotator`] directly is safe, but it must only be used from
-//! the thread that called [`NppRotator::new`] — CUDA primary contexts are
-//! thread-bound and sharing an instance across threads is unsound.
+//! The internal `NppRotator` (private) is `Send` but not `Sync`.  The
+//! recommended entry point is [`rotate_gray8`], which manages a per-thread
+//! instance via `thread_local!` and shields callers from the thread-binding
+//! constraint.  CUDA primary contexts are thread-bound and a `NppRotator`
+//! must only be used from the thread that constructed it.
 
 #![cfg(feature = "gpu-deskew")]
 

@@ -8,8 +8,8 @@
 //!
 //! - **`XObject` images**: `Filter`, `Width`, `Height` read from the stream
 //!   dictionary via reference lookup — no decompression.
-//! - **Form `XObject`s**: recursed up to [`MAX_PRESCAN_DEPTH`] levels deep so
-//!   images inside forms are counted.
+//! - **Form `XObject`s**: recursed up to a small fixed depth (`MAX_PRESCAN_DEPTH`)
+//!   so images inside forms are counted.
 //! - **Inline images**: `Filter`, `W`/`Width`, `H`/`Height` read from the raw
 //!   parameter block via the same `parse_inline_params` path used by the full
 //!   renderer — no pixel decoding.
@@ -20,7 +20,7 @@
 //!
 //! Unlike the full renderer (which projects image pixels through the live CTM
 //! stack), the prescan uses the raw PDF `Width` dict entry and the page width in
-//! points from [`page_size_pts`]:
+//! points (via the crate-internal `page_size_pts_by_id` helper):
 //!
 //! ```text
 //! ppi ≈ (image_width_px / page_width_pts) × 72

@@ -41,8 +41,15 @@ pub(super) struct PageRecorder {
 /// Wraps a [`CudaEvent`] recorded on the backend's stream.  `wait_page`
 /// calls `event.synchronize()`, which blocks the host until every prior
 /// kernel queued on that stream has completed.
-#[derive(Debug)]
-pub struct PageFence(CudaEvent);
+///
+/// `Arc<CudaEvent>` so the trait's `PageFence: Clone` bound holds —
+/// the cache stashes one clone per cached entry to gate
+/// `free_device`, while the renderer holds another to wait on the
+/// per-page submission.  CUDA events are pure synchronisation
+/// primitives (no payload, just the recorded stream-position),
+/// safe to share across threads.
+#[derive(Debug, Clone)]
+pub struct PageFence(Arc<CudaEvent>);
 
 impl PageRecorder {
     pub(super) const fn new(ctx: Arc<GpuCtx>) -> Self {
@@ -73,8 +80,18 @@ impl PageRecorder {
     /// the event.  The host can then block on the event with
     /// `wait_page` instead of synchronising the whole stream.
     pub(super) fn submit_page(&self) -> Result<PageFence> {
-        let event = self.ctx.stream().record_event(None).map_err(be)?;
-        Ok(PageFence(event))
+        Self::record_fence(&self.ctx)
+    }
+
+    /// Record a fresh fence on the backend's stream without going
+    /// through the per-page state machine.  Used by
+    /// `CudaBackend::submit_transfer` since the CUDA path has no
+    /// distinct transfer queue — both transfer and compute ride the
+    /// same stream, and a stream-recorded event is the universal
+    /// "wait until everything before this signals" primitive.
+    pub(super) fn record_fence(ctx: &Arc<GpuCtx>) -> Result<PageFence> {
+        let event = ctx.stream().record_event(None).map_err(be)?;
+        Ok(PageFence(Arc::new(event)))
     }
 
     /// Block until the work covered by `fence` has completed.

@@ -320,9 +320,12 @@ impl std::error::Error for BlitError {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::similar_names,
-    reason = "PDF spec uses paired (dx, dy) / (dx_rel, dy_rel) terminology; renaming would obscure the math"
+#[cfg_attr(
+    feature = "gpu-validation",
+    expect(
+        clippy::similar_names,
+        reason = "PDF spec uses paired (dx, dy) / (dx_rel, dy_rel) terminology; renaming would obscure the math"
+    )
 )]
 #[expect(
     clippy::float_cmp,
@@ -370,6 +373,7 @@ mod tests {
     /// the reference produces byte-identical results.  Cast-precision
     /// lints are suppressed; that's the point — losing precision in
     /// the same way the GPU does is what makes this a reference.
+    #[cfg(feature = "gpu-validation")]
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,

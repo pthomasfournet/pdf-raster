@@ -199,7 +199,7 @@ impl RasterSession {
     }
 
     /// Borrow the underlying [`pdf::Document`] for read-only operations such as
-    /// the [`pdf_raster::prescan_page`] pre-scan pass.
+    /// the [`crate::prescan_page`] pre-scan pass.
     #[must_use]
     pub fn doc(&self) -> &pdf::Document {
         &self.doc
@@ -351,31 +351,11 @@ pub fn open_session(
     // the PDF naturally invalidates the disk tier (Task 5) because
     // the hash changes.  Costs one full BLAKE3 hash at session open
     // (~250 MB/s; ~40ms for a 10MB PDF) — paid once per session, not
-    // per page.  Path-hashing was an earlier expedient that didn't
-    // detect content changes.
-    //
-    // TODO(perf): we re-read the file here even though `pdf_interp::open`
-    // above already mmapped it.  The hash could share the mmap if
-    // `pdf::Document` exposed a `bytes() -> &[u8]` accessor.  For a
-    // 10 MB PDF the wasted IO is ~40 ms (page cache makes the second
-    // read essentially free in practice, but it still allocates a
-    // `Vec` we throw away).  Deferred because the fix touches
-    // `pdf` → `pdf_interp` → `pdf_raster` API surface.
-    //
-    // If the file becomes unreadable between `pdf_interp::open` (which
-    // succeeded above) and now, fall back to a path-hash so the cache
-    // still functions in-process — disk-tier invalidation is sacrificed
-    // but in-process dedup keeps working.
+    // per page.  Borrows the bytes already mmapped by `pdf_interp::open`
+    // so the hash adds zero IO.
     #[cfg(feature = "cache")]
     let doc_id = {
-        let bytes_for_hash = std::fs::read(path).unwrap_or_else(|e| {
-            log::warn!(
-                "open_session: re-read of PDF for DocId hashing failed ({e}); \
-                 falling back to path-hash — disk cache invalidation by content edit will not work"
-            );
-            path.as_os_str().as_encoded_bytes().to_vec()
-        });
-        let hash = gpu::cache::DeviceImageCache::hash_bytes(&bytes_for_hash);
+        let hash = gpu::cache::DeviceImageCache::hash_bytes(doc.bytes());
         gpu::cache::DocId(hash.0)
     };
 
@@ -556,7 +536,8 @@ pub fn render_page_rgb(
 /// allow it.  The session policy is used as-is for all other variants.
 ///
 /// Use this when content-aware routing has classified the page as not needing
-/// GPU decoding — e.g. a pure-vector page whose [`RoutingHint`] is `CpuOnly`.
+/// GPU decoding — e.g. a pure-vector page where the prescan diagnostics
+/// indicate `CpuOnly` is the right effective policy.
 ///
 /// # Errors
 ///

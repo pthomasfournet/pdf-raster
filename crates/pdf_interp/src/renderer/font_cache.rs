@@ -9,9 +9,9 @@
 //!
 //! # Thread safety
 //!
-//! [`FontCache`] is not `Send`.  One instance is created per [`PageRenderer`]
+//! `FontCache` is not `Send`.  One instance is created per page renderer
 //! (one per thread when pages are rendered in parallel).  The shared
-//! [`FontEngine`] is locked only during the face-load call.
+//! `FontEngine` (in the `font` crate) is locked only during the face-load call.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

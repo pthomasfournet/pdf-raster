@@ -437,7 +437,7 @@ impl GraphicsState {
 
 /// Borrowed references to all transfer LUTs from a [`GraphicsState`].
 ///
-/// Constructed via [`GraphicsState::transfer_set`] and stored in [`PipeState`].
+/// Constructed via [`GraphicsState::transfer_set`] and stored in [`crate::PipeState`].
 /// Avoids cloning the tables for each paint operation.
 #[derive(Copy, Clone, Debug)]
 pub struct TransferSet<'a> {

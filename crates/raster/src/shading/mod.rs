@@ -2,11 +2,11 @@
 //!
 //! Replaces `Splash::shadedFill` and `Splash::gouraudTriangleShadedFill`.
 //!
-//! # Module layout
-//! - [`axial`]    — [`AxialPattern`]: linear gradient along an axis vector
-//! - [`radial`]   — [`RadialPattern`]: gradient between two circles
-//! - [`function`] — [`FunctionPattern`]: PDF function sampled per pixel
-//! - [`gouraud`]  — [`gouraud_triangle_fill`]: vertex-coloured triangle scan
+//! # Module layout (named for orientation; visibility varies)
+//! - `axial`    — [`crate::AxialPattern`]: linear gradient along an axis vector
+//! - `radial`   — [`crate::RadialPattern`]: gradient between two circles
+//! - `function` — [`crate::FunctionPattern`]: PDF function sampled per pixel
+//! - `gouraud`  — `gouraud_triangle_fill`: vertex-coloured triangle scan
 //!
 //! # Entry point
 //!

@@ -2,7 +2,7 @@
 //!
 //! [`XPath`] is the Rust equivalent of `SplashXPath` from `splash/SplashXPath.h/.cc`.
 //! It converts a [`Path`] (in user space) into a sorted sequence of line segments
-//! in device space, ready for scan conversion by [`XPathScanner`].
+//! in device space, ready for scan conversion by [`crate::XPathScanner`].
 //!
 //! ## Typical usage pipeline
 //!
@@ -19,7 +19,7 @@
 //! XPathScanner                                          ← scan conversion
 //! ```
 //!
-//! ## Key invariants (established by [`add_segment`](XPath::add_segment))
+//! ## Key invariants (established by `XPath::add_segment` — internal)
 //!
 //! - For every non-horizontal segment, `y0 ≤ y1` after construction (swapped
 //!   if necessary; [`XPathFlags::FLIPPED`] is set when a swap occurred).
@@ -68,8 +68,8 @@ bitflags! {
 ///
 /// # Invariant
 ///
-/// After construction by [`XPath::add_segment`], every non-horizontal segment
-/// satisfies `y0 ≤ y1`. Horizontal segments (`HORIZ` flag set) are exempt.
+/// After construction by `XPath::add_segment` (internal), every non-horizontal
+/// segment satisfies `y0 ≤ y1`. Horizontal segments (`HORIZ` flag set) are exempt.
 #[derive(Clone, Debug)]
 pub struct XPathSeg {
     /// X coordinate of the segment start point, in device space.
