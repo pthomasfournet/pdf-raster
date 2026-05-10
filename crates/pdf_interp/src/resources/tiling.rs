@@ -25,7 +25,7 @@ use super::{read_bbox, read_f64_1, read_matrix, resolve_dict};
 /// Parameters extracted from a PDF Type 1 (tiling) pattern stream.
 ///
 /// Callers use these to rasterise a tile bitmap and assemble a
-/// [`crate::renderer::page::TiledPattern`].
+/// `TiledPattern` (private to `crate::renderer::page::patterns`).
 pub struct TilingDescriptor {
     /// Content stream of the pattern tile (already decompressed).
     pub content: Vec<u8>,

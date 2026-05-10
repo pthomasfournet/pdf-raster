@@ -58,7 +58,7 @@ impl std::error::Error for DeskewError {}
 
 /// Detect the skew angle of `img` and rotate it in-place to correct it.
 ///
-/// Does nothing if the detected angle is below [`MIN_CORRECT_DEG`].
+/// Does nothing if the detected angle is below `MIN_CORRECT_DEG`.
 ///
 /// # Errors
 ///

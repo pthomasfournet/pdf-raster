@@ -42,8 +42,8 @@ use super::ImageColorSpace;
 ///
 /// GPU decoders are passed in for `DCTDecode` and `JPXDecode` streams.  The same
 /// area threshold as `resolve_image` applies — images below
-/// [`GPU_JPEG_THRESHOLD_PX`](super::GPU_JPEG_THRESHOLD_PX) use the CPU path
-/// regardless.  Most inline images are small (thumbnails, icons) and will fall
+/// `super::GPU_JPEG_THRESHOLD_PX` (only present with the `nvjpeg` or `vaapi`
+/// feature) use the CPU path regardless.  Most inline images are small (thumbnails, icons) and will fall
 /// through to the CPU path; the parameters are plumbed through so that the
 /// dispatch logic in `decode_dct` / `decode_jpx` can make the threshold decision
 /// rather than unconditionally bypassing GPU decode for all inline images.

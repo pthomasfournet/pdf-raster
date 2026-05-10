@@ -199,7 +199,7 @@ impl RasterSession {
     }
 
     /// Borrow the underlying [`pdf::Document`] for read-only operations such as
-    /// the [`pdf_raster::prescan_page`] pre-scan pass.
+    /// the [`crate::prescan_page`] pre-scan pass.
     #[must_use]
     pub fn doc(&self) -> &pdf::Document {
         &self.doc
@@ -536,7 +536,8 @@ pub fn render_page_rgb(
 /// allow it.  The session policy is used as-is for all other variants.
 ///
 /// Use this when content-aware routing has classified the page as not needing
-/// GPU decoding — e.g. a pure-vector page whose [`RoutingHint`] is `CpuOnly`.
+/// GPU decoding — e.g. a pure-vector page where the prescan diagnostics
+/// indicate `CpuOnly` is the right effective policy.
 ///
 /// # Errors
 ///

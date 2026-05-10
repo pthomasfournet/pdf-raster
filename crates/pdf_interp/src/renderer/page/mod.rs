@@ -4,13 +4,13 @@
 //! over a decoded operator sequence, and calls into the `raster` crate for
 //! each painting operator.
 //!
-//! Sub-modules:
-//! - [`operators`] — `execute_one` operator dispatch table.
-//! - [`text`] — `show_text` and `show_text_type3` rendering.
-//! - [`patterns`] — `resolve_fill_pattern` and `render_pattern_tile`.
-//! - [`text_ops`] — `GlyphRecord` and `text_to_device` helpers.
-//! - [`annotations`] — annotation appearance stream rendering.
-//! - [`gpu_ops`] — GPU-accelerated fill dispatch.
+//! Sub-modules (all private; named for orientation only):
+//! - `operators` — `execute_one` operator dispatch table.
+//! - `text` — `show_text` and `show_text_type3` rendering.
+//! - `patterns` — `resolve_fill_pattern` and `render_pattern_tile`.
+//! - `text_ops` — `GlyphRecord` and `text_to_device` helpers.
+//! - `annotations` — annotation appearance stream rendering.
+//! - `gpu_ops` — GPU-accelerated fill dispatch.
 //!
 //! # What is implemented
 //!
@@ -144,7 +144,7 @@ impl PageDiagnostics {
     ///
     /// Many scanned PDFs store images at 62–67 PPI.  Rendering at 300 DPI upsamples
     /// 4.5× with no additional information.  Passing the suggested DPI to
-    /// [`RasterOptions::dpi`] renders at the minimum resolution that avoids
+    /// the renderer (`pdf_raster::RasterOptions::dpi`) renders at the minimum resolution that avoids
     /// upsampling, bounded by the caller's quality floor (`min_dpi`) and ceiling
     /// (`max_dpi`).
     ///

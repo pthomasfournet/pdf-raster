@@ -1,6 +1,6 @@
 //! PDF colour space and colour value conversions.
 //!
-//! Maps PDF colour operator values (f64 in [0,1]) to raw u8 pixel components
+//! Maps PDF colour operator values (f64 in `[0,1]`) to raw u8 pixel components
 //! understood by the raster crate.
 //!
 //! Pure conversion functions (`gray_to_u8`, `rgb_to_bytes`, `cmyk_to_rgb_bytes`)

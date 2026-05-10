@@ -11,10 +11,10 @@
 //!
 //! 1. **Downsample** the image 4× (box average) to reduce computation.
 //! 2. **Coarse sweep**: evaluate the differential-square-sum score at
-//!    [`SWEEP_STEPS`] evenly-spaced angles in ±[`MAX_SEARCH_DEG`] using
+//!    `SWEEP_STEPS` evenly-spaced angles in ±`MAX_SEARCH_DEG` using
 //!    Rayon parallel iteration (each angle is independent).
 //! 3. **Refinement**: starting from the best coarse angle, shrink the search
-//!    interval repeatedly until half-width < [`REFINE_STOP_DEG`].
+//!    interval repeatedly until half-width < `REFINE_STOP_DEG`.
 //!
 //! # Score function
 //!
@@ -29,7 +29,7 @@
 //! At 4× downsampling a 300 DPI A4 page (2550×3300) becomes 638×825.
 //! The inner loop scatters foreground weights into a `u32` row-sum array using
 //! data-dependent indices (not auto-vectorisable).  Rayon distributes the
-//! [`SWEEP_STEPS`] independent angle evaluations across available cores; the
+//! `SWEEP_STEPS` independent angle evaluations across available cores; the
 //! 9900X3D's 96 MB V-Cache keeps the downsampled source image warm across all
 //! sweep iterations.
 
@@ -39,7 +39,7 @@ use rayon::prelude::*;
 
 use super::MAX_SEARCH_DEG;
 
-/// Number of candidate angles in the coarse sweep (covers ±[`MAX_SEARCH_DEG`]).
+/// Number of candidate angles in the coarse sweep (covers ±`MAX_SEARCH_DEG`).
 const SWEEP_STEPS: usize = 56; // ≈ 0.255° steps over 14° range
 
 /// Refinement stops when the half-interval width (`delta`) falls below this.
