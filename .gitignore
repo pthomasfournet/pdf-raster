@@ -94,3 +94,5 @@ ROADMAP_INTEL.md
 # /audit/ holds review findings whose fix is too large for the commit at hand
 # but worth not losing.  Stays local; not part of the project's published docs.
 /audit/
+mutants.out/
+mutants.out.old/

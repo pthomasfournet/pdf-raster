@@ -89,17 +89,6 @@ impl TransferLut {
         self.0[v as usize]
     }
 
-    /// Apply the LUT in-place to every byte in `row`.
-    ///
-    /// An empty slice is a no-op.  The slice may span multiple channels;
-    /// callers that want per-channel application must stride through the slice
-    /// themselves.
-    pub fn apply_row(&self, row: &mut [u8]) {
-        for b in &mut *row {
-            *b = self.apply(*b);
-        }
-    }
-
     /// Produce a new LUT where `output[i] = 255 - self[255 - i]`.
     ///
     /// Used by `GraphicsState::set_transfer` to derive the CMYK LUTs from the
@@ -218,25 +207,6 @@ mod tests {
         for i in 0u8..=255 {
             assert_eq!(lut.apply(i), i, "IDENTITY should map {i} to {i}");
         }
-    }
-
-    // ── apply_row ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn apply_row_identity_passthrough() {
-        let lut = TransferLut::IDENTITY;
-        let mut row: Vec<u8> = (0..=255).collect();
-        let original = row.clone();
-        lut.apply_row(&mut row);
-        assert_eq!(row, original);
-    }
-
-    #[test]
-    fn apply_row_empty_is_noop() {
-        let lut = TransferLut::IDENTITY;
-        let mut row: Vec<u8> = Vec::new();
-        lut.apply_row(&mut row); // must not panic and must leave row empty
-        assert!(row.is_empty());
     }
 
     // ── invert_complement ───────────────────────────────────────────────────
