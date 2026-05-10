@@ -5,8 +5,8 @@
 //! - [`fill`] — non-zero winding fill
 //! - [`eo_fill`] — even-odd fill
 //!
-//! Both entry points are thin wrappers around [`fill_impl`] which does
-//! the actual work: build `XPath` → optionally AA-scale → build
+//! Both entry points are thin wrappers around the private `fill_impl` which
+//! does the actual work: build `XPath` → optionally AA-scale → build
 //! `XPathScanner` → walk spans → clip → `pipe::render_span`.
 //!
 //! # AA (vector antialias) mode
@@ -18,8 +18,9 @@
 //!
 //! # Parallel fill
 //!
-//! Rayon-parallel variants ([`fill_parallel`], [`eo_fill_parallel`]) live in
-//! [`parallel`] and are re-exported here when the `rayon` feature is enabled.
+//! Rayon-parallel variants `fill_parallel` / `eo_fill_parallel` live in a
+//! private `parallel` submodule and are re-exported here when the `rayon`
+//! feature is enabled.
 //!
 //! # C++ equivalent
 //! `Splash::fillWithPattern` (Splash.cc ~line 2382).

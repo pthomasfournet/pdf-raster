@@ -12,7 +12,7 @@
 //! # Sub-modules
 //!
 //! Path-level helpers (flattening, dashing, outline expansion) live in
-//! [`path`] and are re-exported here for a flat public API.
+//! the private `path` submodule and are re-exported here for a flat public API.
 //!
 //! # C++ correspondence
 //!

@@ -305,7 +305,7 @@ pub fn apply_separable(mode: BlendMode, src: &[u8], dst: &[u8], out: &mut [u8]) 
 ///
 /// `src` and `dst` are in additive space — CMYK callers convert first
 /// (`255 - channel`).  Only the three components are blended; the caller
-/// handles channel [3] (K/alpha) separately.
+/// handles channel `[3]` (K/alpha) separately.
 ///
 /// # Panics
 ///

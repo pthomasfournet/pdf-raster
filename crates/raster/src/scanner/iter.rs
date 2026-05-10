@@ -1,6 +1,6 @@
 //! Coalescing span iterator over a scanner's intersection row.
 //!
-//! [`ScanIterator`] mirrors `SplashXPathScanIterator::getNextSpan` from
+//! [`crate::ScanIterator`] mirrors `SplashXPathScanIterator::getNextSpan` from
 //! `splash/SplashXPathScanner.cc`. It merges adjacent and overlapping
 //! intersections into contiguous `(x0, x1)` spans (inclusive) and handles
 //! both even-odd and non-zero winding fill rules via the `eo_mask`.

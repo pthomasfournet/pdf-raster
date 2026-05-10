@@ -27,7 +27,7 @@ use raster::types::BlendMode;
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 /// Re-exported from [`gpu::nvjpeg`] for callers that enable the `nvjpeg` feature.
 /// Create via [`gpu::nvjpeg::NvJpegDecoder::new`] with a raw `CUstream` handle,
-/// then pass to [`PageRenderer::set_nvjpeg`].
+/// then pass to the page renderer's `set_nvjpeg` configuration entry point.
 #[cfg(feature = "nvjpeg")]
 pub use gpu::nvjpeg::NvJpegDecoder;
 pub use image::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageDescriptor, ImageFilter, resolve_image};

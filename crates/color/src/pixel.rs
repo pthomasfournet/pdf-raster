@@ -368,7 +368,7 @@ impl AnyColor {
     /// | `Mono1` | `bytes[0] = 0xFF` — all 8 bits set = all pixels white (MSB-first packed format) |
     /// | `Mono8` | `bytes[0] = 255` |
     /// | `Rgb8`, `Bgr8` | `bytes[0..3] = [255, 255, 255]` |
-    /// | `Xbgr8` | `bytes[0..4] = [255, 255, 255, 255]` — byte[3] is the ignored X/padding byte, set to 255 for consistency so the full 4-byte value reads as opaque white in any RGBA interpretation |
+    /// | `Xbgr8` | `bytes[0..4] = [255, 255, 255, 255]` — `byte[3]` is the ignored X/padding byte, set to 255 for consistency so the full 4-byte value reads as opaque white in any RGBA interpretation |
     /// | `Cmyk8`, `DeviceN8` | all bytes zero — CMYK white is zero ink on all channels |
     #[must_use]
     pub const fn white(mode: PixelMode) -> Self {

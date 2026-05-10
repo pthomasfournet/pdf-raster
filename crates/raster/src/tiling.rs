@@ -1,7 +1,7 @@
 //! Tiling pattern source for the compositing pipeline.
 //!
 //! [`TiledPattern`] holds a pre-rasterised tile bitmap and implements
-//! [`pipe::Pattern`] by repeating the tile across device space using modular
+//! [`crate::Pattern`] by repeating the tile across device space using modular
 //! arithmetic.  One tile is computed once and then referenced immutably during
 //! the fill/stroke operation.
 

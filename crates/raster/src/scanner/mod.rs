@@ -1,8 +1,8 @@
 //! Scanline intersection lists for path fill and clip.
 //!
 //! [`XPathScanner`] converts an [`XPath`] edge table into per-scanline
-//! intersection spans, which are then consumed by [`ScanIterator`] to emit
-//! `(x0, x1)` spans for compositing.
+//! intersection spans, which are then consumed by `ScanIterator` (a
+//! private iterator type) to emit `(x0, x1)` spans for compositing.
 //!
 //! ## Design vs. C++ original
 //!
@@ -86,7 +86,7 @@ pub struct Intersect {
 /// Per-scanline intersection table built from an [`XPath`].
 ///
 /// After construction the scanner is read-only; it is cheaply shareable via
-/// [`Arc`] (matching the C++ `shared_ptr<SplashXPathScanner>` used in `SplashClip`).
+/// `Arc` (matching the C++ `shared_ptr<SplashXPathScanner>` used in `SplashClip`).
 ///
 /// ## `SoA` layout invariant
 ///

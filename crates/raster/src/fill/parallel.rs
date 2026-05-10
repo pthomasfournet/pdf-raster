@@ -24,7 +24,7 @@ pub const PARALLEL_FILL_MIN_HEIGHT: u32 = 256;
 /// Non-zero winding fill, parallelized across horizontal bands using rayon.
 ///
 /// Only activated when `n_bands > 1` and the fill Y range spans at least
-/// [`PARALLEL_FILL_MIN_HEIGHT`] rows.  Falls back to sequential [`fill`] otherwise.
+/// [`PARALLEL_FILL_MIN_HEIGHT`] rows.  Falls back to sequential [`super::fill`] otherwise.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors fill API; all params necessary"
@@ -57,7 +57,7 @@ pub fn fill_parallel<P: Pixel + Send>(
 /// Even-odd fill, parallelized across horizontal bands using rayon.
 ///
 /// Only activated when `n_bands > 1` and the fill Y range spans at least
-/// [`PARALLEL_FILL_MIN_HEIGHT`] rows.  Falls back to sequential [`eo_fill`] otherwise.
+/// [`PARALLEL_FILL_MIN_HEIGHT`] rows.  Falls back to sequential [`super::eo_fill`] otherwise.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors eo_fill API; all params necessary"

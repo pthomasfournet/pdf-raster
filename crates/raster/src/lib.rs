@@ -21,7 +21,7 @@
 //! - [`bitmap`] — [`Bitmap<P>`] and [`AaBuf`]
 //! - [`path`] — [`Path`], [`PathBuilder`], Bezier flattening, stroke adjustment
 //! - [`xpath`] — [`XPath`] edge table (flattened, matrix-transformed segments)
-//! - [`scanner`] — [`XPathScanner`] and [`ScanIterator`] (scanline span emission)
+//! - [`scanner`] — [`XPathScanner`] and [`crate::ScanIterator`] (scanline span emission)
 //! - [`clip`] — [`Clip`] (rect + arbitrary path clip stack)
 //! - [`screen`] — [`HalftoneScreen`] (Bayer / stochastic threshold matrix)
 //! - [`state`] — [`GraphicsState`] and [`StateStack`]

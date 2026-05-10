@@ -465,7 +465,7 @@ impl<'doc> PageRenderer<'doc> {
     /// (`alloc → upload → record_* → submit → wait → download`) on the
     /// Vulkan recorder rather than the CUDA `GpuCtx`.  The CUDA path is
     /// not removed; it remains live for sessions opened with
-    /// [`BackendPolicy::Auto`] / [`BackendPolicy::ForceCuda`].
+    /// `BackendPolicy::Auto` / `BackendPolicy::ForceCuda` (defined in `pdf_raster`).
     ///
     /// The Phase 9 device-resident image cache (`DeviceImageCache`,
     /// `DevicePageBuffer`) is CUDA-only — under Vulkan the renderer

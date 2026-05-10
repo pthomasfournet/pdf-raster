@@ -135,7 +135,7 @@ impl FontFace {
         })
     }
 
-    /// Rasterize glyph `char_code` and return a [`GlyphBitmap`].
+    /// Rasterize glyph `char_code` and return a `GlyphBitmap` (defined in `crate::glyph`).
     ///
     /// Mirrors `SplashFTFont::makeGlyph`.
     ///

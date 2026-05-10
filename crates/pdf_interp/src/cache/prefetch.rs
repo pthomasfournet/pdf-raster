@@ -214,8 +214,8 @@ impl Drop for PrefetchHandle {
 /// `Document` is `Send + Sync` and the cache is internally
 /// thread-safe, so handing `Arc`s to multiple workers is safe.
 /// Discovery dedupes via a single-threaded `HashSet<ObjId>` local
-/// to [`discover_pages`]; an image referenced from many pages is
-/// only decoded once.
+/// to a private `discover_pages` helper; an image referenced from
+/// many pages is only decoded once.
 ///
 /// # Panics
 ///

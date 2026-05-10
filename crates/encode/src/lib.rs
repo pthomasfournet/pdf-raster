@@ -1,4 +1,4 @@
-//! Image encoding — write [`Bitmap<P>`] to PPM, PGM, PBM, and PNG.
+//! Image encoding — write a `raster::Bitmap<P>` to PPM, PGM, PBM, and PNG.
 //!
 //! # Supported formats
 //!

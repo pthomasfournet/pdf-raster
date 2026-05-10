@@ -21,8 +21,8 @@
 
 use crate::types::splash_round;
 
-/// An axis-aligned stroke-adjust hint, derived from a [`StrokeAdjustHint`]
-/// after path transformation.
+/// An axis-aligned stroke-adjust hint, derived from a `StrokeAdjustHint`
+/// (see `crate::path::stroke`) after path transformation.
 ///
 /// Matches `SplashXPathAdjust` in `splash/SplashXPath.cc`.
 ///

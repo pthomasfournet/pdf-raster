@@ -25,14 +25,14 @@ const MITER_NEARLY_STRAIGHT: f64 = 0.999_9;
 ///
 /// Mirrors `Splash::flattenPath` (~line 2100 of `Splash.cc`).
 ///
-/// Control-point triples (flagged [`PathFlags::CURVE`]) are replaced by a
-/// sequence of straight-line endpoints computed by adaptive De Casteljau
+/// Control-point triples (flagged [`crate::PathFlags::CURVE`]) are replaced by
+/// a sequence of straight-line endpoints computed by adaptive De Casteljau
 /// subdivision (implemented in [`crate::path::flatten::flatten_curve`]).
 ///
 /// The resulting path contains only `FIRST`, `LAST`, and `CLOSED` flags —
 /// no `CURVE` points remain.
 ///
-/// Note: the `matrix` and `flatness` parameters are used by [`XPath`] internally
+/// Note: the `matrix` and `flatness` parameters are used by [`crate::XPath`] internally
 /// for device-space deviation; however, `flattenPath` in Splash does its
 /// subdivision in **user space** against `flatness²` without a matrix transform.
 /// We match that behaviour: the flatness is passed through unchanged.
