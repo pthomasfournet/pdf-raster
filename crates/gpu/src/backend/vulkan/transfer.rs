@@ -176,9 +176,10 @@ impl TransferContext {
             return Ok(());
         }
         if !size.is_multiple_of(4) {
-            return Err(BackendError::msg(format!(
-                "fill_zero: buffer size ({size}) must be a multiple of 4 for vkCmdFillBuffer"
-            )));
+            return Err(BackendError::UnalignedFill {
+                size,
+                required_alignment: 4,
+            });
         }
         let dst_handle = dst.handle();
         self.run_one_shot(|cmd| {

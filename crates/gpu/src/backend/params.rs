@@ -55,54 +55,36 @@ impl<B: GpuBackend + ?Sized> BlitParams<'_, B> {
     /// # Errors
     /// Returns a `BackendError` if any documented invariant is violated.
     pub fn validate(&self) -> super::Result<()> {
+        const KIND: &str = "BlitInvariantViolation";
+        let invariant =
+            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
         if self.src_w == 0 || self.src_h == 0 {
-            return Err(super::BackendError::new(BlitInvariantViolation(
-                "src dimensions must be > 0",
-            )));
+            return Err(invariant("src dimensions must be > 0"));
         }
         if self.dst_w == 0 || self.dst_h == 0 {
-            return Err(super::BackendError::new(BlitInvariantViolation(
-                "dst dimensions must be > 0",
-            )));
+            return Err(invariant("dst dimensions must be > 0"));
         }
         let [x0, y0, x1, y1] = self.bbox;
         if x0 > x1 || y0 > y1 {
-            return Err(super::BackendError::new(BlitInvariantViolation(
-                "bbox must satisfy x0 <= x1 and y0 <= y1",
-            )));
+            return Err(invariant("bbox must satisfy x0 <= x1 and y0 <= y1"));
         }
         if !self.page_h.is_finite() || self.page_h <= 0.0 {
-            return Err(super::BackendError::new(BlitInvariantViolation(
-                "page_h must be finite and > 0",
-            )));
+            return Err(invariant("page_h must be finite and > 0"));
         }
         if !self.inv_ctm.iter().all(|c| c.is_finite()) {
-            return Err(super::BackendError::new(BlitInvariantViolation(
-                "inv_ctm must contain only finite coefficients",
-            )));
+            return Err(invariant("inv_ctm must contain only finite coefficients"));
         }
         // src_layout: 0 = RGB, 1 = Gray. Anything else (especially 2 = Mask)
         // would fall through the kernel's `if (src_layout == 0) { RGB } else { Gray }`
         // dispatch and silently produce wrong pixels.
         if self.src_layout > 1 {
-            return Err(super::BackendError::new(BlitInvariantViolation(
+            return Err(invariant(
                 "src_layout must be 0 (RGB) or 1 (Gray); Mask layout is CPU-only",
-            )));
+            ));
         }
         Ok(())
     }
 }
-
-#[derive(Debug)]
-struct BlitInvariantViolation(&'static str);
-
-impl std::fmt::Display for BlitInvariantViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BlitParams invariant: {}", self.0)
-    }
-}
-
-impl std::error::Error for BlitInvariantViolation {}
 
 /// Parameters for a GPU antialiased fill pass.
 pub struct AaFillParams<'a, B: GpuBackend + ?Sized> {

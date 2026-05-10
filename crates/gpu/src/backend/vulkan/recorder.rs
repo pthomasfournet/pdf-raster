@@ -520,10 +520,10 @@ impl PageRecorder {
             )));
         }
         if s.desc_sets_in_flight >= MAX_DESC_SETS_PER_PAGE {
-            return Err(BackendError::msg(format!(
-                "descriptor pool exhausted: {} sets allocated this page (max {})",
-                s.desc_sets_in_flight, MAX_DESC_SETS_PER_PAGE
-            )));
+            return Err(BackendError::DescriptorPoolExhausted {
+                allocated: s.desc_sets_in_flight,
+                max: MAX_DESC_SETS_PER_PAGE,
+            });
         }
 
         // Allocate one descriptor set from the per-page pool.

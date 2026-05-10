@@ -20,32 +20,71 @@ pub mod vulkan;
 use std::error::Error;
 use std::fmt;
 
-/// A backend-agnostic error type that wraps any `Error + Send + Sync`.
+/// A backend-agnostic error type.
 ///
-/// The inner `Box<dyn Error + Send + Sync>` carries the original backend-specific
-/// error. [`Display`](fmt::Display) delegates to the inner error directly;
-/// [`Error::source`] returns `None` because the inner message is already part of
-/// the `Display` output — exposing it via `source` would cause `{:#}`
-/// alternate-display to print the message twice. Mirrors the `GpuDecodeError`
-/// pattern in `crate::traits`.
+/// Variants exist for conditions that tests assert on (`matches!`) or
+/// that benefit from typed log clarity. The long tail of errors goes
+/// through [`BackendError::Other`] — Vulkan FFI failures, allocator
+/// errors, init failures, numeric overflow, and free-form messages
+/// constructed via [`BackendError::msg`].
+///
+/// `Display` is hand-rolled per variant; `Error::source` returns
+/// `Some(&inner)` only for `Other` (typed variants are themselves the
+/// source).
 #[derive(Debug)]
-pub struct BackendError(Box<dyn Error + Send + Sync + 'static>);
+pub enum BackendError {
+    /// `alloc_*` was called with `size = 0`. `what` names the allocator
+    /// (`"alloc_device"`, `"alloc_host_pinned"`, `"alloc_device_zeroed"`).
+    ZeroSizeAlloc {
+        /// Name of the rejecting allocator entry point, for diagnostic context.
+        what: &'static str,
+    },
+    /// `vkCmdFillBuffer` requires a 4-byte-aligned size; `alloc_device_zeroed`
+    /// (and other fill paths) surface this loudly rather than silently
+    /// downgrading and leaving 1–3 trailing bytes non-zero.
+    UnalignedFill {
+        /// The offending size in bytes.
+        size: u64,
+        /// The backend's required alignment (always `4` for `vkCmdFillBuffer`).
+        required_alignment: u64,
+    },
+    /// Recorder cap on descriptor sets per page was reached. `max` is the
+    /// production limit (`MAX_DESC_SETS_PER_PAGE`).
+    DescriptorPoolExhausted {
+        /// Number of descriptor sets already allocated this page.
+        allocated: u32,
+        /// The backend's per-page cap.
+        max: u32,
+    },
+    /// A `*Params::validate` invariant failed. `kind` names which
+    /// invariant family (`"BlitInvariantViolation"`, …); `detail` is
+    /// the human-readable "why".
+    InvariantViolation {
+        /// Stable name of the invariant family for `matches!` ergonomics.
+        kind: &'static str,
+        /// Human-readable description of the specific violation.
+        detail: &'static str,
+    },
+    /// Catch-all for any other backend error: Vulkan FFI failures,
+    /// allocator errors, init failures, numeric overflow, free-form
+    /// `BackendError::msg(...)`. `source()` returns the inner error.
+    Other(Box<dyn Error + Send + Sync + 'static>),
+}
 
 impl BackendError {
-    /// Wrap an arbitrary error as a `BackendError`.
+    /// Wrap an arbitrary error as a `BackendError::Other`.
     pub fn new<E: Error + Send + Sync + 'static>(e: E) -> Self {
-        Self(Box::new(e))
+        Self::Other(Box::new(e))
     }
 
-    /// Build a `BackendError` from a free-form message.
+    /// Build a `BackendError::Other` from a free-form message.
     ///
     /// Convenience for callsites that don't have an underlying [`Error`]
-    /// to wrap — typically backend invariants ('feature X not enabled',
-    /// 'malformed input length'). `Display` for the resulting error
-    /// prints the message verbatim.
+    /// to wrap and don't fit any typed variant. Routes through `Other`,
+    /// so `source()` returns the carrier.
     #[must_use]
     pub fn msg(message: impl Into<String>) -> Self {
-        Self(Box::new(MsgError(message.into())))
+        Self::Other(Box::new(MsgError(message.into())))
     }
 }
 
@@ -64,12 +103,35 @@ impl Error for MsgError {}
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Delegate directly — no prefix — so the inner message is the full message.
-        fmt::Display::fmt(&self.0, f)
+        match self {
+            Self::ZeroSizeAlloc { what } => {
+                write!(f, "{what} called with size = 0; backends require size > 0")
+            }
+            Self::UnalignedFill {
+                size,
+                required_alignment,
+            } => write!(
+                f,
+                "fill size {size} is not a multiple of {required_alignment}"
+            ),
+            Self::DescriptorPoolExhausted { allocated, max } => write!(
+                f,
+                "descriptor pool exhausted: {allocated} sets allocated this page (max {max})"
+            ),
+            Self::InvariantViolation { kind, detail } => write!(f, "{kind}: {detail}"),
+            Self::Other(e) => fmt::Display::fmt(e, f),
+        }
     }
 }
 
-impl Error for BackendError {}
+impl Error for BackendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Other(e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
 
 /// Convenience alias for `Result<T, BackendError>`.
 pub type Result<T> = std::result::Result<T, BackendError>;
@@ -79,27 +141,12 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 /// Both Vulkan (`vkAllocateMemory` rejects 0) and CUDA (`cuMemAlloc(0)` returns
 /// `CUDA_ERROR_INVALID_VALUE`) refuse zero-size allocations; pre-checking gives
 /// a uniform, callable-side error rather than a driver-specific status.
-pub(crate) fn reject_zero_size(size: usize, what: &'static str) -> Result<()> {
+pub(crate) const fn reject_zero_size(size: usize, what: &'static str) -> Result<()> {
     if size == 0 {
-        return Err(BackendError::new(ZeroSizeAlloc(what)));
+        return Err(BackendError::ZeroSizeAlloc { what });
     }
     Ok(())
 }
-
-#[derive(Debug)]
-struct ZeroSizeAlloc(&'static str);
-
-impl fmt::Display for ZeroSizeAlloc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} called with size = 0; backends require size > 0",
-            self.0
-        )
-    }
-}
-
-impl Error for ZeroSizeAlloc {}
 
 /// Live VRAM budget snapshot returned by `GpuBackend::detect_vram_budget`.
 ///

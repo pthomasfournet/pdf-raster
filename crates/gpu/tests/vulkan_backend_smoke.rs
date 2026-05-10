@@ -10,8 +10,8 @@
 
 #![cfg(feature = "vulkan")]
 
-use gpu::backend::GpuBackend;
 use gpu::backend::vulkan::VulkanBackend;
+use gpu::backend::{BackendError, GpuBackend};
 
 #[test]
 fn vulkan_backend_initialises() {
@@ -45,8 +45,15 @@ fn vulkan_backend_alloc_zero_size_rejected() {
     let err = backend
         .alloc_device(0)
         .expect_err("alloc_device(0) must be rejected");
-    let msg = err.to_string();
-    assert!(msg.contains("size = 0"), "unexpected error message: {msg}");
+    assert!(
+        matches!(
+            err,
+            BackendError::ZeroSizeAlloc {
+                what: "alloc_device"
+            }
+        ),
+        "expected ZeroSizeAlloc {{ what: \"alloc_device\" }}, got: {err:?}",
+    );
 }
 
 /// Allocate a zeroed device buffer, download into a sentinel-filled
@@ -118,11 +125,11 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
 
     // Keep in sync with `MAX_DESC_SETS_PER_PAGE` in
     // crates/gpu/src/backend/vulkan/recorder.rs (private constant).
-    // The test parses the production error message below and asserts
-    // the embedded `max` value equals this — so a production bump
+    // The let-else below destructures `BackendError::DescriptorPoolExhausted`
+    // and asserts the production `max` field equals this — a production bump
     // without updating PER_PAGE_MAX fails loudly instead of silently
     // passing through the loop.
-    const PER_PAGE_MAX: usize = 64;
+    const PER_PAGE_MAX: u32 = 64;
     const N_PIXELS: u32 = 4;
     const BUF_BYTES: usize = (N_PIXELS as usize) * gpu::RGBA_BPP;
 
@@ -146,23 +153,17 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
             dst: &dst,
             n_pixels: N_PIXELS,
         })
-        .expect_err("65th record_composite must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("descriptor pool exhausted"),
-        "expected exhaustion error, got: {msg}"
-    );
-    // Self-check PER_PAGE_MAX against production's actual limit, parsed
-    // from the error format:
-    //   "descriptor pool exhausted: 64 sets allocated this page (max 64)"
-    let production_max: usize = msg
-        .rsplit_once("(max ")
-        .and_then(|(_, tail)| tail.split_once(')'))
-        .and_then(|(num, _)| num.parse().ok())
-        .unwrap_or_else(|| panic!("could not parse production max from error: {msg}"));
+        .expect_err("record_composite past the cap must be rejected");
+    let BackendError::DescriptorPoolExhausted { allocated, max } = err else {
+        panic!("expected DescriptorPoolExhausted, got: {err:?}");
+    };
     assert_eq!(
-        production_max, PER_PAGE_MAX,
-        "test PER_PAGE_MAX is out of sync with production MAX_DESC_SETS_PER_PAGE"
+        allocated, PER_PAGE_MAX,
+        "exhaustion should report the cap as the count already in flight",
+    );
+    assert_eq!(
+        max, PER_PAGE_MAX,
+        "test PER_PAGE_MAX is out of sync with production MAX_DESC_SETS_PER_PAGE",
     );
 
     // Recorder state stayed Recording (the rejected call exited before
@@ -196,10 +197,15 @@ fn vulkan_backend_alloc_device_zeroed_rejects_unaligned_size() {
     let err = backend
         .alloc_device_zeroed(17)
         .expect_err("alloc_device_zeroed(17) must be rejected (size not multiple of 4)");
-    let msg = err.to_string();
     assert!(
-        msg.contains("multiple of 4"),
-        "expected alignment error, got: {msg}"
+        matches!(
+            err,
+            BackendError::UnalignedFill {
+                size: 17,
+                required_alignment: 4
+            }
+        ),
+        "expected UnalignedFill {{ size: 17, required_alignment: 4 }}, got: {err:?}",
     );
 }
 
