@@ -698,7 +698,7 @@ mod tests {
         ];
         assert_eq!(cmyk.len(), 64, "test vector must be exactly 16 pixels");
 
-        let mut scalar_rgb = vec![0u8; 48];
+        let mut scalar_rgb = [0u8; 48];
         for (src, dst) in cmyk.chunks_exact(4).zip(scalar_rgb.chunks_exact_mut(3)) {
             let (r, g, b) = color::convert::cmyk_to_rgb_reflectance(src[0], src[1], src[2], src[3]);
             dst[0] = r;
@@ -724,9 +724,9 @@ mod tests {
     fn icc_cmyk_matrix_tail_pixels() {
         // 5 pixels: AVX-512 processes 0 full chunks (< 16), NEON processes 0 (< 8).
         // All 5 pixels fall into the scalar tail on every arch.
-        let cmyk: Vec<u8> = (0..5)
+        let cmyk: Vec<u8> = (0u8..5)
             .flat_map(|i| {
-                let v = (i * 50) as u8;
+                let v = i.wrapping_mul(50);
                 [
                     v,
                     v.wrapping_add(10),
@@ -801,29 +801,40 @@ mod tests {
             super::cmyk_to_rgb_avx2(
                 cmyk.as_slice().try_into().expect("exactly 32 bytes"),
                 &mut got,
-            )
-        };
+            );
+        }
         assert_eq!(got, expected, "AVX2 CMYK→RGB mismatch");
     }
 
     #[test]
     fn icc_cmyk_clut_identity_corners() {
         // 2^4 = 16-node CLUT where output = matrix formula at corners.
-        let g: usize = 2;
-        let mut table = vec![0u8; g * g * g * g * 3];
-        for ki in 0..g {
-            for ci in 0..g {
-                for mi in 0..g {
-                    for yi in 0..g {
-                        let idx = (ki * g * g * g + ci * g * g + mi * g + yi) * 3;
-                        let c = (ci * 255) as u8;
-                        let m = (mi * 255) as u8;
-                        let y = (yi * 255) as u8;
-                        let k = (ki * 255) as u8;
+        const G: u8 = 2;
+        let g_usize = G as usize;
+        let mut table = vec![0u8; g_usize * g_usize * g_usize * g_usize * 3];
+        for ki in 0..G {
+            for ci in 0..G {
+                for mi in 0..G {
+                    for yi in 0..G {
+                        let idx = (usize::from(ki) * g_usize * g_usize * g_usize
+                            + usize::from(ci) * g_usize * g_usize
+                            + usize::from(mi) * g_usize
+                            + usize::from(yi))
+                            * 3;
+                        // ki/ci/mi/yi ∈ {0, 1}; * 255 ∈ {0, 255} — fits in u8.
+                        let c = ci * 255;
+                        let m = mi * 255;
+                        let y = yi * 255;
+                        let k = ki * 255;
                         let inv_k = u32::from(255 - k);
-                        table[idx] = ((u32::from(255 - c) * inv_k) / 255) as u8;
-                        table[idx + 1] = ((u32::from(255 - m) * inv_k) / 255) as u8;
-                        table[idx + 2] = ((u32::from(255 - y) * inv_k) / 255) as u8;
+                        // Each `((255 - x) * inv_k) / 255` ∈ [0, 255]; `try_into`
+                        // makes the bound explicit so the lint stays satisfied.
+                        table[idx] = u8::try_from((u32::from(255 - c) * inv_k) / 255)
+                            .expect("by construction <=255");
+                        table[idx + 1] = u8::try_from((u32::from(255 - m) * inv_k) / 255)
+                            .expect("by construction <=255");
+                        table[idx + 2] = u8::try_from((u32::from(255 - y) * inv_k) / 255)
+                            .expect("by construction <=255");
                     }
                 }
             }

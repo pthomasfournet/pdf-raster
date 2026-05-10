@@ -160,8 +160,15 @@ pub trait GpuBackend: Send + Sync {
     type DeviceBuffer: Send + Sync;
     /// An opaque host-pinned buffer handle.
     type HostBuffer: Send + Sync;
-    /// A synchronisation primitive returned by `submit_page` / `upload_async`.
-    type PageFence: Send + Sync;
+    /// A synchronisation primitive returned by `submit_page` /
+    /// `submit_transfer` / `upload_async`.
+    ///
+    /// `Clone` is required so callers can stash a fence inside a long-
+    /// lived structure (e.g. `DeviceImageCache` keeps one per cached
+    /// image to gate `free_device` until the last in-flight DMA
+    /// completes) while a separate render path also waits on it.
+    /// CUDA wraps `Arc<cudaEvent_t>`; Vulkan wraps `Arc<VkFence>`.
+    type PageFence: Send + Sync + Clone;
 
     /// Allocate `size` bytes of device memory.
     ///
@@ -174,12 +181,46 @@ pub trait GpuBackend: Send + Sync {
     /// Returns `BackendError` if `size == 0`, or if the device allocation fails
     /// (OOM or driver error).
     fn alloc_device(&self, size: usize) -> Result<Self::DeviceBuffer>;
-    /// Free a device buffer previously returned by `alloc_device`.
+
+    /// Allocate `size` bytes of device memory and zero-initialise them.
     ///
-    /// The caller must ensure no outstanding `PageFence` still references this
-    /// buffer. Calling `wait_page` on every fence the buffer participated in
-    /// before `free_device` is always safe; the backend may otherwise treat
-    /// such a call as undefined behaviour or a panic.
+    /// The buffer is **eventually zero**: backends that fill on a
+    /// transfer queue (Vulkan) make the zero-fill async, so callers
+    /// that read the buffer must `wait_page` (or `wait_transfer`) on
+    /// the next submission before assuming the contents are zero.
+    /// Backends that fill synchronously (CUDA `cuMemsetD8`) over-
+    /// deliver this contract.
+    ///
+    /// `DevicePageBuffer` relies on this: every page allocates a fresh
+    /// zeroed RGBA8 buffer that the blit kernel only writes touched
+    /// pixels into; reading `(0,0,0,0)` from un-touched pixels is the
+    /// "transparent" signal for the host-side composite.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if `size == 0`, or if the allocation /
+    /// zero-fill fails.
+    fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer>;
+
+    /// Byte length of a device buffer previously returned by
+    /// `alloc_device` / `alloc_device_zeroed`.
+    ///
+    /// Exposed so generic callers (e.g. `DeviceImageCache`) can size
+    /// transfers without holding a parallel length field per entry.
+    fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize;
+
+    /// Free a device buffer previously returned by `alloc_device` or
+    /// `alloc_device_zeroed`.
+    ///
+    /// **Deferred-free contract:** the caller must ensure no
+    /// outstanding `PageFence` (from `upload_async`, `download_async`,
+    /// `submit_transfer`, or `submit_page`) still references this
+    /// buffer. CUDA's stream-recorded events make a same-stream free
+    /// always safe; Vulkan has no equivalent and `vkDestroyBuffer`
+    /// while a copy is in-flight is undefined behaviour. Calling
+    /// `wait_page` (or `wait_transfer`) on every fence the buffer
+    /// participated in before `free_device` is always safe; the
+    /// backend may otherwise treat such a call as undefined behaviour
+    /// or a panic.
     fn free_device(&self, buf: Self::DeviceBuffer);
 
     /// Allocate `size` bytes of host-pinned (DMA-accessible) memory.
@@ -193,10 +234,10 @@ pub trait GpuBackend: Send + Sync {
     fn alloc_host_pinned(&self, size: usize) -> Result<Self::HostBuffer>;
     /// Free a host-pinned buffer previously returned by `alloc_host_pinned`.
     ///
-    /// The caller must ensure no outstanding `PageFence` still references this
-    /// buffer. Calling `wait_page` on every fence the buffer participated in
-    /// before `free_host_pinned` is always safe; the backend may otherwise treat
-    /// such a call as undefined behaviour or a panic.
+    /// Same deferred-free contract as `free_device`: the caller must
+    /// ensure no outstanding `PageFence` (from `upload_async`,
+    /// `download_async`, `submit_transfer`, or `submit_page`) still
+    /// references this buffer.
     fn free_host_pinned(&self, buf: Self::HostBuffer);
 
     /// Begin accumulating GPU work for a new page.
@@ -251,16 +292,163 @@ pub trait GpuBackend: Send + Sync {
     /// `src.len()` must not exceed the device-side capacity of `dst`.
     /// Implementations should reject the call rather than truncate.
     ///
+    /// **Submission timing.** Vulkan accumulates the copy on the
+    /// transfer queue and does NOT submit until `submit_transfer` is
+    /// called; the returned fence still becomes valid at that point.
+    /// CUDA enqueues on the default stream, equivalent to immediate
+    /// submission. Either way, callers wait on the fence rather than
+    /// caring which model is in play.
+    ///
     /// # Errors
     /// Returns `BackendError` if the upload cannot be enqueued, or if
     /// `src.len()` exceeds `dst`'s device capacity.
     fn upload_async(&self, dst: &Self::DeviceBuffer, src: &[u8]) -> Result<Self::PageFence>;
+
+    /// Initiate an asynchronous device-to-host download; returns a
+    /// handle that ties the user-visible `dst` buffer's lifetime to the
+    /// in-flight DMA.
+    ///
+    /// On Vulkan the copy goes via a staging buffer on the
+    /// `TransferContext`'s host-visible heap; the device→staging copy
+    /// is on the GPU and the staging→`dst` memcpy happens lazily
+    /// inside [`Self::wait_download`]. CUDA performs `cuMemcpyDtoHAsync`
+    /// directly into `dst` and signals when the stream catches up.
+    ///
+    /// `src` must outlive the returned handle (the borrow checker
+    /// enforces this through the `'a` lifetime on `DownloadHandle`).
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the download cannot be enqueued, if
+    /// `dst.len()` exceeds `src`'s device length, or if the staging
+    /// buffer cannot be allocated.
+    fn download_async<'a>(
+        &self,
+        src: &'a Self::DeviceBuffer,
+        dst: &'a mut [u8],
+    ) -> Result<DownloadHandle<'a, Self>>
+    where
+        Self: Sized;
+
+    /// Block until a `DownloadHandle` completes; finalises the
+    /// staging→`dst` copy on backends that buffer the download.
+    ///
+    /// After this returns `Ok(())`, the `dst` buffer originally passed
+    /// to `download_async` contains the GPU bytes.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the underlying fence wait fails.
+    fn wait_download(&self, handle: DownloadHandle<'_, Self>) -> Result<()>
+    where
+        Self: Sized;
+
+    /// Submit any work accumulated by `upload_async`,
+    /// `download_async`, or `alloc_device_zeroed` on the transfer
+    /// queue/stream. Returns a fence whose signal indicates that all
+    /// transfers issued since the last `submit_transfer` have
+    /// completed.
+    ///
+    /// CUDA implementations may treat this as a no-op (default-stream
+    /// ordering already serialises the work) and return a freshly
+    /// recorded event. Vulkan implementations end and submit the
+    /// transfer command buffer here.
+    ///
+    /// Callers don't need to invoke this between `upload_async` and a
+    /// later `submit_page` that reads the same buffer — the per-page
+    /// recorder inserts the right cross-queue barriers. It exists for
+    /// the cache's bulk-promotion paths that need to flush a batch of
+    /// uploads/downloads without immediately consuming the result on
+    /// the compute queue.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the submission fails or no work is
+    /// pending (Vulkan can no-op-and-succeed in that case).
+    fn submit_transfer(&self) -> Result<Self::PageFence>;
+
+    /// Block the calling thread until a transfer fence (from
+    /// `upload_async`, `submit_transfer`, or `alloc_device_zeroed`)
+    /// signals.
+    ///
+    /// Distinct from `wait_page` only because Vulkan tracks the
+    /// transfer and graphics/compute queues independently — the same
+    /// `PageFence` type covers both, but the underlying fence may
+    /// belong to either queue's pool. CUDA implementations may treat
+    /// this as identical to `wait_page`.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the fence wait fails.
+    fn wait_transfer(&self, fence: Self::PageFence) -> Result<()>;
 
     /// Query the current VRAM budget from the driver.
     ///
     /// # Errors
     /// Returns `BackendError` if the driver query fails.
     fn detect_vram_budget(&self) -> Result<VramBudget>;
+}
+
+/// Handle returned by [`GpuBackend::download_async`] that owns the
+/// borrow on the user-visible destination slice for the duration of
+/// the in-flight DMA.
+///
+/// Drop-without-wait is safe but wasteful: the staging buffer is
+/// returned to the pool and the bytes never reach `dst`. Implementations
+/// must NOT panic on `Drop` even if the underlying fence has not
+/// signalled — instead, block-and-discard inside `Drop` so the staging
+/// resource always returns to the pool. (Callers who want the bytes
+/// must invoke [`GpuBackend::wait_download`] explicitly.)
+pub struct DownloadHandle<'a, B: GpuBackend + ?Sized> {
+    /// Backend-specific completion state. Boxed so `DownloadHandle`'s
+    /// size doesn't depend on the backend's internal completion type.
+    /// Only the Vulkan backend constructs and consumes it today; the
+    /// CUDA backend's `download_async` is `unimplemented!`, so without
+    /// `vulkan` the field is dead code.
+    #[cfg_attr(
+        not(feature = "vulkan"),
+        expect(
+            dead_code,
+            reason = "constructed by Vulkan; CUDA download path is not yet implemented"
+        )
+    )]
+    pub(crate) inner: Box<dyn DownloadInner + Send + Sync + 'a>,
+    /// `&'a mut [u8]` borrow witness — keeps the destination slice
+    /// borrowed for the handle's lifetime so the caller can't free or
+    /// reuse it while the DMA is in flight.
+    pub(crate) _borrow: std::marker::PhantomData<&'a mut [u8]>,
+    /// The fence the caller can stash to gate other operations.
+    /// Cloned out by `wait_download`; until then the handle owns a
+    /// reference for cancellation safety.
+    pub(crate) fence: B::PageFence,
+}
+
+impl<B: GpuBackend + ?Sized> DownloadHandle<'_, B> {
+    /// Borrow the fence so callers can stash it in a refcount-pinned
+    /// cache entry without moving the handle. The fence's `Clone` impl
+    /// (from the trait bound) makes this cheap.
+    #[must_use]
+    pub const fn fence(&self) -> &B::PageFence {
+        &self.fence
+    }
+}
+
+/// Backend-internal trait for the staging→dst memcpy a Vulkan
+/// download handle performs at completion. CUDA implementations can
+/// supply a no-op impl since `cuMemcpyDtoHAsync` writes directly into
+/// the user buffer.
+///
+/// `pub(crate)` because callers should never touch this — it exists to
+/// give `DownloadHandle::Drop` and `wait_download` a uniform shape
+/// across backends without exposing the staging buffer type.
+pub(crate) trait DownloadInner {
+    /// Block until the underlying transfer signals, then perform any
+    /// staging→dst memcpy the backend deferred. May be called once;
+    /// subsequent calls return `Ok(())` immediately.
+    #[cfg_attr(
+        not(feature = "vulkan"),
+        expect(
+            dead_code,
+            reason = "called by Vulkan's wait_download; CUDA download path is not yet implemented"
+        )
+    )]
+    fn finish(&mut self) -> Result<()>;
 }
 
 #[cfg(test)]

@@ -131,13 +131,16 @@ pub fn jpeg_sof_type(data: &[u8]) -> Option<JpegVariant> {
 mod tests {
     use super::*;
 
+    /// Build a minimal JPEG: SOI + one marker segment + EOI.
+    /// `payload.len()` must fit in `u16 - 2` (segment length includes the
+    /// length field itself); test payloads are tiny so `try_from`
+    /// `.expect` cleanly documents the fixture's bound.
     fn make_jpeg(marker: u8, payload: &[u8]) -> Vec<u8> {
-        let len = (payload.len() as u16) + 2;
+        let len = u16::try_from(payload.len() + 2).expect("payload too large for test fixture");
         let mut v = vec![0xFF, 0xD8];
         v.push(0xFF);
         v.push(marker);
-        v.push((len >> 8) as u8);
-        v.push((len & 0xFF) as u8);
+        v.extend_from_slice(&len.to_be_bytes());
         v.extend_from_slice(payload);
         v.push(0xFF);
         v.push(0xD9);
@@ -184,13 +187,15 @@ mod tests {
     #[test]
     fn skips_app_segments_before_sof() {
         let app0_payload = [0u8; 14];
-        let app0_len = (app0_payload.len() as u16) + 2;
+        let app0_len = u16::try_from(app0_payload.len() + 2).expect("test fixture <= u16");
         let sof0_payload = [8u8, 0, 1];
-        let sof0_len = (sof0_payload.len() as u16) + 2;
+        let sof0_len = u16::try_from(sof0_payload.len() + 2).expect("test fixture <= u16");
         let mut data = vec![0xFF, 0xD8];
-        data.extend_from_slice(&[0xFF, 0xE0, (app0_len >> 8) as u8, (app0_len & 0xFF) as u8]);
+        data.extend_from_slice(&[0xFF, 0xE0]);
+        data.extend_from_slice(&app0_len.to_be_bytes());
         data.extend_from_slice(&app0_payload);
-        data.extend_from_slice(&[0xFF, 0xC0, (sof0_len >> 8) as u8, (sof0_len & 0xFF) as u8]);
+        data.extend_from_slice(&[0xFF, 0xC0]);
+        data.extend_from_slice(&sof0_len.to_be_bytes());
         data.extend_from_slice(&sof0_payload);
         data.extend_from_slice(&[0xFF, 0xD9]);
         assert_eq!(jpeg_sof_type(&data), Some(JpegVariant::Baseline));
@@ -208,13 +213,15 @@ mod tests {
     fn skips_dqt_and_dht_before_sof() {
         // DQT (0xDB) with 2-byte payload, then SOF0 — verifies non-APP segments are skipped.
         let dqt_payload = [0u8; 2];
-        let dqt_len = (dqt_payload.len() as u16) + 2;
+        let dqt_len = u16::try_from(dqt_payload.len() + 2).expect("test fixture <= u16");
         let sof0_payload = [8u8, 0, 1];
-        let sof0_len = (sof0_payload.len() as u16) + 2;
+        let sof0_len = u16::try_from(sof0_payload.len() + 2).expect("test fixture <= u16");
         let mut data = vec![0xFF, 0xD8];
-        data.extend_from_slice(&[0xFF, 0xDB, (dqt_len >> 8) as u8, (dqt_len & 0xFF) as u8]);
+        data.extend_from_slice(&[0xFF, 0xDB]);
+        data.extend_from_slice(&dqt_len.to_be_bytes());
         data.extend_from_slice(&dqt_payload);
-        data.extend_from_slice(&[0xFF, 0xC0, (sof0_len >> 8) as u8, (sof0_len & 0xFF) as u8]);
+        data.extend_from_slice(&[0xFF, 0xC0]);
+        data.extend_from_slice(&sof0_len.to_be_bytes());
         data.extend_from_slice(&sof0_payload);
         data.extend_from_slice(&[0xFF, 0xD9]);
         assert_eq!(jpeg_sof_type(&data), Some(JpegVariant::Baseline));
@@ -224,9 +231,10 @@ mod tests {
     fn sos_before_sof_returns_other() {
         // Malformed: SOS (0xDA) before any SOF. Must return Other quickly, not scan entropy data.
         let sos_payload = [0x01u8, 0x01, 0x00, 0x00, 0x00]; // minimal scan header
-        let sos_len = (sos_payload.len() as u16) + 2;
+        let sos_len = u16::try_from(sos_payload.len() + 2).expect("test fixture <= u16");
         let mut data = vec![0xFF, 0xD8];
-        data.extend_from_slice(&[0xFF, 0xDA, (sos_len >> 8) as u8, (sos_len & 0xFF) as u8]);
+        data.extend_from_slice(&[0xFF, 0xDA]);
+        data.extend_from_slice(&sos_len.to_be_bytes());
         data.extend_from_slice(&sos_payload);
         data.extend_from_slice(&[0xFF, 0xD9]);
         assert_eq!(jpeg_sof_type(&data), Some(JpegVariant::Other));

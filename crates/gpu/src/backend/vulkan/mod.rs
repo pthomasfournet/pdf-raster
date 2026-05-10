@@ -117,6 +117,28 @@ impl GpuBackend for VulkanBackend {
         self.memory.alloc_device(size)
     }
 
+    fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer> {
+        reject_zero_size(size, "alloc_device_zeroed")?;
+        // Today: allocate then sync-zero via a host-side memcpy through
+        // upload_sync.  A future commit replaces this with vkCmdFillBuffer
+        // recorded on the transfer queue (faster, and lets the caller
+        // overlap zero-init with other transfers).  The trait contract
+        // says "eventually zero by next wait_transfer/wait_page" — the
+        // sync path over-delivers, same as CudaBackend.
+        let buf = self.memory.alloc_device(size)?;
+        let zeros = vec![0u8; size];
+        self.transfer.upload_sync(&self.memory, &buf, &zeros)?;
+        Ok(buf)
+    }
+
+    fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize {
+        // Vulkan stores sizes as u64 (vk::DeviceSize); the trait
+        // returns usize.  On 64-bit platforms (the only ones we
+        // support) the conversion is total; the saturating cast
+        // guards against silent truncation if a 32-bit build slips in.
+        usize::try_from(buf.size()).unwrap_or(usize::MAX)
+    }
+
     fn free_device(&self, buf: Self::DeviceBuffer) {
         self.memory.free_device(buf);
     }
@@ -176,6 +198,47 @@ impl GpuBackend for VulkanBackend {
         Ok(PageFence::immediate())
     }
 
+    fn download_async<'a>(
+        &self,
+        src: &'a Self::DeviceBuffer,
+        dst: &'a mut [u8],
+    ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
+        // Sync path today, mirroring upload_async.  The async path
+        // will record vkCmdCopyBuffer onto the transfer queue and
+        // defer the staging→dst memcpy to wait_download via
+        // DownloadInner::finish.  Until then we fulfil the contract
+        // by completing the work eagerly and returning a handle whose
+        // finish() is a no-op.
+        self.transfer.download_sync(&self.memory, src, dst)?;
+        Ok(crate::backend::DownloadHandle {
+            inner: Box::new(NoopDownloadInner),
+            _borrow: std::marker::PhantomData,
+            fence: PageFence::immediate(),
+        })
+    }
+
+    fn wait_download(&self, mut handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
+        handle.inner.finish()
+    }
+
+    fn submit_transfer(&self) -> Result<Self::PageFence> {
+        // Sync transfer path today: there's nothing to flush because
+        // upload_sync / download_sync block inside their call.
+        // Returning `immediate` keeps the trait contract — wait_transfer
+        // on this fence returns immediately.  The async-transfer-queue
+        // commit will end the accumulated transfer command buffer here
+        // and return a real fence.
+        Ok(PageFence::immediate())
+    }
+
+    fn wait_transfer(&self, fence: Self::PageFence) -> Result<()> {
+        // Transfers ride the same timeline-semaphore wait path as
+        // page submissions today; future split-queue work may add a
+        // second timeline.  Either way wait_page is the right call —
+        // both fence types map to the same semaphore today.
+        self.recorder.wait_page(fence)
+    }
+
     fn detect_vram_budget(&self) -> Result<VramBudget> {
         let (used, budget) = device::query_memory_budget(&self.device)?;
         let usable = budget.saturating_sub(used).saturating_mul(3) / 4;
@@ -185,5 +248,18 @@ impl GpuBackend for VulkanBackend {
         // so this holds; clamp anyway in case a driver reports an
         // inconsistent budget.
         Ok(VramBudget::new(total, usable.min(total)))
+    }
+}
+
+/// No-op `DownloadInner` for the sync-download path — the
+/// device→host copy already happened inside `download_sync`, so the
+/// handle's `finish` has nothing to do.  Replaced by a real impl
+/// (staging→dst memcpy under fence wait) when the async transfer
+/// queue lands.
+struct NoopDownloadInner;
+
+impl crate::backend::DownloadInner for NoopDownloadInner {
+    fn finish(&mut self) -> crate::backend::Result<()> {
+        Ok(())
     }
 }

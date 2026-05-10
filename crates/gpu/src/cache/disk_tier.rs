@@ -570,8 +570,19 @@ impl std::fmt::Debug for DiskTier {
 }
 
 /// Test-only allocating variant of a disk cache hit.
+///
+/// `pub(crate)` so test-only `DiskTier::lookup` can return it without
+/// privacy mismatches.  The `redundant-pub-crate` lint flags this
+/// because the enclosing module is private to the crate root, but
+/// narrowing to `pub(super)` would force the return type of `lookup`
+/// (also `pub(crate)`) to either narrow with it or expose it more
+/// widely — both worse than the lint suppression.
 #[cfg(test)]
 #[derive(Debug)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "matches DiskTier::lookup's pub(crate) signature; narrowing to pub(super) creates a privacy mismatch"
+)]
 pub(crate) struct DiskEntry {
     pub(crate) width: u32,
     pub(crate) height: u32,

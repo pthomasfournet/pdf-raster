@@ -61,11 +61,29 @@ impl GpuBackend for CudaBackend {
 
     fn alloc_device(&self, size: usize) -> Result<Self::DeviceBuffer> {
         reject_zero_size(size, "alloc_device")?;
+        // cudarc's `alloc_zeros` always zero-fills.  We over-deliver
+        // the trait contract here (which says `alloc_device` makes no
+        // promise about contents) because cudarc doesn't expose a
+        // cheaper unzeroed allocation path.  The contract is the
+        // weaker one; callers that care must use `alloc_device_zeroed`.
         self.ctx.stream().alloc_zeros::<u8>(size).map_err(be)
     }
 
+    fn alloc_device_zeroed(&self, size: usize) -> Result<Self::DeviceBuffer> {
+        reject_zero_size(size, "alloc_device_zeroed")?;
+        // cudarc syncs on the default stream; the buffer reads as zero
+        // from the next host-visible op without needing wait_transfer.
+        self.ctx.stream().alloc_zeros::<u8>(size).map_err(be)
+    }
+
+    fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize {
+        buf.len()
+    }
+
     fn free_device(&self, _buf: Self::DeviceBuffer) {
-        // cudarc frees the allocation on Drop; nothing to do here.
+        // cudarc records a stream event in PinnedHostSlice's Drop so a
+        // free during in-flight DMA is safe (the actual cuMemFree is
+        // gated on the event signalling).  Nothing to do here.
     }
 
     fn alloc_host_pinned(&self, size: usize) -> Result<Self::HostBuffer> {
@@ -122,6 +140,35 @@ impl GpuBackend for CudaBackend {
         // accidental callers fail at the trait surface rather than silently
         // returning a bogus fence.
         unimplemented!("CudaBackend::upload_async is not implemented yet")
+    }
+
+    fn download_async<'a>(
+        &self,
+        _src: &'a Self::DeviceBuffer,
+        _dst: &'a mut [u8],
+    ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
+        // Stub: lands alongside upload_async.  The CUDA implementation
+        // will issue cuMemcpyDtoHAsync directly into `dst` (no staging
+        // buffer needed — host memory is naturally CPU-accessible) and
+        // return a handle whose `finish` is a no-op event sync.
+        unimplemented!("CudaBackend::download_async is not implemented yet")
+    }
+
+    fn wait_download(&self, _handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
+        unimplemented!("CudaBackend::wait_download is not implemented yet")
+    }
+
+    fn submit_transfer(&self) -> Result<Self::PageFence> {
+        // CUDA: the default stream serialises uploads/downloads with
+        // compute already, so "submit transfer" is a no-op that just
+        // records an event for callers that want a fence to wait on.
+        page_recorder::PageRecorder::record_fence(&self.ctx)
+    }
+
+    fn wait_transfer(&self, fence: Self::PageFence) -> Result<()> {
+        // Same primitive as wait_page on CUDA — both wait on a
+        // CudaEvent recorded on the same stream.
+        self.recorder.wait_page(fence)
     }
 
     fn detect_vram_budget(&self) -> Result<VramBudget> {

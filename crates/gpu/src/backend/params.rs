@@ -277,6 +277,31 @@ mod tests {
         ) -> super::super::Result<Self::PageFence> {
             unreachable!()
         }
+        fn alloc_device_zeroed(&self, _size: usize) -> super::super::Result<Self::DeviceBuffer> {
+            unreachable!()
+        }
+        fn device_buffer_len(&self, _buf: &Self::DeviceBuffer) -> usize {
+            unreachable!()
+        }
+        fn download_async<'a>(
+            &self,
+            _src: &'a Self::DeviceBuffer,
+            _dst: &'a mut [u8],
+        ) -> super::super::Result<super::super::DownloadHandle<'a, Self>> {
+            unreachable!()
+        }
+        fn wait_download(
+            &self,
+            _handle: super::super::DownloadHandle<'_, Self>,
+        ) -> super::super::Result<()> {
+            unreachable!()
+        }
+        fn submit_transfer(&self) -> super::super::Result<Self::PageFence> {
+            unreachable!()
+        }
+        fn wait_transfer(&self, _fence: Self::PageFence) -> super::super::Result<()> {
+            unreachable!()
+        }
         fn detect_vram_budget(&self) -> super::super::Result<super::super::VramBudget> {
             unreachable!()
         }

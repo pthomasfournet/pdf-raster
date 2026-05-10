@@ -1,8 +1,8 @@
-//! Smoke test: VulkanBackend implements GpuBackend on whatever ICD the
-//! system has.  Skipped if the vulkan feature isn't built.
+//! Smoke test: `VulkanBackend` implements `GpuBackend` on whatever ICD
+//! the system has.  Skipped if the `vulkan` feature isn't built.
 //!
 //! Run with:
-//!   cargo test -p gpu --features vulkan --test vulkan_backend_smoke
+//!   `cargo test -p gpu --features vulkan --test vulkan_backend_smoke`
 //!
 //! This test only requires *any* working Vulkan ICD — Mesa lavapipe (the
 //! CPU software ICD) counts.  CI without a discrete GPU can run it via
@@ -58,11 +58,15 @@ fn vulkan_backend_host_buffer_round_trip() {
     assert_eq!(buf.size(), 256);
     let slice = buf.as_mut_slice();
     for (i, b) in slice.iter_mut().enumerate() {
-        *b = (i & 0xff) as u8;
+        *b = u8::try_from(i & 0xff).expect("masked to 0..=255");
     }
     let read_back = buf.as_slice();
     for (i, &b) in read_back.iter().enumerate() {
-        assert_eq!(b, (i & 0xff) as u8, "byte {i} mismatch");
+        assert_eq!(
+            b,
+            u8::try_from(i & 0xff).expect("masked to 0..=255"),
+            "byte {i} mismatch"
+        );
     }
     backend.free_host_pinned(buf);
 }
