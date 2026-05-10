@@ -72,6 +72,47 @@ fn vulkan_backend_alloc_device_zeroed_returns_zero_bytes() {
 }
 
 #[test]
+fn vulkan_backend_alloc_device_zeroed_concurrent() {
+    // Regression: prior to the queue/cmd-pool locks on DeviceCtx +
+    // TransferContext, concurrent callers of run_one_shot raced on
+    // VkCommandPool reset and VkQueue submit (both require external
+    // sync per the Vulkan "Threading Behavior" table).  Spawn N
+    // threads each running the alloc-zero / readback / free cycle in
+    // a tight loop; if synchronization is missing, this either
+    // crashes the driver or produces non-zero readbacks.
+    use std::sync::Arc;
+    use std::thread;
+
+    const THREADS: usize = 4;
+    const ITERS_PER_THREAD: usize = 8;
+
+    let backend = Arc::new(VulkanBackend::new().expect("VulkanBackend::new"));
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let backend = Arc::clone(&backend);
+        handles.push(thread::spawn(move || {
+            for _ in 0..ITERS_PER_THREAD {
+                let buf = backend
+                    .alloc_device_zeroed(4096)
+                    .expect("alloc_device_zeroed");
+                let mut readback = vec![0xAAu8; 4096];
+                backend
+                    .download_sync(&buf, &mut readback)
+                    .expect("download_sync");
+                assert!(
+                    readback.iter().all(|&b| b == 0),
+                    "concurrent alloc_device_zeroed produced non-zero bytes"
+                );
+                backend.free_device(buf);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+}
+
+#[test]
 fn vulkan_backend_alloc_device_zeroed_unaligned_size() {
     // Size 17 is not a multiple of 4; alloc_device_zeroed must still
     // return all-zero bytes via the host-vec fallback path.  Guards the

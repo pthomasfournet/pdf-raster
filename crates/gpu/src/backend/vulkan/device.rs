@@ -11,7 +11,7 @@
 use ash::ext::memory_budget;
 use ash::vk;
 use std::ffi::{CStr, c_char};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::backend::{BackendError, Result};
 
@@ -28,6 +28,17 @@ pub(super) struct DeviceCtx {
     pub(super) compute_queue_family: u32,
     /// The compute queue handle (queue itself is owned by the device).
     pub(super) compute_queue: vk::Queue,
+    /// External-synchronization lock for `compute_queue`.
+    ///
+    /// Vulkan requires `VkQueue` to be externally synchronized (spec
+    /// "Threading Behavior" table): `vkQueueSubmit`, `vkQueueWaitIdle`,
+    /// and any `vkQueuePresent`-class call on the same queue must not
+    /// run concurrently from multiple threads.  Both submitters in this
+    /// backend (the per-page recorder and the transfer context) reach
+    /// for `compute_queue`, so the lock has to live here on the shared
+    /// `DeviceCtx`.  Held only across the queue-touching FFI call
+    /// itself; recording into command buffers happens outside.
+    pub(super) submit_lock: Mutex<()>,
     /// Cached physical-device handle for memory-property + budget queries.
     pub(super) phys: vk::PhysicalDevice,
     /// Cached memory properties (memoryTypeBits → `MemoryType` lookup).
@@ -96,6 +107,7 @@ pub(super) fn init() -> Result<Arc<DeviceCtx>> {
         device,
         compute_queue_family,
         compute_queue,
+        submit_lock: Mutex::new(()),
         phys,
         mem_props,
         max_workgroup_count,

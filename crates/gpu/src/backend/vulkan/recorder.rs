@@ -232,11 +232,24 @@ impl PageRecorder {
             .signal_semaphores(&signal_semaphores)
             .push_next(&mut tl_submit);
 
-        unsafe {
-            self.device
+        // VkQueue is externally synchronized (spec "Threading Behavior"
+        // table) — take the device's submit_lock so this submission
+        // can't race with TransferContext's run_one_shot or another
+        // recorder thread.  Scoped block releases the lock as soon as
+        // the FFI call returns; the rest of the state-machine
+        // bookkeeping doesn't need queue exclusivity.
+        {
+            let _submit_guard = self
                 .device
-                .queue_submit(self.device.compute_queue, &[submit], vk::Fence::null())
-                .map_err(vk_err("vkQueueSubmit"))?;
+                .submit_lock
+                .lock()
+                .expect("device submit_lock poisoned");
+            unsafe {
+                self.device
+                    .device
+                    .queue_submit(self.device.compute_queue, &[submit], vk::Fence::null())
+                    .map_err(vk_err("vkQueueSubmit"))?;
+            }
         }
         s.state = State::Submitted;
         Ok(PageFence {
