@@ -254,19 +254,49 @@ impl PageRecorder {
                 s.state
             )));
         }
-        let semaphores = [self.timeline];
-        let values = [fence.value];
+        Self::wait_timeline(&self.device, self.timeline, fence.value)?;
+        s.state = State::Idle;
+        Ok(())
+    }
+
+    /// Wait on the timeline semaphore for `value` to be reached, with
+    /// no state-machine check.
+    ///
+    /// `wait_page` enforces `state == Submitted` because page rendering
+    /// is a strict begin/record/submit/wait cycle.  Transfer-queue
+    /// fences (returned by `submit_transfer`, `upload_async`,
+    /// `download_async`) ride the same timeline semaphore but DON'T
+    /// participate in the page state machine — `submit_transfer` does
+    /// not transition the recorder.  Use this method to wait on those
+    /// fences without tripping the state check.
+    pub(super) fn wait_transfer_value(&self, fence: PageFence) -> Result<()> {
+        Self::wait_timeline(&self.device, self.timeline, fence.value)
+    }
+
+    /// Inner: vkWaitSemaphores with `u64::MAX` timeout.
+    ///
+    /// Shared between `wait_page` (state-machine-gated) and
+    /// `wait_transfer_value` (no gate).  The split exists to keep the
+    /// state-machine policy and the raw wait separable — adding more
+    /// fence sources later (compute queue split-out, etc.) re-uses
+    /// this without inheriting the page-state check.
+    fn wait_timeline(
+        device: &super::device::DeviceCtx,
+        timeline: vk::Semaphore,
+        value: u64,
+    ) -> Result<()> {
+        let semaphores = [timeline];
+        let values = [value];
         let wait_info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
         // u64::MAX = wait forever.
         unsafe {
-            self.device
+            device
                 .device
                 .wait_semaphores(&wait_info, u64::MAX)
                 .map_err(vk_err("vkWaitSemaphores"))?;
         }
-        s.state = State::Idle;
         Ok(())
     }
 

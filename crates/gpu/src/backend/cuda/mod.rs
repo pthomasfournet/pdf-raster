@@ -81,9 +81,11 @@ impl GpuBackend for CudaBackend {
     }
 
     fn free_device(&self, _buf: Self::DeviceBuffer) {
-        // cudarc records a stream event in PinnedHostSlice's Drop so a
-        // free during in-flight DMA is safe (the actual cuMemFree is
-        // gated on the event signalling).  Nothing to do here.
+        // cudarc's `CudaSlice::Drop` calls `cuMemFreeAsync` on the
+        // owning stream when the buffer was allocated via a stream
+        // (`stream.alloc_zeros` etc.), gating the free on prior stream
+        // work.  Nothing to do here — Drop runs as the value moves out
+        // of scope.
     }
 
     fn alloc_host_pinned(&self, size: usize) -> Result<Self::HostBuffer> {
@@ -134,12 +136,28 @@ impl GpuBackend for CudaBackend {
         self.recorder.wait_page(fence)
     }
 
+    // ── Async transfer stubs ─────────────────────────────────────────
+    //
+    // These three methods panic at runtime via `unimplemented!`.  They
+    // exist on the trait surface for cross-backend parity, but the
+    // CUDA backend reaches host-to-device / device-to-host transfers
+    // through cudarc's `clone_htod` / `memcpy_dtoh` directly inside
+    // the cache today.  The trait-routed path lands alongside the
+    // dedicated copy-engine stream + event signalling.
+    //
+    // We intentionally don't `#[deprecated]` these: the attribute on
+    // a trait-method impl is a no-op (rustc rejects it), and putting
+    // it on the trait method itself would warn every backend's impl
+    // including the Vulkan one which is correct.  The compile-time
+    // signal is the doc-comment + `unimplemented!`.  Future callers
+    // grepping the trait surface get the contract; runtime callers
+    // get a panic with a clear message.
+
     fn upload_async(&self, _dst: &Self::DeviceBuffer, _src: &[u8]) -> Result<Self::PageFence> {
-        // Stub: a dedicated copy-engine stream + event signalling will land
-        // alongside the prefetcher integration. Until then, panic loudly so
-        // accidental callers fail at the trait surface rather than silently
-        // returning a bogus fence.
-        unimplemented!("CudaBackend::upload_async is not implemented yet")
+        unimplemented!(
+            "CudaBackend::upload_async is not implemented yet; \
+             cache callers should use cudarc clone_htod via gpu::cache instead"
+        )
     }
 
     fn download_async<'a>(
@@ -147,11 +165,10 @@ impl GpuBackend for CudaBackend {
         _src: &'a Self::DeviceBuffer,
         _dst: &'a mut [u8],
     ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
-        // Stub: lands alongside upload_async.  The CUDA implementation
-        // will issue cuMemcpyDtoHAsync directly into `dst` (no staging
-        // buffer needed — host memory is naturally CPU-accessible) and
-        // return a handle whose `finish` is a no-op event sync.
-        unimplemented!("CudaBackend::download_async is not implemented yet")
+        unimplemented!(
+            "CudaBackend::download_async is not implemented yet; \
+             cache callers should use cudarc memcpy_dtoh via gpu::cache instead"
+        )
     }
 
     fn wait_download(&self, _handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {

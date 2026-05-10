@@ -133,10 +133,11 @@ impl GpuBackend for VulkanBackend {
 
     fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize {
         // Vulkan stores sizes as u64 (vk::DeviceSize); the trait
-        // returns usize.  On 64-bit platforms (the only ones we
-        // support) the conversion is total; the saturating cast
-        // guards against silent truncation if a 32-bit build slips in.
-        usize::try_from(buf.size()).unwrap_or(usize::MAX)
+        // returns usize.  pdf-raster targets 64-bit only, so the
+        // conversion is total — failing loudly is correct because
+        // a saturating fallback (e.g. usize::MAX) would silently
+        // poison cache size accounting.
+        usize::try_from(buf.size()).expect("DeviceBuffer size fits usize on 64-bit targets")
     }
 
     fn free_device(&self, buf: Self::DeviceBuffer) {
@@ -234,9 +235,11 @@ impl GpuBackend for VulkanBackend {
     fn wait_transfer(&self, fence: Self::PageFence) -> Result<()> {
         // Transfers ride the same timeline-semaphore wait path as
         // page submissions today; future split-queue work may add a
-        // second timeline.  Either way wait_page is the right call —
-        // both fence types map to the same semaphore today.
-        self.recorder.wait_page(fence)
+        // second timeline.  Use the recorder's no-state-check variant:
+        // `submit_transfer` doesn't transition the recorder out of
+        // Idle, so going through `wait_page` would trip its state
+        // assertion every time.
+        self.recorder.wait_transfer_value(fence)
     }
 
     fn detect_vram_budget(&self) -> Result<VramBudget> {

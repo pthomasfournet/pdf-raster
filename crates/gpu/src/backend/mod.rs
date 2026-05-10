@@ -398,16 +398,9 @@ pub trait GpuBackend: Send + Sync {
 pub struct DownloadHandle<'a, B: GpuBackend + ?Sized> {
     /// Backend-specific completion state. Boxed so `DownloadHandle`'s
     /// size doesn't depend on the backend's internal completion type.
-    /// Only the Vulkan backend constructs and consumes it today; the
-    /// CUDA backend's `download_async` is `unimplemented!`, so without
-    /// `vulkan` the field is dead code.
-    #[cfg_attr(
-        not(feature = "vulkan"),
-        expect(
-            dead_code,
-            reason = "constructed by Vulkan; CUDA download path is not yet implemented"
-        )
-    )]
+    /// Read by both `wait_download` (explicit completion) and
+    /// `Drop::drop` (block-and-discard), so it's never dead code even
+    /// when the CUDA `download_async` stub is the only impl in scope.
     pub(crate) inner: Box<dyn DownloadInner + Send + Sync + 'a>,
     /// `&'a mut [u8]` borrow witness — keeps the destination slice
     /// borrowed for the handle's lifetime so the caller can't free or
@@ -429,6 +422,23 @@ impl<B: GpuBackend + ?Sized> DownloadHandle<'_, B> {
     }
 }
 
+/// Block-and-discard on drop: if the caller never invoked
+/// `wait_download`, complete the transfer so the staging buffer
+/// returns to the pool.  Errors are intentionally ignored — we're on
+/// a destructor path and panicking would mask the original error path.
+///
+/// The doc-comment on `DownloadHandle` documents this contract
+/// (implementations must not panic on Drop, must release the staging
+/// resource).  Encoding it at the type level here means future
+/// backends that hold real staging buffers + fences inside their
+/// `DownloadInner` get the contract for free — they only have to
+/// implement `finish()` correctly.
+impl<B: GpuBackend + ?Sized> Drop for DownloadHandle<'_, B> {
+    fn drop(&mut self) {
+        let _ = self.inner.finish();
+    }
+}
+
 /// Backend-internal trait for the staging→dst memcpy a Vulkan
 /// download handle performs at completion. CUDA implementations can
 /// supply a no-op impl since `cuMemcpyDtoHAsync` writes directly into
@@ -439,15 +449,10 @@ impl<B: GpuBackend + ?Sized> DownloadHandle<'_, B> {
 /// across backends without exposing the staging buffer type.
 pub(crate) trait DownloadInner {
     /// Block until the underlying transfer signals, then perform any
-    /// staging→dst memcpy the backend deferred. May be called once;
-    /// subsequent calls return `Ok(())` immediately.
-    #[cfg_attr(
-        not(feature = "vulkan"),
-        expect(
-            dead_code,
-            reason = "called by Vulkan's wait_download; CUDA download path is not yet implemented"
-        )
-    )]
+    /// staging→dst memcpy the backend deferred. Must be safe to call
+    /// twice — `Drop` always calls it; `wait_download` may have called
+    /// it first.  Subsequent calls after the first successful return
+    /// should be `Ok(())` no-ops.
     fn finish(&mut self) -> Result<()>;
 }
 
