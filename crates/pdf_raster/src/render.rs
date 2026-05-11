@@ -738,52 +738,43 @@ struct RenderState {
     cursor: PageCursor,
 }
 
-/// Iterator over the pages to render.
+impl RenderState {
+    /// Advance the cursor and return the next page number to render, or
+    /// `None` once the cursor is exhausted *or* the next page would fall past
+    /// the document's `total_pages`.  Mirrors the documented clamp on
+    /// `RasterOptions::last_page` (rendering stops at the last page in the
+    /// document rather than erroring).
+    fn next_in_range(&mut self) -> Option<u32> {
+        let p = self.cursor.next_page()?;
+        (p <= self.session.total_pages).then_some(p)
+    }
+}
+
+/// Cursor over the pages to render.
 ///
 /// `Range` walks every integer in `first..=last` (used when `RasterOptions::pages`
 /// is `None`).  `Set` walks the explicit page numbers stored in a `PageSet` —
 /// O(set length), not O(last − first), which matters when the set is sparse
 /// across a wide range (e.g. `[1, u32::MAX]`).
 enum PageCursor {
-    Range { next: u32, end: u32 },
+    Range(std::ops::RangeInclusive<u32>),
     Set { set: PageSet, idx: usize },
 }
 
 impl PageCursor {
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "match arms read more clearly than a 2-branch map_or here"
-    )]
     fn new(opts: &RasterOptions) -> Self {
-        match opts.pages.as_ref() {
-            Some(ps) => Self::Set {
+        opts.pages.as_ref().map_or_else(
+            || Self::Range(opts.first_page..=opts.last_page),
+            |ps| Self::Set {
                 set: ps.clone(),
                 idx: 0,
             },
-            None => Self::Range {
-                next: opts.first_page,
-                end: opts.last_page,
-            },
-        }
+        )
     }
 
     fn next_page(&mut self) -> Option<u32> {
         match self {
-            Self::Range { next, end } => {
-                if *next > *end {
-                    return None;
-                }
-                let p = *next;
-                // After yielding u32::MAX, bump `end` to 0 so the next call
-                // returns None — saturating_add alone would leave next == end
-                // == u32::MAX and yield forever.
-                if p == u32::MAX {
-                    *end = 0;
-                } else {
-                    *next = p + 1;
-                }
-                Some(p)
-            }
+            Self::Range(r) => r.next(),
             Self::Set { set, idx } => {
                 let p = *set.as_slice().get(*idx)?;
                 *idx += 1;
@@ -850,14 +841,17 @@ impl Iterator for PageIter {
         }
 
         let state = self.state.as_mut()?.as_mut().ok()?;
-        let page_num = state.cursor.next_page()?;
-        if page_num > state.session.total_pages {
+        let Some(page_num) = state.next_in_range() else {
+            // Drop the session early so callers that peek past the end don't
+            // hold the document open longer than needed.
             self.state = None;
             return None;
-        }
+        };
         Some((page_num, render_one(state, page_num)))
     }
 }
+
+impl std::iter::FusedIterator for PageIter {}
 
 // ── Channel-based render ──────────────────────────────────────────────────────
 
@@ -895,10 +889,7 @@ pub fn render_channel(
             opts: opts_owned,
         };
 
-        while let Some(page_num) = state.cursor.next_page() {
-            if page_num > state.session.total_pages {
-                return;
-            }
+        while let Some(page_num) = state.next_in_range() {
             let result = render_one(&state, page_num);
             if tx.send((page_num, result)).is_err() {
                 return;
