@@ -540,7 +540,7 @@ mod tests {
     }
     use crate::pipe::{PipeSrc, PipeState};
     use crate::state::TransferSet;
-    use color::{Gray8, Rgb8};
+    use color::{Gray8, Rgb8, TransferLut};
 
     fn normal_pipe(a: u8) -> PipeState<'static> {
         PipeState {
@@ -668,38 +668,12 @@ mod tests {
             }
             a
         };
-        static ID: [u8; 256] = {
-            let mut a = [0u8; 256];
-            let mut i = 0u8;
-            loop {
-                a[i as usize] = i;
-                if i == 255 {
-                    break;
-                }
-                i += 1;
-            }
-            a
-        };
-        static DN: [[u8; 256]; 8] = {
-            let mut t = [[0u8; 256]; 8];
-            let mut ch = 0;
-            while ch < 8 {
-                let mut i = 0u8;
-                loop {
-                    t[ch][i as usize] = i;
-                    if i == 255 {
-                        break;
-                    }
-                    i += 1;
-                }
-                ch += 1;
-            }
-            t
-        };
+        static DN: [[u8; 256]; 8] = [TransferLut::IDENTITY.0; 8];
+        let id = TransferLut::IDENTITY.as_array();
         let transfer = TransferSet {
             gray: &INV, // inverting gray transfer
-            rgb: [&ID, &ID, &ID],
-            cmyk: [&ID, &ID, &ID, &ID],
+            rgb: [id; 3],
+            cmyk: [id; 4],
             device_n: &DN,
         };
         let pipe = PipeState {

@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     use crate::pipe::PipeSrc;
     use crate::state::TransferSet;
-    use color::Rgb8;
+    use color::{Rgb8, TransferLut};
 
     fn aa_pipe() -> PipeState<'static> {
         PipeState {
@@ -329,19 +329,8 @@ mod tests {
             }
             t
         };
-        static GRAY_ID: [u8; 256] = {
-            let mut t = [0u8; 256];
-            let mut i: u8 = 0;
-            loop {
-                t[i as usize] = i;
-                if i == 255 {
-                    break;
-                }
-                i += 1;
-            }
-            t
-        };
-        static DN_ID: [[u8; 256]; 8] = [GRAY_ID; 8];
+        static DN_ID: [[u8; 256]; 8] = [TransferLut::IDENTITY.0; 8];
+        let id = TransferLut::IDENTITY.as_array();
 
         let pipe = PipeState {
             blend_mode: BlendMode::Normal,
@@ -350,8 +339,8 @@ mod tests {
             overprint_additive: false,
             transfer: TransferSet {
                 rgb: [&INVERT, &INVERT, &INVERT],
-                gray: &GRAY_ID,
-                cmyk: [&GRAY_ID, &GRAY_ID, &GRAY_ID, &GRAY_ID],
+                gray: id,
+                cmyk: [id; 4],
                 device_n: &DN_ID,
             },
             soft_mask: None,
