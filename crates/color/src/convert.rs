@@ -7,26 +7,16 @@
 //! **Integer blend math**
 //! - [`div255`] — fast approximate division by 255
 //! - [`lerp_u8`] — bilinear interpolation between two bytes
-//! - [`over_u8`] — Porter-Duff src-over for a single channel
-//! - [`clip255`] — clamp u32 to \[0, 255\]
-//!
-//! **Alpha premultiplication**
-//! - [`premul`] — multiply RGB channels by alpha
-//! - [`unpremul`] — undo premultiplication (safe for alpha = 0)
+//! - `clip255` (private) — clamp u32 to \[0, 255\]; used by [`cmyk_to_rgb`]
 //!
 //! **Color-space conversion (u8 domain)**
 //! - [`cmyk_to_rgb`] — simple subtractive CMYK → RGB
 //! - [`cmyk_to_rgb_reflectance`] — reflectance formula for raw JPEG/CMYK pixels
-//! - [`gray_to_rgb`] — broadcast a gray value to RGB
 //!
 //! **Color-space conversion (f64 → u8, normalised PDF values)**
 //! - [`gray_to_u8`] — normalised grey \[0,1\] → byte
 //! - [`rgb_to_bytes`] — normalised RGB \[0,1\] → 3-byte array
 //! - [`cmyk_to_rgb_bytes`] — normalised CMYK \[0,1\] → RGB bytes via PDF §10.3.3
-//!
-//! **Fixed-point byte/col**
-//! - [`byte_to_col`] — u8 → 16.16 `GfxColorComp`
-//! - [`col_to_byte`] — 16.16 `GfxColorComp` → u8
 //!
 //! **Geometry rounding**
 //! - [`splash_floor`] — floor toward −∞, returns i32
@@ -97,31 +87,6 @@ pub fn lerp_u8(a: u8, b: u8, t: u32) -> u8 {
     div255(u32::from(a) * (256 - t) + u32::from(b) * t)
 }
 
-/// Porter-Duff src-over compositing for a single channel.
-///
-/// Computes `src * src_a/255 + dst * (1 − src_a/255)` using [`div255`].
-///
-/// # Arguments
-///
-/// - `src` — source channel value in \[0, 255\]
-/// - `src_a` — source alpha in \[0, 255\]
-/// - `dst` — destination channel value in \[0, 255\]
-///
-/// # Output range
-///
-/// Always \[0, 255\].
-///
-/// # Edge cases
-///
-/// - `src_a = 255` (fully opaque): returns exactly `src`.
-/// - `src_a = 0` (fully transparent): returns exactly `dst`.
-#[inline]
-#[must_use]
-pub fn over_u8(src: u8, src_a: u8, dst: u8) -> u8 {
-    let inv = 255 - u32::from(src_a);
-    div255(u32::from(src) * u32::from(src_a) + u32::from(dst) * inv)
-}
-
 /// Clamp a `u32` to \[0, 255\] and return as `u8`.
 ///
 /// Equivalent to `x.min(255) as u8`.
@@ -130,87 +95,9 @@ pub fn over_u8(src: u8, src_a: u8, dst: u8) -> u8 {
 ///
 /// Always \[0, 255\].
 #[inline]
-#[must_use]
-pub fn clip255(x: u32) -> u8 {
+fn clip255(x: u32) -> u8 {
     // x.min(255) guarantees the value fits in u8; the cast is lossless.
     x.min(255) as u8
-}
-
-// ── Alpha premultiplication ───────────────────────────────────────────────────
-
-/// Premultiply a single channel by alpha using [`div255`].
-///
-/// Private helper that removes repetition from [`premul`].
-/// Both `channel` and `alpha` must be in \[0, 255\].
-#[inline]
-fn premul_channel(channel: u8, alpha: u32) -> u8 {
-    div255(u32::from(channel) * alpha)
-}
-
-/// Undo premultiplication for a single channel using integer rounding division.
-///
-/// Private helper that removes repetition from [`unpremul`].
-/// `channel` must be in \[0, 255\]; `alpha` must be > 0 and in \[1, 255\].
-#[inline]
-fn unpremul_channel(channel: u8, alpha: u32) -> u8 {
-    // Rounded integer division: (channel * 255 + alpha/2) / alpha.
-    // channel ≤ 255, alpha ≥ 1, so the result is in [0, 255]:
-    //   max = (255 * 255 + 127) / 1 = 65152  — but alpha ≥ 1 here only if
-    //   channel ≤ alpha (pre-multiplied value can't exceed alpha), so the
-    //   true maximum after division is 255. The `.min(255)` is a safety net
-    //   for any rounding edge cases, making the `as u8` cast always safe.
-    ((u32::from(channel) * 255 + alpha / 2) / alpha).min(255) as u8
-}
-
-/// Premultiply RGB by alpha (all in \[0, 255\]).
-///
-/// Multiplies each channel by `a / 255` using the [`div255`] approximation.
-///
-/// # Output range
-///
-/// Each output channel is in \[0, 255\].
-#[inline]
-#[must_use]
-pub fn premul(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
-    let aa = u32::from(a);
-    [
-        premul_channel(r, aa),
-        premul_channel(g, aa),
-        premul_channel(b, aa),
-    ]
-}
-
-/// Undo premultiplication.
-///
-/// Recovers the original RGB from premultiplied values by computing
-/// `channel * 255 / alpha` with half-way rounding.
-///
-/// # Arguments
-///
-/// All inputs must be in \[0, 255\].
-///
-/// # Output range
-///
-/// Each output channel is in \[0, 255\].
-///
-/// # Edge cases
-///
-/// - `a = 0`: returns `[0, 0, 0]` (fully transparent — colour is undefined).
-/// - Due to premultiplication quantisation, the round-trip
-///   `unpremul(premul(r, g, b, a), a)` may differ from `(r, g, b)` by ±1
-///   for small alpha values.
-#[inline]
-#[must_use]
-pub fn unpremul(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
-    if a == 0 {
-        return [0, 0, 0];
-    }
-    let aa = u32::from(a);
-    [
-        unpremul_channel(r, aa),
-        unpremul_channel(g, aa),
-        unpremul_channel(b, aa),
-    ]
 }
 
 // ── Color space conversion ────────────────────────────────────────────────────
@@ -249,20 +136,6 @@ pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
     let green = clip255(255u32.saturating_sub(u32::from(m) + kk));
     let blue = clip255(255u32.saturating_sub(u32::from(y) + kk));
     (red, green, blue)
-}
-
-/// Broadcast a gray value to RGB.
-///
-/// Returns `(v, v, v)`. Trivially correct: gray is equal energy in all
-/// three channels.
-///
-/// # Output range
-///
-/// Each output channel equals the input.
-#[inline]
-#[must_use]
-pub const fn gray_to_rgb(v: u8) -> (u8, u8, u8) {
-    (v, v, v)
 }
 
 /// Blend one ink channel against the key: `((255−ink) × (255−k) + 127) / 255`.
@@ -348,54 +221,6 @@ pub fn cmyk_to_rgb_bytes(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
     let g = 1.0 - (m.clamp(0.0, 1.0) + k).min(1.0);
     let b = 1.0 - (y.clamp(0.0, 1.0) + k).min(1.0);
     rgb_to_bytes(r, g, b)
-}
-
-// ── Fixed-point colour component conversions ──────────────────────────────────
-
-/// Convert a `u8` byte to a 16.16 fixed-point colour component.
-///
-/// Implements `(x << 8) | x`, which equals `x * 257`. This maps 0 → 0 and
-/// 255 → 65535, distributing the 256 steps evenly across the full 16-bit range.
-///
-/// # Output range
-///
-/// \[0, 65535\] (fits in the positive half of i32).
-#[inline]
-#[must_use]
-pub const fn byte_to_col(x: u8) -> i32 {
-    let xi = x as i32; // u8 → i32 is lossless; `i32::from` is not const-stable on stable Rust yet
-    (xi << 8) | xi
-}
-
-/// Convert a 16.16 fixed-point colour component to a `u8`, with rounding.
-///
-/// Computes `(x + 0x80) >> 8` then clamps to \[0, 255\].
-///
-/// # Valid input range
-///
-/// Any `i32`. Negative values and values above 65535 are clamped.
-///
-/// # Output range
-///
-/// Always \[0, 255\].
-///
-/// # Why the conversion is safe
-///
-/// `(x + 0x80) >> 8` can produce values below 0 or above 255 for out-of-range
-/// inputs. After `.clamp(0, 255)` the value is guaranteed to be in `[0, 255]`,
-/// so the `try_from` conversion always succeeds.
-///
-/// # Panics
-///
-/// Never panics. Saturating add guards against i32 overflow on extreme inputs.
-#[inline]
-#[must_use]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "clamp(0, 255) guarantees non-negative"
-)]
-pub fn col_to_byte(x: i32) -> u8 {
-    (x.saturating_add(0x80) >> 8).clamp(0, 255) as u8
 }
 
 // ── Geometry rounding (matching SplashMath.h portable fallbacks) ──────────────
@@ -561,55 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn over_u8_opaque_src() {
-        // Fully opaque src must replace dst exactly — no rounding error.
-        // over_u8(src, 255, dst) = div255(src*255 + dst*0) = div255(src*255).
-        // div255(src*255) must equal src for all src in [0,255].
-        for src in 0u8..=255 {
-            assert_eq!(
-                over_u8(src, 255, 0),
-                src,
-                "over_u8({src}, 255, 0) must equal {src}"
-            );
-            assert_eq!(
-                over_u8(src, 255, 128),
-                src,
-                "over_u8({src}, 255, 128) must equal {src}"
-            );
-        }
-    }
-
-    #[test]
-    fn over_u8_transparent_src() {
-        // Fully transparent src must leave dst exactly unchanged.
-        // over_u8(0, 0, dst) = div255(0*0 + dst*255) = div255(dst*255).
-        // div255(dst*255) must equal dst for all dst in [0,255].
-        for dst in 0u8..=255 {
-            assert_eq!(
-                over_u8(0, 0, dst),
-                dst,
-                "over_u8(0, 0, {dst}) must equal {dst}"
-            );
-        }
-    }
-
-    #[test]
-    fn premul_unpremul_roundtrip() {
-        // For small alpha values, premultiplication is lossy (quantization error
-        // compounds on inversion). Only test with alpha >= 64 for ±2 accuracy.
-        for a in [64u8, 128, 255] {
-            let [pr, pg, pb] = premul(200, 100, 50, a);
-            let [r, g, b] = unpremul(pr, pg, pb, a);
-            assert!((i32::from(r) - 200).abs() <= 2, "r={r} a={a}");
-            assert!((i32::from(g) - 100).abs() <= 2, "g={g} a={a}");
-            assert!((i32::from(b) - 50).abs() <= 2, "b={b} a={a}");
-        }
-        // a=0: unpremul returns zeros, no crash.
-        let [r, g, b] = unpremul(0, 0, 0, 0);
-        assert_eq!([r, g, b], [0, 0, 0]);
-    }
-
-    #[test]
     fn splash_floor_ceil_round() {
         let cases = [
             (0.0f64, 0, 0, 0),
@@ -649,28 +425,6 @@ mod tests {
         // NaN — treated as non-positive (returns i32::MIN)
         assert_eq!(splash_floor(f64::NAN), i32::MIN);
         assert_eq!(splash_ceil(f64::NAN), i32::MIN);
-    }
-
-    #[test]
-    fn col_to_byte_clamps_extremes() {
-        assert_eq!(col_to_byte(0), 0u8);
-        assert_eq!(col_to_byte(0xffff), 255u8);
-        assert_eq!(col_to_byte(i32::MIN), 0u8);
-        assert_eq!(col_to_byte(i32::MAX), 255u8);
-    }
-
-    #[test]
-    fn byte_col_roundtrip() {
-        for b in 0u8..=255 {
-            let c = byte_to_col(b);
-            let back = col_to_byte(c);
-            // byte_to_col(x) = (x<<8)|x = x*257; col_to_byte rounds with +0x80,
-            // so the round-trip is within ±1 (inherent to the fixed-point encoding).
-            assert!(
-                (i32::from(back) - i32::from(b)).abs() <= 1,
-                "byte_to_col({b}) = {c}, col_to_byte = {back}"
-            );
-        }
     }
 
     // ── gray_to_u8 ────────────────────────────────────────────────────────────
