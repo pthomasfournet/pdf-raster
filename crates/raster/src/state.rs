@@ -25,30 +25,6 @@ use crate::clip::Clip;
 use crate::types::{LineCap, LineJoin, SPOT_NCOMPS, ScreenParams};
 use color::TransferLut;
 
-// ── StateFlags ────────────────────────────────────────────────────────────────
-
-/// Boolean flags packed into a single byte to avoid `struct_excessive_bools`.
-///
-/// Only `DELETE_SOFT_MASK` is currently used (cleared in `clone_for_xobject`).
-/// Reintroduce named bits as concrete consumers appear.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct StateFlags {
-    bits: u8,
-}
-
-impl StateFlags {
-    const DELETE_SOFT_MASK: u8 = 1 << 2;
-
-    /// Sets whether the soft mask should be deleted on the next state restore.
-    pub const fn set_delete_soft_mask(&mut self, v: bool) {
-        if v {
-            self.bits |= Self::DELETE_SOFT_MASK;
-        } else {
-            self.bits &= !Self::DELETE_SOFT_MASK;
-        }
-    }
-}
-
 // ── GraphicsState ─────────────────────────────────────────────────────────────
 
 /// The complete graphics state for one rendering context.
@@ -111,8 +87,10 @@ pub struct GraphicsState {
     /// Bitmask of color components that participate in overprinting; default `0xFFFF_FFFF` (all).
     pub overprint_mask: u32,
 
-    /// Boolean flags (replaces individual bool fields to satisfy `struct_excessive_bools`).
-    pub flags: StateFlags,
+    /// Whether the soft mask should be deleted on the next state restore.
+    /// New states cloned for an `XObject` explicitly clear this so child
+    /// renders do not inherit the parent's deletion intent.
+    pub delete_soft_mask: bool,
 }
 
 impl GraphicsState {
@@ -168,7 +146,7 @@ impl GraphicsState {
             ],
             device_n_transfer: vec![TransferLut::IDENTITY.0; SPOT_NCOMPS + 4],
             overprint_mask: 0xFFFF_FFFF,
-            flags: StateFlags::default(),
+            delete_soft_mask: false,
         }
     }
 
@@ -262,12 +240,8 @@ impl GraphicsState {
             cmyk_transfer: self.cmyk_transfer.clone(),
             device_n_transfer: self.device_n_transfer.clone(),
             overprint_mask: self.overprint_mask,
-            flags: {
-                let mut f = self.flags;
-                // The new state should not inherit delete_soft_mask.
-                f.set_delete_soft_mask(false);
-                f
-            },
+            // The new state should not inherit delete_soft_mask from the parent.
+            delete_soft_mask: false,
         }
     }
 
