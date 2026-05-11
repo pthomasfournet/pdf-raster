@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock};
 use pdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
 
+pub use colorspace::ColorSpace;
 pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 /// Re-exported from [`gpu::nvjpeg`] for callers that enable the `nvjpeg` feature.
 /// Create via [`gpu::nvjpeg::NvJpegDecoder::new`] with a raw `CUstream` handle,
@@ -259,6 +260,40 @@ impl<'doc> PageResources<'doc> {
         let entry = fonts.get(name)?;
         let dict = resolve_dict(self.doc, entry)?;
         Some(font::resolve_font(self.doc, &dict))
+    }
+
+    /// Resolve the named entry of the page's `/ColorSpace` resource dictionary
+    /// into a [`ColorSpace`] tracking value.
+    ///
+    /// Per PDF §8.6.3, the operand to `cs`/`CS` may be one of the four
+    /// device-space names (`DeviceGray`, `DeviceRGB`, `DeviceCMYK`, `Pattern`)
+    /// which resolve directly, or a key into the page's `/ColorSpace`
+    /// resource dict that resolves to a parameterised colour-space array.
+    ///
+    /// Returns [`ColorSpace::DeviceGray`] when the name isn't found in the
+    /// resource dict and isn't a device-space name — the same safe-fallback
+    /// policy the rest of the resource layer uses on missing inputs.
+    #[must_use]
+    pub fn color_space(&self, name: &[u8]) -> ColorSpace {
+        // Device-space names short-circuit the resource lookup per §8.6.3.
+        if matches!(
+            name,
+            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern"
+        ) {
+            return colorspace::resolve_device_name(name);
+        }
+        let cs_dict = self
+            .doc
+            .get_page_resource_dict(self.resource_context_id, b"ColorSpace")
+            .ok();
+        let Some(entry) = cs_dict.as_ref().and_then(|d| d.get(name)) else {
+            log::debug!(
+                "colorspace: name {:?} not found in /ColorSpace resource dict — fallback DeviceGray",
+                String::from_utf8_lossy(name)
+            );
+            return ColorSpace::DeviceGray;
+        };
+        colorspace::resolve(self.doc, entry)
     }
 
     /// Decode the named image `XObject` from the resource dictionary.
@@ -717,5 +752,30 @@ mod tests {
             ]),
         );
         assert!(parse_blend_mode(&dict).is_none());
+    }
+
+    // ── color_space() resolution ────────────────────────────────────────────
+
+    #[test]
+    fn color_space_device_names_short_circuit_resource_dict() {
+        // Even with no /ColorSpace resource dict, the four device names must
+        // resolve to their direct variants per §8.6.3.
+        let doc = crate::test_helpers::empty_doc();
+        let resources = PageResources::new(&doc, (1, 0));
+        assert_eq!(resources.color_space(b"DeviceGray"), ColorSpace::DeviceGray);
+        assert_eq!(resources.color_space(b"DeviceRGB"), ColorSpace::DeviceRgb);
+        assert_eq!(resources.color_space(b"DeviceCMYK"), ColorSpace::DeviceCmyk,);
+        assert_eq!(
+            resources.color_space(b"Pattern"),
+            ColorSpace::Pattern { base: None },
+        );
+    }
+
+    #[test]
+    fn color_space_unknown_name_falls_back_to_devicegray() {
+        let doc = crate::test_helpers::empty_doc();
+        let resources = PageResources::new(&doc, (1, 0));
+        assert_eq!(resources.color_space(b"CS0"), ColorSpace::DeviceGray);
+        assert_eq!(resources.color_space(b""), ColorSpace::DeviceGray);
     }
 }

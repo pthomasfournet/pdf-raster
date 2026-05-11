@@ -94,9 +94,17 @@ impl PageRenderer<'_> {
             Operator::SetFillRgb(r, g, b) => self.set_fill(RasterColor::rgb(*r, *g, *b)),
             Operator::SetFillCmyk(c, m, y, k) => self.set_fill(RasterColor::cmyk(*c, *m, *y, *k)),
             Operator::SetFillColor(comps) => self.set_fill(components_to_color(comps)),
-            Operator::SetFillColorSpace(_) => {
-                // Switching colour space clears any active pattern.
-                self.gstate.current_mut().fill_pattern = None;
+            Operator::SetFillColorSpace(name) => {
+                // PDF §8.6.8: switching colour space clears any active pattern
+                // and resets the fill colour to its default for the new space
+                // (black-equivalent in device terms — black for RGB/Gray, all
+                // ones for CMYK).  We track the declared space on the gstate
+                // so the uncoloured-pattern dispatch can convert tints
+                // spec-correctly (§8.7.3.3).
+                let cs = self.resources.color_space(name);
+                let gs = self.gstate.current_mut();
+                gs.fill_pattern = None;
+                gs.fill_color_space = cs;
             }
             Operator::SetFillPattern { name, components } => {
                 let gs = self.gstate.current_mut();
@@ -110,9 +118,12 @@ impl PageRenderer<'_> {
                 self.set_stroke(RasterColor::cmyk(*c, *m, *y, *k));
             }
             Operator::SetStrokeColor(comps) => self.set_stroke(components_to_color(comps)),
-            Operator::SetStrokeColorSpace(_) => {
-                // Switching colour space clears any active pattern.
-                self.gstate.current_mut().stroke_pattern = None;
+            Operator::SetStrokeColorSpace(name) => {
+                // Mirror of SetFillColorSpace; see comment above.
+                let cs = self.resources.color_space(name);
+                let gs = self.gstate.current_mut();
+                gs.stroke_pattern = None;
+                gs.stroke_color_space = cs;
             }
             Operator::SetStrokePattern { name, components } => {
                 let gs = self.gstate.current_mut();

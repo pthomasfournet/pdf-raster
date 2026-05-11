@@ -163,7 +163,7 @@ fn resolve_depth(doc: &Document, cs_obj: &Object, depth: u8) -> ColorSpace {
         return ColorSpace::DeviceGray;
     }
     match cs_obj {
-        Object::Name(n) => device_cs_from_name(n),
+        Object::Name(n) => resolve_device_name(n),
         Object::Reference(id) => doc
             .get_object(*id)
             .ok()
@@ -178,10 +178,16 @@ fn resolve_depth(doc: &Document, cs_obj: &Object, depth: u8) -> ColorSpace {
     }
 }
 
-/// Map a PDF device-space name (with `cs`-operator abbreviations from
-/// PDF §8.9.7 Table 89) to a [`ColorSpace`]. Unknown names fall back to
-/// `DeviceGray`.
-fn device_cs_from_name(name: &[u8]) -> ColorSpace {
+/// Map a PDF device-space name (including the `cs`-operator abbreviations
+/// from PDF §8.9.7 Table 89) to a [`ColorSpace`]. Unknown names fall back
+/// to `DeviceGray`.
+///
+/// Public so callers that hold a `&[u8]` name straight from the operator
+/// stream can short-circuit the four device-space cases without allocating
+/// an `Object::Name`. Internal callers in this module use it directly from
+/// the `resolve_*` dispatch.
+#[must_use]
+pub fn resolve_device_name(name: &[u8]) -> ColorSpace {
     match name {
         b"DeviceGray" | b"G" | b"CalGray" => ColorSpace::DeviceGray,
         b"DeviceRGB" | b"RGB" | b"CalRGB" => ColorSpace::DeviceRgb,
