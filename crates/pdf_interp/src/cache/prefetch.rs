@@ -26,7 +26,7 @@
 //! the renderer reaches the image, not to saturate the CPU.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -90,26 +90,6 @@ impl Default for PrefetchConfig {
     }
 }
 
-/// Outcome counters reported by the prefetcher.  Useful for cache
-/// hit-rate verification and log-level diagnostics.
-#[derive(Debug, Default)]
-pub struct PrefetchStats {
-    /// Distinct `(doc_id, obj_id)` image references discovered while
-    /// walking the page tree.  Includes images that were already in
-    /// the cache (so [`Self::decoded`] + [`Self::already_cached`]
-    /// + [`Self::errors`] = `discovered` once the run completes).
-    pub discovered: AtomicU64,
-    /// Images decoded + inserted into the cache by this run.
-    pub decoded: AtomicU64,
-    /// Images that were already in the cache (e.g. host or disk tier
-    /// hit from a prior session).  Counted but not redecoded.
-    pub already_cached: AtomicU64,
-    /// Images the prefetcher attempted but `resolve_image` returned
-    /// `None` for — typically a malformed stream or unsupported
-    /// filter.  Logged at warn level by `resolve_image`.
-    pub errors: AtomicU64,
-}
-
 /// Handle to a running prefetch job.  Drop the handle to cancel
 /// in-flight prefetch and join the workers.
 pub struct PrefetchHandle {
@@ -123,8 +103,9 @@ impl Drop for PrefetchHandle {
         // exit promptly when set.  The mpsc receiver also drops with
         // the sender so any worker blocked on `recv` wakes up too.
         self.cancel.store(true, Ordering::Release);
-        // Best effort join — `wait` may have already drained.
-        // Drain under the lock, then join unlocked.
+        // Drain under the lock, then join unlocked — JoinHandle::join
+        // blocks for the worker's full runtime, which is too long to
+        // hold the workers mutex.
         let drained: Vec<_> = {
             let mut guard = self
                 .workers
@@ -170,7 +151,6 @@ pub fn spawn_prefetch(
         cache,
         doc,
         doc_id,
-        stats: Arc::new(PrefetchStats::default()),
         cancel: Arc::new(AtomicBool::new(false)),
     });
 
@@ -232,7 +212,6 @@ struct PrefetchState {
     cache: Arc<DeviceImageCache>,
     doc: Arc<Document>,
     doc_id: DocId,
-    stats: Arc<PrefetchStats>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -281,8 +260,6 @@ fn discover_pages(state: &PrefetchState, max_images: usize, tx: &mpsc::Sender<Pr
                 continue;
             }
             if state.cache.lookup_by_id(state.doc_id, obj_id).is_some() {
-                let _ = state.stats.discovered.fetch_add(1, Ordering::Relaxed);
-                let _ = state.stats.already_cached.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             // Quick filter check: only push DCT images.  We re-resolve
@@ -292,7 +269,6 @@ fn discover_pages(state: &PrefetchState, max_images: usize, tx: &mpsc::Sender<Pr
             if !is_dct_image_stream(&state.doc, *stream_id) {
                 continue;
             }
-            let _ = state.stats.discovered.fetch_add(1, Ordering::Relaxed);
             if tx
                 .send(PrefetchJob {
                     page_id,
@@ -309,9 +285,8 @@ fn discover_pages(state: &PrefetchState, max_images: usize, tx: &mpsc::Sender<Pr
 }
 
 /// Worker drain loop.  Pulls one job at a time off the shared
-/// receiver, decodes, and counts the outcome in `state.stats`.
-/// Returns when the channel is closed (discovery thread exited) or
-/// cancellation flips.
+/// receiver and decodes it.  Returns when the channel is closed
+/// (discovery thread exited) or cancellation flips.
 fn worker_loop(rx: &Mutex<mpsc::Receiver<PrefetchJob>>, state: &PrefetchState) {
     loop {
         if state.cancel.load(Ordering::Acquire) {
@@ -329,41 +304,26 @@ fn worker_loop(rx: &Mutex<mpsc::Receiver<PrefetchJob>>, state: &PrefetchState) {
 
         // Run the decode under `catch_unwind` so a single bad image
         // can't poison the whole prefetcher.  `resolve_image`
-        // already swallows most errors and returns `None`, but
-        // panic-on-arithmetic-overflow inside a third-party decoder
-        // would otherwise crash the prefetch thread.
+        // already swallows soft errors (returns `None` and logs at
+        // warn level); we only care about panics here.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_one(&state.doc, state.doc_id, &state.cache, &job)
+            decode_one(&state.doc, state.doc_id, &state.cache, &job);
         }));
-        match result {
-            Ok(true) => {
-                let _ = state.stats.decoded.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(false) => {
-                let _ = state.stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(_) => {
-                let _ = state.stats.errors.fetch_add(1, Ordering::Relaxed);
-                log::warn!(
-                    "prefetch: decode panicked for image {:?} on page {:?}",
-                    String::from_utf8_lossy(&job.image_name),
-                    job.page_id,
-                );
-            }
+        if result.is_err() {
+            log::warn!(
+                "prefetch: decode panicked for image {:?} on page {:?}",
+                String::from_utf8_lossy(&job.image_name),
+                job.page_id,
+            );
         }
     }
 }
 
 /// Decode one image `XObject` into the cache via the shared
 /// [`resolve_image`] entry point with all GPU back-ends disabled.
-/// Returns `true` on success (cache populated), `false` on
-/// `resolve_image` returning `None` (logged by `resolve_image` itself).
-fn decode_one(
-    doc: &Document,
-    doc_id: DocId,
-    cache: &Arc<DeviceImageCache>,
-    job: &PrefetchJob,
-) -> bool {
+/// `resolve_image` logs its own failures at warn level; this fn
+/// is fire-and-forget from the worker's perspective.
+fn decode_one(doc: &Document, doc_id: DocId, cache: &Arc<DeviceImageCache>, job: &PrefetchJob) {
     // Use the leaf page dict (not the inheritance-aware
     // `get_page_resource_dict(.., b"XObject")` we used during
     // discovery): `resolve_image` walks `/Resources/XObject` from
@@ -371,9 +331,9 @@ fn decode_one(
     // inheritance.  Inherited-resource cases will resolve `None`
     // here and the renderer decodes on first touch.
     let Ok(page_dict) = doc.get_dictionary(job.page_id) else {
-        return false;
+        return;
     };
-    let result = resolve_image(
+    let _ = resolve_image(
         doc,
         &page_dict,
         &job.image_name,
@@ -390,7 +350,6 @@ fn decode_one(
         Some(cache),
         Some(doc_id),
     );
-    result.is_some()
 }
 
 /// Cheap pre-filter: does `stream_id` resolve to a stream with
