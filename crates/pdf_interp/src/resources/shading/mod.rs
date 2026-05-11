@@ -33,6 +33,7 @@ mod patch;
 
 use std::sync::Arc;
 
+use color::convert::gray_to_u8;
 use pdf::{Dictionary, Document, Object, Stream};
 use raster::pipe::Pattern;
 use raster::shading::axial::AxialPattern;
@@ -844,14 +845,8 @@ pub(super) fn decode_vertex(
 // ── Colour conversion helpers ─────────────────────────────────────────────────
 
 /// Convert a function output (values in `[0, 1]`) to an sRGB triple `[u8; 3]`.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "value is clamped to [0,1] then scaled to [0,255]; round() fits in u8"
-)]
 pub(super) fn cs_to_rgb(cs: ImageColorSpace, channels: &[f64]) -> [u8; 3] {
-    let scale =
-        |i: usize| (channels.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+    let scale = |i: usize| gray_to_u8(channels.get(i).copied().unwrap_or(0.0));
     match cs {
         ImageColorSpace::Gray | ImageColorSpace::Mask => {
             let g = scale(0);

@@ -16,7 +16,7 @@
 
 use std::io::{self, Write};
 
-use color::{Pixel, PixelMode};
+use color::{Pixel, PixelMode, convert::cmyk_to_rgb};
 use raster::Bitmap;
 
 use crate::EncodeError;
@@ -103,7 +103,7 @@ fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
         PixelMode::Cmyk8 => {
             // Source: [C, M, Y, K] → dest: [R, G, B].
             for (i, chunk) in src[..width * 4].chunks_exact(4).enumerate() {
-                let [r, g, b] = cmyk_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+                let (r, g, b) = cmyk_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
                 dst[i * 3] = r;
                 dst[i * 3 + 1] = g;
                 dst[i * 3 + 2] = b;
@@ -112,7 +112,7 @@ fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
         PixelMode::DeviceN8 => {
             // Source: [C, M, Y, K, spot0..3] — use only CMYK (bytes 0..4).
             for (i, chunk) in src[..width * 8].chunks_exact(8).enumerate() {
-                let [r, g, b] = cmyk_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
+                let (r, g, b) = cmyk_to_rgb(chunk[0], chunk[1], chunk[2], chunk[3]);
                 dst[i * 3] = r;
                 dst[i * 3 + 1] = g;
                 dst[i * 3 + 2] = b;
@@ -123,22 +123,6 @@ fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
             debug_assert!(false, "convert_row_to_rgb: unsupported mono mode");
         }
     }
-}
-
-/// Simple CMYK → RGB: `R = 255 − C − K`, clamped to `[0, 255]`.
-///
-/// Naïve subtractive ink-density formula (PDF §10.3.3).
-#[inline]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "each channel is clamped to [0, 255] before the cast; value is always non-negative"
-)]
-fn cmyk_to_rgb(cyan: u8, magenta: u8, yellow: u8, black: u8) -> [u8; 3] {
-    let k = i32::from(black);
-    let r = (255 - i32::from(cyan) - k).clamp(0, 255) as u8;
-    let g = (255 - i32::from(magenta) - k).clamp(0, 255) as u8;
-    let b = (255 - i32::from(yellow) - k).clamp(0, 255) as u8;
-    [r, g, b]
 }
 
 #[cfg(test)]
@@ -276,7 +260,7 @@ mod tests {
     #[test]
     fn cmyk_to_rgb_clamped() {
         // cyan=200, black=100 → 255-200-100 = -45 → clamped to 0.
-        let [r, g, b] = cmyk_to_rgb(200, 0, 0, 100);
+        let (r, g, b) = cmyk_to_rgb(200, 0, 0, 100);
         assert_eq!(r, 0, "negative result must clamp to 0");
         assert_eq!(g, 155, "magenta=0, k=100: 255-0-100=155");
         assert_eq!(b, 155, "yellow=0, k=100: 255-0-100=155");
@@ -286,13 +270,13 @@ mod tests {
     fn cmyk_to_rgb_asymmetric_channels() {
         // Distinct non-zero values per ink so each channel's `255 - chan - k`
         // formula is independently constrained.  K=0 isolates the C/M/Y math.
-        let [r, g, b] = cmyk_to_rgb(10, 50, 200, 0);
+        let (r, g, b) = cmyk_to_rgb(10, 50, 200, 0);
         assert_eq!(r, 245, "cyan=10, k=0: 255-10=245");
         assert_eq!(g, 205, "magenta=50, k=0: 255-50=205");
         assert_eq!(b, 55, "yellow=200, k=0: 255-200=55");
 
         // Non-zero K with all four channels distinct.
-        let [r, g, b] = cmyk_to_rgb(40, 80, 120, 30);
+        let (r, g, b) = cmyk_to_rgb(40, 80, 120, 30);
         assert_eq!(r, 185, "255-40-30=185");
         assert_eq!(g, 145, "255-80-30=145");
         assert_eq!(b, 105, "255-120-30=105");
