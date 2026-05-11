@@ -1324,19 +1324,7 @@ mod tests {
     #[test]
     fn jbig2_decode_invalid_data_returns_none() {
         // Corrupt/empty JBIG2 data must not panic — it must return None.
-        // Use a minimal valid PDF (no streams referenced) for the doc handle.
-        let header = "%PDF-1.4\n";
-        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
-        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
-        let off1 = header.len();
-        let off2 = off1 + obj1.len();
-        let xref_start = off2 + obj2.len();
-        let xref = format!(
-            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
-        );
-        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
-        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
-        let doc = Document::from_bytes_owned(bytes).expect("test PDF parse");
+        let doc = crate::test_helpers::empty_doc();
         let result = decode_jbig2(&doc, b"\x00\x01\x02\x03", 4, 4, false, None);
         assert!(result.is_none());
     }

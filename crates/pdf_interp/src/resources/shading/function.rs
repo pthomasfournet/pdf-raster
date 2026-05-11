@@ -484,25 +484,7 @@ mod tests {
         assert!((result[0] - 0.8).abs() < 1e-5);
     }
 
-    /// Build a minimal parseable Document for the `&Document` parameter.
-    /// The Type 3 stitching path under test references inline sub-function
-    /// dictionaries (not indirect references), so `doc` is never consulted —
-    /// `from_bytes_owned(Vec::new())` would fail parse, so we ship a tiny
-    /// well-formed PDF instead.
-    fn empty_doc() -> Document {
-        let header = "%PDF-1.4\n";
-        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
-        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
-        let off1 = header.len();
-        let off2 = off1 + obj1.len();
-        let xref_start = off2 + obj2.len();
-        let xref = format!(
-            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
-        );
-        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
-        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
-        Document::from_bytes_owned(bytes).expect("test PDF parse")
-    }
+    use crate::test_helpers::empty_doc;
 
     #[test]
     fn eval_stitching_wrong_bounds_count_falls_back() {

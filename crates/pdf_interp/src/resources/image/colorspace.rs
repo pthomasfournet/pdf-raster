@@ -272,20 +272,9 @@ mod tests {
     #[test]
     fn resolve_cs_indirect_reference_falls_back_to_gray() {
         // An unresolvable Reference should not panic — it falls back to Gray.
-        // Build a minimal valid PDF so we have a Document; reference (999, 0)
-        // is absent from the xref so resolution fails and we get the fallback.
-        let header = "%PDF-1.4\n";
-        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
-        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
-        let off1 = header.len();
-        let off2 = off1 + obj1.len();
-        let xref_start = off2 + obj2.len();
-        let xref = format!(
-            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
-        );
-        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
-        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
-        let doc = Document::from_bytes_owned(bytes).expect("test PDF parse");
+        // Reference (999, 0) is absent from the empty doc's xref so resolution
+        // fails and we get the fallback.
+        let doc = crate::test_helpers::empty_doc();
         let obj = Object::Reference((999, 0));
         assert_eq!(resolve_cs(&doc, &obj), ResolvedCs::Gray);
     }

@@ -1055,23 +1055,7 @@ mod tests {
         );
     }
 
-    /// Build a minimal valid PDF byte-stream with one empty page tree and
-    /// parse it via [`Document::from_bytes_owned`].  Used by tests that need a
-    /// real `Document` reference but do not depend on its contents.
-    fn empty_doc() -> Document {
-        let header = "%PDF-1.4\n";
-        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
-        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
-        let off1 = header.len();
-        let off2 = off1 + obj1.len();
-        let xref_start = off2 + obj2.len();
-        let xref = format!(
-            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
-        );
-        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
-        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
-        Document::from_bytes_owned(bytes).expect("test PDF parse")
-    }
+    use crate::test_helpers::empty_doc;
 
     #[test]
     fn no_embedded_bytes_returns_none() {
