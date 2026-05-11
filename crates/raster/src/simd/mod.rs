@@ -6,9 +6,9 @@
 //!
 //! # Sub-modules
 //!
+//! - [`aa_coverage`]   — per-pixel AA coverage counts (`aa_coverage_span`)
 //! - [`blend`]         — solid-colour fill (`blend_solid_rgb8`, `blend_solid_gray8`)
 //! - [`composite`]     — AA per-pixel blend (`composite_aa_rgb8_opaque`)
-//! - [`popcnt`]        — per-pixel AA coverage counts (`aa_coverage_span`)
 //! - [`glyph_unpack`]  — 1-bit-per-pixel mono glyph expansion (`unpack_mono_row`)
 
 // SIMD functions are inherently unsafe; unsafe_code is required throughout this module tree.
@@ -17,12 +17,12 @@
     reason = "SIMD intrinsics require unsafe throughout this module tree"
 )]
 
+pub mod aa_coverage;
 pub mod blend;
 pub mod composite;
 pub mod glyph_unpack;
-pub mod popcnt;
 
+pub use aa_coverage::aa_coverage_span;
 pub use blend::{blend_solid_gray8, blend_solid_rgb8};
 pub use composite::composite_aa_rgb8_opaque;
 pub use glyph_unpack::unpack_mono_row;
-pub use popcnt::aa_coverage_span;

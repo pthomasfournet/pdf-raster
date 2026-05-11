@@ -216,6 +216,13 @@ unsafe fn aa_coverage_span_sve2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
         reason = "aarch64 is 64-bit; svcntb() ≤ 256 fits in usize"
     )]
     let vl = svcntb() as usize;
+    // AArch64 SVE architecture caps vector length at 2048 bits = 256 bytes,
+    // so a fixed 256-byte stack buffer always fits `vl`. Using `Vec::with_capacity`
+    // here would heap-allocate per call; the kernel is invoked per scanline.
+    debug_assert!(
+        vl <= 256,
+        "aa_coverage_span_sve2: svcntb()={vl} exceeds SVE max of 256"
+    );
     let pg = svptrue_b8();
     let mask_lo = svdup_n_u8(0x0F);
     let shift4 = svdup_n_u8(4u8);
@@ -223,10 +230,10 @@ unsafe fn aa_coverage_span_sve2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
     let n = shape.len();
     let (byte_x0, n_chunks) = coverage_chunk_params(x0, n, vl);
 
-    // Staging buffers for svst1_u8 output. Allocated once outside the chunk loop
-    // to avoid per-iteration heap allocation. vl is at most 256 bytes.
-    let mut hi_buf = vec![0u8; vl];
-    let mut lo_buf = vec![0u8; vl];
+    // Staging buffers for svst1_u8 output — stack-allocated to the SVE max
+    // (256 bytes); only the first `vl` bytes are written/read per chunk.
+    let mut hi_buf = [0u8; 256];
+    let mut lo_buf = [0u8; 256];
 
     for chunk_idx in 0..n_chunks {
         let byte_off = byte_x0 + chunk_idx * vl;
@@ -544,6 +551,22 @@ mod tests {
         data.map(|r| r.to_vec())
     }
 
+    /// Build four deterministic pseudo-random rows of `row_bytes` bytes for
+    /// dispatch-vs-scalar cross-check tests. Three rows use distinct hash
+    /// schedules `(mul, add)`; the fourth row is `!i`. Stays in `u8` arithmetic
+    /// throughout — no truncating cast from `usize`.
+    fn dispatch_test_rows(row_bytes: usize, schedules: [(u8, u8); 3]) -> [Vec<u8>; 4] {
+        let mk = |mul: u8, add: u8| -> Vec<u8> {
+            (0u8..)
+                .take(row_bytes)
+                .map(|i| i.wrapping_mul(mul).wrapping_add(add))
+                .collect()
+        };
+        let [(m0, a0), (m1, a1), (m2, a2)] = schedules;
+        let r3: Vec<u8> = (0u8..).take(row_bytes).map(|i| !i).collect();
+        [mk(m0, a0), mk(m1, a1), mk(m2, a2), r3]
+    }
+
     #[test]
     fn coverage_span_all_zero() {
         let rows = make_rows([[0u8; 4]; 4]);
@@ -611,22 +634,13 @@ mod tests {
         // Odd x0=1: SIMD tiers must fall back to scalar; result must still be correct.
         const N: usize = 10;
         let row_bytes = (1 + N).div_ceil(2); // bytes needed for pixels 1..=10
-        let r0: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(0x37))
-            .collect();
-        let r1: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(0x53))
-            .collect();
-        let r2: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(0x17))
-            .collect();
-        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+        let rows = dispatch_test_rows(row_bytes, [(0x37, 0), (0x53, 0), (0x17, 0)]);
 
         let mut expected = vec![0u8; N];
-        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 1, &mut expected);
+        aa_coverage_span_scalar([&rows[0], &rows[1], &rows[2], &rows[3]], 1, &mut expected);
 
         let mut got = vec![0u8; N];
-        aa_coverage_span([&r0, &r1, &r2, &r3], 1, &mut got);
+        aa_coverage_span([&rows[0], &rows[1], &rows[2], &rows[3]], 1, &mut got);
 
         assert_eq!(got, expected, "odd x0 result mismatch");
     }
@@ -639,22 +653,13 @@ mod tests {
         //            scalar  (full path).
         const N: usize = 300;
         let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(0x37))
-            .collect();
-        let r1: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(0x53))
-            .collect();
-        let r2: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(0x17))
-            .collect();
-        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+        let rows = dispatch_test_rows(row_bytes, [(0x37, 0), (0x53, 0), (0x17, 0)]);
 
         let mut expected = vec![0u8; N];
-        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+        aa_coverage_span_scalar([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut expected);
 
         let mut got = vec![0u8; N];
-        aa_coverage_span([&r0, &r1, &r2, &r3], 0, &mut got);
+        aa_coverage_span([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut got);
 
         assert_eq!(got, expected, "dispatch mismatch on N={N}");
     }
@@ -666,31 +671,30 @@ mod tests {
         aa_coverage_span([&row, &row, &row, &row], 0, &mut shape); // must not panic
     }
 
+    /// Schedule used by all per-tier cross-checks below — three distinct
+    /// `(mul, add)` pairs feed the [`dispatch_test_rows`] helper.
+    const TIER_SCHEDULES: [(u8, u8); 3] = [(37, 11), (53, 7), (17, 3)];
+
+    /// Output-pixel span used by every per-tier cross-check. 300 leaves a
+    /// non-aligned tail in every tier (AVX-512: 2 × 64-byte chunks + 22-byte
+    /// scalar; AVX2: 4 × 32-byte chunks + 44-px scalar; NEON: 9 × 16-byte
+    /// chunks + 6-byte scalar).
+    const TIER_TEST_N: usize = 300;
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_coverage_matches_scalar() {
         if !is_x86_feature_detected!("avx512bitalg") || !is_x86_feature_detected!("avx512bw") {
             return;
         }
-        const N: usize = 300; // 2 full 64-byte chunks + 22-byte remainder
-        let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
-            .collect();
-        let r1: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
-            .collect();
-        let r2: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
-            .collect();
-        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+        let rows = dispatch_test_rows(TIER_TEST_N.div_ceil(2), TIER_SCHEDULES);
 
-        let mut expected = vec![0u8; N];
-        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+        let mut expected = vec![0u8; TIER_TEST_N];
+        aa_coverage_span_scalar([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut expected);
 
-        let mut got = vec![0u8; N];
+        let mut got = vec![0u8; TIER_TEST_N];
         // SAFETY: both features confirmed present above.
-        unsafe { aa_coverage_span_avx512([&r0, &r1, &r2, &r3], 0, &mut got) };
+        unsafe { aa_coverage_span_avx512([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut got) };
 
         assert_eq!(got, expected, "AVX-512 coverage mismatch vs scalar");
     }
@@ -701,27 +705,14 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        // 300 output pixels: 4 full 32-byte chunks (128 px each) + 44-byte scalar remainder
-        // ... actually 300 / 64 = 4 full chunks (256 px) + 44-px scalar remainder.
-        const N: usize = 300;
-        let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
-            .collect();
-        let r1: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
-            .collect();
-        let r2: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
-            .collect();
-        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+        let rows = dispatch_test_rows(TIER_TEST_N.div_ceil(2), TIER_SCHEDULES);
 
-        let mut expected = vec![0u8; N];
-        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+        let mut expected = vec![0u8; TIER_TEST_N];
+        aa_coverage_span_scalar([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut expected);
 
-        let mut got = vec![0u8; N];
+        let mut got = vec![0u8; TIER_TEST_N];
         // SAFETY: avx2 confirmed present above.
-        unsafe { aa_coverage_span_avx2([&r0, &r1, &r2, &r3], 0, &mut got) };
+        unsafe { aa_coverage_span_avx2([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut got) };
 
         assert_eq!(got, expected, "AVX2 coverage mismatch vs scalar");
     }
@@ -732,25 +723,14 @@ mod tests {
         if !std::arch::is_aarch64_feature_detected!("sve2") {
             return;
         }
-        const N: usize = 300;
-        let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
-            .collect();
-        let r1: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
-            .collect();
-        let r2: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
-            .collect();
-        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+        let rows = dispatch_test_rows(TIER_TEST_N.div_ceil(2), TIER_SCHEDULES);
 
-        let mut expected = vec![0u8; N];
-        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+        let mut expected = vec![0u8; TIER_TEST_N];
+        aa_coverage_span_scalar([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut expected);
 
-        let mut got = vec![0u8; N];
+        let mut got = vec![0u8; TIER_TEST_N];
         // SAFETY: sve2 confirmed present above.
-        unsafe { aa_coverage_span_sve2([&r0, &r1, &r2, &r3], 0, &mut got) };
+        unsafe { aa_coverage_span_sve2([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut got) };
 
         assert_eq!(got, expected, "SVE2 coverage mismatch vs scalar");
     }
@@ -758,26 +738,14 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_coverage_matches_scalar() {
-        // 300 output pixels — 9 full 16-byte NEON chunks + 6-byte scalar remainder.
-        const N: usize = 300;
-        let row_bytes = N.div_ceil(2);
-        let r0: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
-            .collect();
-        let r1: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
-            .collect();
-        let r2: Vec<u8> = (0..row_bytes)
-            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
-            .collect();
-        let r3: Vec<u8> = (0..row_bytes).map(|i| !(i as u8)).collect();
+        let rows = dispatch_test_rows(TIER_TEST_N.div_ceil(2), TIER_SCHEDULES);
 
-        let mut expected = vec![0u8; N];
-        aa_coverage_span_scalar([&r0, &r1, &r2, &r3], 0, &mut expected);
+        let mut expected = vec![0u8; TIER_TEST_N];
+        aa_coverage_span_scalar([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut expected);
 
-        let mut got = vec![0u8; N];
+        let mut got = vec![0u8; TIER_TEST_N];
         // SAFETY: aarch64 always has NEON.
-        unsafe { aa_coverage_span_neon([&r0, &r1, &r2, &r3], 0, &mut got) };
+        unsafe { aa_coverage_span_neon([&rows[0], &rows[1], &rows[2], &rows[3]], 0, &mut got) };
 
         assert_eq!(got, expected, "NEON coverage mismatch vs scalar");
     }
