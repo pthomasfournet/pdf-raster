@@ -292,7 +292,7 @@ mod tests {
 
         let q = StdArc::new(DecodeQueue::new(AlwaysGray, "test-concurrent"));
         let counter = StdArc::new(AtomicU32::new(0));
-        let n_threads = 8usize;
+        let n_threads = 8u32;
 
         let handles: Vec<_> = (0..n_threads)
             .map(|_| {
@@ -314,7 +314,7 @@ mod tests {
         // Drop the queue explicitly to verify shutdown is clean, matching the
         // production invariant: handles gone before queue drops.
         drop(q);
-        assert_eq!(counter.load(Ordering::Relaxed), n_threads as u32);
+        assert_eq!(counter.load(Ordering::Relaxed), n_threads);
     }
 
     #[test]

@@ -915,14 +915,14 @@ mod tests {
     /// Empty input must return a status error before any FFI call.
     ///
     /// This test does not require a GPU — the empty-slice fast-path in
-    /// `NvJpeg2k::decode` returns `Nvjpeg2kStatus(3)` (BAD_JPEG) immediately.
+    /// `NvJpeg2k::decode` returns `Nvjpeg2kStatus(3)` (`BAD_JPEG`) immediately.
     /// We still need a `NvJpeg2kDecoder` to reach `decode_sync`, so skip if
     /// no GPU is available.
     #[test]
     fn decode_empty_returns_error() {
-        let mut dec = match NvJpeg2kDecoder::new(0) {
-            Ok(d) => d,
-            Err(_) => return, // no GPU available
+        // no GPU available → skip.
+        let Ok(mut dec) = NvJpeg2kDecoder::new(0) else {
+            return;
         };
         let result = dec.decode_sync(&[]);
         assert!(
@@ -961,9 +961,9 @@ mod tests {
     /// Skipped gracefully if no GPU is available.
     #[test]
     fn decode_gray_j2k() {
-        let mut dec = match NvJpeg2kDecoder::new(0) {
-            Ok(d) => d,
-            Err(_) => return, // no GPU — skip
+        // no GPU available → skip.
+        let Ok(mut dec) = NvJpeg2kDecoder::new(0) else {
+            return;
         };
 
         let img = match dec.decode_sync(GRAY_16X16_J2K) {

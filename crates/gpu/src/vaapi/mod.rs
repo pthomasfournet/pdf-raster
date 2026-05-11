@@ -865,6 +865,7 @@ mod tests {
         // Verify jpeg_sof_type correctly identifies a SOF2 stream as Progressive.
         // decode_sync uses this function as its first guard against progressive JPEG;
         // a real decode_sync integration test would require a /dev/dri device.
+        use crate::jpeg_sof::{JpegVariant, jpeg_sof_type};
         #[rustfmt::skip]
         let progressive_jpeg: &[u8] = &[
             0xFF, 0xD8,             // SOI
@@ -878,7 +879,6 @@ mod tests {
             0x03, 0x11, 0x01,
             0xFF, 0xD9,             // EOI
         ];
-        use crate::jpeg_sof::{JpegVariant, jpeg_sof_type};
         assert_eq!(
             jpeg_sof_type(progressive_jpeg),
             Some(JpegVariant::Progressive),
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     #[ignore = "requires VA-API hardware"]
     fn create_surface_and_context_returns_valid_ids() {
-        let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129").expect("VA-API unavailable");
+        let dec = VapiJpegDecoder::new("/dev/dri/renderD129").expect("VA-API unavailable");
         // Create a 16×16 YUV420 context; just check it doesn't error.
         let cached = dec
             .create_surface_and_context(16, 16, false)
@@ -948,7 +948,7 @@ mod tests {
         }
     }
 
-    /// Verifies that decode_sync can be called twice on the same decoder.
+    /// Verifies that `decode_sync` can be called twice on the same decoder.
     /// On hardware, the second call reuses the cached context (same dims).
     /// In CI (no hardware), we just verify the code compiles and the error is
     /// from the driver, not from a logic bug.
@@ -984,10 +984,12 @@ mod tests {
         let jpeg_16 = fs::read("/tmp/test_16x16.jpg").expect("16×16 JPEG not found");
         let jpeg_32 = fs::read("/tmp/test_32x32.jpg").expect("32×32 JPEG not found");
         let mut dec = VapiJpegDecoder::new("/dev/dri/renderD129").expect("VA-API unavailable");
-        dec.decode_sync(&jpeg_16, 16, 16)
+        let _ = dec
+            .decode_sync(&jpeg_16, 16, 16)
             .expect("16×16 decode failed");
         let old_ctx = dec.cached_ctx.as_ref().map(|c| c.ctx);
-        dec.decode_sync(&jpeg_32, 32, 32)
+        let _ = dec
+            .decode_sync(&jpeg_32, 32, 32)
             .expect("32×32 decode failed");
         let new_ctx = dec.cached_ctx.as_ref().map(|c| c.ctx);
         // Context must have changed.

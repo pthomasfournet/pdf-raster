@@ -3,8 +3,9 @@
 //! drift-prone copy-paste pattern where the same 161-byte literal lives in
 //! three test files.
 //!
-//! The constants here are `pub(crate)` so internal test code can `use` them
-//! freely; they're only compiled in `cfg(test)` builds.
+//! The constants here are `pub` inside a `pub(crate) mod`, so internal
+//! test code can `use` them freely while the module itself remains
+//! crate-internal.  Only compiled in `cfg(test)` builds.
 
 #![cfg(test)]
 
@@ -15,7 +16,7 @@
 /// through `JpegHeaders::parse` without error and produce
 /// `width=16, height=16, components=1, num_mcus=4`.
 #[rustfmt::skip]
-pub(super) const GRAY_16X16_JPEG: &[u8] = &[
+pub const GRAY_16X16_JPEG: &[u8] = &[
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x06, 0x04, 0x05, 0x06, 0x05,
     0x04, 0x06, 0x06, 0x05, 0x06, 0x07, 0x07, 0x06, 0x08, 0x0a, 0x10, 0x0a, 0x0a, 0x09, 0x09,
@@ -37,7 +38,7 @@ const _: () = assert!(GRAY_16X16_JPEG.len() == 161);
 /// Minimal SOF2 (progressive) stream — used by parsers that should *not*
 /// silently accept progressive JPEG.
 #[rustfmt::skip]
-pub(super) const PROGRESSIVE_MINIMAL: &[u8] = &[
+pub const PROGRESSIVE_MINIMAL: &[u8] = &[
     0xFF, 0xD8,                                     // SOI
     0xFF, 0xC2, 0x00, 0x11,                         // SOF2, length 17
     0x08, 0x00, 0x10, 0x00, 0x10, 0x03,             // precision + dims + components

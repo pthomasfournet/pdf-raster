@@ -941,9 +941,9 @@ mod tests {
     /// Skipped if no GPU is available.
     #[test]
     fn decode_gray_16x16() {
-        let mut dec = match NvJpegDecoder::new(0) {
-            Ok(d) => d,
-            Err(_) => return, // no GPU available
+        // no GPU available → skip.
+        let Ok(mut dec) = NvJpegDecoder::new(0) else {
+            return;
         };
 
         // decode_sync blocks until GPU work is complete.
@@ -965,9 +965,8 @@ mod tests {
     /// `decode_sync` with an empty slice must return an error, not panic or UB.
     #[test]
     fn decode_empty_returns_error() {
-        let mut dec = match NvJpegDecoder::new(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let Ok(mut dec) = NvJpegDecoder::new(0) else {
+            return;
         };
 
         let result = dec.decode_sync(&[]);
