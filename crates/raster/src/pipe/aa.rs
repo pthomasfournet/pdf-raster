@@ -302,4 +302,134 @@ mod tests {
         let v = dst[0];
         assert!(v >= 95 && v <= 105, "expected ~100, got {v}");
     }
+
+    /// `TransferSet::is_identity_rgb()` gates a SIMD-friendly fast path
+    /// (`composite_aa_rgb8_opaque`) that intentionally skips transfer-LUT
+    /// application. If the predicate mis-reports `true` for a non-identity
+    /// LUT (cargo-mutants whole-body → `true` survives without this test),
+    /// the fast path runs and silently drops the transfer.
+    ///
+    /// Construct a non-identity LUT (channel-inverting), run `render_span_aa`,
+    /// and require the inversion to be visible — only the general path
+    /// applies it.
+    #[test]
+    fn non_identity_transfer_must_use_general_path() {
+        // Build the inverting LUT and a parallel identity LUT entry-by-entry
+        // via `u8` iteration — the `0u8..=255` range gives clippy the bound
+        // it needs to skip the truncation lint.
+        static INVERT: [u8; 256] = {
+            let mut t = [0u8; 256];
+            let mut i: u8 = 0;
+            loop {
+                t[i as usize] = 255 - i;
+                if i == 255 {
+                    break;
+                }
+                i += 1;
+            }
+            t
+        };
+        static GRAY_ID: [u8; 256] = {
+            let mut t = [0u8; 256];
+            let mut i: u8 = 0;
+            loop {
+                t[i as usize] = i;
+                if i == 255 {
+                    break;
+                }
+                i += 1;
+            }
+            t
+        };
+        static DN_ID: [[u8; 256]; 8] = [GRAY_ID; 8];
+
+        let pipe = PipeState {
+            blend_mode: BlendMode::Normal,
+            a_input: 255,
+            overprint_mask: 0xFFFF_FFFF,
+            overprint_additive: false,
+            transfer: TransferSet {
+                rgb: [&INVERT, &INVERT, &INVERT],
+                gray: &GRAY_ID,
+                cmyk: [&GRAY_ID, &GRAY_ID, &GRAY_ID, &GRAY_ID],
+                device_n: &DN_ID,
+            },
+            soft_mask: None,
+            alpha0: None,
+            knockout: false,
+            knockout_opacity: 255,
+            non_isolated_group: false,
+        };
+        assert!(
+            !pipe.transfer.is_identity_rgb(),
+            "test prerequisite: inverting LUT must not register as identity"
+        );
+
+        let color = [200u8, 100, 50];
+        let src = PipeSrc::Solid(&color);
+        let shape = [255u8; 4]; // full coverage → general path writes src, then applies transfer
+        let mut dst = vec![0u8; 12];
+
+        render_span_aa::<Rgb8>(&pipe, &src, &mut dst, None, &shape, 0, 3, 0);
+
+        // General path: full coverage → `apply_transfer_pixel` runs and
+        // emits `255 - src`. Fast path would emit `src` unchanged.
+        for px in 0..4 {
+            assert_eq!(
+                &dst[px * 3..px * 3 + 3],
+                &[55, 155, 205],
+                "pixel {px}: transfer LUT must invert each channel; \
+                 if the fast-path gate mis-fired, dst would be [200, 100, 50]"
+            );
+        }
+    }
+
+    /// `TransferSet::is_identity_rgb()` gates the fast path; when it returns
+    /// `true`, `composite_aa_rgb8_opaque` runs. If the predicate mis-reports
+    /// `false` for a genuinely-identity LUT (cargo-mutants whole-body
+    /// → `false` survives without this test), the general path runs and
+    /// uses a higher-precision `div255` than the fast path, producing
+    /// different output bytes on some inputs.
+    ///
+    /// Pin the byte values that the fast path produces on a representative
+    /// large span; the general path's higher-precision `div255` would shift
+    /// at least one byte by ≥ 1 LSB on this input set.
+    #[test]
+    fn identity_transfer_takes_fast_path_with_pinned_bytes() {
+        let pipe = aa_pipe();
+        assert!(
+            pipe.transfer.is_identity_rgb(),
+            "test prerequisite: aa_pipe() must register as identity"
+        );
+
+        // 17 pixels: crosses the LANE=16 boundary, exercising both the
+        // chunked path and the scalar tail.
+        let color = [200u8, 100, 50];
+        let src = PipeSrc::Solid(&color);
+        let shape: Vec<u8> = (0u8..17).map(|i| i.wrapping_mul(17)).collect();
+        let initial: Vec<u8> = (0u8..51).map(|i| i.wrapping_mul(13)).collect();
+        let mut dst_fast = initial.clone();
+
+        render_span_aa::<Rgb8>(&pipe, &src, &mut dst_fast, None, &shape, 0, 16, 0);
+
+        // Compute the reference via the fast path's formula:
+        //   a_src   = (a_input * shape[i] + 255) >> 8
+        //   c_out_j = ((255 - a_src) * c_dst[j] + a_src * src[j] + 255) >> 8
+        let a_in = 255u16;
+        let mut expected = initial;
+        for (i, &sh) in shape.iter().enumerate() {
+            let a_src = (a_in * u16::from(sh) + 255) >> 8;
+            let inv = 255 - a_src;
+            let b = i * 3;
+            for (j, sc) in color.iter().enumerate() {
+                let v = (inv * u16::from(expected[b + j]) + a_src * u16::from(*sc) + 255) >> 8;
+                // `v` is bounded by the fast path's div255 (`(.. + 255) >> 8` ≤ 255).
+                expected[b + j] = u8::try_from(v).expect("fast-path div255 result must fit in u8");
+            }
+        }
+        assert_eq!(
+            dst_fast, expected,
+            "identity-LUT path must use the fast path's `(v + 255) >> 8` div255"
+        );
+    }
 }
