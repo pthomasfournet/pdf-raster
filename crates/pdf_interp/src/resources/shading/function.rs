@@ -1,12 +1,15 @@
-//! PDF Function evaluation for shading types 2 (Exponential) and 3 (Stitching).
+//! PDF Function evaluation for shading types 0 (Sampled), 2 (Exponential),
+//! and 3 (Stitching).
 //!
 //! The entry point is [`eval_function`], which dispatches on `FunctionType`.
 //!
 //! # Limitations
 //!
-//! For Type 0 (Sampled), the actual sample table is not consulted (stream decoding
-//! is not yet implemented); only the `Decode` range is linearly interpolated.
-//! The PDF `Range` clip is not applied for any function type.
+//! Type 0 (Sampled) supports 1-D inputs with `BitsPerSample` 8 or 16 and the
+//! default `Order` 1 (linear interpolation between adjacent samples).
+//! Multi-dimensional Type 0 functions (`Size = [N0, N1, ...]`), non-1/8/16
+//! `BitsPerSample`, and `Order` 3 (cubic spline) fall back to the
+//! sample-free linear approximation that pre-dated stream decoding.
 
 use pdf::{Dictionary, Document, Object};
 
@@ -43,20 +46,47 @@ fn eval_function_depth(
             "shading: PDF function nesting depth {depth} exceeds limit {MAX_FN_DEPTH} — \
              returning C0 fallback to prevent stack overflow"
         );
-        let fn_dict = resolve_dict(doc, fn_obj)?;
-        return read_fn_color(&fn_dict, b"C0", n);
+        let fn_dict = resolve_fn_dict(doc, fn_obj)?;
+        return read_fn_color(&fn_dict, b"C0", n).map(|c| apply_range_clip(&fn_dict, c));
     }
-    let fn_dict = resolve_dict(doc, fn_obj)?;
+    let fn_dict = resolve_fn_dict(doc, fn_obj)?;
     let fn_type = fn_dict.get_i64(b"FunctionType")?;
-    match fn_type {
+    let result = match fn_type {
         2 => Some(eval_exponential(&fn_dict, t, n)),
         3 => eval_stitching_depth(doc, &fn_dict, t, n, depth),
-        0 => Some(eval_sampled_approx(&fn_dict, t, n)),
+        0 => Some(
+            eval_sampled(doc, fn_obj, &fn_dict, t, n)
+                .unwrap_or_else(|| eval_sampled_approx(&fn_dict, t, n)),
+        ),
         _ => {
             log::debug!("shading: FunctionType {fn_type} not yet implemented — using C0 fallback");
             read_fn_color(&fn_dict, b"C0", n)
         }
-    }
+    };
+    result.map(|c| apply_range_clip(&fn_dict, c))
+}
+
+/// Clip per-channel output values to the function's `Range` array
+/// (PDF §7.10.2 "Range" entry). Missing or short `Range` arrays leave the
+/// channel unconstrained. Applied at every `eval_function_depth` exit so
+/// downstream colour conversion gets values already inside the declared
+/// output range.
+fn apply_range_clip(fn_dict: &Dictionary, channels: Vec<f64>) -> Vec<f64> {
+    let Some(range) = fn_dict.get(b"Range").and_then(Object::as_array) else {
+        return channels;
+    };
+    let pairs: Vec<f64> = range.iter().filter_map(obj_to_f64).collect();
+    channels
+        .into_iter()
+        .enumerate()
+        .map(|(ch, v)| {
+            if pairs.len() < (ch + 1) * 2 {
+                return v;
+            }
+            let (lo, hi) = (pairs[ch * 2], pairs[ch * 2 + 1]);
+            if hi <= lo { v } else { v.clamp(lo, hi) }
+        })
+        .collect()
 }
 
 /// Evaluate a Type 2 Exponential function: `C0 + (t_norm)^N × (C1 − C0)`.
@@ -163,6 +193,175 @@ fn eval_stitching_depth(
     };
 
     eval_function_depth(doc, &fns[idx], t_encoded, n, depth + 1)
+}
+
+/// Evaluate a Type 0 (Sampled) function against its actual sample stream.
+///
+/// Supported scope:
+/// - 1-D input only (`Size = [N]`); higher dimensions return `None` and the
+///   caller falls back to [`eval_sampled_approx`].
+/// - `BitsPerSample` 8 or 16 (MSB-first big-endian).  Other values
+///   (1/2/4/12/24/32) return `None`.
+/// - `Order` defaults to 1 (linear interpolation between adjacent samples);
+///   `Order = 3` (cubic spline) is not implemented and falls back.
+///
+/// PDF §7.10.2 algorithm: normalise `t` against `Domain` → `Encode`, look
+/// up two adjacent samples by integer index, linearly interpolate, then
+/// rescale via `Decode`.
+fn eval_sampled(
+    doc: &Document,
+    fn_obj: &Object,
+    fn_dict: &Dictionary,
+    t: f64,
+    n: usize,
+) -> Option<Vec<f64>> {
+    // Multi-dimensional Type 0 (Size = [N0, N1, ...]) falls back: PDF spec
+    // requires N-linear interpolation over an N-dimensional grid, which is
+    // out of scope here.
+    let size = fn_dict.get(b"Size").and_then(Object::as_array)?;
+    if size.len() != 1 {
+        return None;
+    }
+    let n_samples = size.first().and_then(Object::as_u32)? as usize;
+    if n_samples < 2 {
+        return None;
+    }
+
+    // Order = 1 (linear) is the default and the only supported value.
+    let order = fn_dict.get(b"Order").and_then(obj_to_f64).unwrap_or(1.0);
+    if (order - 1.0).abs() > f64::EPSILON {
+        return None;
+    }
+
+    let bps = fn_dict.get(b"BitsPerSample").and_then(Object::as_u32)?;
+    if bps != 8 && bps != 16 {
+        return None;
+    }
+
+    // The function object must carry a stream — Type 0 sample data is the
+    // stream content.  Inline dictionaries can't represent Type 0.
+    let stream_bytes = stream_bytes_for(doc, fn_obj)?;
+    let bytes_per_sample = (bps as usize) / 8 * n;
+    let expected_len = bytes_per_sample.checked_mul(n_samples)?;
+    if stream_bytes.len() < expected_len {
+        log::warn!(
+            "shading: Type 0 sample stream truncated ({} bytes, expected {expected_len})",
+            stream_bytes.len(),
+        );
+        return None;
+    }
+
+    let (d0, d1) = read_fn_domain(fn_dict);
+    let t_norm = if d1 > d0 {
+        ((t - d0) / (d1 - d0)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // n_samples ≥ 2 by the guard above; cast is finite and well within
+    // f64 mantissa (n_samples capped at u32::MAX by as_u32).
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "n_samples capped at u32; well within f64 mantissa"
+    )]
+    let n_samples_minus_1_f64 = (n_samples - 1) as f64;
+
+    // Encode maps Domain → sample index space; default [0, n_samples − 1].
+    let encode: Vec<f64> = fn_dict
+        .get(b"Encode")
+        .and_then(Object::as_array)
+        .map(|arr| arr.iter().filter_map(obj_to_f64).collect())
+        .unwrap_or_default();
+    let (e_lo, e_hi) = if encode.len() >= 2 {
+        (encode[0], encode[1])
+    } else {
+        (0.0, n_samples_minus_1_f64)
+    };
+    let idx_f = (e_lo + t_norm * (e_hi - e_lo)).clamp(0.0, n_samples_minus_1_f64);
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "idx_f clamped to [0, n_samples − 1] above; n_samples is usize"
+    )]
+    let idx_lo = idx_f.floor() as usize;
+    let idx_hi = (idx_lo + 1).min(n_samples - 1);
+    let frac = idx_f - idx_f.floor();
+
+    // Sample max per BPS for normalisation.
+    let s_max = if bps == 8 { 255.0 } else { 65535.0 };
+
+    // Decode maps normalised sample → output channel space.  Default = [0, 1] per channel.
+    let decode: Vec<f64> = fn_dict
+        .get(b"Decode")
+        .and_then(Object::as_array)
+        .map(|arr| arr.iter().filter_map(obj_to_f64).collect())
+        .unwrap_or_default();
+
+    let read_sample = |sample_idx: usize, ch: usize| -> f64 {
+        // bps is 8 or 16 by the guard above.
+        let off = sample_idx * bytes_per_sample + ch * (bps as usize) / 8;
+        if bps == 8 {
+            f64::from(stream_bytes[off])
+        } else {
+            let hi = u16::from(stream_bytes[off]);
+            let lo = u16::from(stream_bytes[off + 1]);
+            f64::from((hi << 8) | lo)
+        }
+    };
+
+    let channels = (0..n)
+        .map(|ch| {
+            let raw_lo = read_sample(idx_lo, ch) / s_max;
+            let raw_hi = read_sample(idx_hi, ch) / s_max;
+            let raw = raw_lo + frac * (raw_hi - raw_lo);
+            let (d_lo, d_hi) = if decode.len() >= (ch + 1) * 2 {
+                (decode[ch * 2], decode[ch * 2 + 1])
+            } else {
+                (0.0, 1.0)
+            };
+            d_lo + raw * (d_hi - d_lo)
+        })
+        .collect();
+    Some(channels)
+}
+
+/// Resolve `fn_obj` to its function dictionary.
+///
+/// Type 0 functions are *stream* objects (the dict carries `FunctionType` /
+/// `Size` / `BitsPerSample`; the stream content carries the sample bytes),
+/// so the resolver must handle `Object::Stream(s)` directly in addition to
+/// the inline-Dict and Reference-to-Dict cases that
+/// [`crate::resources::resolve_dict`] already covers.
+fn resolve_fn_dict(doc: &Document, fn_obj: &Object) -> Option<Dictionary> {
+    match fn_obj {
+        Object::Stream(s) => Some(s.dict.clone()),
+        Object::Reference(id) => {
+            let referent = doc.get_object(*id).ok()?;
+            match referent.as_ref() {
+                Object::Stream(s) => Some(s.dict.clone()),
+                other => resolve_dict(doc, other),
+            }
+        }
+        _ => resolve_dict(doc, fn_obj),
+    }
+}
+
+/// Return the decompressed stream bytes for `fn_obj` if it is a Stream or
+/// Reference-to-Stream; `None` for inline dicts or non-stream objects.
+fn stream_bytes_for(doc: &Document, fn_obj: &Object) -> Option<Vec<u8>> {
+    let resolved: std::sync::Arc<Object>;
+    let stream = match fn_obj {
+        Object::Stream(s) => s,
+        Object::Reference(id) => {
+            resolved = doc.get_object(*id).ok()?;
+            resolved.as_ref().as_stream()?
+        }
+        _ => return None,
+    };
+    stream
+        .decompressed_content()
+        .map_err(|e| log::debug!("shading: Type 0 stream decode failed: {e}"))
+        .ok()
 }
 
 /// Approximate a Type 0 Sampled function by linearly interpolating the decode range.
@@ -340,6 +539,153 @@ mod tests {
         assert!(
             (result[0] - 0.5).abs() < 1e-5,
             "expected fallback to evaluate sub_a at t=0.5 → 0.5, got {}",
+            result[0]
+        );
+    }
+
+    // ── Type 0 (Sampled) ──────────────────────────────────────────────────────
+
+    /// Build a Type 0 sampled function as a Stream object with the given
+    /// 8-bit sample bytes.  Domain = [0, 1], Range = [0, 1], 1 output channel
+    /// unless `n` is given.
+    fn make_sampled_8bit_stream(samples: &[u8]) -> pdf::Object {
+        let mut dict = pdf::Dictionary::new();
+        dict.set("FunctionType", pdf::Object::Integer(0));
+        dict.set(
+            "Domain",
+            pdf::Object::Array(vec![pdf::Object::Real(0.0), pdf::Object::Real(1.0)]),
+        );
+        dict.set(
+            "Range",
+            pdf::Object::Array(vec![pdf::Object::Real(0.0), pdf::Object::Real(1.0)]),
+        );
+        dict.set(
+            "Size",
+            pdf::Object::Array(vec![pdf::Object::Integer(samples.len() as i64)]),
+        );
+        dict.set("BitsPerSample", pdf::Object::Integer(8));
+        // Length is required for stream parsing in real PDFs; harmless to
+        // include here since we hand the Stream directly to eval_function.
+        dict.set("Length", pdf::Object::Integer(samples.len() as i64));
+        pdf::Object::Stream(pdf::Stream::new(dict, samples.to_vec()))
+    }
+
+    #[test]
+    fn sampled_reads_sample_stream() {
+        // Non-linear sample table: [0, 0, 0, 0, 255] — the stream-reading path
+        // must return ~0 for t < 0.75 and ~255 for t near 1.0.  Pure linear
+        // approximation (eval_sampled_approx) would give t × 1.0 everywhere.
+        let stream = make_sampled_8bit_stream(&[0, 0, 0, 0, 255]);
+        let doc = empty_doc();
+
+        let lo = eval_function(&doc, &stream, 0.0, 1).expect("eval at t=0");
+        assert!(
+            lo[0].abs() < 1e-5,
+            "t=0 should sample idx 0 → 0/255 = 0.0, got {}",
+            lo[0]
+        );
+
+        let mid = eval_function(&doc, &stream, 0.5, 1).expect("eval at t=0.5");
+        assert!(
+            mid[0].abs() < 1e-5,
+            "t=0.5 should sample idx 2 → 0/255 = 0.0; linear-approximation \
+             fallback would return 0.5.  got {}",
+            mid[0]
+        );
+
+        let hi = eval_function(&doc, &stream, 1.0, 1).expect("eval at t=1");
+        assert!(
+            (hi[0] - 1.0).abs() < 1e-5,
+            "t=1 should sample idx 4 → 255/255 = 1.0, got {}",
+            hi[0]
+        );
+    }
+
+    #[test]
+    fn sampled_interpolates_between_samples() {
+        // Samples [0, 100, 200] at indices [0, 1, 2].  t=0.25 maps to idx 0.5
+        // (encode default = [0, n−1] = [0, 2], so t × 2 = 0.5).  Linear interp
+        // between idx 0 (=0) and idx 1 (=100) at frac=0.5 → 50/255.
+        let stream = make_sampled_8bit_stream(&[0, 100, 200]);
+        let doc = empty_doc();
+
+        let result = eval_function(&doc, &stream, 0.25, 1).expect("eval at t=0.25");
+        let expected = 50.0 / 255.0;
+        assert!(
+            (result[0] - expected).abs() < 1e-5,
+            "expected linear interpolation 50/255 ≈ {expected}, got {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn sampled_multidim_falls_back_to_approx() {
+        // Multi-dimensional (Size = [2, 2]) — not yet implemented.  Must not
+        // panic; falls back to eval_sampled_approx which returns the linear
+        // ramp over the Decode range.
+        let mut dict = pdf::Dictionary::new();
+        dict.set("FunctionType", pdf::Object::Integer(0));
+        dict.set(
+            "Domain",
+            pdf::Object::Array(vec![
+                pdf::Object::Real(0.0),
+                pdf::Object::Real(1.0),
+                pdf::Object::Real(0.0),
+                pdf::Object::Real(1.0),
+            ]),
+        );
+        dict.set(
+            "Size",
+            pdf::Object::Array(vec![pdf::Object::Integer(2), pdf::Object::Integer(2)]),
+        );
+        dict.set("BitsPerSample", pdf::Object::Integer(8));
+        let stream = pdf::Object::Stream(pdf::Stream::new(dict, vec![0, 64, 128, 255]));
+        let doc = empty_doc();
+
+        // Just verify no panic and a result is produced.
+        let result = eval_function(&doc, &stream, 0.5, 1);
+        assert!(
+            result.is_some(),
+            "multi-dim Type 0 should fall back, not return None"
+        );
+    }
+
+    // ── Range clip ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn range_clip_clamps_above_max() {
+        // Exponential 0 → 2 evaluated at t=1 would normally return 2.0; the
+        // Range entry [0, 1] should clip it to 1.0.
+        let mut dict = make_exp_dict(0.0, 2.0, 1.0);
+        dict.set(
+            "Range",
+            pdf::Object::Array(vec![pdf::Object::Real(0.0), pdf::Object::Real(1.0)]),
+        );
+        let doc = empty_doc();
+        let fn_obj = pdf::Object::Dictionary(dict);
+        let result = eval_function(&doc, &fn_obj, 1.0, 1).expect("eval at t=1");
+        assert!(
+            (result[0] - 1.0).abs() < 1e-5,
+            "Range clip should cap at 1.0; got {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn range_clip_clamps_below_min() {
+        // C0 = -0.5 would normally pass through at t=0; Range [0, 1] should
+        // clip it to 0.0.
+        let mut dict = make_exp_dict(-0.5, 1.0, 1.0);
+        dict.set(
+            "Range",
+            pdf::Object::Array(vec![pdf::Object::Real(0.0), pdf::Object::Real(1.0)]),
+        );
+        let doc = empty_doc();
+        let fn_obj = pdf::Object::Dictionary(dict);
+        let result = eval_function(&doc, &fn_obj, 0.0, 1).expect("eval at t=0");
+        assert!(
+            result[0].abs() < 1e-5,
+            "Range clip should floor at 0.0; got {}",
             result[0]
         );
     }
