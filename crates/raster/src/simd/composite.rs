@@ -156,7 +156,7 @@ mod tests {
 
         // div255_u16(128 * 255) ≈ 128; blend: div255_u16((255-128)*0 + 128*255) ≈ 128.
         let v = dst[0];
-        assert!(v >= 125 && v <= 131, "expected ~128, got {v}");
+        assert!((125..=131).contains(&v), "expected ~128, got {v}");
     }
 
     #[test]

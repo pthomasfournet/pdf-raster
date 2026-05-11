@@ -537,21 +537,15 @@ mod tests {
         // Interior rows 2,3,4 should have spans; boundary rows 1,5 have horizontal
         // edges (count=0) and produce no interior spans.
         assert!(
-            !ScanIterator::new(&scanner, 2)
-                .collect::<Vec<_>>()
-                .is_empty(),
+            ScanIterator::new(&scanner, 2).next().is_some(),
             "no spans at y=2"
         );
         assert!(
-            !ScanIterator::new(&scanner, 3)
-                .collect::<Vec<_>>()
-                .is_empty(),
+            ScanIterator::new(&scanner, 3).next().is_some(),
             "no spans at y=3"
         );
         assert!(
-            !ScanIterator::new(&scanner, 4)
-                .collect::<Vec<_>>()
-                .is_empty(),
+            ScanIterator::new(&scanner, 4).next().is_some(),
             "no spans at y=4"
         );
     }

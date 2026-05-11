@@ -606,7 +606,7 @@ mod tests {
         //   = Multiply(128, 200)
         //   = div255(128 * 200) ≈ 100.
         let v = dst[0];
-        assert!((v as i32 - 100).abs() <= 1, "expected ~100, got {v}");
+        assert!((i32::from(v) - 100).abs() <= 1, "expected ~100, got {v}");
     }
 
     #[test]
@@ -614,7 +614,7 @@ mod tests {
         // a_src=128, a_dst=200.
         let (ar, ai, aim1) = compute_alphas(128, 200, 255, None, false);
         // a_result = 128 + 200 - div255(128 * 200) ≈ 228.
-        assert!(ar >= 226 && ar <= 230, "a_result={ar}");
+        assert!((226..=230).contains(&ar), "a_result={ar}");
         assert_eq!(ai, ar, "isolated: alpha_i == a_result");
         assert_eq!(aim1, 200, "isolated non-knockout: alpha_im1 == a_dst");
     }
@@ -647,7 +647,7 @@ mod tests {
         // a_src ≈ 128; a_dst = 0; a_result ≈ 128.
         // c = (0 * 0 + 128 * 255) / 128 = 255.
         assert_eq!(dst[0], 255);
-        assert!((alpha[0] as i32 - 128).abs() <= 2, "alpha={}", alpha[0]);
+        assert!((i32::from(alpha[0]) - 128).abs() <= 2, "alpha={}", alpha[0]);
     }
 
     #[test]

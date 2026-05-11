@@ -420,7 +420,7 @@ mod tests {
         // For src=128, dst=128: result should be close to 128.
         let r = blend_soft_light(128, 128);
         assert!(
-            (r as i32 - 128).abs() <= 2,
+            (i32::from(r) - 128).abs() <= 2,
             "soft_light(128,128)={r}, expected ~128"
         );
     }

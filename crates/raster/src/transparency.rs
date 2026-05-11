@@ -575,7 +575,7 @@ mod tests {
         );
     }
 
-    /// `x_max == i32::MAX` must not overflow during begin_group.
+    /// `x_max == i32::MAX` must not overflow during `begin_group`.
     #[test]
     fn begin_group_x_max_i32_max_does_not_overflow() {
         let parent: Bitmap<Rgb8> = Bitmap::new(4, 4, 4, true);

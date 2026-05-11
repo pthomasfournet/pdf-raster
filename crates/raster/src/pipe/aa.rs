@@ -282,7 +282,7 @@ mod tests {
         // a_result = 128 + 255 - div255(128 * 255) ≈ 255.
         // c = ((255 - 128) * 0 + 128 * 255) / 255 ≈ 128.
         let v = dst[0];
-        assert!(v >= 125 && v <= 131, "expected ~128, got {v}");
+        assert!((125..=131).contains(&v), "expected ~128, got {v}");
         assert_eq!(alpha[0], 255);
     }
 
@@ -300,7 +300,7 @@ mod tests {
         // With implicit a_dst=255: result should be a blend.
         // Expected: div255((255 - 128) * 0 + 128 * 200) ≈ 100.
         let v = dst[0];
-        assert!(v >= 95 && v <= 105, "expected ~100, got {v}");
+        assert!((95..=105).contains(&v), "expected ~100, got {v}");
     }
 
     /// `TransferSet::is_identity_rgb()` gates a SIMD-friendly fast path

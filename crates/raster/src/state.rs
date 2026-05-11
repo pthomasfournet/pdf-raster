@@ -523,7 +523,7 @@ mod tests {
         }
     }
 
-    /// In debug builds, constructing a GraphicsState with zero width must panic.
+    /// In debug builds, constructing a `GraphicsState` with zero width must panic.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "width must be > 0")]
@@ -531,7 +531,7 @@ mod tests {
         let _ = GraphicsState::new(0, 100, false);
     }
 
-    /// In debug builds, constructing a GraphicsState with zero height must panic.
+    /// In debug builds, constructing a `GraphicsState` with zero height must panic.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "height must be > 0")]

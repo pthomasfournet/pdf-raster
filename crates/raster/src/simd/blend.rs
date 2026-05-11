@@ -656,7 +656,7 @@ mod tests {
 
     // ── movdir64b tests ───────────────────────────────────────────────────────
 
-    /// `dispatch_rgb8_large` exercises count > MOVDIR64B_THRESHOLD_PX so the
+    /// `dispatch_rgb8_large` exercises count > `MOVDIR64B_THRESHOLD_PX` so the
     /// movdir64b path (or AVX2 on machines without movdir64b) is selected.
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -685,7 +685,7 @@ mod tests {
     }
 
     /// Exercise the movdir64b RGB path directly on capable machines.
-    /// Uses a misaligned allocation (vec::as_mut_ptr is only 8-byte aligned by
+    /// Uses a misaligned allocation (`vec::as_mut_ptr` is only 8-byte aligned by
     /// default) to exercise the preamble path as well.
     #[cfg(target_arch = "x86_64")]
     #[test]

@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn dispatch_matches_scalar_16_pixels() {
-        let bits: Vec<u8> = (0..16).map(|i| (i % 3 == 0) as u8).collect();
+        let bits: Vec<u8> = (0..16).map(|i| u8::from(i % 3 == 0)).collect();
         let packed = make_packed(&bits);
         let mut expected = vec![0u8; 16];
         unpack_mono_row_scalar(&packed, 16, &mut expected);
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn dispatch_matches_scalar_large() {
-        let bits: Vec<u8> = (0u8..128).map(|i| if i % 5 == 0 { 1 } else { 0 }).collect();
+        let bits: Vec<u8> = (0u8..128).map(|i| u8::from(i % 5 == 0)).collect();
         let packed = make_packed(&bits);
         let mut expected = vec![0u8; 128];
         unpack_mono_row_scalar(&packed, 128, &mut expected);
@@ -327,7 +327,7 @@ mod tests {
     fn dispatch_matches_scalar_non_multiple() {
         for width in [1usize, 7, 9, 15, 17, 23, 33, 63, 65] {
             let bits: Vec<u8> = (0..width)
-                .map(|i| (i.wrapping_mul(7) % 3 == 0) as u8)
+                .map(|i| u8::from(i.wrapping_mul(7) % 3 == 0))
                 .collect();
             let packed = make_packed(&bits);
             let mut expected = vec![0u8; width];
