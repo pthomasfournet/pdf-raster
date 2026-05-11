@@ -561,6 +561,7 @@ mod tests {
     /// 8-bit sample bytes.  Domain = [0, 1], Range = [0, 1], 1 output channel
     /// unless `n` is given.
     fn make_sampled_8bit_stream(samples: &[u8]) -> pdf::Object {
+        let len = i64::try_from(samples.len()).expect("test fixture < i64::MAX");
         let mut dict = pdf::Dictionary::new();
         dict.set("FunctionType", pdf::Object::Integer(0));
         dict.set(
@@ -571,14 +572,11 @@ mod tests {
             "Range",
             pdf::Object::Array(vec![pdf::Object::Real(0.0), pdf::Object::Real(1.0)]),
         );
-        dict.set(
-            "Size",
-            pdf::Object::Array(vec![pdf::Object::Integer(samples.len() as i64)]),
-        );
+        dict.set("Size", pdf::Object::Array(vec![pdf::Object::Integer(len)]));
         dict.set("BitsPerSample", pdf::Object::Integer(8));
         // Length is required for stream parsing in real PDFs; harmless to
         // include here since we hand the Stream directly to eval_function.
-        dict.set("Length", pdf::Object::Integer(samples.len() as i64));
+        dict.set("Length", pdf::Object::Integer(len));
         pdf::Object::Stream(pdf::Stream::new(dict, samples.to_vec()))
     }
 
