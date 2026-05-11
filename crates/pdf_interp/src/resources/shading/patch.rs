@@ -749,7 +749,8 @@ mod tests {
         // Top-left corner should be exactly preserved in both halves.
         assert_eq!(left.xy[0][0], p.xy[0][0]);
         assert_eq!(right.xy[3][0], p.xy[3][0]);
-        // Split point on left side should be at midpoint in y.
+        // The u-split seam (left's u=1 edge, right's u=0 edge) sits at the
+        // y-midpoint of the patch's u=0 / u=3 control rows.
         let mid_y = f64::midpoint(p.xy[0][0][1], p.xy[3][0][1]);
         assert!(
             (left.xy[3][0][1] - mid_y).abs() < 1e-9,
@@ -765,10 +766,9 @@ mod tests {
         );
         // Colors: left's u=1 edge should be midpoint of original u edges.
         for ch in 0..3 {
-            let expected =
-                u16::midpoint(u16::from(p.color[0][0][ch]), u16::from(p.color[1][0][ch])) as u8;
+            let expected = u8::midpoint(p.color[0][0][ch], p.color[1][0][ch]);
             assert!(
-                (left.color[1][0][ch] as i16 - expected as i16).abs() <= 1,
+                (i16::from(left.color[1][0][ch]) - i16::from(expected)).abs() <= 1,
                 "color mismatch ch={ch}"
             );
         }
