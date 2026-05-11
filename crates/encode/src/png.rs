@@ -319,10 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn rgb_with_alpha_2x2_pins_row_offset() {
-        // Multi-row RGB+alpha bitmap to constrain the row_off = y * w * 4 math
-        // in write_png_rgb's alpha-promotion branch (the existing 2×1 test
-        // can't see mutations on `* w` or `* 4` because y=0 and w=2).
+    fn rgb_with_alpha_multi_row_promotion() {
+        // The 2×1 rgb_with_alpha_writes_rgba_png test only exercises a single
+        // row; this 2×2 fixture verifies the per-row offset math is correct
+        // for at least two rows of RGB+alpha promotion.
         let mut bmp: Bitmap<Rgb8> = Bitmap::new(2, 2, 1, true);
         // Row 0 RGB: [10, 20, 30, 40, 50, 60]; Row 1 RGB: [70, 80, 90, 100, 110, 120].
         bmp.row_bytes_mut(0)

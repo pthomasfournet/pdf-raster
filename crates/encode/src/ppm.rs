@@ -299,10 +299,9 @@ mod tests {
     }
 
     #[test]
-    fn cmyk_ppm_multi_pixel_constrains_dst_stride() {
-        // 2×2 with four distinct CMYK pixels — each pixel hits a different
-        // (i*3, i*3+1, i*3+2) destination triple, so mutations on the dst
-        // index arithmetic in the Cmyk8 branch can no longer hide behind w=1.
+    fn cmyk_ppm_multi_pixel_layout() {
+        // 2×2 with four distinct CMYK pixels — covers per-pixel CMYK→RGB
+        // conversion across multiple rows and per-row destination stride.
         let mut bmp: Bitmap<Cmyk8> = Bitmap::new(2, 2, 1, false);
         // Row 0: [(10, 0, 0, 0), (0, 20, 0, 0)] → [(245,255,255), (255,235,255)]
         bmp.row_bytes_mut(0)
@@ -322,9 +321,10 @@ mod tests {
     }
 
     #[test]
-    fn rgba8_xbgr_ppm_multi_pixel_constrains_stride() {
-        // The single-pixel Xbgr8 test can't see mutations on `i * 4` or
-        // `i * 3` because i is always 0.  Use 2×1 with distinct pixels.
+    fn rgba8_xbgr_ppm_multi_pixel_channel_swap() {
+        // 2×1 fixture verifying the Xbgr8 → RGB channel swap applies
+        // independently to each pixel (the 1×1 test couldn't observe per-pixel
+        // advance through the source and destination buffers).
         let mut bmp: Bitmap<Rgba8> = Bitmap::new(2, 1, 1, false);
         // [A=255, B=10, G=20, R=30]  [A=240, B=11, G=22, R=33]
         bmp.row_bytes_mut(0)
@@ -336,8 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn devicen_multi_pixel_constrains_dst_stride() {
-        // 2×1 DeviceN8 with two distinct CMYK portions.  Spot bytes ignored.
+    fn devicen_ignores_spot_channels_per_pixel() {
+        // 2×1 DeviceN8 (8 bytes/pixel = CMYK + 4 spot) verifying that the
+        // spot bytes are skipped per pixel and only the CMYK portion drives
+        // the RGB output.
         let mut bmp: Bitmap<DeviceN8> = Bitmap::new(2, 1, 1, false);
         // px0 CMYK=(10, 0, 0, 0) → (245, 255, 255); spot=99..
         // px1 CMYK=(0, 40, 80, 0) → (255, 215, 175); spot=88..
@@ -349,7 +351,7 @@ mod tests {
         assert_eq!(
             &out[hlen..],
             &[245, 255, 255, 255, 215, 175],
-            "two-pixel DeviceN must constrain i*3 dst stride and ignore spots",
+            "spot bytes must be skipped per pixel; only CMYK drives the RGB output"
         );
     }
 }
