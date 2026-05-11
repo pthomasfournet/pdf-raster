@@ -56,9 +56,15 @@
 //! // `rayon` is a transitive dependency of `pdf_raster`; add it explicitly
 //! // to your Cargo.toml only if you call rayon APIs directly: rayon = "1"
 //! //
-//! // Keep the consumer loop on the calling thread (not inside a rayon::scope)
-//! // to avoid pool starvation: render_channel's producer also runs on rayon's
-//! // global pool and can deadlock if all workers are occupied by scope tasks.
+//! // The consumer `recv` loop MUST run on the calling thread (not inside a
+//! // `rayon::scope` or a worker closure): `render_channel`'s producer also
+//! // runs on rayon's global pool, so a recv loop inside a scope task could
+//! // deadlock if the pool fills with scope tasks all blocked on `recv`.
+//! //
+//! // `rayon::spawn` *inside* the recv-arm is safe — those tasks return
+//! // without blocking on recv themselves.  For non-CPU consumer work
+//! // (Tesseract OCR, disk I/O), prefer `std::thread::spawn` to keep the
+//! // rayon pool free for the renderer.
 //! let opts = RasterOptions {
 //!     dpi: 300.0,
 //!     first_page: 1,
@@ -222,20 +228,37 @@ impl BackendPolicy {
     /// `log::warn!` (not stderr) so library embedders control the sink.
     #[must_use]
     pub fn from_env_var(name: &str) -> Self {
-        let raw = std::env::var(name).unwrap_or_default();
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "auto" => Self::Auto,
-            "cpu" => Self::CpuOnly,
-            "cuda" => Self::ForceCuda,
-            "vaapi" => Self::ForceVaapi,
-            "vulkan" => Self::ForceVulkan,
-            other => {
-                log::warn!(
-                    "{name}={other:?} not recognised; using Auto. \
-                     Valid values: auto, cpu, cuda, vaapi, vulkan."
-                );
-                Self::Auto
-            }
+        // Unset / empty / unreadable env var → Auto with no allocation.
+        let Some(raw) = std::env::var_os(name) else {
+            return Self::Auto;
+        };
+        let Some(s) = raw.to_str() else {
+            log::warn!("{name} contains non-UTF-8 bytes; using Auto");
+            return Self::Auto;
+        };
+        s.parse().unwrap_or_else(|()| {
+            log::warn!(
+                "{name}={s:?} not recognised; using Auto. \
+                 Valid values: auto, cpu, cuda, vaapi, vulkan."
+            );
+            Self::Auto
+        })
+    }
+}
+
+impl std::str::FromStr for BackendPolicy {
+    type Err = ();
+
+    /// Parse a backend name.  Whitespace is trimmed and matching is
+    /// case-insensitive.  Empty input maps to `Auto`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::CpuOnly),
+            "cuda" => Ok(Self::ForceCuda),
+            "vaapi" => Ok(Self::ForceVaapi),
+            "vulkan" => Ok(Self::ForceVulkan),
+            _ => Err(()),
         }
     }
 }
@@ -370,58 +393,46 @@ impl PageSet {
         self.0.len()
     }
 
-    /// Always returns `false`.
-    ///
-    /// A `PageSet` is guaranteed non-empty by construction; this method exists
-    /// to satisfy the `clippy::len_without_is_empty` lint.
+    /// Always returns `false`.  A `PageSet` is guaranteed non-empty by
+    /// construction (see [`PageSet::new`]); this method exists to satisfy the
+    /// `clippy::len_without_is_empty` lint.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 }
 
-// ── Public types ──────────────────────────────────────────────────────────────
+// ── Render options & output ───────────────────────────────────────────────────
 
 /// Options controlling how pages are rendered.
 #[derive(Debug, Clone)]
 pub struct RasterOptions {
-    /// Render resolution in dots per inch.  Must be > 0.
-    ///
-    /// Pass this same value to Tesseract's `set_source_resolution` — lying about
-    /// DPI degrades OCR accuracy because Tesseract uses it for internal scaling.
-    /// Recommended: 300 DPI for scanned documents.
+    /// Must be > 0.  Pass this same value to Tesseract's `set_source_resolution`
+    /// — lying about DPI degrades OCR accuracy because Tesseract uses it for
+    /// internal scaling.  Recommended: 300 DPI for scanned documents.
     pub dpi: f32,
 
-    /// First page to render (1-based, inclusive).  Must be ≥ 1.
-    ///
-    /// Ignored when [`pages`](Self::pages) is `Some` — the render window is
-    /// derived from the `PageSet` bounds instead.
+    /// First page (1-based, inclusive).  Must be ≥ 1.  Ignored when
+    /// [`pages`](Self::pages) is `Some` — the render window is then derived
+    /// from the `PageSet` bounds.
     pub first_page: u32,
 
-    /// Last page to render (1-based, inclusive).  Must be ≥ `first_page`.
-    ///
-    /// If `last_page` exceeds the document's page count, rendering stops at the
-    /// last page in the document rather than returning an error.
-    ///
-    /// Ignored when [`pages`](Self::pages) is `Some` — the render window is
-    /// derived from the `PageSet` bounds instead.
+    /// Last page (1-based, inclusive).  Must be ≥ `first_page`.  If it exceeds
+    /// the document's page count, rendering stops at the last page in the
+    /// document rather than returning an error.  Ignored when
+    /// [`pages`](Self::pages) is `Some`.
     pub last_page: u32,
 
-    /// Apply deskew before returning pixels.
-    ///
     /// Uses an intensity-weighted projection-profile sweep (no binarisation
     /// threshold) with GPU bilinear rotation via CUDA NPP (`gpu-deskew` feature)
     /// or CPU bilinear fallback.  Corrects skew up to ±7° with sub-0.05°
     /// accuracy.  Disable for native-text PDFs that are never physically skewed.
     pub deskew: bool,
 
-    /// Sparse page selection.
-    ///
-    /// When `Some`, only the pages in the [`PageSet`] are rendered and yielded.
-    /// The iteration window is `PageSet::first()..=PageSet::last()`; intermediate
-    /// pages not in the set are skipped without rendering.
-    ///
-    /// When `None`, all pages in `first_page..=last_page` are rendered.
+    /// Sparse page selection.  When `Some`, only the pages in the [`PageSet`]
+    /// are rendered and yielded; intermediate pages are skipped without
+    /// rendering.  When `None`, all pages in `first_page..=last_page` are
+    /// rendered.
     pub pages: Option<PageSet>,
 }
 
@@ -460,7 +471,7 @@ pub struct RenderedPage {
     pub diagnostics: PageDiagnostics,
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Top-level render entry points ─────────────────────────────────────────────
 
 /// Render a range of pages from a PDF file.
 ///
@@ -629,5 +640,45 @@ mod page_set_tests {
             pages: Some(ps),
         };
         assert!(opts.pages.is_some());
+    }
+
+    #[test]
+    fn backend_policy_parses_known_names() {
+        use std::str::FromStr;
+        assert_eq!(BackendPolicy::from_str("auto"), Ok(BackendPolicy::Auto));
+        assert_eq!(BackendPolicy::from_str("cpu"), Ok(BackendPolicy::CpuOnly));
+        assert_eq!(
+            BackendPolicy::from_str("cuda"),
+            Ok(BackendPolicy::ForceCuda)
+        );
+        assert_eq!(
+            BackendPolicy::from_str("vaapi"),
+            Ok(BackendPolicy::ForceVaapi)
+        );
+        assert_eq!(
+            BackendPolicy::from_str("vulkan"),
+            Ok(BackendPolicy::ForceVulkan)
+        );
+    }
+
+    #[test]
+    fn backend_policy_empty_is_auto() {
+        use std::str::FromStr;
+        assert_eq!(BackendPolicy::from_str(""), Ok(BackendPolicy::Auto));
+    }
+
+    #[test]
+    fn backend_policy_trims_and_ignores_case() {
+        use std::str::FromStr;
+        assert_eq!(
+            BackendPolicy::from_str("  CUDA  "),
+            Ok(BackendPolicy::ForceCuda)
+        );
+    }
+
+    #[test]
+    fn backend_policy_rejects_unknown() {
+        use std::str::FromStr;
+        assert!(BackendPolicy::from_str("metal").is_err());
     }
 }
