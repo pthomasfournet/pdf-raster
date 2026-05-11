@@ -656,22 +656,11 @@ mod tests {
         // regardless of pixel mode, so gray transfer was silently wrong.
         // Build an inverting gray LUT and a pass-through rgb LUT; the general
         // pipe over a Gray8 pixel must invert the output via the gray table.
-        static INV: [u8; 256] = {
-            let mut a = [0u8; 256];
-            let mut i = 0u8;
-            loop {
-                a[i as usize] = 255 - i;
-                if i == 255 {
-                    break;
-                }
-                i += 1;
-            }
-            a
-        };
         static DN: [[u8; 256]; 8] = [TransferLut::IDENTITY.0; 8];
         let id = TransferLut::IDENTITY.as_array();
+        let inv = TransferLut::INVERTED.as_array();
         let transfer = TransferSet {
-            gray: &INV, // inverting gray transfer
+            gray: inv, // inverting gray transfer
             rgb: [id; 3],
             cmyk: [id; 4],
             device_n: &DN,

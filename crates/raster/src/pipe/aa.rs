@@ -314,23 +314,11 @@ mod tests {
     /// applies it.
     #[test]
     fn non_identity_transfer_must_use_general_path() {
-        // Build the inverting LUT and a parallel identity LUT entry-by-entry
-        // via `u8` iteration — the `0u8..=255` range gives clippy the bound
-        // it needs to skip the truncation lint.
-        static INVERT: [u8; 256] = {
-            let mut t = [0u8; 256];
-            let mut i: u8 = 0;
-            loop {
-                t[i as usize] = 255 - i;
-                if i == 255 {
-                    break;
-                }
-                i += 1;
-            }
-            t
-        };
+        // Inverting RGB transfer + identity gray/cmyk/device_n; the inverting
+        // table is what makes this test's transfer set non-identity.
         static DN_ID: [[u8; 256]; 8] = [TransferLut::IDENTITY.0; 8];
         let id = TransferLut::IDENTITY.as_array();
+        let inv = TransferLut::INVERTED.as_array();
 
         let pipe = PipeState {
             blend_mode: BlendMode::Normal,
@@ -338,7 +326,7 @@ mod tests {
             overprint_mask: 0xFFFF_FFFF,
             overprint_additive: false,
             transfer: TransferSet {
-                rgb: [&INVERT, &INVERT, &INVERT],
+                rgb: [inv; 3],
                 gray: id,
                 cmyk: [id; 4],
                 device_n: &DN_ID,

@@ -75,6 +75,26 @@ impl TransferLut {
         Self(t)
     };
 
+    /// The per-byte inverting mapping: every value `i` maps to `255 - i`.
+    ///
+    /// Unlike [`invert_complement`](Self::invert_complement) (which composes an
+    /// existing LUT with the complement), this is the standalone "negate" LUT —
+    /// suitable for test fixtures that need a non-identity transfer where the
+    /// output is easy to assert against. Same `u8` loop-counter rationale as
+    /// [`IDENTITY`](Self::IDENTITY): index-to-byte cast is lossless by type.
+    pub const INVERTED: Self = {
+        let mut t = [0u8; 256];
+        let mut i = 0u8;
+        loop {
+            t[i as usize] = 255 - i;
+            if i == 255 {
+                break;
+            }
+            i += 1;
+        }
+        Self(t)
+    };
+
     /// Apply the LUT to a single byte.
     ///
     /// # Safety / infallibility

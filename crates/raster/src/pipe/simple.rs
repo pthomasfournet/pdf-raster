@@ -153,23 +153,12 @@ mod tests {
         // Inverting transfer (T[v] = 255 − v) used for all RGB channels; the
         // identity tables are used for the gray / CMYK / device_n slots that
         // aren't exercised here.
-        static INV: [u8; 256] = {
-            let mut a = [0u8; 256];
-            let mut i = 0u8;
-            loop {
-                a[i as usize] = 255 - i;
-                if i == 255 {
-                    break;
-                }
-                i += 1;
-            }
-            a
-        };
         static DN: [[u8; 256]; 8] = [TransferLut::IDENTITY.0; 8];
         let id = TransferLut::IDENTITY.as_array();
+        let inv = TransferLut::INVERTED.as_array();
 
         let transfer = TransferSet {
-            rgb: [&INV, &INV, &INV],
+            rgb: [inv; 3],
             gray: id,
             cmyk: [id; 4],
             device_n: &DN,
