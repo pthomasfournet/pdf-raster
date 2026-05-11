@@ -13,6 +13,5 @@
 pub mod prefetch;
 
 pub use prefetch::{
-    MAX_PREFETCH_WORKERS, PrefetchConfig, PrefetchHandle, PrefetchStats, PrefetchStatsSnapshot,
-    spawn_prefetch,
+    MAX_PREFETCH_WORKERS, PrefetchConfig, PrefetchHandle, PrefetchStats, spawn_prefetch,
 };

@@ -110,75 +110,11 @@ pub struct PrefetchStats {
     pub errors: AtomicU64,
 }
 
-impl PrefetchStats {
-    fn snapshot(&self) -> PrefetchStatsSnapshot {
-        PrefetchStatsSnapshot {
-            discovered: self.discovered.load(Ordering::Relaxed),
-            decoded: self.decoded.load(Ordering::Relaxed),
-            already_cached: self.already_cached.load(Ordering::Relaxed),
-            errors: self.errors.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Plain-data snapshot of [`PrefetchStats`] — what
-/// [`PrefetchHandle::wait`] returns once the prefetcher has drained.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct PrefetchStatsSnapshot {
-    /// See [`PrefetchStats::discovered`].
-    pub discovered: u64,
-    /// See [`PrefetchStats::decoded`].
-    pub decoded: u64,
-    /// See [`PrefetchStats::already_cached`].
-    pub already_cached: u64,
-    /// See [`PrefetchStats::errors`].
-    pub errors: u64,
-}
-
-/// Handle to a running prefetch job.  Drop the handle to cancel and
-/// join the workers; or call [`Self::wait`] to block until every
-/// queued image has been processed.
+/// Handle to a running prefetch job.  Drop the handle to cancel
+/// in-flight prefetch and join the workers.
 pub struct PrefetchHandle {
     cancel: Arc<AtomicBool>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
-    stats: Arc<PrefetchStats>,
-}
-
-impl PrefetchHandle {
-    /// Block until every queued image has been processed and all
-    /// workers have exited cleanly, then return the final counters.
-    ///
-    /// Idempotent: a second call returns the same stats and is a
-    /// no-op (the worker handles have already been joined).
-    pub fn wait(&self) -> PrefetchStatsSnapshot {
-        // Drain handles out from under the lock so the rest of the
-        // wait happens unlocked — `JoinHandle::join` blocks for the
-        // worker's full runtime, which is too long to hold the
-        // workers mutex.
-        let drained: Vec<_> = {
-            let mut guard = self
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.drain(..).collect()
-        };
-        for handle in drained {
-            // Workers swallow panics by design (a bad image must not
-            // poison the whole prefetch run).  `join` returning Err
-            // here would mean a panic escaped — log and move on.
-            if let Err(e) = handle.join() {
-                log::warn!("prefetch worker panicked: {e:?}");
-            }
-        }
-        self.stats.snapshot()
-    }
-
-    /// Read the current stats without joining.  Counters are
-    /// monotonic so a partial read is still meaningful, e.g. when
-    /// the renderer wants a progress bar.
-    pub fn stats(&self) -> PrefetchStatsSnapshot {
-        self.stats.snapshot()
-    }
 }
 
 impl Drop for PrefetchHandle {
@@ -276,7 +212,6 @@ pub fn spawn_prefetch(
     PrefetchHandle {
         cancel: Arc::clone(&state.cancel),
         workers: Mutex::new(handles),
-        stats: Arc::clone(&state.stats),
     }
 }
 
@@ -509,15 +444,6 @@ startxref\n180\n%%EOF"
         let c = PrefetchConfig::default();
         assert_eq!(c.workers, 2);
         assert_eq!(c.max_images, 4096);
-    }
-
-    #[test]
-    fn stats_default_starts_at_zero() {
-        let snap = PrefetchStats::default().snapshot();
-        assert_eq!(snap.discovered, 0);
-        assert_eq!(snap.decoded, 0);
-        assert_eq!(snap.already_cached, 0);
-        assert_eq!(snap.errors, 0);
     }
 
     #[test]
