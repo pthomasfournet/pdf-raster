@@ -398,6 +398,25 @@ pub(super) const fn expand_inline_name(name: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    /// Minimal valid PDF with one empty page tree.  Inline-image decoding for
+    /// the test cases below resolves `ColorSpace` from device-name objects
+    /// (`/G`, `/IM`) without touching the document, so the catalogue can stay
+    /// empty — `from_bytes_owned(Vec::new())` would fail to parse.
+    fn empty_doc() -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("test PDF parse")
+    }
+
     // ── parse_inline_params / expand_inline_key ───────────────────────────────
 
     #[test]
@@ -515,12 +534,11 @@ mod tests {
     // ── decode_inline_image ────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "TODO: port to byte-builder PDF (decode_raw not yet migrated)"]
     fn inline_image_raw_gray() {
         // 2×2 raw DeviceGray image, 8 bpc, no filter.
         let params = b"/W 2 /H 2 /CS /G /BPC 8";
         let data = [0x00u8, 0x80, 0xFF, 0x40];
-        let doc = Document::from_bytes_owned(Vec::new()).expect("test PDF parse");
+        let doc = empty_doc();
         let img = decode_inline_image(
             &doc,
             params,
@@ -544,13 +562,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO: port to byte-builder PDF (decode_raw not yet migrated)"]
     fn inline_image_mask() {
         // 2×1 mask image (ImageMask=true means Mask colour space).
         let params = b"/W 2 /H 1 /IM true /BPC 1";
         // 1-bpp mask: byte 0b10000000 → pixel 0 = 1 (transparent), pixel 1 = 0 (paint).
         let data = [0b1000_0000u8];
-        let doc = Document::from_bytes_owned(Vec::new()).expect("test PDF parse");
+        let doc = empty_doc();
         let img = decode_inline_image(
             &doc,
             params,
@@ -575,10 +592,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO: port to byte-builder PDF (decode_raw not yet migrated)"]
     fn inline_image_degenerate_dims() {
         let params = b"/W 0 /H 1 /CS /G /BPC 8";
-        let doc = Document::from_bytes_owned(Vec::new()).expect("test PDF parse");
+        let doc = empty_doc();
         assert!(
             decode_inline_image(
                 &doc,
@@ -600,11 +616,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO: port to byte-builder PDF (decode_raw not yet migrated)"]
     fn inline_image_missing_dims() {
         // No width/height → None.
         let params = b"/CS /G /BPC 8";
-        let doc = Document::from_bytes_owned(Vec::new()).expect("test PDF parse");
+        let doc = empty_doc();
         assert!(
             decode_inline_image(
                 &doc,
