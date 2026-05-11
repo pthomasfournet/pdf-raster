@@ -30,7 +30,7 @@ const MAX_FN_DEPTH: u8 = 10;
 /// - **Type 0** (Sampled): linear interpolation across the decode range (stream data not used).
 ///
 /// Unknown types fall back to `C0` if available.
-pub(super) fn eval_function(doc: &Document, fn_obj: &Object, t: f64, n: usize) -> Option<Vec<f64>> {
+pub fn eval_function(doc: &Document, fn_obj: &Object, t: f64, n: usize) -> Option<Vec<f64>> {
     eval_function_depth(doc, fn_obj, t, n, 0)
 }
 

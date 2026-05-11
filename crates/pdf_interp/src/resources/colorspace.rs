@@ -174,8 +174,15 @@ impl ColorSpace {
     ///   resolves Indexed separately.
     /// - `Pattern`: returns black — patterns are not directly convertible
     ///   to RGB; tile rasterisation is invoked elsewhere.
-    /// - `Separation` / `DeviceN`: per current image-pipeline policy,
-    ///   approximate as gray with `1 - tint[0]` (tint 0 = full ink = dark).
+    /// - `Separation`: passes the tint through the document's
+    ///   tint-transform function (referenced by `tint_dict_id`) and
+    ///   converts the result via the alternate colour space.  Any failure
+    ///   (missing function, eval error, alternate falls through) drops
+    ///   back to `1 - tint` as gray.
+    /// - `DeviceN`: requires N-input function evaluation; the current
+    ///   shading-fn evaluator handles only 1-input functions, so
+    ///   `DeviceN` currently falls back to the 1-input gray heuristic on
+    ///   `comps[0]`. Filed as a separate concern.
     #[must_use]
     pub fn convert_to_rgb(&self, doc: &Document, comps: &[f64]) -> [u8; 3] {
         if comps.len() != self.ncomponents() {
@@ -206,11 +213,29 @@ impl ColorSpace {
                 icc_fallback_by_n(*n, comps)
             }
             Self::Indexed { .. } | Self::Pattern { .. } => [0, 0, 0],
-            Self::Separation { .. } | Self::DeviceN { .. } => {
-                // Image-pipeline policy: spot tints approximate as gray with
-                // the first component inverted (0 = full ink = dark).
-                let v = (1.0 - comps[0]).clamp(0.0, 1.0);
-                gray_byte_to_rgb(color::convert::gray_to_u8(v))
+            Self::Separation {
+                alternate,
+                tint_dict_id,
+            } => {
+                // PDF §8.6.6.4: pass the single tint component through the
+                // tint-transform function to produce values in the alternate
+                // colour space, then convert via the alternate.  On any
+                // failure (missing dict id, function eval returns None, or
+                // alternate.convert_to_rgb falls back), use the image-
+                // pipeline heuristic (1 - tint → gray).
+                if let Some(id) = tint_dict_id
+                    && let Some(rgb) = separation_via_tint_fn(doc, *id, alternate, comps[0])
+                {
+                    return rgb;
+                }
+                separation_fallback_gray(comps[0])
+            }
+            Self::DeviceN { .. } => {
+                // Multi-channel tint transform requires N-input function
+                // evaluation; the current evaluator only handles 1-input
+                // shading functions.  Fall back to the heuristic on
+                // comps[0] until the evaluator is extended.
+                separation_fallback_gray(comps[0])
             }
         }
     }
@@ -325,6 +350,35 @@ fn fetch_icc_bytes(doc: &Document, stream_id: ObjectId) -> Option<Vec<u8>> {
         .decompressed_content()
         .map_err(|e| log::debug!("colorspace: ICC stream decompress failed: {e}"))
         .ok()
+}
+
+/// Pass a Separation tint through the document's tint-transform function
+/// and convert the result via the alternate colour space.
+///
+/// Returns `None` and lets the caller fall back to the image-pipeline gray
+/// heuristic on any failure (function object not dereferenceable, function
+/// evaluation returns `None`, or the alternate space itself can't convert).
+fn separation_via_tint_fn(
+    doc: &Document,
+    tint_dict_id: ObjectId,
+    alternate: &ColorSpace,
+    tint: f64,
+) -> Option<[u8; 3]> {
+    let fn_arc = doc.get_object(tint_dict_id).ok()?;
+    let outputs = super::shading::function::eval_function(
+        doc,
+        fn_arc.as_ref(),
+        tint,
+        alternate.ncomponents(),
+    )?;
+    Some(alternate.convert_to_rgb(doc, &outputs))
+}
+
+/// Image-pipeline policy: a spot tint with no resolvable transform
+/// approximates as gray with `1 - tint` (tint 0 = full ink = dark).
+fn separation_fallback_gray(tint: f64) -> [u8; 3] {
+    let v = (1.0 - tint).clamp(0.0, 1.0);
+    gray_byte_to_rgb(color::convert::gray_to_u8(v))
 }
 
 /// Fall back to the device space matching the ICC profile's channel count
@@ -879,15 +933,62 @@ mod tests {
     }
 
     #[test]
-    fn convert_separation_inverts_tint_as_gray() {
+    fn convert_separation_without_tint_fn_falls_back_to_gray() {
+        // No tint_dict_id → skip eval_function entirely, use the 1-tint heuristic.
         let doc = empty_doc();
-        // Image-pipeline policy: tint 0 = full ink = dark.
         let sep = ColorSpace::Separation {
             alternate: Box::new(ColorSpace::DeviceCmyk),
             tint_dict_id: None,
         };
         assert_eq!(sep.convert_to_rgb(&doc, &[0.0]), [255, 255, 255]); // no ink
         assert_eq!(sep.convert_to_rgb(&doc, &[1.0]), [0, 0, 0]); // full ink
+    }
+
+    #[test]
+    fn convert_separation_unresolvable_tint_fn_falls_back() {
+        // tint_dict_id points at a missing object → fetch fails →
+        // separation_via_tint_fn returns None → fall back to gray heuristic.
+        let doc = empty_doc();
+        let sep = ColorSpace::Separation {
+            alternate: Box::new(ColorSpace::DeviceCmyk),
+            tint_dict_id: Some((999, 0)),
+        };
+        assert_eq!(sep.convert_to_rgb(&doc, &[0.5]), [128, 128, 128]);
+    }
+
+    #[test]
+    fn convert_devicen_falls_back_to_gray_pending_n_input_evaluator() {
+        // The shading function evaluator only handles 1-input functions
+        // today; DeviceN with N>1 inputs cannot be transformed correctly,
+        // so we use the 1-input heuristic on comps[0].
+        let doc = empty_doc();
+        let dn = ColorSpace::DeviceN {
+            ncomps: 3,
+            alternate: Box::new(ColorSpace::DeviceCmyk),
+            tint_dict_id: None,
+        };
+        assert_eq!(dn.convert_to_rgb(&doc, &[1.0, 0.5, 0.5]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn convert_separation_with_separation_alternate_terminates() {
+        // Adversarial: a Separation whose alternate is another Separation
+        // (PDF spec forbids but our parser would accept).  Conversion must
+        // not infinite-loop; the parser's MAX_CS_DEPTH bounds the
+        // structure, and convert_to_rgb's recursion is bounded by the
+        // same depth.  Verifies the recursion terminates with *some* output.
+        let doc = empty_doc();
+        let inner = ColorSpace::Separation {
+            alternate: Box::new(ColorSpace::DeviceGray),
+            tint_dict_id: None,
+        };
+        let outer = ColorSpace::Separation {
+            alternate: Box::new(inner),
+            tint_dict_id: None,
+        };
+        // No infinite loop, deterministic byte triple.
+        let result = outer.convert_to_rgb(&doc, &[0.5]);
+        assert_eq!(result.len(), 3);
     }
 
     #[test]

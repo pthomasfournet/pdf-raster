@@ -28,7 +28,7 @@
 //! and Type 3 (Stitching) functions are implemented; other types are treated
 //! as a solid mid-point colour.
 
-mod function;
+pub(crate) mod function;
 mod patch;
 
 use std::sync::Arc;
