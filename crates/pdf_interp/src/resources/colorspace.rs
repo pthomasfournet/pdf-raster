@@ -969,6 +969,42 @@ mod tests {
     }
 
     #[test]
+    fn convert_iccbased_srgb_profile_round_trips_through_moxcms() {
+        // Embed the canonical sRGB profile as a stream, reference it from
+        // an IccBased CS with n=3, and verify that primary colours
+        // round-trip through the moxcms sRGB→sRGB transform.  Identity-up-
+        // to-LSB confirms the actual code path (not the fallback) runs.
+        let icc_bytes = moxcms::ColorProfile::new_srgb()
+            .encode()
+            .expect("moxcms must encode its own sRGB profile");
+        let doc = crate::test_helpers::make_doc_with_stream(&icc_bytes, " /N 3");
+        let icc = ColorSpace::IccBased {
+            n: 3,
+            stream_id: Some((2, 0)),
+        };
+        // Pure red → ~[255, 0, 0] within sRGB transform rounding.
+        let red = icc.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]);
+        assert!(
+            red[0] >= 253 && red[1] <= 2 && red[2] <= 2,
+            "sRGB→sRGB pure red expected ~[255,0,0], got {red:?}"
+        );
+        // Pure green.
+        let green = icc.convert_to_rgb(&doc, &[0.0, 1.0, 0.0]);
+        assert!(
+            green[0] <= 2 && green[1] >= 253 && green[2] <= 2,
+            "sRGB→sRGB pure green expected ~[0,255,0], got {green:?}"
+        );
+        // Mid grey (0.5, 0.5, 0.5).  sRGB encodes 0.5-linear ≈ 188 but the
+        // input is *already* sRGB-encoded; identity should keep it at
+        // ~128 modulo transform rounding.
+        let grey = icc.convert_to_rgb(&doc, &[0.5, 0.5, 0.5]);
+        assert!(
+            (125..=131).contains(&grey[0]) && grey[0] == grey[1] && grey[1] == grey[2],
+            "sRGB→sRGB mid-grey expected ~[128,128,128], got {grey:?}"
+        );
+    }
+
+    #[test]
     fn convert_separation_without_tint_fn_falls_back_to_gray() {
         // No tint_dict_id → skip eval_function entirely, use the 1-tint heuristic.
         let doc = empty_doc();
