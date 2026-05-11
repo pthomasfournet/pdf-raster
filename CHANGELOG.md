@@ -2,7 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.2] - 2026-05-11
+
+### Bug Fixes
+
+- U32 overflow in three scale_mask kernels + golden tests
+- 14 pre-existing clippy lints under --features ...,vaapi --tests
+- Clean clippy --tests (40 → 0 warnings)
+- Use PDF font dict Widths for simple fonts (PDF §9.2.4)
+
+### Documentation
+
+- Document alloc_device_zeroed compute-queue contention
+
+### Features
+
+- GpuBackend::record_zero_buffer on CUDA + Vulkan
+
+### Other
+
+- PageCursor over PageSet, fix sparse iteration hang
+- Simplify PageCursor on top of 041465a
+- Drop dead public helpers + downgrade clip255 to private
+- NaN regression-pins + drop clip255 + 2x #[expect] removed
+- Collapse cmyk_to_rgb to chained u8::saturating_sub
+- Unreachable! over debug_assert, cs_to_rgb invariants
+- Kill per-call Vec alloc in SVE2 + rename popcnt → aa_coverage
+- State-first validation + shared fill_size helper
+- Saturate PDF width casts via pdf_width_to_i32
+
+### Refactor
+
+- Route ppm + shading helpers through color::convert
+- Delete dead popcnt_aa_row + all 5 tier impls
+- Unify 8 scale kernels behind one ImageSource path
+
+### Testing
+
+- Pin both branches of is_identity_rgb gate
+- Structural rotate_gpu pin + clippy clean under gpu-deskew
+- CPU rotation invariants kill 17 cargo-mutants survivors
+
 ## [0.9.1] - 2026-05-11
+
+### Chores
+
+- Release v0.9.1
+
+### Documentation
+
+- Prep v0.9.1 release notes
 
 ### Other
 

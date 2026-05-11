@@ -27,6 +27,118 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.9.2 (May 2026)
+
+**Spec-correctness fix on the simple-font text path — the headline.**
+
+- **PDF §9.2.4 Widths-array lookup for simple fonts**
+  (`pdf_interp/resources/font.rs`). The renderer was using FreeType's
+  `horiAdvance` for every byte of simple-font text, but for any font
+  not embedded in the PDF (most academic / English-language PDFs),
+  FreeType returns Helvetica-substitute metrics. The spec is explicit
+  that the font dict's `Widths` array MUST prevail over the font
+  program's widths, "even when no font file is embedded." Fixed by
+  adding `FontDescriptor::width_for_code(char_code) -> Option<i32>`
+  (with `MissingWidth` fallback per PDF §9.8.2) and routing the
+  per-byte advance through it; `face.glyph_advance` is now consulted
+  only when the `Widths` array is absent entirely (the 14 standard
+  fonts pre-PDF-1.5). Pixel-diff against pdftoppm:
+  - `corpus-05-academic-book`: avg RMSE **57.7 → 40.6** (−17.1).
+  - `ritual-14th.pdf`: avg RMSE **43.1 → 24.3** (−18.8).
+  - Other corpora: identical (use Type 0 or have no `Widths` array).
+
+**Phase 10 GPU backend trait — gap closed.**
+
+- **`GpuBackend::record_zero_buffer`** on the trait + CUDA + Vulkan
+  implementations. Folds the zero-fill into the active per-page
+  command buffer / stream instead of riding `alloc_device_zeroed`'s
+  separate submit + `vkQueueWaitIdle`. Vulkan records
+  `vkCmdFillBuffer` + transfer→compute barrier; CUDA issues
+  `cuMemsetD8Async` on the recorder stream. 4 new tests across both
+  backends (state-machine rejection, unaligned-size rejection, dirty-
+  alloc → zeros round-trip). Renderer-side migration to actually use
+  the method is a separate task — the trait surface is no longer the
+  blocker for it.
+- **State-first validation in `record_zero_buffer`** + extracted
+  shared `validate_fill_size` helper (returning `FillAction::Skip` /
+  `FillAction::Fill`) so the alignment / zero-size checks deduplicate
+  between `transfer::fill_zero` and `recorder::record_zero_buffer`.
+
+**Pre-existing bugs fixed:**
+
+- **`pdf_raster::PageCursor` sparse-iteration hang** (`041465a`). When
+  the consumer drained pages out of `PageSet`'s iterator order, the
+  cursor could deadlock. Replaced the `PageSet` iterator with a
+  cursor that tracks emitted pages directly. Behaviour-preserving on
+  the common dense path.
+- **u32 overflow in three `scale_mask` kernels** (`e2fb73b`). On
+  oversized images the column/row strides multiplied at u32 and
+  wrapped, producing a corrupt scaled image. Switched to u64
+  arithmetic where the stride * index product can overflow. Golden
+  tests added.
+- **Saturated PDF width casts** (`83c1426`). All five sites that
+  parsed PDF advance widths (`Widths`, `MissingWidth`, `DW`, `W` array
+  + range forms) used `as i32` which silently wraps on adversarial
+  input. Replaced with a single `pdf_width_to_i32` helper that uses
+  `i32::try_from` + sign-aware saturation. An attacker-controlled
+  `MissingWidth: i64::MAX` no longer becomes `-1`.
+
+**Hardening:**
+
+- **`color::convert` NaN regression-pins** (`a3ffaeb`). Float-to-u8
+  conversions in `cmyk_to_rgb` and `gray_to_rgb` now have explicit
+  test fixtures for NaN / ±Inf / out-of-range values; the
+  `clip255` private helper handles the saturation invariant.
+- **`raster::pipe::aa::is_identity_rgb`** branch coverage
+  (`6cea8f5`). Pinned both branches via golden tests; previously
+  only the slow path had a test.
+- **`encode::ppm` + `shading` helpers** routed through `color::convert`
+  (`ffd0f4e`, `23026dd`). Eliminated three duplicate gray→RGB
+  upcast paths; the survivor is the only spec-correct one.
+- **`raster::simd` SVE2 per-call `Vec` alloc** killed (`20ab842`).
+  The SVE2 AA coverage kernel allocated a scratch buffer on every
+  scanline; moved to a per-tile `Vec` that gets reused. The 5
+  unused tier impls + `popcnt_aa_row` rename to `aa_coverage`
+  cleaned up alongside.
+
+**Refactors:**
+
+- **`raster/image`** — 8 scale-mask kernels unified behind a single
+  `ImageSource` path (`717cc4a`). Net −400 lines; behaviour
+  identical (golden-tested).
+- **Image module split** (`raster::image::*`): `mod.rs` → `iter.rs`,
+  `scale.rs`, `transform.rs`. Each submodule is now < 400 lines
+  with a single cohesive responsibility.
+
+**Test coverage — cargo-mutants survivors killed:**
+
+- **CPU rotation invariants** (`ea5ee31`). 4 new tests on
+  `rotate_cpu` / `bilinear_sample` / `rotate_pixel_scalar` + 4
+  boundary-pixel assertions on the existing `rotate_zero_is_identity`.
+  cargo-mutants on `pdf_raster/deskew/rotate.rs --features
+  gpu-deskew`: **18 → 1** survivors. The one remaining is the
+  aarch64-only NEON dispatcher, untestable on x86.
+- **Structural `rotate_gpu` dimension pin** (`6f20264`). Runs
+  without a CUDA device; asserts the returned bitmap's
+  width / height / buffer-len match the source.
+- **GPU `record_zero_buffer`** smoke + state-machine tests (cited
+  above).
+
+**Clippy / fmt cleanups:**
+
+- `pdf_interp --tests` — **40 → 0** warnings (`6533b17`). Auto-fix
+  sweep + 12 `#[expect(float_cmp, reason = ...)]` annotations on
+  bit-exact identity-matrix / sentinel-fallback tests.
+- `gpu --features ...,vaapi --tests` — **14 → 0** pre-existing
+  warnings (`f9d5f52`). Mostly `#[ignore]`d hardware-integration
+  tests that had never been linted with the vaapi feature combo.
+
+**Documentation:**
+
+- **Vulkan `alloc_device_zeroed` doc-comment** documents the
+  compute-queue contention (`16e4b98`) and points callers with an
+  active page recording at the new `record_zero_buffer`.
+
 ### v0.9.1 (May 2026)
 
 **Dead-code sweep — cargo-mutants surfaced unused public API across the
