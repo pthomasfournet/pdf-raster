@@ -105,6 +105,45 @@ impl Drop for DeviceBuffer {
     }
 }
 
+/// Outcome of validating a `vkCmdFillBuffer` size against the Vulkan
+/// spec's 4-byte-multiple requirement.
+///
+/// `Skip` is the explicit "no-op" signal — callers can short-circuit
+/// without issuing the command at all. `Fill(size)` carries the
+/// validated size for the caller to pass to `cmd_fill_buffer`. The
+/// `Result` wrapper carries the misaligned-size error so callers do
+/// `let size = validate_fill_size(buf.size())?;` and pattern-match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FillAction {
+    /// Buffer has zero bytes; nothing to fill.  Returned for
+    /// `size == 0` rather than `Fill(0)` so callers can't accidentally
+    /// issue a zero-length `vkCmdFillBuffer` (which the spec rejects
+    /// anyway, but explicit is cheaper than a driver round-trip).
+    Skip,
+    /// Validated size in bytes; safe to pass to `vkCmdFillBuffer`.
+    Fill(u64),
+}
+
+/// Validate a buffer size against `vkCmdFillBuffer`'s 4-byte-multiple
+/// rule, surfacing misalignment as a typed error rather than letting
+/// the driver silently round down (which would leave 1–3 trailing
+/// bytes non-zero).
+///
+/// Returns `Ok(FillAction::Skip)` for zero-size, `Ok(FillAction::Fill)`
+/// for valid sizes, and `Err(BackendError::UnalignedFill)` otherwise.
+pub(super) const fn validate_fill_size(size: u64) -> Result<FillAction> {
+    if size == 0 {
+        return Ok(FillAction::Skip);
+    }
+    if !size.is_multiple_of(4) {
+        return Err(BackendError::UnalignedFill {
+            size,
+            required_alignment: 4,
+        });
+    }
+    Ok(FillAction::Fill(size))
+}
+
 /// A host-visible (CPU-mappable) buffer.
 ///
 /// `HOST_VISIBLE | HOST_COHERENT` so writes from the CPU are immediately
@@ -384,5 +423,42 @@ impl SlabAllocator {
         }
 
         Ok((buffer, allocation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_fill_size_skips_zero() {
+        assert_eq!(validate_fill_size(0).unwrap(), FillAction::Skip);
+    }
+
+    #[test]
+    fn validate_fill_size_accepts_aligned() {
+        assert_eq!(validate_fill_size(4).unwrap(), FillAction::Fill(4));
+        assert_eq!(validate_fill_size(4096).unwrap(), FillAction::Fill(4096));
+        // u64::MAX is not a multiple of 4 (ends 0b11), so use a large
+        // explicit aligned value instead.
+        let big = (1u64 << 62) - 4;
+        assert_eq!(validate_fill_size(big).unwrap(), FillAction::Fill(big));
+    }
+
+    #[test]
+    fn validate_fill_size_rejects_unaligned() {
+        for size in [1u64, 2, 3, 5, 6, 7, 17, 4095, 4097] {
+            let err = validate_fill_size(size).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    BackendError::UnalignedFill {
+                        size: s,
+                        required_alignment: 4,
+                    } if s == size
+                ),
+                "expected UnalignedFill{{{size},4}}, got: {err:?}"
+            );
+        }
     }
 }

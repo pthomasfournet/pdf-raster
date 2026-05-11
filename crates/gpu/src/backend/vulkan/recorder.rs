@@ -484,18 +484,11 @@ impl PageRecorder {
     ///
     /// Emits a transfer→compute memory barrier afterwards so any later
     /// kernel dispatch in the same page observes the zeros.
+    ///
+    /// Validation order is state → size: a wrong-state caller with a
+    /// zero-byte buffer still surfaces the state error rather than
+    /// silently succeeding (fail-loud).
     pub(super) fn record_zero_buffer(&self, buf: &super::memory::DeviceBuffer) -> Result<()> {
-        let size = buf.size();
-        if size == 0 {
-            return Ok(());
-        }
-        if !size.is_multiple_of(4) {
-            return Err(BackendError::UnalignedFill {
-                size,
-                required_alignment: 4,
-            });
-        }
-
         let s = self.inner.lock().expect("recorder mutex poisoned");
         if s.state != State::Recording {
             return Err(BackendError::msg(format!(
@@ -503,6 +496,10 @@ impl PageRecorder {
                 s.state
             )));
         }
+        let size = match super::memory::validate_fill_size(buf.size())? {
+            super::memory::FillAction::Skip => return Ok(()),
+            super::memory::FillAction::Fill(s) => s,
+        };
         let dst_handle = buf.handle();
         // Safety: cmd is in Recording state (state check above); dst was
         // created with TRANSFER_DST usage via the slab allocator's

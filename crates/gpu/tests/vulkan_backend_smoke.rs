@@ -321,10 +321,9 @@ fn vulkan_backend_record_zero_buffer_rejects_unaligned_size() {
         "expected UnalignedFill{{17,4}}, got: {err:?}"
     );
     // Finish the page cleanly so VulkanBackend::Drop doesn't see
-    // in-flight work — the recorder is still in Recording state after
-    // the rejected call (the state check ran AFTER the size check, so
-    // we never transitioned).  submit then wait drains the empty cmd
-    // buffer.
+    // in-flight work — the recorder stays in Recording state after a
+    // rejected call (neither the state nor the size check transitions
+    // anything).  submit then wait drains the empty cmd buffer.
     let fence = backend.submit_page().expect("submit_page");
     backend.wait_page(fence).expect("wait_page");
     backend.free_device(buf);

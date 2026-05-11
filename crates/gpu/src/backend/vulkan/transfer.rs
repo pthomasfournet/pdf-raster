@@ -21,7 +21,7 @@ use crate::backend::{BackendError, Result};
 
 use super::device::DeviceCtx;
 use super::error::vk_err;
-use super::memory::{DeviceBuffer, HostBuffer, SlabAllocator};
+use super::memory::{DeviceBuffer, FillAction, HostBuffer, SlabAllocator, validate_fill_size};
 
 /// Convert a host-side `usize` length to `u64` and verify it doesn't
 /// exceed the device-side buffer capacity.  `op_label` and `cap_label`
@@ -171,16 +171,10 @@ impl TransferContext {
     /// rounding down (which would leave the trailing 1–3 bytes
     /// non-zero).
     pub(super) fn fill_zero(&self, dst: &DeviceBuffer) -> Result<()> {
-        let size = dst.size();
-        if size == 0 {
-            return Ok(());
-        }
-        if !size.is_multiple_of(4) {
-            return Err(BackendError::UnalignedFill {
-                size,
-                required_alignment: 4,
-            });
-        }
+        let size = match validate_fill_size(dst.size())? {
+            FillAction::Skip => return Ok(()),
+            FillAction::Fill(s) => s,
+        };
         let dst_handle = dst.handle();
         self.run_one_shot(|cmd| {
             // Safety: run_one_shot has cmd in Recording state; dst_handle
