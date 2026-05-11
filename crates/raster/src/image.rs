@@ -390,7 +390,13 @@ fn scale_mask_ydown_xdown(
 
             let pix = pix_buf[xx..xx + x_step].iter().sum::<u32>();
             xx += x_step;
-            dest[dest_off] = ((pix * d) >> 23).min(255) as u8;
+            // `pix * d` reaches `y_step * x_step * 255 * (255 << 23) /
+            // (y_step * x_step) = 255 * 255 << 23 ≈ 5.5e11` in the worst
+            // case — wider than u32. Widen the multiply to u64; the
+            // `>> 23` then `min(255)` keeps the result in u8 range.
+            let scaled = ((u64::from(pix) * u64::from(d)) >> 23).min(255);
+            dest[dest_off] =
+                u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255");
             dest_off += 1;
         }
     }
@@ -445,7 +451,13 @@ fn scale_mask_ydown_xup(
 
         for pix_val in pix_buf.iter().take(src_w) {
             let x_step = bresenham_step(&mut xt, xq, src_w, xp);
-            let pix = ((pix_val * d) >> 23).min(255) as u8;
+            // Mask scaling: `pix_val * d` can reach `255 * 255 << 23 ≈
+            // 5.5e11`, which is wider than u32. Widen to u64 before the
+            // multiply; the `>> 23` then `min(255)` brings the result back
+            // into u8 range.
+            let scaled = ((u64::from(*pix_val) * u64::from(d)) >> 23).min(255);
+            let pix =
+                u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255");
             for slot in &mut dest[dest_off..dest_off + x_step] {
                 *slot = pix;
             }
@@ -525,7 +537,11 @@ fn scale_mask_yup_xdown(
                 .map(|&b| u32::from(b))
                 .sum::<u32>();
             xx += x_step;
-            dest[row_start + dx] = ((pix * d) >> 23).min(255) as u8;
+            // Mask path: `pix * d` exceeds u32 in the worst case
+            // (`255 * 255 << 23 ≈ 5.5e11`). Widen to u64 before multiply.
+            let scaled = ((u64::from(pix) * u64::from(d)) >> 23).min(255);
+            dest[row_start + dx] =
+                u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255");
         }
         dest_off += scaled_w;
 
@@ -1825,5 +1841,145 @@ mod tests {
             // Column 5+ must be unpainted.
             assert_eq!(bmp.row(y)[5].r, 0, "col 5 should be clipped");
         }
+    }
+
+    // ── Golden hash tests for all 8 scale kernels ─────────────────────────────
+    //
+    // These pin the byte-exact output of every dispatch branch of `scale_mask`
+    // and `scale_image` across deterministic sources and ratio combinations
+    // that exercise both Bresenham branches (q ≠ 0, multiple wraps per span).
+    //
+    // The hashes are produced by an inline FNV-1a-64 — stable across Rust
+    // versions, unlike `std::collections::hash_map::DefaultHasher`. They
+    // guarantee that any refactor preserving the current behaviour will still
+    // pass; any byte-level drift in any of the 8 kernels will fail loudly.
+
+    /// FNV-1a 64-bit. Spec-stable across Rust versions and platforms; the
+    /// chosen polynomial constants are the canonical FNV-1a values. Used
+    /// purely to compact the per-kernel byte-pin into a single comparable
+    /// value in the assertions below.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// A deterministic 1-bit `MaskSource` whose bit at `(x, y)` is set iff
+    /// `(x * 7 + y * 13) % 5 < 3`. The choice of `5 / 7 / 13` gives a
+    /// nontrivial spatial pattern: rows and columns don't repeat with small
+    /// period, and roughly 60 % of pixels are set, so the box-filtered
+    /// downsamples produce non-trivial gradient values.
+    struct GoldenMask;
+    impl MaskSource for GoldenMask {
+        fn get_row(&mut self, y: u32, row_buf: &mut [u8]) {
+            for (byte_idx, slot) in row_buf.iter_mut().enumerate() {
+                let mut packed: u8 = 0;
+                for bit in 0..8u32 {
+                    let x = byte_idx as u32 * 8 + bit;
+                    let on = (x.wrapping_mul(7).wrapping_add(y.wrapping_mul(13))) % 5 < 3;
+                    if on {
+                        packed |= 1 << (7 - bit);
+                    }
+                }
+                *slot = packed;
+            }
+        }
+    }
+
+    /// A deterministic multi-channel `ImageSource`: channel `c` of pixel
+    /// `(x, y)` is `(x * (17 + c) + y * (23 + c)) % 256` taken as `u8`. With
+    /// `ncomps = 3` the three channels evolve independently of each other,
+    /// so a refactor that crossed channel boundaries would show up.
+    struct GoldenImage {
+        ncomps: usize,
+    }
+    impl ImageSource for GoldenImage {
+        fn get_row(&mut self, y: u32, row_buf: &mut [u8]) {
+            let width = row_buf.len() / self.ncomps;
+            for x in 0..width {
+                for c in 0..self.ncomps {
+                    let mul = 17u32 + c as u32;
+                    let add = 23u32 + c as u32;
+                    let v = (x as u32)
+                        .wrapping_mul(mul)
+                        .wrapping_add(y.wrapping_mul(add));
+                    row_buf[x * self.ncomps + c] = (v & 0xFF) as u8;
+                }
+            }
+        }
+    }
+
+    /// Mask, both axes downsampling: src 11×13 → scaled 5×7.
+    /// Ratios coprime in both axes (`13 % 7 = 6`, `11 % 5 = 1`) → Bresenham
+    /// `q ≠ 0` and the accumulator wraps multiple times per span.
+    #[test]
+    fn scale_mask_ydown_xdown_golden() {
+        let out = scale_mask(&mut GoldenMask, 11, 13, 5, 7);
+        assert_eq!(out.len(), 5 * 7);
+        assert_eq!(fnv1a64(&out), 0xC72C_2A67_D157_65F4);
+    }
+
+    /// Mask, Y down + X up: src 11×13 → scaled 23×7.
+    #[test]
+    fn scale_mask_ydown_xup_golden() {
+        let out = scale_mask(&mut GoldenMask, 11, 13, 23, 7);
+        assert_eq!(out.len(), 23 * 7);
+        assert_eq!(fnv1a64(&out), 0x3C80_F065_9EB6_35B6);
+    }
+
+    /// Mask, Y up + X down: src 11×13 → scaled 5×29.
+    #[test]
+    fn scale_mask_yup_xdown_golden() {
+        let out = scale_mask(&mut GoldenMask, 11, 13, 5, 29);
+        assert_eq!(out.len(), 5 * 29);
+        assert_eq!(fnv1a64(&out), 0x8056_EED7_DF0E_665E);
+    }
+
+    /// Mask, both axes upsampling: src 5×7 → scaled 23×29.
+    #[test]
+    fn scale_mask_yup_xup_golden() {
+        let out = scale_mask(&mut GoldenMask, 5, 7, 23, 29);
+        assert_eq!(out.len(), 23 * 29);
+        assert_eq!(fnv1a64(&out), 0x5940_5245_567D_707F);
+    }
+
+    /// Image (ncomps = 3), both axes downsampling.
+    #[test]
+    fn scale_image_ydown_xdown_golden() {
+        let mut src = GoldenImage { ncomps: 3 };
+        let out = scale_image(&mut src, 11, 13, 5, 7, 3);
+        assert_eq!(out.len(), 5 * 7 * 3);
+        assert_eq!(fnv1a64(&out), 0x6CDB_D839_4499_6365);
+    }
+
+    /// Image (ncomps = 3), Y down + X up.
+    #[test]
+    fn scale_image_ydown_xup_golden() {
+        let mut src = GoldenImage { ncomps: 3 };
+        let out = scale_image(&mut src, 11, 13, 23, 7, 3);
+        assert_eq!(out.len(), 23 * 7 * 3);
+        assert_eq!(fnv1a64(&out), 0xA8DF_24A4_C3D9_F281);
+    }
+
+    /// Image (ncomps = 3), Y up + X down.
+    #[test]
+    fn scale_image_yup_xdown_golden() {
+        let mut src = GoldenImage { ncomps: 3 };
+        let out = scale_image(&mut src, 11, 13, 5, 29, 3);
+        assert_eq!(out.len(), 5 * 29 * 3);
+        assert_eq!(fnv1a64(&out), 0xBB21_A5B6_484F_2159);
+    }
+
+    /// Image (ncomps = 4 — covers CMYK channel-count path), both axes
+    /// upsampling: src 5×7 → scaled 23×29.
+    #[test]
+    fn scale_image_yup_xup_golden() {
+        let mut src = GoldenImage { ncomps: 4 };
+        let out = scale_image(&mut src, 5, 7, 23, 29, 4);
+        assert_eq!(out.len(), 23 * 29 * 4);
+        assert_eq!(fnv1a64(&out), 0xA063_5327_4D9F_A0C1);
     }
 }
