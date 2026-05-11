@@ -45,6 +45,15 @@ impl RasterColor {
         }
     }
 
+    /// Construct directly from a pre-converted RGB byte triple. Useful when
+    /// the caller has already done a colour-space conversion (e.g.
+    /// `ColorSpace::convert_to_rgb`) and would otherwise round-trip through
+    /// `f64 / 255.0` → `rgb_to_bytes` for no reason.
+    #[must_use]
+    pub const fn from_bytes(rgb: [u8; 3]) -> Self {
+        Self { bytes: rgb }
+    }
+
     /// Raw bytes slice for `PipeSrc::Solid`.
     ///
     /// Always 3 bytes (RGB), matching `Rgb8::BYTES`.
