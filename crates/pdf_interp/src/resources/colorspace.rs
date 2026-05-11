@@ -163,9 +163,12 @@ impl ColorSpace {
     /// - `Lab`: CIE Lab → D65 XYZ → sRGB through the standard formulae.
     ///   Whitepoint defaults to D65 (the spec's most common choice); the
     ///   per-document whitepoint stored in `dict_id` is not yet applied.
-    /// - `IccBased`: falls back to the device space with the matching
-    ///   channel count (1→Gray, 3→Rgb, 4→Cmyk).  Full ICC CLUT lookup is
-    ///   a later phase.
+    /// - `IccBased`: dereferences `stream_id`, runs a `moxcms` 8-bit
+    ///   transform from the embedded profile to sRGB for 3- and 4-channel
+    ///   profiles.  1-channel ICC falls back to `DeviceGray` because
+    ///   `moxcms` doesn't expose a Gray layout for transforms.  Any
+    ///   error (missing stream, malformed profile, transform failure)
+    ///   falls back to the device-space-by-N path.
     /// - `Indexed`: returns black — the palette lookup needs the lookup
     ///   stream which the gstate doesn't carry.  The image pipeline
     ///   resolves Indexed separately.
@@ -175,7 +178,6 @@ impl ColorSpace {
     ///   approximate as gray with `1 - tint[0]` (tint 0 = full ink = dark).
     #[must_use]
     pub fn convert_to_rgb(&self, doc: &Document, comps: &[f64]) -> [u8; 3] {
-        let _ = doc; // unused at present; future variants will dereference lazy IDs.
         if comps.len() != self.ncomponents() {
             log::debug!(
                 "colorspace: {:?} expects {} components, got {}",
@@ -192,12 +194,17 @@ impl ColorSpace {
                 color::convert::cmyk_to_rgb_bytes(comps[0], comps[1], comps[2], comps[3])
             }
             Self::Lab { .. } => lab_to_srgb(comps[0], comps[1], comps[2]),
-            Self::IccBased { n, .. } => match n {
-                1 => gray_byte_to_rgb(color::convert::gray_to_u8(comps[0])),
-                3 => color::convert::rgb_to_bytes(comps[0], comps[1], comps[2]),
-                4 => color::convert::cmyk_to_rgb_bytes(comps[0], comps[1], comps[2], comps[3]),
-                _ => [0, 0, 0],
-            },
+            Self::IccBased { n, stream_id } => {
+                // Try the embedded profile first; fall back to device-by-N on
+                // any failure (missing stream, malformed profile, Gray layout
+                // unsupported by moxcms, etc.).
+                if let Some(id) = stream_id
+                    && let Some(rgb) = icc_transform(doc, *id, *n, comps)
+                {
+                    return rgb;
+                }
+                icc_fallback_by_n(*n, comps)
+            }
             Self::Indexed { .. } | Self::Pattern { .. } => [0, 0, 0],
             Self::Separation { .. } | Self::DeviceN { .. } => {
                 // Image-pipeline policy: spot tints approximate as gray with
@@ -258,6 +265,77 @@ fn srgb_encode(c: f64) -> f64 {
 /// Expand a single grey byte into an opaque RGB triple `[v, v, v]`.
 const fn gray_byte_to_rgb(v: u8) -> [u8; 3] {
     [v, v, v]
+}
+
+/// Run a `moxcms` 8-bit transform from an embedded ICC profile to sRGB for a
+/// single 3- or 4-channel tint. Returns `None` and lets the caller fall back
+/// when:
+/// - the profile stream isn't dereferenceable or fails to decompress,
+/// - the profile bytes don't parse as an ICC profile,
+/// - the channel count is unsupported by `moxcms`'s 8-bit `Layout` (Gray),
+/// - the transform construction or execution returns an error.
+///
+/// `n` is the profile's declared channel count from `/N`. `comps` is the
+/// normalised tint in [0, 1].
+fn icc_transform(doc: &Document, stream_id: ObjectId, n: u8, comps: &[f64]) -> Option<[u8; 3]> {
+    use moxcms::{ColorProfile, Layout, TransformOptions};
+    let layout = match n {
+        3 => Layout::Rgb,
+        4 => Layout::Rgba,
+        _ => return None, // Gray (n=1) or unsupported.
+    };
+    let icc_bytes = fetch_icc_bytes(doc, stream_id)?;
+    let src_profile = ColorProfile::new_from_slice(&icc_bytes)
+        .map_err(|e| log::debug!("colorspace: ICC profile parse failed: {e}"))
+        .ok()?;
+    let dst_profile = ColorProfile::new_srgb();
+    let xform = src_profile
+        .create_transform_8bit(
+            layout,
+            &dst_profile,
+            Layout::Rgb,
+            TransformOptions::default(),
+        )
+        .map_err(|e| log::debug!("colorspace: ICC transform creation failed: {e}"))
+        .ok()?;
+    // Normalised f64 [0,1] → u8 [0,255]; one pixel = n bytes. Trailing
+    // channels past `comps.len()` are zero-padded (only reached when the
+    // upstream count check is bypassed by a future caller — paranoia).
+    let src_bytes: [u8; 4] = [
+        color::convert::gray_to_u8(comps[0]),
+        color::convert::gray_to_u8(comps.get(1).copied().unwrap_or(0.0)),
+        color::convert::gray_to_u8(comps.get(2).copied().unwrap_or(0.0)),
+        color::convert::gray_to_u8(comps.get(3).copied().unwrap_or(0.0)),
+    ];
+    let src_slice = &src_bytes[..usize::from(n)];
+    let mut dst = [0u8; 3];
+    xform
+        .transform(src_slice, &mut dst)
+        .map_err(|e| log::debug!("colorspace: ICC transform execution failed: {e}"))
+        .ok()?;
+    Some(dst)
+}
+
+/// Dereference an ICC profile stream by object id and return its
+/// decompressed content. Returns `None` on any lookup or decode failure.
+fn fetch_icc_bytes(doc: &Document, stream_id: ObjectId) -> Option<Vec<u8>> {
+    let obj_arc = doc.get_object(stream_id).ok()?;
+    let stream = obj_arc.as_ref().as_stream()?;
+    stream
+        .decompressed_content()
+        .map_err(|e| log::debug!("colorspace: ICC stream decompress failed: {e}"))
+        .ok()
+}
+
+/// Fall back to the device space matching the ICC profile's channel count
+/// when the moxcms transform isn't available. Mirrors the pre-CLUT behaviour.
+fn icc_fallback_by_n(n: u8, comps: &[f64]) -> [u8; 3] {
+    match n {
+        1 => gray_byte_to_rgb(color::convert::gray_to_u8(comps[0])),
+        3 => color::convert::rgb_to_bytes(comps[0], comps[1], comps[2]),
+        4 => color::convert::cmyk_to_rgb_bytes(comps[0], comps[1], comps[2], comps[3]),
+        _ => [0, 0, 0],
+    }
 }
 
 /// Resolve a PDF `ColorSpace` object into a [`ColorSpace`] tracking value.
@@ -756,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_iccbased_falls_back_by_n() {
+    fn convert_iccbased_no_stream_falls_back_by_n() {
         let doc = empty_doc();
         let icc1 = ColorSpace::IccBased {
             n: 1,
@@ -770,9 +848,34 @@ mod tests {
             n: 4,
             stream_id: None,
         };
+        // No stream_id → skip moxcms, use device-by-N fallback directly.
         assert_eq!(icc1.convert_to_rgb(&doc, &[1.0]), [255, 255, 255]);
         assert_eq!(icc3.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]), [255, 0, 0]);
         assert_eq!(icc4.convert_to_rgb(&doc, &[0.0, 0.0, 0.0, 1.0]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn convert_iccbased_unresolvable_stream_falls_back() {
+        // stream_id points to an object not in the doc — fetch_icc_bytes
+        // returns None, icc_transform returns None, fallback runs.
+        let doc = empty_doc();
+        let icc = ColorSpace::IccBased {
+            n: 3,
+            stream_id: Some((999, 0)),
+        };
+        assert_eq!(icc.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]), [255, 0, 0]);
+    }
+
+    #[test]
+    fn convert_iccbased_n1_gray_skips_moxcms_and_falls_back() {
+        // moxcms doesn't expose a Gray layout for 8-bit transforms; even
+        // with a valid stream id, icc_transform returns None for n=1.
+        let doc = empty_doc();
+        let icc = ColorSpace::IccBased {
+            n: 1,
+            stream_id: Some((1, 0)),
+        };
+        assert_eq!(icc.convert_to_rgb(&doc, &[0.5]), [128, 128, 128]);
     }
 
     #[test]
