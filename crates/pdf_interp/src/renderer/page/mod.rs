@@ -1448,6 +1448,7 @@ impl<'doc> PageRenderer<'doc> {
                         }
                     }
                     ImageColorSpace::Mask => {
+                        // No smask gate here — PDF §8.9.6 (function-entry assert).
                         for dx in bx0..bx1 {
                             let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
                             ix_fp = ix_fp.wrapping_add(ix_step_fp);
@@ -1504,6 +1505,7 @@ impl<'doc> PageRenderer<'doc> {
                             }
                         }
                         ImageColorSpace::Mask => {
+                            // No smask gate here — PDF §8.9.6 (function-entry assert).
                             if img_bytes.get(img_idx) == Some(&0x00) {
                                 data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
                             }
