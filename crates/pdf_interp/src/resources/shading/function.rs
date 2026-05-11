@@ -276,17 +276,71 @@ mod tests {
         assert!((result[0] - 0.8).abs() < 1e-5);
     }
 
+    /// Build a minimal parseable Document for the `&Document` parameter.
+    /// The Type 3 stitching path under test references inline sub-function
+    /// dictionaries (not indirect references), so `doc` is never consulted —
+    /// `from_bytes_owned(Vec::new())` would fail parse, so we ship a tiny
+    /// well-formed PDF instead.
+    fn empty_doc() -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let xref_start = off2 + obj2.len();
+        let xref = format!(
+            "xref\n0 3\n0000000000 65535 f\r\n{off1:010} 00000 n\r\n{off2:010} 00000 n\r\n",
+        );
+        let trailer = format!("trailer\n<</Size 3 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes = format!("{header}{obj1}{obj2}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("test PDF parse")
+    }
+
     #[test]
-    #[ignore = "TODO: port to byte-builder PDF — pdf::Document has no public new() constructor"]
     fn eval_stitching_wrong_bounds_count_falls_back() {
-        // 2 sub-functions need 1 bound value; giving 0 should not panic.
-        // The previous version of this test built an empty Document via the
-        // old PDF library's no-arg constructor plus a free-standing fn_dict;
-        // the new pdf::Document only exposes from_bytes_owned, so this needs
-        // a byte-builder rewrite.  The sub-functions referenced are inline
-        // dictionaries, so a Document is only required to satisfy the
-        // &Document parameter — see `crates/pdf_interp/src/lib.rs`
-        // `js_guard_tests::make_doc` for the minimal-PDF byte construction
-        // pattern.
+        // PDF §7.10.3: a Type 3 stitching function with k sub-functions must
+        // carry k−1 Bounds values.  Two sub-functions therefore need exactly
+        // one bound; supplying zero is malformed.  eval_stitching_depth must
+        // fall back to evaluating the first sub-function rather than panicking
+        // on the missing breakpoint.
+        let sub_a = make_exp_dict(0.2, 0.8, 1.0); // linear ramp 0.2 → 0.8
+        let sub_b = make_exp_dict(0.0, 1.0, 1.0); // distinct sub so fallback is observable
+        let mut stitching = pdf::Dictionary::new();
+        stitching.set("FunctionType", pdf::Object::Integer(3));
+        stitching.set(
+            "Domain",
+            pdf::Object::Array(vec![pdf::Object::Real(0.0), pdf::Object::Real(1.0)]),
+        );
+        stitching.set(
+            "Functions",
+            pdf::Object::Array(vec![
+                pdf::Object::Dictionary(sub_a),
+                pdf::Object::Dictionary(sub_b),
+            ]),
+        );
+        // Bounds intentionally empty — should have 1 entry for 2 sub-functions.
+        stitching.set("Bounds", pdf::Object::Array(vec![]));
+        stitching.set(
+            "Encode",
+            pdf::Object::Array(vec![
+                pdf::Object::Real(0.0),
+                pdf::Object::Real(1.0),
+                pdf::Object::Real(0.0),
+                pdf::Object::Real(1.0),
+            ]),
+        );
+
+        let doc = empty_doc();
+        let fn_obj = pdf::Object::Dictionary(stitching);
+
+        // Must not panic; must use sub_a (the first sub-function) as fallback.
+        let result =
+            eval_function(&doc, &fn_obj, 0.5, 1).expect("fallback should produce a result");
+        // sub_a at t=0.5 is 0.2 + 0.5 × (0.8 − 0.2) = 0.5.
+        assert!(
+            (result[0] - 0.5).abs() < 1e-5,
+            "expected fallback to evaluate sub_a at t=0.5 → 0.5, got {}",
+            result[0]
+        );
     }
 }
