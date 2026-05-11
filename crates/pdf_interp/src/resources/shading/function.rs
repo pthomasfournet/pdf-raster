@@ -228,8 +228,16 @@ fn eval_sampled(
     }
 
     // Order = 1 (linear) is the default and the only supported value.
+    // PDF §7.10.2 specifies Order as an integer (1 or 3), so values from a
+    // spec-conforming PDF are exactly representable in f64 — bit-exact
+    // comparison against 1.0 is appropriate.  Any other value (including
+    // 3, or a malformed Real that isn't 1.0) means fall back.
     let order = fn_dict.get(b"Order").and_then(obj_to_f64).unwrap_or(1.0);
-    if (order - 1.0).abs() > f64::EPSILON {
+    #[expect(
+        clippy::float_cmp,
+        reason = "PDF §7.10.2 Order is an integer (1 or 3); bit-exact == 1.0 is the right test"
+    )]
+    if order != 1.0 {
         return None;
     }
 
@@ -241,7 +249,8 @@ fn eval_sampled(
     // The function object must carry a stream — Type 0 sample data is the
     // stream content.  Inline dictionaries can't represent Type 0.
     let stream_bytes = stream_bytes_for(doc, fn_obj)?;
-    let bytes_per_sample = (bps as usize) / 8 * n;
+    let bytes_per_channel = (bps as usize) / 8;
+    let bytes_per_sample = bytes_per_channel * n;
     let expected_len = bytes_per_sample.checked_mul(n_samples)?;
     if stream_bytes.len() < expected_len {
         log::warn!(
@@ -298,8 +307,8 @@ fn eval_sampled(
         .unwrap_or_default();
 
     let read_sample = |sample_idx: usize, ch: usize| -> f64 {
-        // bps is 8 or 16 by the guard above.
-        let off = sample_idx * bytes_per_sample + ch * (bps as usize) / 8;
+        // bps is 8 or 16 by the guard above; bytes_per_channel is bps/8.
+        let off = sample_idx * bytes_per_sample + ch * bytes_per_channel;
         if bps == 8 {
             f64::from(stream_bytes[off])
         } else {
@@ -368,7 +377,7 @@ fn stream_bytes_for(doc: &Document, fn_obj: &Object) -> Option<Vec<u8>> {
 ///
 /// Without decompressed stream bytes, this is the best possible approximation:
 /// it returns the correct endpoints at `t = Domain[0]` and `t = Domain[1]`.
-pub(super) fn eval_sampled_approx(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f64> {
+fn eval_sampled_approx(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f64> {
     let (d0, d1) = read_fn_domain(fn_dict);
     // Guard: d1 > d0 before dividing; avoids divide-by-zero and clamp panic.
     let t_norm = if d1 > d0 {
