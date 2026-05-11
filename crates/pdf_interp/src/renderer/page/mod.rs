@@ -1170,6 +1170,15 @@ impl<'doc> PageRenderer<'doc> {
         if img.width == 0 || img.height == 0 {
             return;
         }
+        // PDF §8.9.6: stencil masks (/ImageMask true → ImageColorSpace::Mask)
+        // do not carry an /SMask.  The Mask arms below intentionally skip
+        // the smask gate that the Rgb / Gray arms apply; this assert pins
+        // the spec invariant so a future decoder change that sets `smask`
+        // on a Mask descriptor surfaces in debug builds.
+        debug_assert!(
+            img.smask.is_none() || !matches!(img.color_space, ImageColorSpace::Mask),
+            "PDF §8.9.6: image masks must not carry SMask",
+        );
 
         // Track diagnostics: image presence and per-filter counts.
         self.diag.has_images = true;
