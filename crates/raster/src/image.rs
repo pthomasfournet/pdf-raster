@@ -252,10 +252,56 @@ const fn bresenham_step(acc: &mut usize, q: usize, scaled: usize, p: usize) -> u
     }
 }
 
+// ── Scale-kernel saturation constants ────────────────────────────────────────
+
+/// `sat_factor` for `scale_image_inner` when the destination is a mask.
+///
+/// The kernel computes `(sum * d) >> 23` where `d = sat_factor / divisor`,
+/// so a mask saturates `0..=255` input coverage values to `0..=255` output
+/// coverage. `255u32 << 23 ≈ 2.14e9`.
+const MASK_SAT_FACTOR: u32 = 255u32 << 23;
+
+/// `sat_factor` for `scale_image_inner` when the destination is a colour
+/// image. Per-channel intensity is preserved (no 255× amplification).
+const IMAGE_SAT_FACTOR: u32 = 1u32 << 23;
+
+/// Adapter that exposes a [`MaskSource`] as a single-channel [`ImageSource`].
+///
+/// The mask source produces 1-bit-packed rows; the adapter unpacks each row
+/// into `u8` (0 or 255) on demand, so the scaling kernel sees an ordinary
+/// 1-channel byte image and the same `scale_image_inner` body serves both
+/// `scale_mask` and `scale_image`.
+struct MaskAsImage<'a> {
+    mask: &'a mut dyn MaskSource,
+    /// Scratch for one packed mask row: `src_w.div_ceil(8)` bytes. Owned by
+    /// the adapter so the kernel doesn't need to know about packed-row sizing.
+    packed_buf: Vec<u8>,
+    src_w: usize,
+}
+
+impl<'a> MaskAsImage<'a> {
+    fn new(mask: &'a mut dyn MaskSource, src_w: usize) -> Self {
+        Self {
+            mask,
+            packed_buf: vec![0u8; src_w.div_ceil(8)],
+            src_w,
+        }
+    }
+}
+
+impl ImageSource for MaskAsImage<'_> {
+    fn get_row(&mut self, y: u32, row_buf: &mut [u8]) {
+        self.mask.get_row(y, &mut self.packed_buf);
+        unpack_mask_row(&self.packed_buf, self.src_w, row_buf);
+    }
+}
+
 // ── Mask scaling ──────────────────────────────────────────────────────────────
 
 /// Scale a 1-bit mask to `scaled_w × scaled_h`, producing one `u8` (0–255) per
-/// destination pixel.  Exactly mirrors `Splash::scaleMask`.
+/// destination pixel. Exactly mirrors `Splash::scaleMask`.
+///
+/// Thin wrapper over [`scale_image_inner`] via [`MaskAsImage`].
 fn scale_mask(
     mask_src: &mut dyn MaskSource,
     src_w: usize,
@@ -263,403 +309,111 @@ fn scale_mask(
     scaled_w: usize,
     scaled_h: usize,
 ) -> Vec<u8> {
-    let mut dest = vec![0u8; scaled_w * scaled_h];
-    let packed_row_bytes = src_w.div_ceil(8);
-    let mut packed_buf = vec![0u8; packed_row_bytes];
-    let mut line_buf = vec![0u8; src_w];
-
-    if scaled_h < src_h {
-        if scaled_w < src_w {
-            scale_mask_ydown_xdown(
-                mask_src,
-                src_w,
-                src_h,
-                scaled_w,
-                scaled_h,
-                &mut dest,
-                &mut packed_buf,
-                &mut line_buf,
-            );
-        } else {
-            scale_mask_ydown_xup(
-                mask_src,
-                src_w,
-                src_h,
-                scaled_w,
-                scaled_h,
-                &mut dest,
-                &mut packed_buf,
-                &mut line_buf,
-            );
-        }
-    } else if scaled_w < src_w {
-        scale_mask_yup_xdown(
-            mask_src,
-            src_w,
-            src_h,
-            scaled_w,
-            scaled_h,
-            &mut dest,
-            &mut packed_buf,
-            &mut line_buf,
-        );
-    } else {
-        scale_mask_yup_xup(
-            mask_src,
-            src_w,
-            src_h,
-            scaled_w,
-            scaled_h,
-            &mut dest,
-            &mut packed_buf,
-            &mut line_buf,
-        );
-    }
-
-    dest
+    let mut adapter = MaskAsImage::new(mask_src, src_w);
+    scale_image_inner(
+        &mut adapter,
+        src_w,
+        src_h,
+        scaled_w,
+        scaled_h,
+        1,
+        MASK_SAT_FACTOR,
+    )
 }
 
-/// Vertical and horizontal box-filter downsampling.
+/// Saturating `(sum * d) >> 23` narrow to `u8`.
 ///
-/// C++: `Splash::scaleMaskYdownXdown`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors C++ scaleMaskYdownXdown; all buffers are necessary"
-)]
-fn scale_mask_ydown_xdown(
-    mask_src: &mut dyn MaskSource,
-    src_w: usize,
-    src_h: usize,
-    scaled_w: usize,
-    scaled_h: usize,
-    dest: &mut [u8],
-    packed_buf: &mut [u8],
-    line_buf: &mut [u8],
-) {
-    let yp = src_h / scaled_h;
-    let yq = src_h % scaled_h;
-    let xp = src_w / scaled_w;
-    let xq = src_w % scaled_w;
-
-    let mut pix_buf = vec![0u32; src_w];
-    let mut yt = 0usize;
-    let mut dest_off = 0usize;
-    let mut src_y = 0u32;
-
-    for _dy in 0..scaled_h {
-        let y_step = bresenham_step(&mut yt, yq, scaled_h, yp);
-
-        pix_buf.fill(0);
-        for _i in 0..y_step {
-            mask_src.get_row(src_y, packed_buf);
-            src_y += 1;
-            unpack_mask_row(packed_buf, src_w, line_buf);
-            for (pix, &lb) in pix_buf.iter_mut().zip(line_buf.iter()) {
-                *pix += u32::from(lb);
-            }
-        }
-
-        let d0 = if xp > 0 {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "y_step*xp ≤ src_h*src_w; fits u32 for practical image sizes"
-            )]
-            {
-                (255u32 << 23) / (y_step * xp) as u32
-            }
-        } else {
-            0
-        };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "y_step*(xp+1) ≤ src_h*(src_w+1); fits u32 for practical image sizes"
-        )]
-        let d1 = (255u32 << 23) / (y_step * (xp + 1)) as u32;
-
-        let mut xt = 0usize;
-        let mut xx = 0usize;
-        for _dx in 0..scaled_w {
-            let (x_step, d) = {
-                let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 {
-                    (step, d1)
-                } else {
-                    (step, d0)
-                }
-            };
-
-            let pix = pix_buf[xx..xx + x_step].iter().sum::<u32>();
-            xx += x_step;
-            // `pix * d` reaches `y_step * x_step * 255 * (255 << 23) /
-            // (y_step * x_step) = 255 * 255 << 23 ≈ 5.5e11` in the worst
-            // case — wider than u32. Widen the multiply to u64; the
-            // `>> 23` then `min(255)` keeps the result in u8 range.
-            let scaled = ((u64::from(pix) * u64::from(d)) >> 23).min(255);
-            dest[dest_off] =
-                u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255");
-            dest_off += 1;
-        }
-    }
+/// `sum * d` is widened to `u64` because the worst-case product for the
+/// mask path is `255 * 255 << 23 ≈ 5.5e11`, larger than `u32::MAX`. The
+/// `>> 23` then `min(255)` keeps the result in `u8` range regardless.
+#[inline]
+fn saturate_scaled(sum: u32, d: u32) -> u8 {
+    let scaled = ((u64::from(sum) * u64::from(d)) >> 23).min(255);
+    u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255")
 }
 
-/// Box-filter Y downsampling, nearest-neighbor X upsampling.
+/// Box-filter divisors for the X-down kernels.
 ///
-/// C++: `Splash::scaleMaskYdownXup`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors C++ scaleMaskYdownXup; all buffers are necessary"
-)]
-fn scale_mask_ydown_xup(
-    mask_src: &mut dyn MaskSource,
-    src_w: usize,
-    src_h: usize,
-    scaled_w: usize,
-    scaled_h: usize,
-    dest: &mut [u8],
-    packed_buf: &mut [u8],
-    line_buf: &mut [u8],
-) {
-    let yp = src_h / scaled_h;
-    let yq = src_h % scaled_h;
-    let xp = scaled_w / src_w;
-    let xq = scaled_w % src_w;
-
-    let mut pix_buf = vec![0u32; src_w];
-    let mut yt = 0usize;
-    let mut dest_off = 0usize;
-    let mut src_y = 0u32;
-
-    for _dy in 0..scaled_h {
-        let y_step = bresenham_step(&mut yt, yq, scaled_h, yp);
-
-        pix_buf.fill(0);
-        for _i in 0..y_step {
-            mask_src.get_row(src_y, packed_buf);
-            src_y += 1;
-            unpack_mask_row(packed_buf, src_w, line_buf);
-            for (pix, &lb) in pix_buf.iter_mut().zip(line_buf.iter()) {
-                *pix += u32::from(lb);
-            }
-        }
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "y_step ≤ src_h; fits u32 for practical image sizes"
-        )]
-        let d = (255u32 << 23) / y_step as u32;
-        let mut xt = 0usize;
-
-        for pix_val in pix_buf.iter().take(src_w) {
-            let x_step = bresenham_step(&mut xt, xq, src_w, xp);
-            // Mask scaling: `pix_val * d` can reach `255 * 255 << 23 ≈
-            // 5.5e11`, which is wider than u32. Widen to u64 before the
-            // multiply; the `>> 23` then `min(255)` brings the result back
-            // into u8 range.
-            let scaled = ((u64::from(*pix_val) * u64::from(d)) >> 23).min(255);
-            let pix =
-                u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255");
-            for slot in &mut dest[dest_off..dest_off + x_step] {
-                *slot = pix;
-            }
-            dest_off += x_step;
-        }
-    }
-}
-
-/// Nearest-neighbor Y upsampling, box-filter X downsampling.
+/// `d_full` is the divisor used when Bresenham picks `x_step = xp`;
+/// `d_plus_one` is used when `x_step = xp + 1`. Both are precomputed once
+/// per output row (or once per call when `y_step` is constant).
 ///
-/// C++: `Splash::scaleMaskYupXdown`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors C++ scaleMaskYupXdown; all buffers are necessary"
-)]
-fn scale_mask_yup_xdown(
-    mask_src: &mut dyn MaskSource,
-    src_w: usize,
-    src_h: usize,
-    scaled_w: usize,
-    scaled_h: usize,
-    dest: &mut [u8],
-    packed_buf: &mut [u8],
-    line_buf: &mut [u8],
-) {
-    let yp = scaled_h / src_h;
-    let yq = scaled_h % src_h;
-    let xp = src_w / scaled_w;
-    let xq = src_w % scaled_w;
-
-    let d0 = if xp > 0 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "xp ≤ src_w; fits u32 for practical image sizes"
-        )]
-        {
-            (255u32 << 23) / xp as u32
-        }
+/// `xp = 0` only happens when `scaled_w > src_w` — i.e. an *upsampling*
+/// X dispatch — so the Xdown kernels never see it, but `d_full` is still
+/// defined as 0 for that case to keep the precondition straightforward.
+#[inline]
+fn xdown_divisors(sat_factor: u32, y_step: usize, xp: usize) -> (u32, u32) {
+    let d_full = if xp > 0 {
+        let denom = u32::try_from(y_step.saturating_mul(xp))
+            .expect("y_step * xp fits in u32 for practical image sizes");
+        sat_factor / denom
     } else {
         0
     };
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "xp+1 ≤ src_w+1; fits u32 for practical image sizes"
-    )]
-    let d1 = (255u32 << 23) / (xp + 1) as u32;
-
-    let mut yt = 0usize;
-    let mut dest_off = 0usize;
-
-    for sy in 0..src_h {
-        let y_step = bresenham_step(&mut yt, yq, src_h, yp);
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
-        )]
-        mask_src.get_row(sy as u32, packed_buf);
-        unpack_mask_row(packed_buf, src_w, line_buf);
-
-        let row_start = dest_off;
-        let mut xt = 0usize;
-        let mut xx = 0usize;
-
-        for dx in 0..scaled_w {
-            let (x_step, d) = {
-                let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 {
-                    (step, d1)
-                } else {
-                    (step, d0)
-                }
-            };
-
-            let pix = line_buf[xx..xx + x_step]
-                .iter()
-                .map(|&b| u32::from(b))
-                .sum::<u32>();
-            xx += x_step;
-            // Mask path: `pix * d` exceeds u32 in the worst case
-            // (`255 * 255 << 23 ≈ 5.5e11`). Widen to u64 before multiply.
-            let scaled = ((u64::from(pix) * u64::from(d)) >> 23).min(255);
-            dest[row_start + dx] =
-                u8::try_from(scaled).expect("scaled box-filter pixel was just clamped to <= 255");
-        }
-        dest_off += scaled_w;
-
-        for i in 1..y_step {
-            dest.copy_within(row_start..row_start + scaled_w, row_start + i * scaled_w);
-        }
-        dest_off += (y_step - 1) * scaled_w;
-    }
+    let denom_plus = u32::try_from(y_step.saturating_mul(xp + 1))
+        .expect("y_step * (xp+1) fits in u32 for practical image sizes");
+    let d_plus_one = sat_factor / denom_plus;
+    (d_full, d_plus_one)
 }
 
-/// Nearest-neighbor upsampling in both axes.
+/// Internal scaling kernel shared by [`scale_mask`] and [`scale_image`].
 ///
-/// C++: `Splash::scaleMaskYupXup`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors C++ scaleMaskYupXup; all buffers are necessary"
-)]
-fn scale_mask_yup_xup(
-    mask_src: &mut dyn MaskSource,
-    src_w: usize,
-    src_h: usize,
-    scaled_w: usize,
-    scaled_h: usize,
-    dest: &mut [u8],
-    packed_buf: &mut [u8],
-    line_buf: &mut [u8],
-) {
-    let yp = scaled_h / src_h;
-    let yq = scaled_h % src_h;
-    let xp = scaled_w / src_w;
-    let xq = scaled_w % src_w;
-
-    let mut yt = 0usize;
-    let mut dest_off = 0usize;
-
-    for sy in 0..src_h {
-        let y_step = bresenham_step(&mut yt, yq, src_h, yp);
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
-        )]
-        mask_src.get_row(sy as u32, packed_buf);
-        unpack_mask_row(packed_buf, src_w, line_buf);
-
-        let row_start = dest_off;
-        let mut xt = 0usize;
-        let mut xx = 0usize;
-
-        for &lb in line_buf.iter().take(src_w) {
-            let x_step = bresenham_step(&mut xt, xq, src_w, xp);
-            let pix = if lb != 0 { 255u8 } else { 0u8 };
-            for slot in &mut dest[row_start + xx..row_start + xx + x_step] {
-                *slot = pix;
-            }
-            xx += x_step;
-        }
-        dest_off += scaled_w;
-
-        for i in 1..y_step {
-            dest.copy_within(row_start..row_start + scaled_w, row_start + i * scaled_w);
-        }
-        dest_off += (y_step - 1) * scaled_w;
-    }
-}
-
-// ── Image scaling ─────────────────────────────────────────────────────────────
-
-/// Scale a colour image to `scaled_w × scaled_h`.
-/// Output: `scaled_w * scaled_h * ncomps` bytes (row-major, no padding).
-fn scale_image(
+/// Dispatches on `(scaled_h vs src_h, scaled_w vs src_w)` to one of four
+/// corner kernels (`ydown_xdown`, `ydown_xup`, `yup_xdown`, `yup_xup`),
+/// parametrised by `ncomps` (1 for mask, N for image) and `sat_factor`
+/// (`MASK_SAT_FACTOR` for mask, `IMAGE_SAT_FACTOR` for image).
+fn scale_image_inner(
     image_src: &mut dyn ImageSource,
     src_w: usize,
     src_h: usize,
     scaled_w: usize,
     scaled_h: usize,
     ncomps: usize,
+    sat_factor: u32,
 ) -> Vec<u8> {
     let mut dest = vec![0u8; scaled_w * scaled_h * ncomps];
     let mut line_buf = vec![0u8; src_w * ncomps];
 
     if scaled_h < src_h {
         if scaled_w < src_w {
-            scale_image_ydown_xdown(
+            scale_kernel_ydown_xdown(
                 image_src,
                 src_w,
                 src_h,
                 scaled_w,
                 scaled_h,
                 ncomps,
+                sat_factor,
                 &mut dest,
                 &mut line_buf,
             );
         } else {
-            scale_image_ydown_xup(
+            scale_kernel_ydown_xup(
                 image_src,
                 src_w,
                 src_h,
                 scaled_w,
                 scaled_h,
                 ncomps,
+                sat_factor,
                 &mut dest,
                 &mut line_buf,
             );
         }
     } else if scaled_w < src_w {
-        scale_image_yup_xdown(
+        scale_kernel_yup_xdown(
             image_src,
             src_w,
             src_h,
             scaled_w,
             scaled_h,
             ncomps,
+            sat_factor,
             &mut dest,
             &mut line_buf,
         );
     } else {
-        scale_image_yup_xup(
+        scale_kernel_yup_xup(
             image_src,
             src_w,
             src_h,
@@ -676,18 +430,20 @@ fn scale_image(
 
 /// Box-filter downsampling in both Y and X.
 ///
-/// C++: `Splash::scaleImageYdownXdown`.
+/// C++ provenance: `Splash::scaleMaskYdownXdown` (ncomps=1) and
+/// `Splash::scaleImageYdownXdown` (ncomps=N).
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors C++ scaleImageYdownXdown; all buffers are necessary"
+    reason = "kernel is private; all params are necessary to share the body across mask + image"
 )]
-fn scale_image_ydown_xdown(
+fn scale_kernel_ydown_xdown(
     image_src: &mut dyn ImageSource,
     src_w: usize,
     src_h: usize,
     scaled_w: usize,
     scaled_h: usize,
     ncomps: usize,
+    sat_factor: u32,
     dest: &mut [u8],
     line_buf: &mut [u8],
 ) {
@@ -705,7 +461,7 @@ fn scale_image_ydown_xdown(
         let y_step = bresenham_step(&mut yt, yq, scaled_h, yp);
 
         pix_buf.fill(0);
-        for _i in 0..y_step {
+        for _ in 0..y_step {
             image_src.get_row(src_y, line_buf);
             src_y += 1;
             for (pix, &lb) in pix_buf.iter_mut().zip(line_buf.iter()) {
@@ -713,38 +469,16 @@ fn scale_image_ydown_xdown(
             }
         }
 
-        let d0 = if xp > 0 {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "y_step*xp fits u32 for practical image sizes"
-            )]
-            {
-                (1u32 << 23) / (y_step * xp) as u32
-            }
-        } else {
-            0
-        };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "y_step*(xp+1) fits u32 for practical image sizes"
-        )]
-        let d1 = (1u32 << 23) / (y_step * (xp + 1)) as u32;
+        let (d_full, d_plus_one) = xdown_divisors(sat_factor, y_step, xp);
 
         let mut xt = 0usize;
         let mut xx = 0usize;
         for _dx in 0..scaled_w {
-            let (x_step, d) = {
-                let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 {
-                    (step, d1)
-                } else {
-                    (step, d0)
-                }
-            };
-
+            let x_step = bresenham_step(&mut xt, xq, scaled_w, xp);
+            let d = if x_step == xp + 1 { d_plus_one } else { d_full };
             for c in 0..ncomps {
-                let pix: u32 = (0..x_step).map(|i| pix_buf[(xx + i) * ncomps + c]).sum();
-                dest[dest_off + c] = ((pix * d) >> 23).min(255) as u8;
+                let sum: u32 = (0..x_step).map(|i| pix_buf[(xx + i) * ncomps + c]).sum();
+                dest[dest_off + c] = saturate_scaled(sum, d);
             }
             xx += x_step;
             dest_off += ncomps;
@@ -754,18 +488,19 @@ fn scale_image_ydown_xdown(
 
 /// Box-filter Y downsampling, nearest-neighbor X upsampling.
 ///
-/// C++: `Splash::scaleImageYdownXup`.
+/// C++ provenance: `Splash::scaleMaskYdownXup` / `Splash::scaleImageYdownXup`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors C++ scaleImageYdownXup; all buffers are necessary"
+    reason = "kernel is private; all params are necessary to share the body across mask + image"
 )]
-fn scale_image_ydown_xup(
+fn scale_kernel_ydown_xup(
     image_src: &mut dyn ImageSource,
     src_w: usize,
     src_h: usize,
     scaled_w: usize,
     scaled_h: usize,
     ncomps: usize,
+    sat_factor: u32,
     dest: &mut [u8],
     line_buf: &mut [u8],
 ) {
@@ -783,7 +518,7 @@ fn scale_image_ydown_xup(
         let y_step = bresenham_step(&mut yt, yq, scaled_h, yp);
 
         pix_buf.fill(0);
-        for _i in 0..y_step {
+        for _ in 0..y_step {
             image_src.get_row(src_y, line_buf);
             src_y += 1;
             for (pix, &lb) in pix_buf.iter_mut().zip(line_buf.iter()) {
@@ -791,20 +526,16 @@ fn scale_image_ydown_xup(
             }
         }
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "y_step ≤ src_h; fits u32 for practical image sizes"
-        )]
-        let d = (1u32 << 23) / y_step as u32;
+        let d = sat_factor
+            / u32::try_from(y_step).expect("y_step ≤ src_h fits in u32 for practical image sizes");
         let mut xt = 0usize;
 
+        let mut pix_vals = [0u8; MAX_NCOMPS];
         for sx in 0..src_w {
             let x_step = bresenham_step(&mut xt, xq, src_w, xp);
             let base = sx * ncomps;
-            // Fixed-size scratch; ncomps ≤ MAX_NCOMPS is enforced by the caller.
-            let mut pix_vals = [0u8; MAX_NCOMPS];
             for c in 0..ncomps {
-                pix_vals[c] = ((pix_buf[base + c] * d) >> 23).min(255) as u8;
+                pix_vals[c] = saturate_scaled(pix_buf[base + c], d);
             }
             for _ in 0..x_step {
                 dest[dest_off..dest_off + ncomps].copy_from_slice(&pix_vals[..ncomps]);
@@ -816,18 +547,19 @@ fn scale_image_ydown_xup(
 
 /// Nearest-neighbor Y upsampling, box-filter X downsampling.
 ///
-/// C++: `Splash::scaleImageYupXdown`.
+/// C++ provenance: `Splash::scaleMaskYupXdown` / `Splash::scaleImageYupXdown`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors C++ scaleImageYupXdown; all buffers are necessary"
+    reason = "kernel is private; all params are necessary to share the body across mask + image"
 )]
-fn scale_image_yup_xdown(
+fn scale_kernel_yup_xdown(
     image_src: &mut dyn ImageSource,
     src_w: usize,
     src_h: usize,
     scaled_w: usize,
     scaled_h: usize,
     ncomps: usize,
+    sat_factor: u32,
     dest: &mut [u8],
     line_buf: &mut [u8],
 ) {
@@ -836,22 +568,8 @@ fn scale_image_yup_xdown(
     let xp = src_w / scaled_w;
     let xq = src_w % scaled_w;
 
-    let d0 = if xp > 0 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "xp ≤ src_w; fits u32 for practical image sizes"
-        )]
-        {
-            (1u32 << 23) / xp as u32
-        }
-    } else {
-        0
-    };
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "xp+1 ≤ src_w+1; fits u32 for practical image sizes"
-    )]
-    let d1 = (1u32 << 23) / (xp + 1) as u32;
+    // y_step factor is 1 for this kernel — the divisors don't depend on Y.
+    let (d_full, d_plus_one) = xdown_divisors(sat_factor, 1, xp);
 
     let mut yt = 0usize;
     let mut dest_off = 0usize;
@@ -859,31 +577,22 @@ fn scale_image_yup_xdown(
     for sy in 0..src_h {
         let y_step = bresenham_step(&mut yt, yq, src_h, yp);
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
-        )]
-        image_src.get_row(sy as u32, line_buf);
+        let src_y = u32::try_from(sy)
+            .expect("source row index ≤ src_h fits in u32 for practical image sizes");
+        image_src.get_row(src_y, line_buf);
 
         let row_start = dest_off;
         let mut xt = 0usize;
         let mut xx = 0usize;
 
         for dx in 0..scaled_w {
-            let (x_step, d) = {
-                let step = bresenham_step(&mut xt, xq, scaled_w, xp);
-                if step == xp + 1 {
-                    (step, d1)
-                } else {
-                    (step, d0)
-                }
-            };
-
+            let x_step = bresenham_step(&mut xt, xq, scaled_w, xp);
+            let d = if x_step == xp + 1 { d_plus_one } else { d_full };
             for c in 0..ncomps {
-                let pix: u32 = (0..x_step)
+                let sum: u32 = (0..x_step)
                     .map(|i| u32::from(line_buf[(xx + i) * ncomps + c]))
                     .sum();
-                dest[row_start + dx * ncomps + c] = ((pix * d) >> 23).min(255) as u8;
+                dest[row_start + dx * ncomps + c] = saturate_scaled(sum, d);
             }
             xx += x_step;
         }
@@ -901,12 +610,15 @@ fn scale_image_yup_xdown(
 
 /// Nearest-neighbor upsampling in both axes.
 ///
-/// C++: `Splash::scaleImageYupXup`.
+/// C++ provenance: `Splash::scaleMaskYupXup` / `Splash::scaleImageYupXup`.
+/// No saturation is needed — each output pixel is a direct copy of one source
+/// pixel. (For the mask path, source bytes are already 0 or 255 by
+/// construction in [`unpack_mask_row`].)
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors C++ scaleImageYupXup; all buffers are necessary"
+    reason = "kernel is private; all params are necessary to share the body across mask + image"
 )]
-fn scale_image_yup_xup(
+fn scale_kernel_yup_xup(
     image_src: &mut dyn ImageSource,
     src_w: usize,
     src_h: usize,
@@ -927,11 +639,9 @@ fn scale_image_yup_xup(
     for sy in 0..src_h {
         let y_step = bresenham_step(&mut yt, yq, src_h, yp);
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "sy ≤ src_h ≤ u32::MAX for practical image sizes"
-        )]
-        image_src.get_row(sy as u32, line_buf);
+        let src_y = u32::try_from(sy)
+            .expect("source row index ≤ src_h fits in u32 for practical image sizes");
+        image_src.get_row(src_y, line_buf);
 
         let row_start = dest_off;
         let mut xt = 0usize;
@@ -956,6 +666,31 @@ fn scale_image_yup_xup(
         }
         dest_off += (y_step - 1) * scaled_w * ncomps;
     }
+}
+
+// ── Image scaling ─────────────────────────────────────────────────────────────
+
+/// Scale a colour image to `scaled_w × scaled_h`.
+///
+/// Output is `scaled_w * scaled_h * ncomps` bytes (row-major, no padding).
+/// Thin wrapper over [`scale_image_inner`].
+fn scale_image(
+    image_src: &mut dyn ImageSource,
+    src_w: usize,
+    src_h: usize,
+    scaled_w: usize,
+    scaled_h: usize,
+    ncomps: usize,
+) -> Vec<u8> {
+    scale_image_inner(
+        image_src,
+        src_w,
+        src_h,
+        scaled_w,
+        scaled_h,
+        ncomps,
+        IMAGE_SAT_FACTOR,
+    )
 }
 
 // ── Row-as-pattern helper ─────────────────────────────────────────────────────
