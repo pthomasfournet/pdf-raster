@@ -173,7 +173,8 @@ impl XPath {
             .map(|p| transform(matrix, p.x, p.y))
             .collect();
 
-        // Phase 1 always uses adjust_lines=false, line_pos_i=0 (thin-line adjustment is Phase 2).
+        // Thin-line stroke adjustment (the `adjust_lines=true` branch of
+        // `XPathAdjust::new`) has no caller today; pass the no-op values.
         let adjusts = build_adjusts(&path.hints, &tpts, false, 0);
 
         // Apply stroke adjustments to the transformed points.
@@ -440,23 +441,22 @@ pub const fn transform(m: &[f64; 6], xi: f64, yi: f64) -> PathPoint {
 ///
 /// # Parameters `adjust_lines` and `line_pos_i`
 ///
-/// These parameters are **reserved for Phase 2 thin-line stroke adjustment**
-/// and are currently always called with `(false, 0)`. When `adjust_lines` is
-/// `false` the `line_pos_i` value is unused and the `XPathAdjust::new` branch
-/// that computes adjusted `r0`/`r1` from `line_pos_i` is never reached.
-///
-/// Do **not** remove these parameters; they will be wired up in Phase 2.
+/// Forwarded verbatim to [`XPathAdjust::new`], where they drive the thin-line
+/// snap branch (when both rounded endpoints coincide and `adjust_lines` is
+/// true, the span is expanded to `[line_pos_i, line_pos_i + 1]`). Every
+/// caller in the tree passes `(false, 0)`, which is the no-op configuration;
+/// the assert below pins that contract so an unexpected caller surfaces in
+/// debug builds rather than silently producing thin-line-snapped output.
 fn build_adjusts(
     hints: &[StrokeAdjustHint],
     tpts: &[PathPoint],
     adjust_lines: bool,
     line_pos_i: i32,
 ) -> Vec<XPathAdjust> {
-    // Document the current calling convention; Phase 2 will relax this.
     debug_assert!(
         !adjust_lines && line_pos_i == 0,
-        "build_adjusts: adjust_lines={adjust_lines} line_pos_i={line_pos_i}; \
-         Phase 2 thin-line adjustment not yet implemented"
+        "build_adjusts: only the no-op configuration (false, 0) is reachable today; \
+         got adjust_lines={adjust_lines} line_pos_i={line_pos_i}"
     );
     let mut adjusts = Vec::with_capacity(hints.len());
     for h in hints {
