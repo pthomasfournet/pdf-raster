@@ -435,7 +435,7 @@ mod tests {
         // Interior pixels (rows 2..4, cols 1..5) should be painted.
         for y in 2..5u32 {
             let row = bmp.row(y);
-            for (x, px) in row.iter().enumerate().take(6).skip(1) {
+            for (x, px) in row.iter().enumerate().skip(1).take(5) {
                 assert_eq!(px.r, 200, "y={y} x={x} R");
                 assert_eq!(px.g, 100, "y={y} x={x} G");
                 assert_eq!(px.b, 50, "y={y} x={x} B");
@@ -514,21 +514,26 @@ mod tests {
 
     #[test]
     fn aa_gamma_table_correct() {
-        // Validate every entry against the defining formula: round((i/16)^1.5 * 255).
-        for i in 0u8..=16 {
-            // i ∈ [0,16] → (i/16)^1.5 ∈ [0,1] → ×255 ∈ [0,255] → round to non-
-            // negative integer in [0,255]; the `as u8` is provably in range.
+        // Validate every entry against the defining formula:
+        // round((i / (AA_SIZE² )) ^ 1.5 * 255).  Derive the divisor from the
+        // table's own length so the test stays correct if AA_SIZE changes.
+        let max_idx = AA_GAMMA.len() - 1; // == AA_SIZE * AA_SIZE
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "AA_GAMMA.len() ≤ 65 in practice; f64 represents it exactly"
+        )]
+        let divisor = max_idx as f64;
+        for (i, &actual) in AA_GAMMA.iter().enumerate() {
+            // i ∈ [0, max_idx]; (i/max_idx)^1.5 ∈ [0,1]; ×255 ∈ [0,255]; round
+            // to non-negative integer in [0,255] — the `as u8` is provably in range.
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
+                clippy::cast_precision_loss,
                 reason = "value is f64::round() of a [0,255]-bounded expression"
             )]
-            let expected = ((f64::from(i) / 16.0).powf(1.5) * 255.0).round() as u8;
-            assert_eq!(
-                AA_GAMMA[usize::from(i)],
-                expected,
-                "AA_GAMMA[{i}]: expected {expected}"
-            );
+            let expected = ((i as f64 / divisor).powf(1.5) * 255.0).round() as u8;
+            assert_eq!(actual, expected, "AA_GAMMA[{i}]: expected {expected}");
         }
     }
 

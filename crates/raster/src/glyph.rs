@@ -509,7 +509,7 @@ mod tests {
         // Rows 2..5, cols 2..5 should be red.
         for y in 2..6u32 {
             let row = bmp.row(y);
-            for (x, px) in row.iter().enumerate().take(6).skip(2) {
+            for (x, px) in row.iter().enumerate().skip(2).take(4) {
                 assert_eq!(px.r, 255, "y={y} x={x} R");
             }
         }

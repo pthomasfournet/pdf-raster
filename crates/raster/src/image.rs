@@ -1612,10 +1612,11 @@ mod tests {
         fn get_row(&mut self, y: u32, row_buf: &mut [u8]) {
             for (byte_idx, slot) in row_buf.iter_mut().enumerate() {
                 let mut packed: u8 = 0;
-                // Tests pass row_buf < u32::MAX/8 bytes; byte_idx fits in u32.
+                // Test callers pass row widths ≤ 11 px → row_buf ≤ 2 bytes →
+                // byte_idx ≤ 1, trivially in u32.
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "test fixture; row_buf is bounded to small widths"
+                    reason = "callers pass widths ≤ 11 px; byte_idx ≤ 1 fits in u32"
                 )]
                 let byte_idx_u32 = byte_idx as u32;
                 for bit in 0..8u32 {
@@ -1640,12 +1641,12 @@ mod tests {
     impl ImageSource for GoldenImage {
         fn get_row(&mut self, y: u32, row_buf: &mut [u8]) {
             let width = row_buf.len() / self.ncomps;
-            // Test fixture: x < width < u32::MAX and c < ncomps ≤ 4; both casts
+            // Test callers pass widths ≤ 11 px and ncomps ≤ 4, so x and c both
             // fit in u32. The final `& 0xFF` truncation is intentional — that's
             // how the per-pixel byte is derived.
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "test fixture; bounded inputs and intentional 0xFF masking"
+                reason = "callers bound width ≤ 11 and ncomps ≤ 4; 0xFF mask is intentional"
             )]
             for x in 0..width {
                 for c in 0..self.ncomps {
