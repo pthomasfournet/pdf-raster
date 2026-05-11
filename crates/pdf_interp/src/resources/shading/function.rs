@@ -511,8 +511,11 @@ mod tests {
         // one bound; supplying zero is malformed.  eval_stitching_depth must
         // fall back to evaluating the first sub-function rather than panicking
         // on the missing breakpoint.
-        let sub_a = make_exp_dict(0.2, 0.8, 1.0); // linear ramp 0.2 → 0.8
-        let sub_b = make_exp_dict(0.0, 1.0, 1.0); // distinct sub so fallback is observable
+        let sub_a = make_exp_dict(0.2, 0.8, 1.0); // sub_a(0.5) = 0.5
+        // sub_b chosen so sub_b(0.5) = 0.95, distinct from sub_a(0.5) = 0.5;
+        // if the fallback used the wrong sub-function the assertion below
+        // would fire.
+        let sub_b = make_exp_dict(0.9, 1.0, 1.0);
         let mut stitching = pdf::Dictionary::new();
         stitching.set("FunctionType", pdf::Object::Integer(3));
         stitching.set(
