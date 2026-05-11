@@ -22,15 +22,15 @@
 //!
 //! | PDF variant   | [`ColorSpace`] variant |
 //! |---|---|
-//! | `/DeviceGray`, `/G` | [`ColorSpace::DeviceGray`] |
-//! | `/DeviceRGB`, `/RGB` | [`ColorSpace::DeviceRgb`] |
-//! | `/DeviceCMYK`, `/CMYK` | [`ColorSpace::DeviceCmyk`] |
-//! | `[/CalGray ...]`     | [`ColorSpace::DeviceGray`] (approximated) |
-//! | `[/CalRGB ...]`      | [`ColorSpace::DeviceRgb`] (approximated) |
+//! | `/DeviceGray`, `/G` (Table 89 abbreviation), `/CalGray` | [`ColorSpace::DeviceGray`] |
+//! | `/DeviceRGB`, `/RGB` (Table 89), `/CalRGB` | [`ColorSpace::DeviceRgb`] |
+//! | `/DeviceCMYK`, `/CMYK` (Table 89) | [`ColorSpace::DeviceCmyk`] |
+//! | `[/CalGray ...]` array form | [`ColorSpace::DeviceGray`] (approximated) |
+//! | `[/CalRGB ...]` array form | [`ColorSpace::DeviceRgb`] (approximated) |
 //! | `[/Lab ...]`         | [`ColorSpace::Lab`] |
 //! | `[/ICCBased <ref>]`  | [`ColorSpace::IccBased`] |
 //! | `[/Indexed ...]`     | [`ColorSpace::Indexed`] |
-//! | `[/Pattern]` or `[/Pattern <base>]` | [`ColorSpace::Pattern`] |
+//! | `/Pattern` or `[/Pattern <base>]` | [`ColorSpace::Pattern`] |
 //! | `[/Separation ...]`  | [`ColorSpace::Separation`] |
 //! | `[/DeviceN ...]`     | [`ColorSpace::DeviceN`] |
 //! | unknown / malformed  | [`ColorSpace::DeviceGray`] (safe fallback) |
@@ -51,11 +51,12 @@
 //!   `convert_to_rgb` still returns black for `Indexed`.  Palette
 //!   dereference + recursive base conversion is the missing piece; the
 //!   image pipeline handles Indexed via a separate path for images.
-//! - **`DeviceN` tint transform**: the shading-fn evaluator only handles
-//!   1-input functions, so `DeviceN` (N≥1 inputs) falls back to the
-//!   single-component gray heuristic on `comps[0]`.  Extending the
-//!   evaluator to N-input PostScript-style functions (Type 4) is its
-//!   own scope.
+//! - **`DeviceN` with N > 1 tint inputs**: the shading-fn evaluator
+//!   only handles 1-input functions; `DeviceN` with multiple colorants
+//!   falls back to the single-component gray heuristic on `comps[0]`.
+//!   Single-colorant `DeviceN` (N = 1) routes through the same tint
+//!   path as `Separation`.  Extending the evaluator to N-input
+//!   PostScript-style functions (Type 4) is its own scope.
 
 use pdf::{Document, Object, ObjectId};
 
@@ -198,10 +199,13 @@ impl ColorSpace {
     ///   converts the result via the alternate colour space.  Any failure
     ///   (missing function, eval error, alternate falls through) drops
     ///   back to `1 - tint` as gray.
-    /// - `DeviceN`: requires N-input function evaluation; the current
-    ///   shading-fn evaluator handles only 1-input functions, so
-    ///   `DeviceN` currently falls back to the 1-input gray heuristic on
-    ///   `comps[0]`. Filed as a separate concern.
+    /// - `DeviceN`: when `ncomps == 1` (single-colorant `DeviceN` —
+    ///   rare but spec-legal), routes through the same tint-function
+    ///   path as `Separation`.  When `ncomps > 1`, falls back to the
+    ///   gray heuristic on `comps[0]` — the existing shading-fn
+    ///   evaluator only takes a single `t: f64`, and N-input
+    ///   PostScript-style (Type 4) function evaluation is a separate
+    ///   scope.
     #[must_use]
     pub fn convert_to_rgb(&self, doc: &Document, comps: &[f64]) -> [u8; 3] {
         if comps.len() != self.ncomponents() {
@@ -249,11 +253,24 @@ impl ColorSpace {
                 }
                 separation_fallback_gray(comps[0])
             }
-            Self::DeviceN { .. } => {
-                // Multi-channel tint transform requires N-input function
-                // evaluation; the current evaluator only handles 1-input
-                // shading functions.  Fall back to the heuristic on
-                // comps[0] until the evaluator is extended.
+            Self::DeviceN {
+                ncomps,
+                alternate,
+                tint_dict_id,
+            } => {
+                // PDF §8.6.6.5: like Separation but with N tint inputs.  The
+                // shading-fn evaluator (`super::shading::function::eval_function`)
+                // only takes a single `t: f64`, so we can route through it
+                // when `ncomps == 1` (a single-colorant DeviceN — uncommon,
+                // but spec-legal).  N > 1 needs an N-input evaluator
+                // (PostScript-style Type 4 functions); falls back to the
+                // gray heuristic on `comps[0]` until that lands.
+                if *ncomps == 1
+                    && let Some(id) = tint_dict_id
+                    && let Some(rgb) = separation_via_tint_fn(doc, *id, alternate, comps[0])
+                {
+                    return rgb;
+                }
                 separation_fallback_gray(comps[0])
             }
         }
@@ -976,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_devicen_falls_back_to_gray_pending_n_input_evaluator() {
+    fn convert_devicen_multi_input_falls_back_to_gray() {
         // The shading function evaluator only handles 1-input functions
         // today; DeviceN with N>1 inputs cannot be transformed correctly,
         // so we use the 1-input heuristic on comps[0].
@@ -987,6 +1004,33 @@ mod tests {
             tint_dict_id: None,
         };
         assert_eq!(dn.convert_to_rgb(&doc, &[1.0, 0.5, 0.5]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn convert_devicen_single_input_no_tint_fn_falls_back_to_gray() {
+        // ncomps=1 with no resolvable tint function → gray heuristic on the
+        // single tint component (1.0 → "full ink" → black).
+        let doc = empty_doc();
+        let dn = ColorSpace::DeviceN {
+            ncomps: 1,
+            alternate: Box::new(ColorSpace::DeviceCmyk),
+            tint_dict_id: None,
+        };
+        assert_eq!(dn.convert_to_rgb(&doc, &[1.0]), [0, 0, 0]);
+        assert_eq!(dn.convert_to_rgb(&doc, &[0.0]), [255, 255, 255]);
+    }
+
+    #[test]
+    fn convert_devicen_single_input_unresolvable_tint_fn_falls_back() {
+        // ncomps=1 with a tint id that doesn't resolve → eval_function
+        // returns None → fall back to the gray heuristic.
+        let doc = empty_doc();
+        let dn = ColorSpace::DeviceN {
+            ncomps: 1,
+            alternate: Box::new(ColorSpace::DeviceCmyk),
+            tint_dict_id: Some((999, 0)),
+        };
+        assert_eq!(dn.convert_to_rgb(&doc, &[0.5]), [128, 128, 128]);
     }
 
     #[test]
