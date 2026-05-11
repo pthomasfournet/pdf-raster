@@ -12,6 +12,7 @@ use raster::types::{BlendMode, LineCap, LineJoin};
 
 use super::color::RasterColor;
 use super::text::TextState;
+use crate::resources::colorspace::ColorSpace;
 
 /// PDF current transformation matrix — a 6-element `[a b c d e f]` array.
 pub type Ctm = [f64; 6];
@@ -121,6 +122,17 @@ pub struct InterpGState {
     pub stroke_pattern: Option<Vec<u8>>,
     /// Tint components for an uncoloured stroke pattern (`PaintType` 2).
     pub stroke_pattern_components: Vec<f64>,
+    /// Declared colour space for fill operations (PDF §8.6).
+    ///
+    /// Set by `cs /Name`; defaults to `DeviceGray` per §8.6.4.1.  Used by the
+    /// uncoloured-pattern tint dispatch to interpret `fill_pattern_components`
+    /// in the spec-correct base space rather than guessing from component
+    /// count.  No effect on direct `g`/`rg`/`k` operators (they bypass the
+    /// colour-space slot per spec).
+    pub fill_color_space: ColorSpace,
+    /// Declared colour space for stroke operations (PDF §8.6).  Mirrors
+    /// `fill_color_space`; set by `CS /Name`.
+    pub stroke_color_space: ColorSpace,
 }
 
 impl Clone for InterpGState {
@@ -144,6 +156,8 @@ impl Clone for InterpGState {
             fill_pattern_components: self.fill_pattern_components.clone(),
             stroke_pattern: self.stroke_pattern.clone(),
             stroke_pattern_components: self.stroke_pattern_components.clone(),
+            fill_color_space: self.fill_color_space.clone(),
+            stroke_color_space: self.stroke_color_space.clone(),
         }
     }
 }
@@ -171,6 +185,10 @@ impl InterpGState {
             fill_pattern_components: Vec::new(),
             stroke_pattern: None,
             stroke_pattern_components: Vec::new(),
+            // PDF §8.6.4.1: DeviceGray is the initial colour space for both
+            // stroking and non-stroking operations until the first `cs`/`CS`.
+            fill_color_space: ColorSpace::DeviceGray,
+            stroke_color_space: ColorSpace::DeviceGray,
         }
     }
 }
