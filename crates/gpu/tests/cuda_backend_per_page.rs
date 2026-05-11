@@ -57,3 +57,28 @@ fn cuda_backend_per_page_composite_then_softmask() {
     // all succeed end-to-end without a panic, an `unimplemented!`, or
     // a CUDA error.
 }
+
+#[cfg(feature = "gpu-validation")]
+#[test]
+fn cuda_backend_record_zero_buffer_round_trip() {
+    // begin_page → record_zero_buffer → submit_page → wait_page must
+    // complete without an `unimplemented!`, a kernel-launch error, or
+    // a CUDA error.  The Vulkan-side smoke test does the readback
+    // verification; here we only care that the trait method dispatches
+    // through `cuMemsetD8Async` cleanly.
+    use gpu::backend::GpuBackend;
+    use gpu::backend::cuda::CudaBackend;
+
+    const SIZE: usize = 4096;
+    let backend = CudaBackend::new().expect("CudaBackend::new");
+    let buf = backend.alloc_device(SIZE).expect("alloc_device");
+
+    backend.begin_page().expect("begin_page");
+    backend
+        .record_zero_buffer(&buf)
+        .expect("record_zero_buffer");
+    let fence = backend.submit_page().expect("submit_page");
+    backend.wait_page(fence).expect("wait_page");
+
+    backend.free_device(buf);
+}

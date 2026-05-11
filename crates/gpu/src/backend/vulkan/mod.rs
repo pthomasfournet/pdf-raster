@@ -125,17 +125,18 @@ impl GpuBackend for VulkanBackend {
         // Mis-aligned sizes fail loudly rather than silently downgrading
         // to a 33 MB host-vec staging path.
         //
-        // KNOWN CONTENTION: `fill_zero` rides `run_one_shot`, which holds
+        // Allocation-time zero-fill rides `run_one_shot`, which holds
         // both `TransferContext::cmd_pool` and `DeviceCtx::compute_queue`
         // for the full submit + `vkQueueWaitIdle` (~1–2 ms for a 4K RGBA8
-        // page). Concurrent renderer threads serialise here. The clean
-        // fix is to fold the fill into the page's own command buffer via
-        // a `record_zero_buffer` trait method, called by the renderer
-        // between `begin_page` and `submit_page`. That requires the
-        // renderer to be migrated to the `GpuBackend` trait first; until
-        // the trait grows a backend-agnostic upload/download surface
-        // (see the doc comment on `DevicePageBuffer` in
-        // `crates/gpu/src/cache/page_buffer.rs`), this stays as-is.
+        // page). Concurrent renderer threads serialise here.
+        //
+        // The cheaper path is [`GpuBackend::record_zero_buffer`], which
+        // folds the fill into the page's own command buffer between
+        // `begin_page` and `submit_page` — zero extra submits, no
+        // transfer-queue lock. Callers that already hold an active page
+        // recording should prefer it. This method exists for paths that
+        // need the buffer zeroed *outside* a page (e.g., one-shot setup,
+        // tests).
         self.transfer.fill_zero(&buf)?;
         Ok(buf)
     }
@@ -189,6 +190,10 @@ impl GpuBackend for VulkanBackend {
 
     fn record_apply_soft_mask(&self, params: params::SoftMaskParams<'_, Self>) -> Result<()> {
         self.recorder.record_apply_soft_mask(params)
+    }
+
+    fn record_zero_buffer(&self, buf: &Self::DeviceBuffer) -> Result<()> {
+        self.recorder.record_zero_buffer(buf)
     }
 
     fn submit_page(&self) -> Result<Self::PageFence> {

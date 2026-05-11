@@ -246,6 +246,9 @@ mod tests {
         fn record_apply_soft_mask(&self, _p: SoftMaskParams<'_, Self>) -> super::super::Result<()> {
             unreachable!()
         }
+        fn record_zero_buffer(&self, _buf: &Self::DeviceBuffer) -> super::super::Result<()> {
+            unreachable!()
+        }
         fn submit_page(&self) -> super::super::Result<Self::PageFence> {
             unreachable!()
         }

@@ -476,6 +476,60 @@ impl PageRecorder {
         )
     }
 
+    /// Record a `vkCmdFillBuffer(buf, 0, size, 0)` into the active
+    /// per-page command buffer.  No descriptor set, no pipeline bind —
+    /// `vkCmdFillBuffer` is a transfer-stage command, so this is
+    /// cheaper than the kernel-dispatch path and doesn't consume from
+    /// the per-page descriptor budget.
+    ///
+    /// Emits a transfer→compute memory barrier afterwards so any later
+    /// kernel dispatch in the same page observes the zeros.
+    pub(super) fn record_zero_buffer(&self, buf: &super::memory::DeviceBuffer) -> Result<()> {
+        let size = buf.size();
+        if size == 0 {
+            return Ok(());
+        }
+        if !size.is_multiple_of(4) {
+            return Err(BackendError::UnalignedFill {
+                size,
+                required_alignment: 4,
+            });
+        }
+
+        let s = self.inner.lock().expect("recorder mutex poisoned");
+        if s.state != State::Recording {
+            return Err(BackendError::msg(format!(
+                "record_zero_buffer called from {:?} state; expected Recording",
+                s.state
+            )));
+        }
+        let dst_handle = buf.handle();
+        // Safety: cmd is in Recording state (state check above); dst was
+        // created with TRANSFER_DST usage via the slab allocator's
+        // DEVICE_USAGE; size is a checked multiple of 4.
+        unsafe {
+            self.device
+                .device
+                .cmd_fill_buffer(s.cmd, dst_handle, 0, size, 0);
+
+            // transfer→compute barrier: a later record_* may read the
+            // zeros via a storage-buffer binding, so the fill writes
+            // must be visible to SHADER_STORAGE_READ before the next
+            // dispatch.  Pessimistic (covers any later kernel that
+            // reads buf) but cheap relative to the fill itself.
+            let mem_barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                )];
+            let dep_info = vk::DependencyInfo::default().memory_barriers(&mem_barrier);
+            self.device.device.cmd_pipeline_barrier2(s.cmd, &dep_info);
+        }
+        Ok(())
+    }
+
     /// Bail if `groups` exceeds the device's `maxComputeWorkGroupCount`
     /// per axis.  Without this, an oversized dispatch returns an opaque
     /// `ERROR_DEVICE_LOST` from the driver later — much harder to debug.

@@ -334,6 +334,24 @@ pub trait GpuBackend: Send + Sync {
     /// # Errors
     /// Returns `BackendError` if the operation cannot be recorded.
     fn record_apply_soft_mask(&self, params: params::SoftMaskParams<'_, Self>) -> Result<()>;
+    /// Record a zero-fill of `buf` into the current page's command list.
+    ///
+    /// Folds what [`Self::alloc_device_zeroed`] does as a separate one-shot
+    /// submission into the page's own command buffer / stream: zero extra
+    /// submits, no transfer-queue lock acquisition, no `vkQueueWaitIdle`
+    /// in the alloc path.  Callers that have an active `begin_page` (e.g.
+    /// the per-page composite buffer) should prefer this over
+    /// `alloc_device_zeroed` to avoid serialising concurrent renderer
+    /// threads on the Vulkan transfer pool.
+    ///
+    /// The fill becomes visible by the time the page's `wait_page`
+    /// returns — same "eventually zero" contract as `alloc_device_zeroed`.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the operation cannot be recorded.
+    /// Vulkan's `vkCmdFillBuffer` requires the buffer size to be a multiple
+    /// of 4; non-aligned sizes return [`BackendError::UnalignedFill`].
+    fn record_zero_buffer(&self, buf: &Self::DeviceBuffer) -> Result<()>;
     /// Submit all recorded work for the current page; returns a fence to wait on.
     ///
     /// # Errors

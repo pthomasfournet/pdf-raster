@@ -245,6 +245,92 @@ fn vulkan_backend_immediate_fence_round_trips() {
 }
 
 #[test]
+fn vulkan_backend_record_zero_buffer_zeros_dirty_alloc() {
+    // alloc_device returns a buffer with undefined contents; upload a
+    // sentinel pattern, then record_zero_buffer inside a page submission,
+    // then verify the readback is all-zero.
+    //
+    // This is the production-shape path the audit asked for: zero-fill
+    // folded into the per-page command buffer instead of riding its own
+    // submit + vkQueueWaitIdle in alloc_device_zeroed.
+    const SIZE: usize = 4096;
+    let (backend, _serial) = shared_backend();
+    let buf = backend.alloc_device(SIZE).expect("alloc_device");
+    let sentinel = vec![0xCDu8; SIZE];
+    backend
+        .upload_sync(&buf, &sentinel)
+        .expect("upload sentinel");
+
+    backend.begin_page().expect("begin_page");
+    backend
+        .record_zero_buffer(&buf)
+        .expect("record_zero_buffer");
+    let fence = backend.submit_page().expect("submit_page");
+    backend.wait_page(fence).expect("wait_page");
+
+    let mut readback = vec![0xAAu8; SIZE];
+    backend
+        .download_sync(&buf, &mut readback)
+        .expect("download");
+    if let Some(bad) = readback.iter().position(|&b| b != 0) {
+        panic!(
+            "record_zero_buffer left non-zero byte 0x{:02x} at index {bad}",
+            readback[bad]
+        );
+    }
+    backend.free_device(buf);
+}
+
+#[test]
+fn vulkan_backend_record_zero_buffer_rejects_outside_recording_state() {
+    // record_zero_buffer is a state-machine op: legal only between
+    // begin_page and submit_page.  Calling it from Idle must error,
+    // not record into a stale command buffer.
+    let (backend, _serial) = shared_backend();
+    let buf = backend.alloc_device(64).expect("alloc_device");
+    let err = backend
+        .record_zero_buffer(&buf)
+        .expect_err("record_zero_buffer outside Recording must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("expected Recording"),
+        "expected state-machine error, got: {msg}"
+    );
+    backend.free_device(buf);
+}
+
+#[test]
+fn vulkan_backend_record_zero_buffer_rejects_unaligned_size() {
+    // vkCmdFillBuffer requires 4-byte-aligned size; record_zero_buffer
+    // surfaces this loudly via BackendError::UnalignedFill instead of
+    // silently leaving 1–3 trailing bytes non-zero.
+    let (backend, _serial) = shared_backend();
+    let buf = backend.alloc_device(17).expect("alloc_device(17)");
+    backend.begin_page().expect("begin_page");
+    let err = backend
+        .record_zero_buffer(&buf)
+        .expect_err("record_zero_buffer on 17-byte buf must be rejected");
+    assert!(
+        matches!(
+            err,
+            BackendError::UnalignedFill {
+                size: 17,
+                required_alignment: 4,
+            }
+        ),
+        "expected UnalignedFill{{17,4}}, got: {err:?}"
+    );
+    // Finish the page cleanly so VulkanBackend::Drop doesn't see
+    // in-flight work — the recorder is still in Recording state after
+    // the rejected call (the state check ran AFTER the size check, so
+    // we never transitioned).  submit then wait drains the empty cmd
+    // buffer.
+    let fence = backend.submit_page().expect("submit_page");
+    backend.wait_page(fence).expect("wait_page");
+    backend.free_device(buf);
+}
+
+#[test]
 fn vulkan_backend_alloc_device_zeroed_rejects_unaligned_size() {
     // vkCmdFillBuffer requires 4-byte-aligned size; alloc_device_zeroed
     // must surface this loudly rather than silently downgrading.

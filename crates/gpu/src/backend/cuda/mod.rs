@@ -116,6 +116,10 @@ impl GpuBackend for CudaBackend {
         self.recorder.record_apply_soft_mask(params)
     }
 
+    fn record_zero_buffer(&self, buf: &Self::DeviceBuffer) -> Result<()> {
+        self.recorder.record_zero_buffer(buf)
+    }
+
     fn submit_page(&self) -> Result<Self::PageFence> {
         self.recorder.submit_page()
     }

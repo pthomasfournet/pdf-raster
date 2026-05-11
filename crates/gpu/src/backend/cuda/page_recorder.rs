@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::CudaEvent;
+use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr};
 
 use super::be;
 use crate::GpuCtx;
@@ -232,5 +232,26 @@ impl PageRecorder {
         self.ctx
             .launch_soft_mask_async(p.pixels, p.mask, p.n_pixels)
             .map_err(be)
+    }
+
+    /// Record an async zero-fill on the backend's stream via
+    /// `cuMemsetD8Async`.  Same single-stream serialisation as the
+    /// `launch_*_async` helpers: any later record_* call ordered after
+    /// this one observes zeros without an explicit barrier.
+    pub(super) fn record_zero_buffer(&self, buf: &CudaSlice<u8>) -> Result<()> {
+        let num_bytes = buf.num_bytes();
+        if num_bytes == 0 {
+            return Ok(());
+        }
+        let stream = self.ctx.stream();
+        let (dptr, _sync) = buf.device_ptr(stream);
+        // Safety: dptr was returned by cudarc for `buf` on `stream`;
+        // num_bytes equals the buffer's size; the stream owns the
+        // ordering against subsequent kernel launches.  Mirrors the
+        // pattern in cudarc's safe `memset_zeros` which calls the same
+        // unsafe entry point.
+        unsafe { cudarc::driver::result::memset_d8_async(dptr, 0, num_bytes, stream.cu_stream()) }
+            .map_err(be)?;
+        Ok(())
     }
 }
