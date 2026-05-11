@@ -284,6 +284,17 @@ pub struct TransferSet<'a> {
     /// CMYK transfer tables: `[C, M, Y, K]`, each 256 bytes.
     pub cmyk: [&'a [u8; 256]; 4],
     /// `DeviceN` transfer tables: `SPOT_NCOMPS + 4` tables of 256 bytes each, as a slice.
+    ///
+    /// Shape is intentionally `&[[u8; 256]]` (slice of owned arrays) rather
+    /// than `&[&[u8; 256]]` (slice of references).  Production stores these
+    /// as `Vec<[u8; 256]>` on `GraphicsState` because custom transfer
+    /// functions from PDF `/TR` produce owned tables; a slice-of-references
+    /// view would require either rebuilding a `Vec<&[u8; 256]>` per
+    /// `transfer_set()` call (per-paint allocation) or maintaining a
+    /// parallel index that stays in sync with the owned storage.  The
+    /// owned-array shape keeps the hot path allocation-free at the cost
+    /// of needing a separate `static DN: [[u8; 256]; 8]` declaration in
+    /// each test site.
     pub device_n: &'a [[u8; 256]],
 }
 
