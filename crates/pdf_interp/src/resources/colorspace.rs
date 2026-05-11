@@ -86,6 +86,11 @@ pub enum ColorSpace {
         base: Box<Self>,
         /// Maximum valid index — palette has `hival + 1` entries.
         hival: u8,
+        /// `Reference` to the lookup stream/string holding the palette
+        /// entries; `None` if the array's fourth element was an inline
+        /// string (the parser doesn't store the bytes — palette lookup
+        /// would need to re-resolve via the source `Object`).
+        lookup_id: Option<ObjectId>,
     },
     /// Pattern space. PDF §8.7.2. The optional `base` is the underlying
     /// colour space for uncoloured patterns (`PaintType` 2); `None` for
@@ -372,7 +377,16 @@ fn resolve_indexed(doc: &Document, arr: &[Object], depth: u8) -> ColorSpace {
         .map(|n| n.clamp(0, 255))
         .and_then(|n| u8::try_from(n).ok())
         .unwrap_or(0);
-    ColorSpace::Indexed { base, hival }
+    // PDF §8.6.6.3: element 3 is either a hex/literal string (inline
+    // palette bytes) or an indirect reference to a stream. We store the
+    // reference; inline strings are uncommon outside small Indexed-Gray
+    // palettes and would need re-resolution via the source object.
+    let lookup_id = arr.get(3).and_then(reference_id);
+    ColorSpace::Indexed {
+        base,
+        hival,
+        lookup_id,
+    }
 }
 
 fn resolve_separation(doc: &Document, arr: &[Object], depth: u8) -> ColorSpace {
@@ -526,6 +540,7 @@ mod tests {
             ColorSpace::Indexed {
                 base: Box::new(ColorSpace::DeviceRgb),
                 hival: 255,
+                lookup_id: None,
             },
         );
     }
@@ -544,6 +559,27 @@ mod tests {
             ColorSpace::Indexed {
                 base: Box::new(ColorSpace::DeviceGray),
                 hival: 255,
+                lookup_id: None,
+            },
+        );
+    }
+
+    #[test]
+    fn indexed_array_captures_lookup_stream_reference() {
+        // [/Indexed /DeviceRGB 15 <ref>]  — the lookup is an indirect ref.
+        let doc = empty_doc();
+        let arr = vec![
+            name_obj(b"Indexed"),
+            name_obj(b"DeviceRGB"),
+            Object::Integer(15),
+            Object::Reference((42, 0)),
+        ];
+        assert_eq!(
+            resolve(&doc, &Object::Array(arr)),
+            ColorSpace::Indexed {
+                base: Box::new(ColorSpace::DeviceRgb),
+                hival: 15,
+                lookup_id: Some((42, 0)),
             },
         );
     }
@@ -621,6 +657,7 @@ mod tests {
             ColorSpace::Indexed {
                 base: Box::new(ColorSpace::DeviceRgb),
                 hival: 255,
+                lookup_id: None,
             }
             .ncomponents(),
             1,
