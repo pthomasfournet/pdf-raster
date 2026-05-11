@@ -1,9 +1,6 @@
-//! Bit-population-count for `AaBuf` rows.
+//! Per-pixel AA coverage counts for `AaBuf` rows.
 //!
-//! Two public entry points:
-//!
-//! - `popcnt_aa_row(row)` — counts total set bits in a packed byte slice.
-//!   Used by clip-path AA paths that need row-level totals.
+//! Single public entry point:
 //!
 //! - `aa_coverage_span(rows, x0, shape)` — fills a `shape` buffer with
 //!   per-pixel AA coverage counts for output pixels `x0 .. x0+shape.len()`.
@@ -18,22 +15,6 @@
 //! each row: the **high** nibble if `x` is even, the **low** nibble if `x` is
 //! odd.  Each nibble holds 0–4 set bits (one per AA sub-sample).  Summing the
 //! four rows gives a coverage count in 0..=16.
-//!
-//! # Acceleration tiers for `popcnt_aa_row`
-//!
-//! ## x86-64 (most to least preferred)
-//! 1. **AVX-512 VPOPCNTDQ** (`avx512vpopcntdq` + `avx512bw`): 64 B/iter via `_mm512_popcnt_epi8`.
-//! 2. **AVX2** (`avx2`): VPSHUFB 16-entry nibble lookup, 32 B/iter.
-//! 3. **`popcnt`**: 8 B/iter via the scalar hardware `POPCNT` instruction.
-//! 4. **Scalar**: `u8::count_ones` per byte.
-//!
-//! ## aarch64 (most to least preferred)
-//! 1. **SVE2** (`nightly-sve2` feature + `sve2` target feature): `svcnt_u8_z` + `svaddv_u8`,
-//!    `svcntb()` B/iter (16 B on fixed-128 M4/Graviton4; up to 256 B on wide SVE2 cores).
-//!    Requires nightly Rust (`stdarch_aarch64_sve` feature gate) and `sve2` CPU feature.
-//! 2. **NEON `vcntq_u8`**: hardware byte popcount, 16 B/iter.
-//!    Result narrowed with `vpaddlq_u8` (→ u16) then summed with `vaddvq_u16`.
-//!    NEON is mandatory on all ARMv8-A cores; no runtime detection is needed.
 //!
 //! # Acceleration tiers for `aa_coverage_span`
 //!
@@ -52,20 +33,6 @@
 //!    NEON is mandatory on all ARMv8-A cores; no runtime detection is needed.
 
 // ── Scalar helpers ────────────────────────────────────────────────────────────
-
-/// Count set bits in `row` one byte at a time.
-// On aarch64 the NEON dispatch always runs; scalar is only used in tests.
-#[cfg_attr(
-    target_arch = "aarch64",
-    expect(
-        dead_code,
-        reason = "aarch64 dispatch uses NEON; scalar is test-only on this arch"
-    )
-)]
-#[inline]
-pub(super) fn popcnt_aa_row_scalar(row: &[u8]) -> u32 {
-    row.iter().map(|b| b.count_ones()).sum()
-}
 
 /// Nibble popcount table: `NIBBLE_POP[n]` = number of set bits in `n` (0..=4).
 const NIBBLE_POP: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
@@ -126,41 +93,7 @@ fn coverage_chunk_params(x0: usize, n: usize, chunk_bytes: usize) -> (usize, usi
     (byte_x0, n_chunks)
 }
 
-// ── aarch64 NEON tiers ────────────────────────────────────────────────────────
-
-#[cfg(target_arch = "aarch64")]
-/// NEON tier for `popcnt_aa_row`: 16 B/iter using `vcntq_u8`.
-///
-/// `vcntq_u8` is a single hardware instruction on all ARMv8-A cores
-/// (M1–M4, Cortex-A72/A76).  NEON is mandatory on aarch64; no runtime
-/// detection is needed.
-///
-/// # Safety
-///
-/// Must be compiled for `target_arch = "aarch64"`.  NEON is mandatory on
-/// all ARMv8-A targets covered by this cfg, so the intrinsics are always valid.
-#[target_feature(enable = "neon")]
-unsafe fn popcnt_aa_row_neon(row: &[u8]) -> u32 {
-    use std::arch::aarch64::{uint8x16_t, vaddvq_u16, vcntq_u8, vld1q_u8, vpaddlq_u8};
-
-    let mut total = 0u32;
-    let mut chunks = row.chunks_exact(16);
-    for chunk in chunks.by_ref() {
-        // SAFETY: chunk is exactly 16 bytes; unaligned loads are always valid on ARMv8.
-        let v: uint8x16_t = unsafe { vld1q_u8(chunk.as_ptr()) };
-        // vcntq_u8: hardware byte-level popcount (ARMv8-A CNT instruction).
-        let pcnt: uint8x16_t = vcntq_u8(v);
-        // vpaddlq_u8: pairwise widen u8→u16, preventing overflow
-        // (max 8 bits/byte × 16 bytes = 128 ≤ u16::MAX).
-        let wide = vpaddlq_u8(pcnt);
-        // vaddvq_u16: horizontal sum of 8 u16 lanes → scalar.
-        total += u32::from(vaddvq_u16(wide));
-    }
-    for &b in chunks.remainder() {
-        total += b.count_ones();
-    }
-    total
-}
+// ── aarch64 NEON tier ─────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
 /// NEON tier for `aa_coverage_span`: 32 output pixels (16 row bytes) per iteration.
@@ -256,56 +189,6 @@ unsafe fn aa_coverage_span_neon(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
 // full width, Neoverse V2) svcntb() may be 32–64, giving 2–4× NEON throughput.
 
 #[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
-/// SVE2 tier for `popcnt_aa_row`.
-///
-/// Processes `svcntb()` bytes per iteration using `svcnt_u8_z` (the SVE2
-/// equivalent of NEON `vcntq_u8`) with the all-true predicate. On 128-bit SVE2
-/// (Apple M4, Graviton4 fixed width) this equals the NEON throughput; on wider
-/// server SVE2 implementations the vector length is larger.
-///
-/// # Safety
-///
-/// Caller must ensure the `sve2` CPU feature is available.
-#[target_feature(enable = "sve2")]
-unsafe fn popcnt_aa_row_sve2(row: &[u8]) -> u32 {
-    use std::arch::aarch64::{svaddv_u8, svcnt_u8_z, svcntb, svld1_u8, svptrue_b8};
-
-    // svcntb() returns u64; aarch64 is always 64-bit so the cast to usize is lossless.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "aarch64 is 64-bit; svcntb() ≤ 256 fits in usize"
-    )]
-    let vl = svcntb() as usize; // bytes per SVE2 vector (16–256)
-    let pg = svptrue_b8(); // all-true predicate
-
-    let mut total = 0u32;
-    let mut i = 0usize;
-
-    while i + vl <= row.len() {
-        // SAFETY: caller guarantees sve2 is available; ptr is in-bounds (loop guard).
-        let v = unsafe { svld1_u8(pg, row.as_ptr().add(i)) };
-        // svcnt_u8_z: popcount each byte lane with all-true predicate.
-        let cnt = svcnt_u8_z(pg, v);
-        // svaddv_u8: horizontal reduction to scalar u64.
-        // Max: svcntb() ≤ 256 lanes × 8 bits/byte = 2048 ≤ u32::MAX.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "svaddv_u8 sum ≤ vl*8 ≤ 2048, fits in u32"
-        )]
-        {
-            total += svaddv_u8(pg, cnt) as u32;
-        }
-        i += vl;
-    }
-
-    // Scalar tail (< vl bytes remaining).
-    for &b in &row[i..] {
-        total += b.count_ones();
-    }
-    total
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
 /// SVE2 tier for `aa_coverage_span`.
 ///
 /// Each SVE2 vector of `vl` row bytes encodes `vl * 2` output pixels as
@@ -398,159 +281,14 @@ unsafe fn aa_coverage_span_sve2(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
     }
 }
 
-// ── x86-64 SIMD tiers ─────────────────────────────────────────────────────────
-
-#[cfg(target_arch = "x86_64")]
-/// `popcnt` tier: 8 B/iter via the scalar hardware `POPCNT` instruction.
-///
-/// # Safety
-///
-/// Caller must ensure the `popcnt` CPU feature is available.
-#[target_feature(enable = "popcnt")]
-unsafe fn popcnt_aa_row_sse(row: &[u8]) -> u32 {
-    use std::arch::x86_64::_popcnt64;
-
-    let mut total = 0u32;
-    let mut chunks = row.chunks_exact(8);
-    for chunk in chunks.by_ref() {
-        // SAFETY: chunk is exactly 8 bytes; read_unaligned handles any alignment.
-        // `popcnt` CPU feature guaranteed by `#[target_feature]`.
-        let word = unsafe { chunk.as_ptr().cast::<u64>().read_unaligned() };
-        // _popcnt64 is safe to call within a `#[target_feature(enable = "popcnt")]`
-        // function — the feature guarantee makes it non-unsafe in this context.
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "_popcnt64 returns a non-negative count in 0..=64"
-        )]
-        {
-            total += _popcnt64(word.cast_signed()) as u32;
-        }
-    }
-    for &b in chunks.remainder() {
-        total += b.count_ones();
-    }
-    total
-}
-
-#[cfg(target_arch = "x86_64")]
-/// AVX-512 VPOPCNTDQ tier: 64 B/iter via `_mm512_popcnt_epi8`.
-///
-/// # Safety
-///
-/// Caller must ensure `avx512vpopcntdq` and `avx512bw` CPU features are available.
-#[target_feature(enable = "avx512vpopcntdq,avx512bw")]
-unsafe fn popcnt_aa_row_avx512(row: &[u8]) -> u32 {
-    use std::arch::x86_64::{_mm512_loadu_si512, _mm512_popcnt_epi8, _mm512_storeu_si512};
-
-    let mut total = 0u32;
-    let mut chunks = row.chunks_exact(64);
-    for chunk in chunks.by_ref() {
-        // SAFETY: chunk is exactly 64 bytes; unaligned load/store are always valid.
-        // `avx512vpopcntdq` + `avx512bw` guaranteed by `#[target_feature]`.
-        unsafe {
-            let v = _mm512_loadu_si512(chunk.as_ptr().cast());
-            // Each byte lane receives the popcount of the corresponding source byte.
-            let pcnt = _mm512_popcnt_epi8(v);
-            let mut buf = [0u8; 64];
-            _mm512_storeu_si512(buf.as_mut_ptr().cast(), pcnt);
-            for b in buf {
-                total += u32::from(b);
-            }
-        }
-    }
-    for &b in chunks.remainder() {
-        total += b.count_ones();
-    }
-    total
-}
-
-// ── x86-64 AVX2 tiers ────────────────────────────────────────────────────────
-
-#[cfg(target_arch = "x86_64")]
-/// AVX2 tier for `popcnt_aa_row`: 32 B/iter using the VPSHUFB nibble trick.
-///
-/// VPSHUFB (`_mm256_shuffle_epi8`) acts as a 16-entry parallel lookup table:
-/// - Load a 32-byte chunk into a YMM register.
-/// - Isolate the low 4 bits of each byte (nibble mask `0x0F`).
-/// - `VPSHUFB(lut, nibble)` → per-lane popcount of each nibble.
-/// - Sum the nibble popcounts (2 per source byte) to get the full byte popcount.
-/// - Horizontal sum with `_mm256_sad_epu8` → 4 partial sums in a u64 lane;
-///   extract and accumulate.
-///
-/// # Safety
-///
-/// Caller must ensure the `avx2` CPU feature is available.
-#[target_feature(enable = "avx2")]
-unsafe fn popcnt_aa_row_avx2(row: &[u8]) -> u32 {
-    use std::arch::x86_64::{
-        _mm256_add_epi64, _mm256_and_si256, _mm256_extract_epi64, _mm256_loadu_si256,
-        _mm256_sad_epu8, _mm256_set_epi8, _mm256_set1_epi8, _mm256_setzero_si256,
-        _mm256_shuffle_epi8, _mm256_srli_epi16,
-    };
-
-    // Nibble popcount LUT: lut[n] = popcount(n) for n in 0..16.
-    // Broadcast to both 128-bit lanes of the YMM register.
-    // SAFETY: intrinsics are valid within a #[target_feature(enable = "avx2")] fn.
-    let lut = _mm256_set_epi8(
-        4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0, // high lane (indices 16-31)
-        4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0, // low lane  (indices 0-15)
-    );
-    let mask_lo = _mm256_set1_epi8(0x0F_u8.cast_signed());
-    let mut acc = _mm256_setzero_si256();
-
-    let mut chunks = row.chunks_exact(32);
-    for chunk in chunks.by_ref() {
-        // SAFETY: chunk is exactly 32 bytes.
-        let v = unsafe { _mm256_loadu_si256(chunk.as_ptr().cast()) };
-        // Low nibble of each byte.
-        let lo = _mm256_and_si256(v, mask_lo);
-        // High nibble shifted down to bits 3:0.
-        let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_lo);
-        // Popcount each nibble via VPSHUFB table lookup.
-        let pcnt_lo = _mm256_shuffle_epi8(lut, lo);
-        let pcnt_hi = _mm256_shuffle_epi8(lut, hi);
-        // Sum nibble popcounts pairwise → byte popcounts.
-        // (We keep them separate and add to acc via SAD, same as gzip/zlib popcount style.)
-        // _mm256_sad_epu8: sum 8 byte-lanes vs 0 → four u64 partial sums.
-        let zero = _mm256_setzero_si256();
-        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(pcnt_lo, zero));
-        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(pcnt_hi, zero));
-    }
-
-    // Extract four 64-bit partial sums and accumulate.
-    // _mm256_extract_epi64 is safe to call within a #[target_feature(enable = "avx2")] fn.
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "_mm256_extract_epi64 returns a non-negative sum of byte-level popcounts"
-    )]
-    let total = _mm256_extract_epi64(acc, 0) as u64
-        + _mm256_extract_epi64(acc, 1) as u64
-        + _mm256_extract_epi64(acc, 2) as u64
-        + _mm256_extract_epi64(acc, 3) as u64;
-
-    // Scalar tail for any bytes not covered by complete 32-byte chunks.
-    let mut tail_total = total;
-    for &b in chunks.remainder() {
-        tail_total += u64::from(b.count_ones());
-    }
-
-    // Total fits in u32: max bits = row.len() × 8 ≤ (bitmap_width / 8) × 8 ≤ 32768 × 8 = 262144 ≤ u32::MAX.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "total popcount ≤ row.len() * 8 ≤ 32768 * 8 = 262144 — fits in u32"
-    )]
-    {
-        tail_total as u32
-    }
-}
+// ── x86-64 AVX2 tier ──────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 /// AVX2 tier for `aa_coverage_span`: 64 output pixels (32 row bytes) per iteration.
 ///
-/// Each row byte encodes two consecutive pixels as nibbles.  VPSHUFB is used as
-/// a 16-entry parallel lookup table for nibble popcounts — the same trick as
-/// `popcnt_aa_row_avx2`.  Accumulation across the four rows stays in u8 (max
-/// 4 rows × 4 bits/nibble = 16 ≤ 255).
+/// Each row byte encodes two consecutive pixels as nibbles.  VPSHUFB is used
+/// as a 16-entry parallel lookup table for nibble popcounts. Accumulation
+/// across the four rows stays in u8 (max 4 rows × 4 bits/nibble = 16 ≤ 255).
 ///
 /// After the four-row accumulation, the 32-element `hi` (even pixels) and
 /// `lo` (odd pixels) u8 vectors are interleaved into `shape` by extracting
@@ -727,54 +465,6 @@ unsafe fn aa_coverage_span_avx512(rows: [&[u8]; 4], x0: usize, shape: &mut [u8])
 
 // ── Public dispatch ───────────────────────────────────────────────────────────
 
-/// Count the number of set bits in an `AaBuf` row.
-///
-/// Selects the fastest available tier at runtime:
-/// - x86-64: AVX-512 VPOPCNTDQ → AVX2 VPSHUFB → hardware `popcnt` → scalar
-/// - aarch64: SVE2 `svcnt_u8_z` (if `nightly-sve2` feature + CPU support) → NEON `vcntq_u8` → scalar
-/// - other architectures: scalar
-#[must_use]
-pub fn popcnt_aa_row(row: &[u8]) -> u32 {
-    dispatch_popcnt(row)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn dispatch_popcnt(row: &[u8]) -> u32 {
-    if is_x86_feature_detected!("avx512vpopcntdq") && is_x86_feature_detected!("avx512bw") {
-        // SAFETY: both features confirmed present.
-        return unsafe { popcnt_aa_row_avx512(row) };
-    }
-    if is_x86_feature_detected!("avx2") {
-        // SAFETY: avx2 confirmed present.
-        return unsafe { popcnt_aa_row_avx2(row) };
-    }
-    if is_x86_feature_detected!("popcnt") {
-        // SAFETY: `popcnt` feature confirmed present.
-        return unsafe { popcnt_aa_row_sse(row) };
-    }
-    popcnt_aa_row_scalar(row)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn dispatch_popcnt(row: &[u8]) -> u32 {
-    #[cfg(feature = "nightly-sve2")]
-    if std::arch::is_aarch64_feature_detected!("sve2") {
-        // SAFETY: sve2 feature confirmed present.
-        return unsafe { popcnt_aa_row_sve2(row) };
-    }
-    // NEON is mandatory on all ARMv8-A targets (no runtime detection needed).
-    // SAFETY: aarch64 always has NEON.
-    unsafe { popcnt_aa_row_neon(row) }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline]
-fn dispatch_popcnt(row: &[u8]) -> u32 {
-    popcnt_aa_row_scalar(row)
-}
-
 /// Fill `shape[i]` with the AA coverage count (0..=16) for output pixel `x0 + i`.
 ///
 /// `rows` are the four `AaBuf` sub-row byte slices, each of length
@@ -846,68 +536,6 @@ fn dispatch_coverage(rows: [&[u8]; 4], x0: usize, shape: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── popcnt_aa_row ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn scalar_all_zeros() {
-        assert_eq!(popcnt_aa_row_scalar(&[0u8; 8]), 0);
-    }
-
-    #[test]
-    fn scalar_all_ones() {
-        assert_eq!(popcnt_aa_row_scalar(&[0xFFu8; 8]), 64);
-    }
-
-    #[test]
-    fn scalar_known_pattern() {
-        // 0b1010_1010 = 4 bits set per byte
-        assert_eq!(popcnt_aa_row_scalar(&[0xAAu8; 4]), 16);
-    }
-
-    #[test]
-    fn scalar_empty() {
-        assert_eq!(popcnt_aa_row_scalar(&[]), 0);
-    }
-
-    #[test]
-    fn dispatch_matches_scalar() {
-        let row: Vec<u8> = (0u8..=127).collect();
-        assert_eq!(popcnt_aa_row(&row), popcnt_aa_row_scalar(&row));
-    }
-
-    #[test]
-    fn dispatch_non_power_of_two_length() {
-        // 270 bytes — exercises both the full-chunk path and the scalar remainder
-        // on every tier (64-byte AVX-512 chunks leave 14 bytes; 16-byte NEON
-        // chunks leave 14 bytes; 8-byte popcnt chunks leave 6 bytes).
-        let row: Vec<u8> = (0u8..=255).chain(0u8..14).collect();
-        assert_eq!(row.len(), 270);
-        assert_eq!(popcnt_aa_row(&row), popcnt_aa_row_scalar(&row));
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn sse_popcnt_matches_scalar() {
-        if !is_x86_feature_detected!("popcnt") {
-            return;
-        }
-        let row: Vec<u8> = (0u8..=127).collect();
-        // SAFETY: `popcnt` feature confirmed present.
-        let got = unsafe { popcnt_aa_row_sse(&row) };
-        assert_eq!(got, popcnt_aa_row_scalar(&row));
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_popcnt_matches_scalar() {
-        // 270 bytes — exercises full 16-byte chunks and a 14-byte scalar remainder.
-        let row: Vec<u8> = (0u8..=255).chain(0u8..14).collect();
-        assert_eq!(row.len(), 270);
-        // SAFETY: aarch64 always has NEON.
-        let got = unsafe { popcnt_aa_row_neon(&row) };
-        assert_eq!(got, popcnt_aa_row_scalar(&row));
-    }
 
     // ── aa_coverage_span ──────────────────────────────────────────────────────
 
@@ -1069,20 +697,6 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn avx2_popcnt_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
-        // 270 bytes: 8 full 32-byte chunks + 14-byte scalar remainder.
-        let row: Vec<u8> = (0u8..=255).chain(0u8..14).collect();
-        assert_eq!(row.len(), 270);
-        // SAFETY: avx2 confirmed present above.
-        let got = unsafe { popcnt_aa_row_avx2(&row) };
-        assert_eq!(got, popcnt_aa_row_scalar(&row), "AVX2 popcnt mismatch");
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
     fn avx2_coverage_matches_scalar() {
         if !is_x86_feature_detected!("avx2") {
             return;
@@ -1110,20 +724,6 @@ mod tests {
         unsafe { aa_coverage_span_avx2([&r0, &r1, &r2, &r3], 0, &mut got) };
 
         assert_eq!(got, expected, "AVX2 coverage mismatch vs scalar");
-    }
-
-    #[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
-    #[test]
-    fn sve2_popcnt_matches_scalar() {
-        if !std::arch::is_aarch64_feature_detected!("sve2") {
-            return;
-        }
-        // 270 bytes — exercises full SVE2 chunks and a scalar remainder.
-        let row: Vec<u8> = (0u8..=255).chain(0u8..14).collect();
-        assert_eq!(row.len(), 270);
-        // SAFETY: sve2 confirmed present above.
-        let got = unsafe { popcnt_aa_row_sve2(&row) };
-        assert_eq!(got, popcnt_aa_row_scalar(&row), "SVE2 popcnt mismatch");
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "nightly-sve2"))]
