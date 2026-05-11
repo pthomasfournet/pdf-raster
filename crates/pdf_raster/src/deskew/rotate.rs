@@ -454,6 +454,34 @@ mod tests {
         let r_src = &src.row_bytes(32)[1..63];
         let r_dst = &rotated.row_bytes(32)[1..63];
         assert_eq!(r_src, r_dst, "centre row should be unchanged at 0°");
+
+        // Pin the OOB-guard strict-inequality boundaries: at 0° the inverse
+        // map is identity, so output `(0, y)` samples source `x0 = 0` and
+        // output `(sx_max, y)` samples `x0 = sx_max = w - 2 = 62`.  If the
+        // guard `<` → `<=`, x0=0 wrongly becomes OOB → 255.  If `>` → `>=`,
+        // x0=62 wrongly becomes OOB → 255.  The checkerboard has 0 at both
+        // boundaries on row 32, so a white-fill mutation is unmissable.
+        assert_eq!(
+            rotated.row_bytes(32)[0],
+            src.row_bytes(32)[0],
+            "x0 = 0 must be in-bounds (guards `x0 < 0`, not `x0 <= 0`)"
+        );
+        assert_eq!(
+            rotated.row_bytes(32)[62],
+            src.row_bytes(32)[62],
+            "x0 = sx_max must be in-bounds (guards `x0 > sx_max`, not `x0 >= sx_max`)"
+        );
+        // And the y-axis boundaries: row 0 and row 62.
+        assert_eq!(
+            rotated.row_bytes(0)[32],
+            src.row_bytes(0)[32],
+            "y0 = 0 must be in-bounds (guards `y0 < 0`, not `y0 <= 0`)"
+        );
+        assert_eq!(
+            rotated.row_bytes(62)[32],
+            src.row_bytes(62)[32],
+            "y0 = sy_max must be in-bounds (guards `y0 > sy_max`, not `y0 >= sy_max`)"
+        );
     }
 
     /// `rotate_inplace` at 0° does not panic.
@@ -461,6 +489,165 @@ mod tests {
     fn rotate_inplace_zero_no_panic() {
         let mut img = Bitmap::<Gray8>::new(32, 32, 1, false);
         rotate_inplace(&mut img, 0.0).unwrap();
+    }
+
+    /// `rotate_inplace` must actually mutate `*img`, not return Ok and leave
+    /// the input untouched.  Pins the `rotate_inplace → Ok(())` mutant by
+    /// asserting visible pixel content changes after a non-trivial rotation.
+    #[test]
+    fn rotate_inplace_modifies_pixels() {
+        // 32×32 image with a single white-stripe column on the left half so
+        // any non-no-op rotation visibly redistributes the white.
+        let mut img = Bitmap::<Gray8>::new(32, 32, 1, false);
+        for y in 0..32u32 {
+            let row = img.row_bytes_mut(y);
+            row[5] = 255; // vertical white line at x=5
+        }
+        let before_col5 = (0..32u32).map(|y| img.row_bytes(y)[5]).collect::<Vec<_>>();
+        // 45° rotation breaks the vertical line into diagonal pieces.
+        rotate_inplace(&mut img, 45.0).unwrap();
+        let after_col5 = (0..32u32).map(|y| img.row_bytes(y)[5]).collect::<Vec<_>>();
+        assert_ne!(
+            before_col5, after_col5,
+            "rotate_inplace at 45° must mutate the bitmap, not no-op"
+        );
+    }
+
+    /// The centre pixel is the rotation pivot — at any angle it maps to
+    /// itself, so the rotated image's centre must equal the source's centre
+    /// (within bilinear-rounding tolerance).  This pins the centre-pivot
+    /// shift formulae (`cx`, `cy` and the offset terms in `sx_base`/
+    /// `sy_base`): any operator swap that mis-locates the pivot would shift
+    /// the centre pixel away from its source value.
+    ///
+    /// Uses a centre-asymmetric pattern (single bright dot at the centre,
+    /// black elsewhere) so any pivot drift onto a neighbouring black pixel
+    /// changes the centre value dramatically.  A smooth gradient would let
+    /// pivot-off-by-one mutations slip through because the bilinear samples
+    /// of an off-by-one pivot still approximate the same gradient value.
+    ///
+    /// Tests three angles (12°, 31.7°, 89°) so a mutation that happens to
+    /// preserve the pivot at one specific angle still fails at another.
+    #[test]
+    fn rotate_cpu_centre_pixel_is_rotation_fixed_point() {
+        // Mid-grey dot at the centre (not 255) so the OOB-white fallback
+        // (255) on a coordinate corruption is visibly different from a true
+        // centre sample — catches mutations that produce NaN source
+        // coordinates and silently route through the OOB guard.
+        const DOT: u8 = 128;
+        // Odd dimensions so cx, cy land on integer pixel centres (16.0).
+        let mut src = Bitmap::<Gray8>::new(33, 33, 1, false);
+        src.row_bytes_mut(16)[16] = DOT;
+
+        for angle in [12.0_f32, 31.7, 89.0] {
+            let rotated = rotate_cpu(&src, angle);
+            let dst_centre = rotated.row_bytes(16)[16];
+            // True bilinear sample at the rotated centre averages the DOT
+            // pixel with some-fraction-of-zero neighbours, landing in
+            // [~80, 128] depending on angle.  An off-by-one pivot would
+            // sample 4 zero pixels (~0); a NaN-coordinate mutation would
+            // OOB-fallback to 255.  Bracket both failure modes.
+            assert!(
+                (50..=200).contains(&dst_centre),
+                "centre pixel must be a true bilinear sample of the centre dot at {angle}°: \
+                 got dst={dst_centre} (expected ~50..=200); \
+                 ~0 = pivot drift, 255 = NaN/OOB"
+            );
+        }
+    }
+
+    /// `rotate_cpu(rotate_cpu(S, 180), 180)` must equal S on the interior,
+    /// modulo small bilinear-rounding error.  Catches any inner-loop
+    /// arithmetic mutation that doesn't self-invert (e.g. `*` → `+` would
+    /// break the double-rotation identity).
+    #[test]
+    fn rotate_cpu_180_then_180_round_trips() {
+        let mut src = Bitmap::<Gray8>::new(32, 32, 1, false);
+        for y in 0..32u32 {
+            let row = src.row_bytes_mut(y);
+            for (x, px) in row.iter_mut().enumerate() {
+                // (x * 7 + y * 11) % 256 keeps the cast in [0, 255].
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "modulo 256 keeps the value in [0, u8::MAX]"
+                )]
+                {
+                    *px = ((x * 7 + y as usize * 11) % 256) as u8;
+                }
+            }
+        }
+
+        let once = rotate_cpu(&src, 180.0);
+        let twice = rotate_cpu(&once, 180.0);
+
+        // Interior pixels only — borders accumulate two white-fill rounds.
+        // Bilinear sampling at 180° hits half-pixel coordinates (cx/cy are
+        // .5 in odd-sized images, 31.5 here), so a ±2 tolerance absorbs the
+        // double-round error.
+        let mut max_diff = 0i32;
+        for y in 4..28u32 {
+            let sr = &src.row_bytes(y)[4..28];
+            let tr = &twice.row_bytes(y)[4..28];
+            for (&a, &b) in sr.iter().zip(tr.iter()) {
+                max_diff = max_diff.max((i32::from(a) - i32::from(b)).abs());
+            }
+        }
+        assert!(
+            max_diff <= 2,
+            "180°×2 round-trip diverges from identity: max diff {max_diff} > 2"
+        );
+    }
+
+    /// A 1-pixel-wide source rotated by a small angle must have white-fill
+    /// (255) at the diagonal corners where the inverse mapping falls
+    /// outside the source.  Pins the OOB-guard bounds checks
+    /// (`x0 < 0 || y0 < 0 || x0 > sx_max || y0 > sy_max`) by exercising
+    /// pixels that depend on the strict `>` / `<` comparison — if any
+    /// boundary flips to `>=` / `<=`, an in-range pixel turns white or
+    /// vice versa.
+    #[test]
+    fn rotate_cpu_oob_guard_fills_diagonal_with_white() {
+        // 8×8 source, fully black (all zeros).  After a 5° rotation, the
+        // four corner regions of the output map to OOB source coordinates
+        // and get filled with white.
+        let src = Bitmap::<Gray8>::new(8, 8, 1, false);
+        let rotated = rotate_cpu(&src, 5.0);
+
+        // Corner pixels of the rotated 8×8: their inverse-mapped source
+        // coordinates fall outside [0, 6] × [0, 6] (sx_max = sy_max = 6).
+        // At 5° with cx = cy = 3.5, the (0,0) output corner maps to roughly
+        // sx = 3.5 - 3.5*cos5 - (-3.5)*sin5 ≈ 0.32, sy = -3.5*sin5 + (-3.5)*cos5 + 3.5 ≈ -0.18.
+        // sy < 0 ⇒ OOB ⇒ white.  Source is all zeros, so any non-255 corner
+        // would indicate the OOB guard is mis-firing.
+        assert_eq!(
+            rotated.row_bytes(0)[0],
+            255,
+            "(0,0) corner must be white-filled (inverse maps OOB at 5°)"
+        );
+        assert_eq!(
+            rotated.row_bytes(0)[7],
+            255,
+            "(7,0) corner must be white-filled"
+        );
+        assert_eq!(
+            rotated.row_bytes(7)[0],
+            255,
+            "(0,7) corner must be white-filled"
+        );
+        assert_eq!(
+            rotated.row_bytes(7)[7],
+            255,
+            "(7,7) corner must be white-filled"
+        );
+
+        // Centre pixel: maps to (3.5, 3.5) which IS in-bounds; sample of
+        // black source = 0.  If the bounds-check inverted to <= / >=, the
+        // centre would also be white.
+        assert_eq!(
+            rotated.row_bytes(4)[4],
+            0,
+            "centre pixel must sample in-bounds black source, not OOB white"
+        );
     }
 
     /// Rotating 360° should return approximately the original image.
