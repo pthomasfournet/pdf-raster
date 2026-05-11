@@ -58,14 +58,6 @@ pub trait ImageSource: Send {
     ///
     /// `row_buf.len()` must equal `src_width * ncomps`.
     fn get_row(&mut self, y: u32, row_buf: &mut [u8]);
-
-    /// Optionally fill `alpha_buf` with per-pixel alpha for source row `y`.
-    ///
-    /// Returns `true` if alpha was written, `false` if the image is fully opaque.
-    /// `alpha_buf.len()` must equal `src_width`.
-    fn get_alpha(&mut self, _y: u32, _alpha_buf: &mut [u8]) -> bool {
-        false
-    }
 }
 
 /// Caller-supplied source for a 1-bit image mask: one row at a time.

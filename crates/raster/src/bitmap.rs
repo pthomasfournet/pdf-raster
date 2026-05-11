@@ -145,25 +145,6 @@ impl<P: Pixel> Bitmap<P> {
         &mut self.data[off..off + self.stride]
     }
 
-    /// Raw pointer to the start of row `y`. For SIMD inner loops.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `y >= height`.
-    #[must_use]
-    pub fn row_ptr(&self, y: u32) -> *const u8 {
-        self.row_bytes(y).as_ptr()
-    }
-
-    /// Mutable raw pointer to the start of row `y`. For SIMD inner loops.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `y >= height`.
-    pub fn row_ptr_mut(&mut self, y: u32) -> *mut u8 {
-        self.row_bytes_mut(y).as_mut_ptr()
-    }
-
     // ── Alpha access ──────────────────────────────────────────────────────────
 
     /// Alpha plane row `y`, if the alpha plane was allocated.
@@ -184,26 +165,6 @@ impl<P: Pixel> Bitmap<P> {
             let w = u32_to_usize(self.width);
             let off = u32_to_usize(y) * w;
             &a[off..off + w]
-        })
-    }
-
-    /// Mutable alpha plane row `y`.
-    ///
-    /// Returns `None` if this bitmap was created without an alpha plane.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `y >= height`.
-    pub fn alpha_row_mut(&mut self, y: u32) -> Option<&mut [u8]> {
-        assert!(
-            y < self.height,
-            "row index {y} is out of bounds for bitmap height {}",
-            self.height
-        );
-        let w = u32_to_usize(self.width);
-        self.alpha.as_mut().map(|a| {
-            let off = u32_to_usize(y) * w;
-            &mut a[off..off + w]
         })
     }
 
