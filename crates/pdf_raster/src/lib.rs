@@ -393,12 +393,31 @@ impl PageSet {
         self.0.len()
     }
 
+    /// Iterate the pages in ascending order.
+    pub fn iter(&self) -> std::iter::Copied<std::slice::Iter<'_, u32>> {
+        self.0.iter().copied()
+    }
+
+    /// View the pages as a sorted, deduplicated slice.  O(1).
+    #[must_use]
+    pub fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+
     /// Always returns `false`.  A `PageSet` is guaranteed non-empty by
     /// construction (see [`PageSet::new`]); this method exists to satisfy the
     /// `clippy::len_without_is_empty` lint.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         false
+    }
+}
+
+impl<'a> IntoIterator for &'a PageSet {
+    type Item = u32;
+    type IntoIter = std::iter::Copied<std::slice::Iter<'a, u32>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 

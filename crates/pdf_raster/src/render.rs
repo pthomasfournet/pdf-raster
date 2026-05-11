@@ -7,7 +7,7 @@ use raster::Bitmap;
 
 #[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
 use crate::gpu_init;
-use crate::{BackendPolicy, RasterOptions, RenderedPage, SessionConfig};
+use crate::{BackendPolicy, PageSet, RasterOptions, RenderedPage, SessionConfig};
 
 // ── Safety limit ──────────────────────────────────────────────────────────────
 
@@ -735,25 +735,62 @@ fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
 struct RenderState {
     session: RasterSession,
     opts: RasterOptions,
-    current_page: u32,
+    cursor: PageCursor,
 }
 
-/// Returns the inclusive page range to iterate: `PageSet` bounds when
-/// `opts.pages` is set, otherwise `first_page..=last_page`.
-fn page_window(opts: &RasterOptions) -> std::ops::RangeInclusive<u32> {
-    opts.pages
-        .as_ref()
-        .map_or(opts.first_page..=opts.last_page, |ps| {
-            ps.first()..=ps.last()
-        })
-}
-
-/// Returns `true` if `page_num` should be rendered given `opts`.
+/// Iterator over the pages to render.
 ///
-/// When `opts.pages` is `None` every page in the iteration window is rendered.
-/// When `Some`, only pages present in the [`PageSet`] are rendered.
-fn should_render(opts: &RasterOptions, page_num: u32) -> bool {
-    opts.pages.as_ref().is_none_or(|ps| ps.contains(page_num))
+/// `Range` walks every integer in `first..=last` (used when `RasterOptions::pages`
+/// is `None`).  `Set` walks the explicit page numbers stored in a `PageSet` —
+/// O(set length), not O(last − first), which matters when the set is sparse
+/// across a wide range (e.g. `[1, u32::MAX]`).
+enum PageCursor {
+    Range { next: u32, end: u32 },
+    Set { set: PageSet, idx: usize },
+}
+
+impl PageCursor {
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "match arms read more clearly than a 2-branch map_or here"
+    )]
+    fn new(opts: &RasterOptions) -> Self {
+        match opts.pages.as_ref() {
+            Some(ps) => Self::Set {
+                set: ps.clone(),
+                idx: 0,
+            },
+            None => Self::Range {
+                next: opts.first_page,
+                end: opts.last_page,
+            },
+        }
+    }
+
+    fn next_page(&mut self) -> Option<u32> {
+        match self {
+            Self::Range { next, end } => {
+                if *next > *end {
+                    return None;
+                }
+                let p = *next;
+                // After yielding u32::MAX, bump `end` to 0 so the next call
+                // returns None — saturating_add alone would leave next == end
+                // == u32::MAX and yield forever.
+                if p == u32::MAX {
+                    *end = 0;
+                } else {
+                    *next = p + 1;
+                }
+                Some(p)
+            }
+            Self::Set { set, idx } => {
+                let p = *set.as_slice().get(*idx)?;
+                *idx += 1;
+                Some(p)
+            }
+        }
+    }
 }
 
 fn validate_opts(opts: &RasterOptions) -> Option<RasterError> {
@@ -789,9 +826,8 @@ pub fn render_pages(
         };
     }
 
-    let window = page_window(opts);
     let state = open_session(path, &SessionConfig::default()).map(|session| RenderState {
-        current_page: *window.start(),
+        cursor: PageCursor::new(opts),
         session,
         opts: opts.clone(),
     });
@@ -814,26 +850,12 @@ impl Iterator for PageIter {
         }
 
         let state = self.state.as_mut()?.as_mut().ok()?;
-        let window = page_window(&state.opts);
-        loop {
-            if state.current_page > *window.end() || state.current_page > state.session.total_pages
-            {
-                self.state = None;
-                return None;
-            }
-
-            let page_num = state.current_page;
-            // Saturate rather than wrap: u32::MAX is a legal page number
-            // in a PageSet, so a plain `+= 1` would overflow to 0 and
-            // loop forever on the next iteration.
-            state.current_page = state.current_page.saturating_add(1);
-
-            if !should_render(&state.opts, page_num) {
-                continue;
-            }
-
-            return Some((page_num, render_one(state, page_num)));
+        let page_num = state.cursor.next_page()?;
+        if page_num > state.session.total_pages {
+            self.state = None;
+            return None;
         }
+        Some((page_num, render_one(state, page_num)))
     }
 }
 
@@ -867,17 +889,15 @@ pub fn render_channel(
             }
         };
 
-        let window = page_window(&opts_owned);
-        let last = *window.end().min(&session.total_pages);
-        let state = RenderState {
-            current_page: *window.start(),
+        let mut state = RenderState {
+            cursor: PageCursor::new(&opts_owned),
             session,
             opts: opts_owned,
         };
 
-        for page_num in *window.start()..=last {
-            if !should_render(&state.opts, page_num) {
-                continue;
+        while let Some(page_num) = state.cursor.next_page() {
+            if page_num > state.session.total_pages {
+                return;
             }
             let result = render_one(&state, page_num);
             if tx.send((page_num, result)).is_err() {
@@ -1142,5 +1162,80 @@ mod channel_tests {
             validate_opts(&opts).is_none(),
             "zero first/last_page must be accepted when pages=Some"
         );
+    }
+
+    fn opts_with_pages(set: crate::PageSet) -> RasterOptions {
+        RasterOptions {
+            dpi: 72.0,
+            first_page: 0,
+            last_page: 0,
+            deskew: false,
+            pages: Some(set),
+        }
+    }
+
+    #[test]
+    fn cursor_range_yields_inclusive_window() {
+        let opts = RasterOptions {
+            dpi: 72.0,
+            first_page: 3,
+            last_page: 5,
+            deskew: false,
+            pages: None,
+        };
+        let mut c = PageCursor::new(&opts);
+        assert_eq!(c.next_page(), Some(3));
+        assert_eq!(c.next_page(), Some(4));
+        assert_eq!(c.next_page(), Some(5));
+        assert_eq!(c.next_page(), None);
+        assert_eq!(c.next_page(), None);
+    }
+
+    #[test]
+    fn cursor_range_saturates_at_u32_max() {
+        // last_page=u32::MAX is the documented "render to end of document" idiom.
+        // next.saturating_add(1) must keep `next > end` once we've yielded u32::MAX.
+        let opts = RasterOptions {
+            dpi: 72.0,
+            first_page: u32::MAX - 1,
+            last_page: u32::MAX,
+            deskew: false,
+            pages: None,
+        };
+        let mut c = PageCursor::new(&opts);
+        assert_eq!(c.next_page(), Some(u32::MAX - 1));
+        assert_eq!(c.next_page(), Some(u32::MAX));
+        assert_eq!(c.next_page(), None);
+    }
+
+    #[test]
+    fn cursor_set_yields_exactly_set_members() {
+        let ps = crate::PageSet::new(vec![5, 1, 10, 1]).unwrap();
+        let opts = opts_with_pages(ps);
+        let mut c = PageCursor::new(&opts);
+        assert_eq!(c.next_page(), Some(1));
+        assert_eq!(c.next_page(), Some(5));
+        assert_eq!(c.next_page(), Some(10));
+        assert_eq!(c.next_page(), None);
+    }
+
+    #[test]
+    fn cursor_set_walks_only_set_length_for_sparse_input() {
+        // Regression: previously `PageIter` walked every integer in
+        // first()..=last() and probed `PageSet::contains` on each — for
+        // [1, u32::MAX] that meant ~4.3 billion iterations.  The cursor must
+        // yield exactly two pages and terminate.
+        let ps = crate::PageSet::new(vec![1, u32::MAX]).unwrap();
+        let opts = opts_with_pages(ps);
+        let mut c = PageCursor::new(&opts);
+        let mut yielded = Vec::new();
+        while let Some(p) = c.next_page() {
+            yielded.push(p);
+            assert!(
+                yielded.len() <= 2,
+                "cursor yielded a third page on a 2-element PageSet"
+            );
+        }
+        assert_eq!(yielded, vec![1, u32::MAX]);
     }
 }
