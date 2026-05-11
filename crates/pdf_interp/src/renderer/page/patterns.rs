@@ -199,11 +199,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pattern_tint_uses_base_cs_when_available() {
-        // Pattern with DeviceRGB base + 3 components → RGB conversion, not
-        // the heuristic (which would also pick RGB by count; pick a value
-        // where RGB and the heuristic would *differ* if the path were
-        // mishandled by the count → only Lab vs RGB really differ).
+    fn pattern_tint_devicergb_base_passes_through() {
+        // Verifies the DeviceRGB base path doesn't regress vs the heuristic.
+        // The Lab test below proves the new path is actually taken (since
+        // the heuristic would mis-interpret a Lab tint as RGB).
         let fill_cs = ColorSpace::Pattern {
             base: Some(Box::new(ColorSpace::DeviceRgb)),
         };
@@ -220,7 +219,9 @@ mod tests {
         };
         let tint = resolve_pattern_tint(&fill_cs, &[50.0, 0.0, 0.0]);
         // sRGB-encoded mid-grey from L*=50 is ~119 (gamma-correct).
-        let [r, g, b] = [tint.as_slice()[0], tint.as_slice()[1], tint.as_slice()[2]];
+        let &[r, g, b] = tint.as_slice() else {
+            panic!("RasterColor must produce a 3-byte slice");
+        };
         assert!(
             (115..=125).contains(&r) && r == g && g == b,
             "expected mid-grey ~119 from Lab L=50, got [{r},{g},{b}]"
