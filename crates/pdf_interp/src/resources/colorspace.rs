@@ -139,6 +139,114 @@ impl ColorSpace {
             Self::DeviceN { ncomps, .. } => usize::from(*ncomps),
         }
     }
+
+    /// Convert a tint-component slice to an sRGB byte triple per PDF §8.6.
+    ///
+    /// `comps` must have exactly [`ncomponents`](Self::ncomponents)
+    /// elements; any mismatch falls back to opaque black.
+    ///
+    /// # Variant behaviour
+    ///
+    /// - `DeviceGray/Rgb/Cmyk`: direct conversion via the existing
+    ///   `color::convert` helpers (CMYK uses the naive §10.3.3 path; ICC
+    ///   profile handling is a separate phase).
+    /// - `Lab`: CIE Lab → D65 XYZ → sRGB through the standard formulae.
+    ///   Whitepoint defaults to D65 (the spec's most common choice); the
+    ///   per-document whitepoint stored in `dict_id` is not yet applied.
+    /// - `IccBased`: falls back to the device space with the matching
+    ///   channel count (1→Gray, 3→Rgb, 4→Cmyk).  Full ICC CLUT lookup is
+    ///   a later phase.
+    /// - `Indexed`: returns black — the palette lookup needs the lookup
+    ///   stream which the gstate doesn't carry.  The image pipeline
+    ///   resolves Indexed separately.
+    /// - `Pattern`: returns black — patterns are not directly convertible
+    ///   to RGB; tile rasterisation is invoked elsewhere.
+    /// - `Separation` / `DeviceN`: per current image-pipeline policy,
+    ///   approximate as gray with `1 - tint[0]` (tint 0 = full ink = dark).
+    #[must_use]
+    pub fn convert_to_rgb(&self, comps: &[f64]) -> [u8; 3] {
+        if comps.len() != self.ncomponents() {
+            log::debug!(
+                "colorspace: {:?} expects {} components, got {}",
+                self,
+                self.ncomponents(),
+                comps.len(),
+            );
+            return [0, 0, 0];
+        }
+        match self {
+            Self::DeviceGray => gray_byte_to_rgb(color::convert::gray_to_u8(comps[0])),
+            Self::DeviceRgb => color::convert::rgb_to_bytes(comps[0], comps[1], comps[2]),
+            Self::DeviceCmyk => {
+                color::convert::cmyk_to_rgb_bytes(comps[0], comps[1], comps[2], comps[3])
+            }
+            Self::Lab { .. } => lab_to_srgb(comps[0], comps[1], comps[2]),
+            Self::IccBased { n, .. } => match n {
+                1 => gray_byte_to_rgb(color::convert::gray_to_u8(comps[0])),
+                3 => color::convert::rgb_to_bytes(comps[0], comps[1], comps[2]),
+                4 => color::convert::cmyk_to_rgb_bytes(comps[0], comps[1], comps[2], comps[3]),
+                _ => [0, 0, 0],
+            },
+            Self::Indexed { .. } | Self::Pattern { .. } => [0, 0, 0],
+            Self::Separation { .. } | Self::DeviceN { .. } => {
+                // Image-pipeline policy: spot tints approximate as gray with
+                // the first component inverted (0 = full ink = dark).
+                let v = (1.0 - comps[0]).clamp(0.0, 1.0);
+                gray_byte_to_rgb(color::convert::gray_to_u8(v))
+            }
+        }
+    }
+}
+
+/// CIE Lab → sRGB conversion through D65 XYZ. Per CIE 1976 + IEC 61966-2-1.
+///
+/// PDF Lab encodes `L* ∈ [0, 100]`, `a* / b* ∈ [-128, 127]` per the spec's
+/// Range default; callers pass the post-Decode normalised values directly.
+fn lab_to_srgb(l_star: f64, a_star: f64, b_star: f64) -> [u8; 3] {
+    // 1. Lab → XYZ (D65 whitepoint).
+    const XN: f64 = 0.95047;
+    const YN: f64 = 1.0;
+    const ZN: f64 = 1.08883;
+    let fy = (l_star + 16.0) / 116.0;
+    let fx = a_star / 500.0 + fy;
+    let fz = fy - b_star / 200.0;
+    let x = XN * lab_f_inv(fx);
+    let y = YN * lab_f_inv(fy);
+    let z = ZN * lab_f_inv(fz);
+
+    // 2. XYZ (D65) → linear sRGB (BT.709 / sRGB matrix).
+    let r_lin = x.mul_add(3.2406, y.mul_add(-1.5372, z * -0.4986));
+    let g_lin = x.mul_add(-0.9689, y.mul_add(1.8758, z * 0.0415));
+    let b_lin = x.mul_add(0.0557, y.mul_add(-0.2040, z * 1.0570));
+
+    // 3. Linear → sRGB gamma.
+    color::convert::rgb_to_bytes(srgb_encode(r_lin), srgb_encode(g_lin), srgb_encode(b_lin))
+}
+
+/// Inverse of the CIE Lab `f` function. `δ = 6/29`; threshold `t > δ` cubes,
+/// else uses the linear segment.
+fn lab_f_inv(t: f64) -> f64 {
+    const DELTA: f64 = 6.0 / 29.0;
+    if t > DELTA {
+        t * t * t
+    } else {
+        3.0 * DELTA * DELTA * (t - 4.0 / 29.0)
+    }
+}
+
+/// Linear → sRGB gamma encoding per IEC 61966-2-1 (piecewise).
+fn srgb_encode(c: f64) -> f64 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        c.powf(1.0 / 2.4).mul_add(1.055, -0.055)
+    }
+}
+
+/// Expand a single grey byte into an opaque RGB triple `[v, v, v]`.
+const fn gray_byte_to_rgb(v: u8) -> [u8; 3] {
+    [v, v, v]
 }
 
 /// Resolve a PDF `ColorSpace` object into a [`ColorSpace`] tracking value.
@@ -534,6 +642,115 @@ mod tests {
             }
             .ncomponents(),
             5,
+        );
+    }
+
+    // ── convert_to_rgb ──────────────────────────────────────────────────────
+
+    #[test]
+    fn convert_devicegray_full_range() {
+        assert_eq!(ColorSpace::DeviceGray.convert_to_rgb(&[0.0]), [0, 0, 0]);
+        assert_eq!(
+            ColorSpace::DeviceGray.convert_to_rgb(&[1.0]),
+            [255, 255, 255],
+        );
+        assert_eq!(
+            ColorSpace::DeviceGray.convert_to_rgb(&[0.5]),
+            [128, 128, 128], // gray_to_u8 rounds 0.5*255 = 127.5 → 128
+        );
+    }
+
+    #[test]
+    fn convert_devicergb_passes_through() {
+        assert_eq!(
+            ColorSpace::DeviceRgb.convert_to_rgb(&[1.0, 0.0, 0.0]),
+            [255, 0, 0],
+        );
+        assert_eq!(
+            ColorSpace::DeviceRgb.convert_to_rgb(&[0.0, 1.0, 0.0]),
+            [0, 255, 0],
+        );
+    }
+
+    #[test]
+    fn convert_devicecmyk_uses_naive_conversion() {
+        // (0, 0, 0, 0) = white in CMYK.
+        assert_eq!(
+            ColorSpace::DeviceCmyk.convert_to_rgb(&[0.0, 0.0, 0.0, 0.0]),
+            [255, 255, 255],
+        );
+        // (1, 1, 1, 1) = black.
+        assert_eq!(
+            ColorSpace::DeviceCmyk.convert_to_rgb(&[1.0, 1.0, 1.0, 1.0]),
+            [0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn convert_lab_black_is_black() {
+        // L*=0 ≡ black; a*/b* irrelevant.
+        let black = ColorSpace::Lab { dict_id: None }.convert_to_rgb(&[0.0, 0.0, 0.0]);
+        assert_eq!(black, [0, 0, 0]);
+    }
+
+    #[test]
+    fn convert_lab_white_is_white() {
+        // L*=100, a*=b*=0 ≡ D65 white.  sRGB encoding may not be exactly 255
+        // due to floating-point rounding; allow ±2 LSB.
+        let [r, g, b] = ColorSpace::Lab { dict_id: None }.convert_to_rgb(&[100.0, 0.0, 0.0]);
+        assert!(
+            r >= 253 && g >= 253 && b >= 253,
+            "expected ~white, got [{r},{g},{b}]"
+        );
+    }
+
+    #[test]
+    fn convert_iccbased_falls_back_by_n() {
+        let icc1 = ColorSpace::IccBased {
+            n: 1,
+            stream_id: None,
+        };
+        let icc3 = ColorSpace::IccBased {
+            n: 3,
+            stream_id: None,
+        };
+        let icc4 = ColorSpace::IccBased {
+            n: 4,
+            stream_id: None,
+        };
+        assert_eq!(icc1.convert_to_rgb(&[1.0]), [255, 255, 255]);
+        assert_eq!(icc3.convert_to_rgb(&[1.0, 0.0, 0.0]), [255, 0, 0]);
+        assert_eq!(icc4.convert_to_rgb(&[0.0, 0.0, 0.0, 1.0]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn convert_separation_inverts_tint_as_gray() {
+        // Image-pipeline policy: tint 0 = full ink = dark.
+        let sep = ColorSpace::Separation {
+            alternate: Box::new(ColorSpace::DeviceCmyk),
+            tint_dict_id: None,
+        };
+        assert_eq!(sep.convert_to_rgb(&[0.0]), [255, 255, 255]); // no ink
+        assert_eq!(sep.convert_to_rgb(&[1.0]), [0, 0, 0]); // full ink
+    }
+
+    #[test]
+    fn convert_wrong_component_count_falls_back_to_black() {
+        // DeviceRgb wants 3 components; passing 1 must not panic.
+        assert_eq!(ColorSpace::DeviceRgb.convert_to_rgb(&[0.5]), [0, 0, 0]);
+        assert_eq!(ColorSpace::DeviceGray.convert_to_rgb(&[]), [0, 0, 0]);
+        assert_eq!(
+            ColorSpace::DeviceCmyk.convert_to_rgb(&[0.5, 0.5]),
+            [0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn convert_pattern_returns_black() {
+        // Pattern is never directly convertible to RGB.
+        assert_eq!(
+            ColorSpace::Pattern { base: None }.convert_to_rgb(&[]),
+            [0, 0, 0],
         );
     }
 }
