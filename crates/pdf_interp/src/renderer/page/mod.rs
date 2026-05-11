@@ -1624,7 +1624,7 @@ impl<'doc> PageRenderer<'doc> {
 // ── Component → colour helpers ────────────────────────────────────────────────
 
 /// Map a raw component slice to a [`RasterColor`] by channel count.
-fn components_to_color(comps: &[f64]) -> RasterColor {
+pub(super) fn components_to_color(comps: &[f64]) -> RasterColor {
     match comps {
         [g] => RasterColor::gray(*g),
         [r, g, b] => RasterColor::rgb(*r, *g, *b),

@@ -8,8 +8,11 @@
 //! | `PaintType` | Name | Support |
 //! |---|---|---|
 //! | 1 | Coloured | yes — tile is rasterised at its native colours |
-//! | 2 | Uncoloured | partial — tint components are resolved to a solid colour and
-//!   applied as a fill override; full per-path tint application is not implemented |
+//! | 2 | Uncoloured | yes — `scn /Name c1 [c2 c3 [c4]]` tint components are mapped
+//!   to a fill colour (1→Gray, 3→RGB, 4→CMYK) and pushed into the tile renderer's
+//!   initial graphics state before the shape-only content stream runs.  The
+//!   parent Pattern colour space is not tracked, so the component-count heuristic
+//!   stands in for spec-correct colour-space dispatch |
 //!
 //! # Coordinate system
 //!

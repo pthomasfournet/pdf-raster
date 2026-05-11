@@ -1,7 +1,8 @@
 //! Tiling pattern resolution and tile rendering.
 
+use super::super::color::RasterColor;
 use super::super::gstate::{ctm_multiply, ctm_transform};
-use super::{MAX_TILE_PX, PageRenderer};
+use super::{MAX_TILE_PX, PageRenderer, components_to_color};
 use crate::resources::PageResources;
 use color::Rgb8;
 use raster::{Bitmap, TiledPattern};
@@ -17,7 +18,16 @@ impl PageRenderer<'_> {
         let desc = self.resources.tiling_pattern(name)?;
 
         // Compose pattern matrix with current CTM to get pattern-space → device-space.
-        let ctm = self.gstate.current().ctm;
+        let gs = self.gstate.current();
+        let ctm = gs.ctm;
+        // PaintType 2 (uncoloured) patterns paint shape-only content streams;
+        // the tint comes from the `scn /Name c1 [c2 c3 [c4]]` arguments captured
+        // here as `fill_pattern_components`.  PaintType 1 (coloured) ignores it.
+        // The tint's underlying colour space is the parent Pattern's base CS,
+        // which we don't track today — fall back to the component-count
+        // heuristic (1 → Gray, 3 → RGB, 4 → CMYK).
+        let tint = (desc.paint_type == 2 && !gs.fill_pattern_components.is_empty())
+            .then(|| components_to_color(&gs.fill_pattern_components));
         let pat_ctm = ctm_multiply(&desc.matrix, &ctm);
 
         // Tile size in device pixels — scale the XStep/YStep by the linear scale
@@ -59,7 +69,7 @@ impl PageRenderer<'_> {
         let tile_ctm = [pat_ctm[0], pat_ctm[1], pat_ctm[2], pat_ctm[3], 0.0, 0.0];
 
         // Rasterise the tile.
-        let tile_bitmap = self.render_pattern_tile(&desc, tile_w, tile_h, &tile_ctm);
+        let tile_bitmap = self.render_pattern_tile(&desc, tile_w, tile_h, &tile_ctm, tint);
 
         // Phase = where the pattern origin lands in device space (after y-flip).
         let page_h = f64::from(self.height);
@@ -92,12 +102,19 @@ impl PageRenderer<'_> {
     /// Creates a child `PageRenderer` scoped to the pattern's resource context and
     /// executes the pattern's content stream.  The tile bitmap is `tile_w ×
     /// tile_h` pixels with a white background.
+    ///
+    /// `tint` is the resolved fill colour for `PaintType` 2 (uncoloured)
+    /// patterns; it is set as the tile renderer's default fill before the
+    /// content stream runs, so shape-only streams pick it up via the initial
+    /// graphics state.  Pass `None` for `PaintType` 1 (coloured) — the content
+    /// stream supplies its own colours.
     pub(super) fn render_pattern_tile(
         &self,
         desc: &crate::resources::tiling::TilingDescriptor,
         tile_w: u32,
         tile_h: u32,
         tile_ctm: &[f64; 6],
+        tint: Option<RasterColor>,
     ) -> Bitmap<Rgb8> {
         // Build a temporary child renderer sharing the same document / font engine.
         let doc = self.resources.doc();
@@ -110,7 +127,11 @@ impl PageRenderer<'_> {
         };
 
         // Override the CTM to map pattern space → tile device space.
-        tile_renderer.gstate.current_mut().ctm = *tile_ctm;
+        let gs = tile_renderer.gstate.current_mut();
+        gs.ctm = *tile_ctm;
+        if let Some(c) = tint {
+            gs.fill_color = c;
+        }
 
         // If the pattern has no own resources, point it at the parent context.
         if !desc.has_own_resources {
