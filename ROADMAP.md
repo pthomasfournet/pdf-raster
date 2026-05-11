@@ -27,6 +27,118 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v0.9.1 (May 2026)
+
+**Dead-code sweep — cargo-mutants surfaced unused public API across the
+workspace; ~700 net lines removed.**
+
+- **`font::t3_cache` module deleted** (-209 lines).  Full LRU
+  implementation that mirrored the Splash 8-slot per-instance bitmap
+  cache, never wired up.  Type 3 glyph caching, if it returns, should
+  extend `font::GlyphCache` (now keyed on `GlyphKey`) rather than
+  reintroduce a sibling cache.  A pointer comment in
+  `pdf_interp::renderer::page::text::show_text_type3` documents the
+  trigger.
+- **`raster::state::StateFlags` collapsed to a single `bool` field**
+  (-191 lines across two commits).  The 8-bit packed flag struct had
+  been reduced to one live bit (`delete_soft_mask`); kept only that
+  bool on `GraphicsState` directly.  Bit-mask packing existed to
+  silence `clippy::struct_excessive_bools` on 8 flags; with 1 flag
+  remaining it had no justification.  If a future flag returns, add it
+  as a field, not a re-introduced bit packing.
+- **`pdf_interp::cache::PrefetchHandle::{wait, stats}`** and
+  `PrefetchStats::snapshot` deleted; `PrefetchStats` counters and
+  `PrefetchState.stats` field also removed (the worker `fetch_add`
+  calls had become write-only after the snapshot reader was deleted).
+  `RasterSession` holds `PrefetchHandle` purely as a Drop side-effect;
+  the handle's methods had zero callers.
+- **`pdf_raster::RenderedPage::suggested_dpi` delegate deleted.**
+  One-line `pub fn` wrapping `self.diagnostics.suggested_dpi(...)`
+  with no external callers.  Users now reach through the public
+  `diagnostics` field directly.
+- **`Bitmap::row_ptr`, `Bitmap::row_ptr_mut`, `Bitmap::alpha_row_mut`,
+  `ImageSource::get_alpha`** deleted from `raster`.  All public
+  surfaces with zero callers; `row_ptr*` documented as "for SIMD inner
+  loops" but no SIMD code referenced them.
+
+**C++-idiom cleanup:**
+
+- **`FontFace::glyph_advance` returns `Option<f64>`** (was `-1.0`
+  sentinel).  Caller's silent `.max(0.0)` (which masked FreeType load
+  failures as zero-advance) becomes explicit `.unwrap_or(0.0)`,
+  matching PDF §9.4.4 "advance even on missing glyph" semantics.
+- **`raster::stroke` module — 5 of 6 helpers demoted from `pub` to
+  crate-private** (`stroke_narrow`, `stroke_wide`, `flatten_path`,
+  `make_dashed_path`, `make_stroke_path`).  The C++ inheritance
+  hierarchy had leaked through the module's public surface; only
+  `stroke` and `StrokeParams` have external callers.  Crate-level
+  re-export shrank from 7 names to 2.
+- **`BackendPolicy: FromStr`** extracted from `from_env_var`.
+  Vocabulary parsing now testable without env-var fixtures; added
+  4 unit tests.  Switched env-var read to `std::env::var_os` —
+  unset/empty common path is zero-alloc; non-UTF-8 env values now
+  emit a `log::warn!` instead of falling through silently.
+- **Stale poppler line-number refs** stripped from
+  `transparency.rs`, `glyph.rs`, `stroke/*`, `image.rs`,
+  `fill/mod.rs`.  Function-name provenance retained where it
+  documents the algorithmic source.
+
+**Hardening:**
+
+- `Bitmap` / `AaBuf`: extracted 7 duplicated bounds-check asserts into
+  two `assert_row_in_bounds` helpers.
+- `pdf_interp` example binaries: every `.unwrap()` / `.expect("X")` on
+  `open` / `parse_page` replaced with `unwrap_or_else(|e| { eprintln!;
+  exit(1); })` — failures now fail loudly with the path / page /
+  underlying error rather than a terse panic.  `examples/render_page.rs`
+  also gained real bounds checking on the f64 → u32 dimension cast
+  (a malformed `PageGeometry` or extreme `--dpi` could previously
+  saturate to `u32::MAX`).
+- `pdf_raster::PageSet::is_empty` is now `const fn -> false`; the
+  non-empty invariant from `PageSet::new` is structurally enforced.
+
+**Pre-existing bugs fixed:**
+
+- `pdf_interp/examples/render_page.rs` called `.get(&page)` on
+  `doc.get_pages()` — broken since the lopdf → native-pdf migration
+  (the return is an iterator, not a `HashMap`).  Now uses
+  `pdf::Document::get_page(idx - 1)` with explicit 1-based bounds
+  checking.
+- Three `pdf_interp` example binaries (`dump_ops`, `smoke`,
+  `scan_fills`) had no `//!` header and triggered workspace
+  `-W missing-docs`; `dump_ops` also re-walked `std::env::args()`
+  twice.
+
+**Known findings deferred for a follow-up release:**
+
+- `PageIter` in the page-iteration path walks every integer from
+  `PageSet::first()` to `PageSet::last()`, probing membership.
+  `PageSet::new([1, u32::MAX])` therefore spins through 4 billion
+  iterations.  Fix shape is a `PageCursor` enum that iterates the
+  `PageSet`'s elements directly when set.
+- The AVX-512 RGB+identity-transfer fast path in AA composition is
+  correctness-preserving but has no byte-equality test against the
+  general path.  A regression that changes one path's rounding could
+  pass unit tests and only be caught by the pixel-diff integration
+  suite.
+- `glyph_advance` does a full FreeType `load_glyph` per text byte for
+  simple fonts, even though PDF §9.2.4 says the font dictionary's
+  `Widths` array is authoritative.  Wiring `FontDescriptor.widths` into
+  the simple-font branch (mirroring the Type 0 path) would eliminate
+  the per-byte `load_glyph`.
+- GPU rotation tests in the deskew path assert `Ok(_)` without
+  comparing pixels against the CPU implementation; an empty `Bitmap`
+  would currently pass.  Needs a `gpu-validation`-gated parity test.
+- The 4-way × 2-mode scaling combinatorics in `raster::image`
+  (8 directional `scale_{mask,image}_*` functions, ~400 LOC of
+  near-duplicate box-filter code) is a candidate for a generic
+  `scale_kernel<XDir, YDir>` once a second resampling kernel
+  (e.g. Lanczos) lands and forces a shared abstraction.
+
+**Verification:** all 689 workspace unit tests pass; clippy clean
+across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
+`pdf_raster`/`bench`/`pdf-raster` (CLI); rustdoc clean.
+
 ### v0.9.0 (May 2026)
 
 **Backend selection — Vulkan-default, env-var override, process-static init:**

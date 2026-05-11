@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-05-11
+
+### Other
+
+- Backend trait + Vulkan hardening + cleanups (#1)
+- Drop dead C++-era code, tighten visibility, kill -1.0 sentinel
+- Hardening + simplify review on top of 3c2804c
+- Delete dead RenderedPage::suggested_dpi delegate
+- Use {f64,u16}::midpoint in shading/patch.rs tests
+- Delete dead StateFlags accessors and GraphicsState delegates
+- Delete more dead methods surfaced by mutants partial
+- Delete dead PrefetchHandle API surfaced by mutants
+- Finish the PrefetchStats deletion 0bb5f87 deferred
+- Extract bounds-check helpers, fix stale doc ref
+- Collapse single-bit StateFlags wrapper to plain bool
+- Use u8::midpoint directly + From for u8→i16
+- Simplify-pass fixes on 0711af1 scope
+- Fail-loud-and-gracefully on all open/parse paths
+- Reframe mutant-driven test names to describe behaviour
+
 ## [0.9.0] - 2026-05-09
 
 ### Bug Fixes
@@ -23,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - Drop stale CUDA-12.8 path pins after driver/toolkit bump
 - Audit init paths — already lazy, no change needed
 - Add PGO + BOLT release build script
+- Release v0.9.0
 
 ### Documentation
 
@@ -36,6 +57,7 @@ All notable changes to this project will be documented in this file.
 - Drop internal-doc paths from public ROADMAP
 - Phase 11 v0.9.0 release notes + contest results
 - Full E1-E4 vs mutool, post-mortem, mutool defaults only
+- Prep v0.9.0 release notes
 
 ### Features
 
