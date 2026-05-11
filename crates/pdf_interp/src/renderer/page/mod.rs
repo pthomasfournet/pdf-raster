@@ -1305,15 +1305,31 @@ impl<'doc> PageRenderer<'doc> {
             );
             return;
         };
-        // Decoder contract: bytes.len() == width × height × bpp.  A truncated
-        // buffer would silently invite the unsafe `get_unchecked` arms below
-        // to read out of bounds; assert in debug builds.  Plain `*` is correct:
-        // a debug-mode overflow panic on absurd metadata is the desired failure.
-        debug_assert_eq!(
-            img_bytes.len(),
-            img_width_usize * img.height as usize * img.color_space.bytes_per_pixel(),
-            "img_bytes length does not match width × height × bpp; decoder produced a truncated buffer",
-        );
+        // Decoder contract: bytes.len() == width × height × bpp.  Promote
+        // the contract to a release-mode check so a truncated buffer (an
+        // adversarial PDF reporting larger dims than the decoder produced)
+        // skips the image cleanly instead of letting the safe slice index
+        // below panic in the inner loop.  One CMP per image; well below
+        // noise.
+        let expected_len = img_width_usize
+            .checked_mul(img.height as usize)
+            .and_then(|n| n.checked_mul(img.color_space.bytes_per_pixel()));
+        let Some(expected_len) = expected_len else {
+            log::warn!(
+                "blit_image: image dimensions overflow usize ({}×{}×{} bpp) — skipping",
+                img.width,
+                img.height,
+                img.color_space.bytes_per_pixel(),
+            );
+            return;
+        };
+        if img_bytes.len() < expected_len {
+            log::warn!(
+                "blit_image: decoder produced short buffer ({} bytes, expected {expected_len}) — skipping",
+                img_bytes.len(),
+            );
+            return;
+        }
 
         let data = self.bitmap.data_mut();
         let stride = self.width as usize * 3; // Rgb8: 3 bytes per pixel
@@ -1352,11 +1368,6 @@ impl<'doc> PageRenderer<'doc> {
                 reason = "img dims are u32; usize→i64 cast is safe on 64-bit targets"
             )]
             let img_max_x = (img_width_usize - 1) as i64;
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "img dims are u32; usize→i64 cast is safe on 64-bit targets"
-            )]
-            let img_max_y = (img.height as usize - 1) as i64;
 
             let smask = img.smask.as_deref();
 
@@ -1387,13 +1398,10 @@ impl<'doc> PageRenderer<'doc> {
                                 continue;
                             }
                             let src = img_idx * 3;
-                            // SAFETY: ix ∈ [0, img_width-1] and iy ∈ [0, img_height-1]
-                            // by the clamp above, so src+3 ≤ img.data.len().
-                            #[expect(
-                                unsafe_code,
-                                reason = "bounds proven by clamp: ix < img_width, iy < img_height"
-                            )]
-                            let rgb = unsafe { img_bytes.get_unchecked(src..src + 3) };
+                            // Bounds checked: ix ∈ [0, img_width-1] and
+                            // iy ∈ [0, img_height-1] by the clamp above; the
+                            // length precheck guarantees src+3 ≤ img_bytes.len().
+                            let rgb = &img_bytes[src..src + 3];
                             let pixel_off = row_off + dx as usize * 3;
                             data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                         }
@@ -1406,12 +1414,8 @@ impl<'doc> PageRenderer<'doc> {
                             if smask.is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0) {
                                 continue;
                             }
-                            // SAFETY: same bounds proof as RGB arm.
-                            #[expect(
-                                unsafe_code,
-                                reason = "bounds proven by clamp: ix < img_width, iy < img_height"
-                            )]
-                            let v = unsafe { *img_bytes.get_unchecked(img_idx) };
+                            // Same bounds rationale as RGB arm.
+                            let v = img_bytes[img_idx];
                             let pixel_off = row_off + dx as usize * 3;
                             data[pixel_off] = v;
                             data[pixel_off + 1] = v;
@@ -1423,21 +1427,14 @@ impl<'doc> PageRenderer<'doc> {
                             let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
                             ix_fp = ix_fp.wrapping_add(ix_step_fp);
                             let img_idx = row_base + ix;
-                            // SAFETY: same bounds proof as RGB arm.
-                            #[expect(
-                                unsafe_code,
-                                reason = "bounds proven by clamp: ix < img_width, iy < img_height"
-                            )]
-                            if unsafe { *img_bytes.get_unchecked(img_idx) } == 0x00 {
+                            // Same bounds rationale as RGB arm.
+                            if img_bytes[img_idx] == 0x00 {
                                 let pixel_off = row_off + dx as usize * 3;
                                 data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
                             }
                         }
                     }
                 }
-
-                // Suppress unused-variable warning in non-GPU builds.
-                let _ = img_max_y;
             }
         } else {
             // General path: arbitrary affine CTM (rotation, shear, non-axis-aligned scale).
