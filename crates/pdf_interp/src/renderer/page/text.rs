@@ -202,12 +202,20 @@ impl PageRenderer<'_> {
                 }
             } else {
                 // Simple font: one byte per character code.
+                // PDF §9.2.4: the Widths array is the authoritative advance source
+                // for simple fonts (within [FirstChar, LastChar]); MissingWidth
+                // applies out-of-range.  FreeType's horiAdvance is consulted ONLY
+                // when Widths is absent entirely (e.g. the 14 standard fonts
+                // pre-PDF 1.5, where a substitute face supplies metrics).
                 for &byte in bytes {
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
                     push_glyph(u32::from(byte), u32::from(byte), pen_x, pen_y);
 
                     // PDF §9.4.4: pen advances even for missing/invisible glyphs.
-                    let advance_glyph = face.glyph_advance(u32::from(byte)).unwrap_or(0.0);
+                    let advance_glyph = descriptor.width_for_code(u32::from(byte)).map_or_else(
+                        || face.glyph_advance(u32::from(byte)).unwrap_or(0.0),
+                        |w| f64::from(w) / 1000.0,
+                    );
                     let extra = if byte == b' ' { word_spacing } else { 0.0 };
                     let tx_adv = (advance_glyph * font_size + char_spacing + extra) * horiz_scaling;
                     let [a, b_m, c, d, e, f] = tm;

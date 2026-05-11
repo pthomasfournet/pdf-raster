@@ -152,6 +152,11 @@ pub struct FontDescriptor {
     pub widths: Vec<i32>,
     /// First char code covered by `widths`.
     pub first_char: u32,
+    /// `MissingWidth` from the `FontDescriptor` sub-dict — the advance width
+    /// (in thousandths of a text-space unit) used for char codes outside the
+    /// `[first_char, first_char + widths.len())` range.  Default `0` per PDF
+    /// §9.8.2.
+    pub missing_width: i32,
     /// Glyph-index table: `code_to_gid[char_code]` → FT glyph index.
     /// Empty means the identity map (`char_code` == glyph index).
     pub code_to_gid: Vec<u32>,
@@ -167,6 +172,33 @@ pub struct FontDescriptor {
     /// all FreeType-backed fonts.  When `Some`, `bytes` is `None` and `kind`
     /// is `Other` (Type 3 has no font program; glyphs are content streams).
     pub type3: Option<Type3Data>,
+}
+
+impl FontDescriptor {
+    /// Return the simple-font advance width (in thousandths of a text-space
+    /// unit) for `char_code`, or `None` if the `Widths` array is empty.
+    ///
+    /// PDF §9.2.4: the `Widths` array is the **authoritative** width source
+    /// for simple fonts in the `[FirstChar, LastChar]` range.  Outside that
+    /// range, `MissingWidth` applies.  The whole array is allowed to be
+    /// absent only for the 14 standard fonts (Helvetica, Times-Roman, …),
+    /// where the `FreeType` `horiAdvance` of the substitute face is the
+    /// fallback — that's what `None` here signals to the caller.
+    ///
+    /// Not for Type 0 (use `CidEncoding::width_for_cid`) or Type 3
+    /// (use `Type3Glyph::width_units`).
+    #[must_use]
+    pub fn width_for_code(&self, char_code: u32) -> Option<i32> {
+        if self.widths.is_empty() {
+            return None;
+        }
+        // Below FirstChar → out-of-range below; use MissingWidth.
+        // At-or-above FirstChar: look up; out-of-range above also uses MissingWidth.
+        let Some(idx) = (char_code as usize).checked_sub(self.first_char as usize) else {
+            return Some(self.missing_width);
+        };
+        Some(self.widths.get(idx).copied().unwrap_or(self.missing_width))
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -189,6 +221,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     let kind = classify_kind(dict);
     let bytes = extract_bytes(doc, dict);
     let (first_char, widths) = extract_widths(dict);
+    let missing_width = extract_missing_width(doc, dict);
     let (code_to_gid, differences) = extract_encoding(doc, dict, kind);
 
     FontDescriptor {
@@ -196,10 +229,28 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         bytes,
         widths,
         first_char,
+        missing_width,
         code_to_gid,
         differences,
         cid_encoding: None,
         type3: None,
+    }
+}
+
+/// Extract `MissingWidth` from the `FontDescriptor` sub-dict.  Returns `0`
+/// when absent (PDF §9.8.2 default).  PDF stores `MissingWidth` inside the
+/// `FontDescriptor` sub-dict, not the parent font dict — this helper handles
+/// the indirect-reference resolution that `extract_widths` does not need.
+fn extract_missing_width(doc: &Document, dict: &Dictionary) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "PDF glyph advance widths are always in [0, 4096]; safe to cast to i32"
+    )]
+    {
+        resolve_fd(doc, dict)
+            .as_ref()
+            .and_then(|fd| fd.get_i64(b"MissingWidth"))
+            .map_or(0, |v| v as i32)
     }
 }
 
@@ -408,6 +459,9 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         bytes,
         widths: vec![],
         first_char: 0,
+        // Type 0 fonts use `CidEncoding::width_for_cid` exclusively;
+        // `missing_width` is never consulted but must be initialised.
+        missing_width: 0,
         code_to_gid: vec![],
         differences: empty_differences(),
         cid_encoding: Some(CidEncoding {
@@ -522,6 +576,11 @@ fn resolve_type3_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         bytes: None,
         widths,
         first_char,
+        // Type 3 glyphs carry their own widths via `Type3Glyph::width_units`;
+        // the top-level Widths array is the same source the d0/d1 operators
+        // store. `MissingWidth` doesn't apply (PDF spec §9.6 — Type 3 uses
+        // Widths exclusively), so 0 is the correct never-consulted default.
+        missing_width: 0,
         code_to_gid: vec![],
         differences,
         cid_encoding: None,
@@ -883,6 +942,98 @@ mod tests {
         let (fc, ws) = extract_widths(&d);
         assert_eq!(fc, 0);
         assert!(ws.is_empty());
+    }
+
+    /// Build a `FontDescriptor` with explicit widths for testing the
+    /// `width_for_code` lookup paths.  The fields not exercised by the
+    /// lookup are filled with stubs.
+    fn descriptor_with_widths(
+        first_char: u32,
+        widths: Vec<i32>,
+        missing_width: i32,
+    ) -> FontDescriptor {
+        FontDescriptor {
+            kind: PdfFontKind::Type1,
+            bytes: None,
+            widths,
+            first_char,
+            missing_width,
+            code_to_gid: vec![],
+            differences: empty_differences(),
+            cid_encoding: None,
+            type3: None,
+        }
+    }
+
+    #[test]
+    fn width_for_code_in_range() {
+        let d = descriptor_with_widths(32, vec![278, 500, 556], 0);
+        assert_eq!(d.width_for_code(32), Some(278));
+        assert_eq!(d.width_for_code(33), Some(500));
+        assert_eq!(d.width_for_code(34), Some(556));
+    }
+
+    #[test]
+    fn width_for_code_above_range_returns_missing_width() {
+        let d = descriptor_with_widths(32, vec![278, 500, 556], 250);
+        // 35 is just past LastChar = first_char + len - 1 = 34.
+        assert_eq!(d.width_for_code(35), Some(250));
+        assert_eq!(d.width_for_code(255), Some(250));
+    }
+
+    #[test]
+    fn width_for_code_below_range_returns_missing_width() {
+        // PDF §9.2.4: below FirstChar is also "out of range" → MissingWidth.
+        let d = descriptor_with_widths(32, vec![278, 500, 556], 250);
+        assert_eq!(d.width_for_code(0), Some(250));
+        assert_eq!(d.width_for_code(31), Some(250));
+    }
+
+    #[test]
+    fn width_for_code_empty_widths_returns_none() {
+        // Standard 14 fonts (Helvetica etc.) pre-PDF-1.5 can omit Widths;
+        // None signals to the caller to fall back to the FreeType face.
+        let d = descriptor_with_widths(0, vec![], 0);
+        assert_eq!(d.width_for_code(65), None);
+    }
+
+    #[test]
+    fn extract_missing_width_inline_dict() {
+        let fd = make_dict(&[(b"MissingWidth", Object::Integer(750))]);
+        let parent = make_dict(&[(b"FontDescriptor", Object::Dictionary(fd))]);
+        let doc = empty_doc();
+        assert_eq!(extract_missing_width(&doc, &parent), 750);
+    }
+
+    #[test]
+    fn extract_missing_width_absent_returns_zero() {
+        // FontDescriptor sub-dict exists but no MissingWidth key.
+        let fd = make_dict(&[]);
+        let parent = make_dict(&[(b"FontDescriptor", Object::Dictionary(fd))]);
+        let doc = empty_doc();
+        assert_eq!(extract_missing_width(&doc, &parent), 0);
+    }
+
+    #[test]
+    fn extract_missing_width_no_descriptor_returns_zero() {
+        // Whole FontDescriptor key absent → default 0.
+        let parent = make_dict(&[(b"Subtype", Object::Name(b"Type1".to_vec()))]);
+        let doc = empty_doc();
+        assert_eq!(extract_missing_width(&doc, &parent), 0);
+    }
+
+    #[test]
+    fn width_for_code_zero_width_in_range_is_distinct_from_missing() {
+        // A literal 0 in the Widths array means "glyph has no advance"
+        // (zero-width joiner, combining marks). MUST NOT fall through to
+        // MissingWidth — they're different signals.
+        let d = descriptor_with_widths(32, vec![278, 0, 556], 999);
+        assert_eq!(d.width_for_code(33), Some(0), "in-range 0 must be returned");
+        assert_eq!(
+            d.width_for_code(35),
+            Some(999),
+            "out-of-range must return MissingWidth, not 0"
+        );
     }
 
     /// Build a minimal valid PDF byte-stream with one empty page tree and
