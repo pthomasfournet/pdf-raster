@@ -63,7 +63,13 @@ mod tests {
 
     #[test]
     fn encodes_x_coordinate_in_output() {
-        // Each pixel's R/G/B equals its x coordinate (mod 256).
+        // Each pixel's R/G/B equals its x coordinate (mod 256). fill_span is
+        // called with integer x ∈ [10, 13], so f64-as-u8 is exact here.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "test passes integer x ∈ [10,13]; cast is exact"
+        )]
         let p = FunctionPattern::new(|x, _y| {
             let v = x as u8;
             [v, v, v]
@@ -71,6 +77,10 @@ mod tests {
         let mut out = vec![0u8; 4 * 3];
         p.fill_span(0, 10, 13, &mut out);
         for i in 0..4usize {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "i ∈ [0,4); 10 + i ≤ 13 fits in u8"
+            )]
             let expected = (10 + i) as u8;
             assert_eq!(out[i * 3], expected, "pixel {i} R");
             assert_eq!(out[i * 3 + 1], expected, "pixel {i} G");
@@ -92,6 +102,11 @@ mod tests {
 
     #[test]
     fn encodes_y_coordinate_in_output() {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "test passes integer y = 42; cast is exact"
+        )]
         let p = FunctionPattern::new(|_x, y| [0, 0, y as u8]);
         let mut out = [0u8; 3];
         p.fill_span(42, 0, 0, &mut out);

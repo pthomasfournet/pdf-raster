@@ -509,8 +509,8 @@ mod tests {
         // Rows 2..5, cols 2..5 should be red.
         for y in 2..6u32 {
             let row = bmp.row(y);
-            for x in 2..6usize {
-                assert_eq!(row[x].r, 255, "y={y} x={x} R");
+            for (x, px) in row.iter().enumerate().take(6).skip(2) {
+                assert_eq!(px.r, 255, "y={y} x={x} R");
             }
         }
         assert_eq!(bmp.row(1)[1].r, 0);
@@ -538,8 +538,8 @@ mod tests {
 
         for y in 0..4u32 {
             let row = bmp.row(y);
-            for x in 0..4usize {
-                assert_eq!(row[x].r, 0, "should be unpainted");
+            for px in row.iter().take(4) {
+                assert_eq!(px.r, 0, "should be unpainted");
             }
         }
     }
@@ -566,12 +566,12 @@ mod tests {
         blit_glyph::<Rgb8>(&mut bmp, &clip, true, &pipe, &src, 0, 0, &glyph);
 
         let row0 = bmp.row(0);
-        for x in 0..8usize {
-            assert_eq!(row0[x].g, 255, "row 0 x={x} should be painted");
+        for (x, px) in row0.iter().enumerate().take(8) {
+            assert_eq!(px.g, 255, "row 0 x={x} should be painted");
         }
         let row1 = bmp.row(1);
-        for x in 0..8usize {
-            assert_eq!(row1[x].g, 0, "row 1 x={x} should be clear");
+        for (x, px) in row1.iter().enumerate().take(8) {
+            assert_eq!(px.g, 0, "row 1 x={x} should be clear");
         }
     }
 

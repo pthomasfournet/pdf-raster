@@ -435,10 +435,10 @@ mod tests {
         // Interior pixels (rows 2..4, cols 1..5) should be painted.
         for y in 2..5u32 {
             let row = bmp.row(y);
-            for x in 1..=5usize {
-                assert_eq!(row[x].r, 200, "y={y} x={x} R");
-                assert_eq!(row[x].g, 100, "y={y} x={x} G");
-                assert_eq!(row[x].b, 50, "y={y} x={x} B");
+            for (x, px) in row.iter().enumerate().take(6).skip(1) {
+                assert_eq!(px.r, 200, "y={y} x={x} R");
+                assert_eq!(px.g, 100, "y={y} x={x} G");
+                assert_eq!(px.b, 50, "y={y} x={x} B");
             }
         }
 
@@ -516,6 +516,13 @@ mod tests {
     fn aa_gamma_table_correct() {
         // Validate every entry against the defining formula: round((i/16)^1.5 * 255).
         for i in 0u8..=16 {
+            // i ∈ [0,16] → (i/16)^1.5 ∈ [0,1] → ×255 ∈ [0,255] → round to non-
+            // negative integer in [0,255]; the `as u8` is provably in range.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "value is f64::round() of a [0,255]-bounded expression"
+            )]
             let expected = ((f64::from(i) / 16.0).powf(1.5) * 255.0).round() as u8;
             assert_eq!(
                 AA_GAMMA[usize::from(i)],

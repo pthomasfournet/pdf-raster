@@ -165,22 +165,31 @@ mod tests {
         let src = [100u8, 150, 200];
         let a_input = 200u8;
         let count = 37usize; // crosses chunk boundary: 2 full chunks + 5 tail
+        // i * 7 / i * 3 are mod-256 reduced before the cast, so the truncation
+        // is intentional and exact.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "mod-256 result fits in u8 by construction"
+        )]
         let shape: Vec<u8> = (0..count).map(|i| (i * 7 % 256) as u8).collect();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "mod-256 result fits in u8 by construction"
+        )]
         let initial: Vec<u8> = (0..count * 3).map(|i| (i * 3 % 256) as u8).collect();
 
         // Scalar reference
         let mut ref_dst = initial.clone();
         let a_in = u16::from(a_input);
         let [sr, sg, sb] = [u16::from(src[0]), u16::from(src[1]), u16::from(src[2])];
-        for i in 0..count {
-            let a_src = div255_u16(a_in * u16::from(shape[i]));
+        for (shape_v, ref_chunk) in shape.iter().zip(ref_dst.chunks_exact_mut(3)) {
+            let a_src = div255_u16(a_in * u16::from(*shape_v));
             let inv = 255 - a_src;
-            let b = i * 3;
             #[expect(clippy::cast_possible_truncation, reason = "div255_u16 result ≤ 255")]
             {
-                ref_dst[b] = div255_u16(inv * u16::from(ref_dst[b]) + a_src * sr) as u8;
-                ref_dst[b + 1] = div255_u16(inv * u16::from(ref_dst[b + 1]) + a_src * sg) as u8;
-                ref_dst[b + 2] = div255_u16(inv * u16::from(ref_dst[b + 2]) + a_src * sb) as u8;
+                ref_chunk[0] = div255_u16(inv * u16::from(ref_chunk[0]) + a_src * sr) as u8;
+                ref_chunk[1] = div255_u16(inv * u16::from(ref_chunk[1]) + a_src * sg) as u8;
+                ref_chunk[2] = div255_u16(inv * u16::from(ref_chunk[2]) + a_src * sb) as u8;
             }
         }
 
