@@ -4,16 +4,19 @@
 //! This is the *input* representation — the colour space declared by the
 //! content stream — distinct from the [`super::image::ImageColorSpace`]
 //! output category used by the image blit path. The taxonomy is needed by
-//! the operators that resolve uncoloured-pattern tints (§8.7.3.3) and any
-//! future ICC-correct CMYK→RGB conversion on stroke/fill.
+//! the operators that resolve uncoloured-pattern tints (§8.7.3.3) and the
+//! gstate-level conversion to sRGB for stroke/fill operators.
 //!
 //! # Scope
 //!
 //! The variants capture what we need to track *which* space is active;
 //! they don't carry the full colorant-mapping data (Lab whitepoint
 //! values, the ICC profile bytes, the full Separation tint function, etc.)
-//! — those are pulled lazily via the stored [`ObjectId`] when the
-//! conversion path actually runs.
+//! — those are pulled lazily via the stored [`ObjectId`] when
+//! [`ColorSpace::convert_to_rgb`] actually runs.  ICC profiles are
+//! transformed through `moxcms`; Separation tints flow through the
+//! shading-fn evaluator (`super::shading::function::eval_function`) into
+//! the alternate space.
 //!
 //! # PDF §8.6 mapping
 //!
@@ -38,6 +41,21 @@
 //! graphics state to carry several kilobytes of profile data per push/pop.
 //! Storing the `ObjectId` keeps the gstate small and lets the conversion
 //! path dereference only when it actually needs the data.
+//!
+//! # Current limitations
+//!
+//! - **Lab whitepoint**: `convert_to_rgb` hard-codes D65; the per-document
+//!   whitepoint stored in `Lab::dict_id` isn't read yet.  Affects rare
+//!   prepress PDFs that use D50 or other reference whites.
+//! - **`Indexed` lookup**: `lookup_id` is captured at parse time but
+//!   `convert_to_rgb` still returns black for `Indexed`.  Palette
+//!   dereference + recursive base conversion is the missing piece; the
+//!   image pipeline handles Indexed via a separate path for images.
+//! - **`DeviceN` tint transform**: the shading-fn evaluator only handles
+//!   1-input functions, so `DeviceN` (N≥1 inputs) falls back to the
+//!   single-component gray heuristic on `comps[0]`.  Extending the
+//!   evaluator to N-input PostScript-style functions (Type 4) is its
+//!   own scope.
 
 use pdf::{Document, Object, ObjectId};
 
@@ -169,9 +187,10 @@ impl ColorSpace {
     ///   `moxcms` doesn't expose a Gray layout for transforms.  Any
     ///   error (missing stream, malformed profile, transform failure)
     ///   falls back to the device-space-by-N path.
-    /// - `Indexed`: returns black — the palette lookup needs the lookup
-    ///   stream which the gstate doesn't carry.  The image pipeline
-    ///   resolves Indexed separately.
+    /// - `Indexed`: returns black.  `lookup_id` is captured at parse
+    ///   time but the palette-dereference + recursive base-space
+    ///   conversion isn't wired through yet.  The image pipeline
+    ///   handles Indexed via a separate path for image streams.
     /// - `Pattern`: returns black — patterns are not directly convertible
     ///   to RGB; tile rasterisation is invoked elsewhere.
     /// - `Separation`: passes the tint through the document's
