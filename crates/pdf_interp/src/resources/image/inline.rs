@@ -438,10 +438,10 @@ mod tests {
 
     #[test]
     fn parse_inline_params_basic() {
+        use crate::resources::dict_ext::DictExt;
         // /W 4 /H 2 /CS /G /BPC 8 (abbreviated keys + abbreviated CS name)
         let params = b"/W 4 /H 2 /CS /G /BPC 8";
         let dict = parse_inline_params(params);
-        use crate::resources::dict_ext::DictExt;
         assert_eq!(dict.get_i64(b"Width"), Some(4));
         assert_eq!(dict.get_i64(b"Height"), Some(2));
         assert_eq!(dict.get_i64(b"BitsPerComponent"), Some(8));
@@ -454,10 +454,10 @@ mod tests {
 
     #[test]
     fn parse_inline_params_full_names() {
+        use crate::resources::dict_ext::DictExt;
         // Full (non-abbreviated) names should also parse correctly.
         let params = b"/Width 3 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8";
         let dict = parse_inline_params(params);
-        use crate::resources::dict_ext::DictExt;
         assert_eq!(dict.get_i64(b"Width"), Some(3));
         assert_eq!(dict.get_i64(b"Height"), Some(1));
         assert_eq!(dict.get_i64(b"BitsPerComponent"), Some(8));

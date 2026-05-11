@@ -106,6 +106,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "begin_text must reset to the bit-exact identity matrix constant; a partial reset that drifted by 1 ULP from the literal would still be a bug"
+    )]
     fn begin_text_resets_matrices() {
         let mut ts = TextState::default();
         ts.text_matrix[4] = 100.0;
@@ -125,8 +129,10 @@ mod tests {
 
     #[test]
     fn next_line_uses_leading() {
-        let mut ts = TextState::default();
-        ts.leading = 14.0;
+        let mut ts = TextState {
+            leading: 14.0,
+            ..TextState::default()
+        };
         ts.move_by(0.0, 100.0); // move to some y first
         let (_, y0) = ts.origin();
         ts.next_line();

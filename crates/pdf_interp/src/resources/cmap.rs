@@ -479,7 +479,7 @@ mod tests {
     fn parse_cid_char_single_byte() {
         // Full CMap stream with a `<<...>>` dict literal — exercises the `>`
         // skip fix in the tokeniser.
-        let stream = br#"
+        let stream = br"
 /CIDInit /ProcSet findresource begin
 12 dict begin
 begincmap
@@ -498,7 +498,7 @@ endcmap
 CMapName currentdict /CMap defineresource pop
 end
 end
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         assert_eq!(cmap.code_bytes, 1);
         assert_eq!(cmap.map.get(&0x20), Some(&32));
@@ -509,14 +509,14 @@ end
 
     #[test]
     fn parse_cid_range_two_byte() {
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
 1 begincidrange
 <0020> <0022> 100
 endcidrange
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         assert_eq!(cmap.code_bytes, 2);
         assert_eq!(cmap.map.get(&0x0020), Some(&100));
@@ -527,7 +527,7 @@ endcidrange
 
     #[test]
     fn parse_bfchar() {
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
@@ -535,7 +535,7 @@ endcodespacerange
 <0041> <0041>
 <0042> <0042>
 endbfchar
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         assert_eq!(cmap.map.get(&0x0041), Some(&0x0041));
         assert_eq!(cmap.map.get(&0x0042), Some(&0x0042));
@@ -543,14 +543,14 @@ endbfchar
 
     #[test]
     fn parse_bfrange() {
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <00> <FF>
 endcodespacerange
 1 beginbfrange
 <0041> <0043> <0041>
 endbfrange
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         assert_eq!(cmap.map.get(&0x0041), Some(&0x0041));
         assert_eq!(cmap.map.get(&0x0042), Some(&0x0042));
@@ -559,14 +559,14 @@ endbfrange
 
     #[test]
     fn degenerate_range_skipped() {
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
 1 begincidrange
 <0050> <0040> 0
 endcidrange
-        "#;
+        ";
         // hi < lo: codespace is valid but range block is empty.
         let cmap = parse_cmap(stream).expect("should parse with empty map");
         assert!(cmap.map.is_empty());
@@ -574,14 +574,14 @@ endcidrange
 
     #[test]
     fn iter_codes_two_byte() {
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
 1 begincidrange
 <0041> <0043> 10
 endcidrange
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         let bytes: &[u8] = &[0x00, 0x41, 0x00, 0x42, 0x00, 0x43];
         let decoded: Vec<(u32, u32)> = cmap.iter_codes(bytes).collect();
@@ -590,14 +590,14 @@ endcidrange
 
     #[test]
     fn iter_codes_missing_maps_to_zero() {
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <00> <FF>
 endcodespacerange
 1 begincidchar
 <41> 65
 endcidchar
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         let bytes: &[u8] = &[0x41, 0x42]; // 0x42 not in map
         let decoded: Vec<(u32, u32)> = cmap.iter_codes(bytes).collect();
@@ -613,7 +613,7 @@ endcidchar
     fn missing_end_keyword_does_not_consume_next_section() {
         // A truncated stream with no endcidchar — the parser must not eat the
         // begincidrange block that follows.
-        let stream = br#"
+        let stream = br"
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
@@ -622,7 +622,7 @@ endcodespacerange
 begincidrange
 <0042> <0043> 20
 endcidrange
-        "#;
+        ";
         let cmap = parse_cmap(stream).expect("should parse");
         assert_eq!(cmap.map.get(&0x0041), Some(&10));
         assert_eq!(cmap.map.get(&0x0042), Some(&20));

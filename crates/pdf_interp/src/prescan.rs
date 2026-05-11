@@ -353,9 +353,9 @@ mod tests {
     /// Layout (object numbers):
     ///   1: Catalog
     ///   2: Pages
-    ///   3: Page (Type=Page, Parent=2, MediaBox=[0 0 612 792], Contents=4)
+    ///   3: Page (Type=Page, Parent=2, `MediaBox`=[0 0 612 792], Contents=4)
     ///   4: Content stream (length = `content_bytes.len()`)
-    fn doc_with_content(content_bytes: Vec<u8>) -> (Document, u32) {
+    fn doc_with_content(content_bytes: &[u8]) -> (Document, u32) {
         let header = "%PDF-1.4\n";
         let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n".to_string();
         let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n".to_string();
@@ -387,7 +387,7 @@ mod tests {
         bytes.extend_from_slice(obj2.as_bytes());
         bytes.extend_from_slice(obj3.as_bytes());
         bytes.extend_from_slice(obj4_header.as_bytes());
-        bytes.extend_from_slice(&content_bytes);
+        bytes.extend_from_slice(content_bytes);
         bytes.extend_from_slice(obj4_footer.as_bytes());
         bytes.extend_from_slice(xref.as_bytes());
         bytes.extend_from_slice(trailer.as_bytes());
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn prescan_page_out_of_range_returns_err() {
-        let (doc, _) = doc_with_content(b"BT /F1 12 Tf (Hello) Tj ET".to_vec());
+        let (doc, _) = doc_with_content(b"BT /F1 12 Tf (Hello) Tj ET");
         let result = prescan_page(&doc, 99);
         assert!(
             matches!(result, Err(InterpError::PageOutOfRange { .. })),
@@ -412,7 +412,7 @@ mod tests {
     fn prescan_pure_text_page_no_images() {
         // Content stream: begin text, show text, end text.
         let ops = b"BT /F1 12 Tf 72 720 Td (Hello World) Tj ET";
-        let (doc, page_num) = doc_with_content(ops.to_vec());
+        let (doc, page_num) = doc_with_content(ops);
         let diag = prescan_page(&doc, page_num).expect("prescan should succeed");
         assert!(!diag.has_images, "pure text page must not have images");
         assert!(diag.dominant_filter.is_none());
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn prescan_empty_page_is_clean() {
-        let (doc, page_num) = doc_with_content(b"".to_vec());
+        let (doc, page_num) = doc_with_content(b"");
         let diag = prescan_page(&doc, page_num).expect("prescan of empty page should succeed");
         assert!(!diag.has_images);
         assert!(!diag.has_vector_text);
@@ -478,8 +478,8 @@ mod tests {
     #[test]
     fn dict_integer_reads_integer_and_real() {
         let mut dict = Dictionary::new();
-        dict.set(b"Width".to_vec(), Object::Integer(640));
-        dict.set(b"Height".to_vec(), Object::Real(480.0));
+        dict.set(b"Width", Object::Integer(640));
+        dict.set(b"Height", Object::Real(480.0));
         assert_eq!(dict_integer(&dict, b"Width"), Some(640));
         assert_eq!(dict_integer(&dict, b"Height"), Some(480));
         assert_eq!(dict_integer(&dict, b"Missing"), None);
@@ -488,8 +488,8 @@ mod tests {
     #[test]
     fn scan_image_dict_increments_dct_filter_count() {
         let mut dict = Dictionary::new();
-        dict.set(b"Filter".to_vec(), Object::Name(b"DCTDecode".to_vec()));
-        dict.set(b"Width".to_vec(), Object::Integer(1024));
+        dict.set(b"Filter", Object::Name(b"DCTDecode".to_vec()));
+        dict.set(b"Width", Object::Integer(1024));
 
         let mut filter_counts = [0u32; IMAGE_FILTER_COUNT];
         let mut max_ppi = 0.0f32;
@@ -520,6 +520,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "bit-exact: max_ppi starts at literal 0.0 and the early-return path on page_width == 0.0 must leave it untouched — epsilon comparison would mask a regression where the no-op accidentally wrote a value"
+    )]
     fn update_max_ppi_zero_page_width_is_noop() {
         let mut max_ppi = 0.0f32;
         update_max_ppi(&mut max_ppi, 1000, 0.0);

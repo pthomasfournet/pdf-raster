@@ -706,6 +706,10 @@ pub(super) fn decode_type7_mesh(
 mod tests {
     use super::*;
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper: 4 corner positions + 4 corner colours map naturally to 8 args; bundling into a struct just shifts the boilerplate to the call sites"
+    )]
     fn flat_patch(
         x0: f64,
         y0: f64,
@@ -718,12 +722,13 @@ mod tests {
     ) -> Patch {
         // Bilinear interpolation of control points across the 4×4 grid.
         let mut p = Patch::zero();
-        for r in 0..4usize {
-            let tr = r as f64 / 3.0;
-            for c in 0..4usize {
-                let tc = c as f64 / 3.0;
-                p.xy[r][c][0] = x0 + (x1 - x0) * tc;
-                p.xy[r][c][1] = y0 + (y1 - y0) * tr;
+        for r in 0..4u32 {
+            let tr = f64::from(r) / 3.0;
+            for c in 0..4u32 {
+                let tc = f64::from(c) / 3.0;
+                let (ri, ci) = (r as usize, c as usize);
+                p.xy[ri][ci][0] = (x1 - x0).mul_add(tc, x0);
+                p.xy[ri][ci][1] = (y1 - y0).mul_add(tr, y0);
             }
         }
         p.color[0][0] = c00;
@@ -734,6 +739,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "split must preserve corner control points bit-exactly — the split formulas only read these corners, they do not arithmetically derive them"
+    )]
     fn split_patch_u_flat_corners_unchanged() {
         let p = flat_patch(
             0.0,
@@ -775,6 +784,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "split must preserve corner control points bit-exactly — same rationale as the split_patch_u sibling test"
+    )]
     fn split_patch_v_flat_corners_unchanged() {
         let p = flat_patch(
             0.0,
@@ -795,6 +808,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "color_delta on a uniform-color patch must return the literal 0.0 (no per-channel difference exists); epsilon would mask a regression where the formula leaked a non-zero value through e.g. a wrong index"
+    )]
     fn color_delta_uniform_is_zero() {
         let mut p = Patch::zero();
         let c = [128u8, 64, 32];

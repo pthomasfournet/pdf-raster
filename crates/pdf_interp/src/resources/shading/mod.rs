@@ -983,6 +983,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "bbox_from_coords reorders min/max but does no arithmetic on the values; the output array must equal the sorted literal bit-exactly"
+    )]
     fn bbox_from_two_points() {
         let b = bbox_from_coords(&[3.0, 7.0, 10.0, 2.0]);
         assert_eq!(b, [3.0, 2.0, 10.0, 7.0]);
@@ -1001,12 +1005,20 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "fallback returns the literal 1.0 constant on NaN input; an epsilon comparison would mask a regression where the fallback returned something like 0.999… instead"
+    )]
     fn ctm_scale_nan_falls_back_to_one() {
         let ctm = [f64::NAN, 0.0, 0.0, 1.0, 0.0, 0.0];
         assert_eq!(ctm_scale(&ctm), 1.0);
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "fallback returns the literal 1.0 constant on infinite input; same rationale as the NaN sibling test"
+    )]
     fn ctm_scale_inf_falls_back_to_one() {
         let ctm = [f64::INFINITY, 0.0, 0.0, 1.0, 0.0, 0.0];
         assert_eq!(ctm_scale(&ctm), 1.0);

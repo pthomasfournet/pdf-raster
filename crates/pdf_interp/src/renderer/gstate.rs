@@ -238,6 +238,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "identity × b must equal b bit-exactly: IEEE 754 guarantees 1.0*x == x and 0.0+x == x for finite x, so any drift here means ctm_multiply has a real bug (e.g. wrong index order)"
+    )]
     fn ctm_identity_multiply() {
         let a = CTM_IDENTITY;
         let b = [2.0, 0.0, 0.0, 3.0, 10.0, 20.0];
