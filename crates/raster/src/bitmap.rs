@@ -114,6 +114,16 @@ impl<P: Pixel> Bitmap<P> {
         bytemuck::cast_slice_mut(&mut bytes[..w])
     }
 
+    /// Shared bounds check used by every row accessor.
+    #[inline]
+    fn assert_row_in_bounds(&self, y: u32) {
+        assert!(
+            y < self.height,
+            "row index {y} is out of bounds for bitmap height {}",
+            self.height
+        );
+    }
+
     /// Raw byte read-only access to the full stride of row `y` (including padding).
     ///
     /// # Panics
@@ -121,11 +131,7 @@ impl<P: Pixel> Bitmap<P> {
     /// Panics if `y >= height`.
     #[must_use]
     pub fn row_bytes(&self, y: u32) -> &[u8] {
-        assert!(
-            y < self.height,
-            "row index {y} is out of bounds for bitmap height {}",
-            self.height
-        );
+        self.assert_row_in_bounds(y);
         let off = u32_to_usize(y) * self.stride;
         &self.data[off..off + self.stride]
     }
@@ -136,11 +142,7 @@ impl<P: Pixel> Bitmap<P> {
     ///
     /// Panics if `y >= height`.
     pub fn row_bytes_mut(&mut self, y: u32) -> &mut [u8] {
-        assert!(
-            y < self.height,
-            "row index {y} is out of bounds for bitmap height {}",
-            self.height
-        );
+        self.assert_row_in_bounds(y);
         let off = u32_to_usize(y) * self.stride;
         &mut self.data[off..off + self.stride]
     }
@@ -156,11 +158,7 @@ impl<P: Pixel> Bitmap<P> {
     /// Panics if `y >= height`.
     #[must_use]
     pub fn alpha_row(&self, y: u32) -> Option<&[u8]> {
-        assert!(
-            y < self.height,
-            "row index {y} is out of bounds for bitmap height {}",
-            self.height
-        );
+        self.assert_row_in_bounds(y);
         self.alpha.as_ref().map(|a| {
             let w = u32_to_usize(self.width);
             let off = u32_to_usize(y) * w;
@@ -192,18 +190,15 @@ impl<P: Pixel> Bitmap<P> {
     /// Simultaneous mutable access to the pixel row and the alpha row.
     ///
     /// Returns `(pixel_row_bytes, Some(alpha_row))` or `(pixel_row_bytes, None)`.
-    /// This avoids the borrow-checker conflict of calling `row_bytes_mut` and
-    /// `alpha_row_mut` separately on the same `&mut self`.
+    /// Provided because the borrow checker rejects holding two mutable
+    /// references into the same `&mut self` (pixel data and alpha plane) via
+    /// separate accessor calls.
     ///
     /// # Panics
     ///
     /// Panics if `y >= height`.
     pub fn row_and_alpha_mut(&mut self, y: u32) -> (&mut [u8], Option<&mut [u8]>) {
-        assert!(
-            y < self.height,
-            "row index {y} is out of bounds for bitmap height {}",
-            self.height
-        );
+        self.assert_row_in_bounds(y);
         let stride = self.stride;
         let w = u32_to_usize(self.width);
         let off = u32_to_usize(y) * stride;
@@ -514,6 +509,16 @@ impl AaBuf {
         self.width.div_ceil(8)
     }
 
+    /// Shared bounds check used by every row accessor.
+    #[inline]
+    fn assert_row_in_bounds(&self, row: usize) {
+        assert!(
+            row < self.height,
+            "row index {row} is out of bounds for AaBuf height {}",
+            self.height
+        );
+    }
+
     /// Clear all bits to 0.
     #[inline]
     pub fn clear(&mut self) {
@@ -528,11 +533,7 @@ impl AaBuf {
     ///
     /// Panics if `row >= height`.
     pub fn set_span(&mut self, row: usize, x0: usize, x1: usize) {
-        assert!(
-            row < self.height,
-            "row index {row} is out of bounds for AaBuf height {}",
-            self.height
-        );
+        self.assert_row_in_bounds(row);
         let x0 = x0.min(self.width);
         let x1 = x1.min(self.width);
         if x0 >= x1 {
@@ -580,12 +581,8 @@ impl AaBuf {
     #[inline]
     #[must_use]
     pub fn get_byte(&self, row: usize, byte_idx: usize) -> u8 {
+        self.assert_row_in_bounds(row);
         let rb = self.row_bytes();
-        assert!(
-            row < self.height,
-            "row index {row} is out of bounds for AaBuf height {}",
-            self.height
-        );
         assert!(
             byte_idx < rb,
             "byte_idx {byte_idx} is out of bounds for row_bytes {rb}"
@@ -600,11 +597,7 @@ impl AaBuf {
     /// Panics if `row >= height`.
     #[must_use]
     pub fn row_slice(&self, row: usize) -> &[u8] {
-        assert!(
-            row < self.height,
-            "row index {row} is out of bounds for AaBuf height {}",
-            self.height
-        );
+        self.assert_row_in_bounds(row);
         let rb = self.row_bytes();
         &self.data[row * rb..(row + 1) * rb]
     }
