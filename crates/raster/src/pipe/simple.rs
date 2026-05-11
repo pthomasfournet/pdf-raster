@@ -114,7 +114,7 @@ pub(crate) fn render_span_simple<P: Pixel>(
 mod tests {
     use super::*;
     use crate::state::TransferSet;
-    use color::{Rgb8, TransferLut};
+    use color::Rgb8;
 
     fn opaque_normal_pipe() -> PipeState<'static> {
         PipeState {
@@ -150,18 +150,21 @@ mod tests {
 
     #[test]
     fn transfer_applied_to_solid() {
-        // Use an inverting transfer: T[v] = 255 - v.
-        let lut_data: [u8; 256] = core::array::from_fn(|i| 255 - i as u8);
-        let lut = TransferLut(lut_data);
-
-        // Build a TransferSet that uses the inverting LUT for all RGB channels.
-        // We need a 'static reference, so we use a static binding.
-        // For testing, allocate on heap and leak it.
-        let r_ref: &'static [u8; 256] = Box::leak(Box::new(lut_data));
-        let g_ref: &'static [u8; 256] = Box::leak(Box::new(lut_data));
-        let b_ref: &'static [u8; 256] = Box::leak(Box::new(lut_data));
-
-        // identity arrays for CMYK/gray/device_n
+        // Inverting transfer (T[v] = 255 − v) used for all RGB channels; the
+        // identity tables are used for the gray / CMYK / device_n slots that
+        // aren't exercised here.
+        static INV: [u8; 256] = {
+            let mut a = [0u8; 256];
+            let mut i = 0u8;
+            loop {
+                a[i as usize] = 255 - i;
+                if i == 255 {
+                    break;
+                }
+                i += 1;
+            }
+            a
+        };
         static ID: [u8; 256] = {
             let mut a = [0u8; 256];
             let mut i = 0u8;
@@ -192,12 +195,11 @@ mod tests {
         };
 
         let transfer = TransferSet {
-            rgb: [r_ref, g_ref, b_ref],
+            rgb: [&INV, &INV, &INV],
             gray: &ID,
             cmyk: [&ID, &ID, &ID, &ID],
             device_n: &DN,
         };
-        let _ = lut; // suppress unused warning
 
         let pipe = PipeState {
             blend_mode: BlendMode::Normal,
