@@ -845,6 +845,14 @@ pub(super) fn decode_vertex(
 // ── Colour conversion helpers ─────────────────────────────────────────────────
 
 /// Convert a function output (values in `[0, 1]`) to an sRGB triple `[u8; 3]`.
+///
+/// # Tolerance for malformed inputs
+///
+/// - Missing channels (`channels.len() < cs_channel_count(cs)`) default to `0.0`
+///   — encountered with malformed shading functions that return short arrays.
+/// - Values outside `[0, 1]` are clamped by [`gray_to_u8`].
+/// - `NaN` channel values map to `0` (via [`gray_to_u8`]'s float-to-int
+///   saturation).
 pub(super) fn cs_to_rgb(cs: ImageColorSpace, channels: &[f64]) -> [u8; 3] {
     let scale = |i: usize| gray_to_u8(channels.get(i).copied().unwrap_or(0.0));
     match cs {
@@ -936,6 +944,28 @@ mod tests {
         assert_eq!(rgb[0], 255);
         assert_eq!(rgb[1], 0);
         assert!(rgb[2] > 120 && rgb[2] < 135);
+    }
+
+    /// Short channel slices must default missing channels to 0, not panic —
+    /// malformed PDF shading functions sometimes return undersized arrays.
+    #[test]
+    fn cs_to_rgb_short_channel_slice_defaults_to_zero() {
+        assert_eq!(cs_to_rgb(ImageColorSpace::Rgb, &[]), [0, 0, 0]);
+        assert_eq!(cs_to_rgb(ImageColorSpace::Rgb, &[1.0]), [255, 0, 0]);
+        assert_eq!(cs_to_rgb(ImageColorSpace::Gray, &[]), [0, 0, 0]);
+    }
+
+    /// Over-range values are clamped via `gray_to_u8`; NaN saturates to 0.
+    #[test]
+    fn cs_to_rgb_out_of_range_and_nan() {
+        assert_eq!(
+            cs_to_rgb(ImageColorSpace::Rgb, &[2.0, -0.5, 0.5]),
+            [255, 0, 128]
+        );
+        assert_eq!(
+            cs_to_rgb(ImageColorSpace::Rgb, &[f64::NAN, 1.0, 1.0]),
+            [0, 255, 255]
+        );
     }
 
     #[test]

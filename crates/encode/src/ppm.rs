@@ -119,8 +119,11 @@ fn convert_row_to_rgb<P: Pixel>(src: &[u8], dst: &mut [u8], width: usize) {
             }
         }
         PixelMode::Mono1 | PixelMode::Mono8 => {
-            // Guarded in write_ppm; this branch is unreachable.
-            debug_assert!(false, "convert_row_to_rgb: unsupported mono mode");
+            // `write_ppm` rejects mono modes up front, so this branch is
+            // unreachable. Use `unreachable!` (not `debug_assert!`) so the
+            // contract holds in release builds — otherwise a mono row would
+            // silently produce all-black output instead of panicking.
+            unreachable!("convert_row_to_rgb: mono modes are screened by write_ppm");
         }
     }
 }
