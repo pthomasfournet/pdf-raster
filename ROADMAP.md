@@ -223,29 +223,27 @@ workspace; ~700 net lines removed.**
 
 **Known findings deferred for a follow-up release:**
 
-- `PageIter` in the page-iteration path walks every integer from
-  `PageSet::first()` to `PageSet::last()`, probing membership.
-  `PageSet::new([1, u32::MAX])` therefore spins through 4 billion
-  iterations.  Fix shape is a `PageCursor` enum that iterates the
-  `PageSet`'s elements directly when set.
-- The AVX-512 RGB+identity-transfer fast path in AA composition is
-  correctness-preserving but has no byte-equality test against the
-  general path.  A regression that changes one path's rounding could
-  pass unit tests and only be caught by the pixel-diff integration
-  suite.
-- `glyph_advance` does a full FreeType `load_glyph` per text byte for
-  simple fonts, even though PDF §9.2.4 says the font dictionary's
-  `Widths` array is authoritative.  Wiring `FontDescriptor.widths` into
-  the simple-font branch (mirroring the Type 0 path) would eliminate
-  the per-byte `load_glyph`.
-- GPU rotation tests in the deskew path assert `Ok(_)` without
-  comparing pixels against the CPU implementation; an empty `Bitmap`
-  would currently pass.  Needs a `gpu-validation`-gated parity test.
 - The 4-way × 2-mode scaling combinatorics in `raster::image`
-  (8 directional `scale_{mask,image}_*` functions, ~400 LOC of
+  (4 directional `scale_kernel_{y,x}{up,down}` functions, ~220 LOC of
   near-duplicate box-filter code) is a candidate for a generic
   `scale_kernel<XDir, YDir>` once a second resampling kernel
-  (e.g. Lanczos) lands and forces a shared abstraction.
+  (e.g. Lanczos) lands and forces a shared abstraction.  Open audit
+  report: `audit/2026-05-11-scale-kernel-generic-direction.md`.
+
+*(Four earlier deferred items have shipped or were already covered
+in this release: `PageIter` 4-billion-iter spin → fixed by the
+`PageCursor` refactor (`041465a` / `8d9a0b6`) cited above; simple-font
+`glyph_advance` → fixed by the PDF §9.2.4 `Widths`-array headline
+(`ab556d7`) above; GPU rotation pixel parity → already covered by
+`gpu_vs_cpu_rotation_parity` under `gpu-validation` in
+`crates/pdf_raster/src/deskew/rotate.rs:690`, complementing the
+structural `rotate_gpu_preserves_dimensions_or_errors` pin
+(`6f20264`) cited above; AVX-512 fast-path vs general-path
+byte-equality → pinned by
+`fast_path_matches_general_div255_within_one_lsb` in
+`crates/raster/src/pipe/aa.rs`, cross-product corpus of 320 cases
+asserting `|fast - exact| ≤ 1` per byte and verifying the corpus
+actually exercises the 1-LSB divergence.)*
 
 **Verification:** all 689 workspace unit tests pass; clippy clean
 across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
