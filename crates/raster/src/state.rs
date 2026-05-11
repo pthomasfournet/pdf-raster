@@ -29,117 +29,23 @@ use color::TransferLut;
 
 /// Boolean flags packed into a single byte to avoid `struct_excessive_bools`.
 ///
-/// Bit layout (all positions are distinct):
-/// ```text
-/// bit 0 – MULTIPLY_PATTERN_ALPHA
-/// bit 1 – STROKE_ADJUST
-/// bit 2 – DELETE_SOFT_MASK
-/// bit 3 – IN_NON_ISOLATED_GROUP
-/// bit 4 – IN_KNOCKOUT_GROUP
-/// bit 5 – FILL_OVERPRINT
-/// bit 6 – STROKE_OVERPRINT
-/// bit 7 – OVERPRINT_ADDITIVE
-/// ```
+/// Only `DELETE_SOFT_MASK` is currently used (cleared in `clone_for_xobject`).
+/// Reintroduce named bits as concrete consumers appear.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct StateFlags {
     bits: u8,
 }
 
 impl StateFlags {
-    // Each constant occupies a unique bit position (0–7); all eight u8 bits
-    // are consumed, so no two masks can ever overlap.
-    const MULTIPLY_PATTERN_ALPHA: u8 = 1 << 0; // bit 0
-    const STROKE_ADJUST: u8 = 1 << 1; // bit 1
-    const DELETE_SOFT_MASK: u8 = 1 << 2; // bit 2
-    const IN_NON_ISOLATED_GROUP: u8 = 1 << 3; // bit 3
-    const IN_KNOCKOUT_GROUP: u8 = 1 << 4; // bit 4
-    const FILL_OVERPRINT: u8 = 1 << 5; // bit 5
-    const STROKE_OVERPRINT: u8 = 1 << 6; // bit 6
-    const OVERPRINT_ADDITIVE: u8 = 1 << 7; // bit 7
+    const DELETE_SOFT_MASK: u8 = 1 << 2;
 
-    const fn get(self, mask: u8) -> bool {
-        self.bits & mask != 0
-    }
-    const fn set(&mut self, mask: u8, v: bool) {
-        if v {
-            self.bits |= mask;
-        } else {
-            self.bits &= !mask;
-        }
-    }
-
-    /// Returns `true` if pattern alpha should be multiplied into the stroke/fill alpha.
-    #[must_use]
-    pub const fn multiply_pattern_alpha(self) -> bool {
-        self.get(Self::MULTIPLY_PATTERN_ALPHA)
-    }
-    /// Returns `true` if stroke adjustment (pixel-grid hinting for thin lines) is enabled.
-    #[must_use]
-    pub const fn stroke_adjust(self) -> bool {
-        self.get(Self::STROKE_ADJUST)
-    }
-    /// Returns `true` if the soft mask should be deleted on the next state restore.
-    #[must_use]
-    pub const fn delete_soft_mask(self) -> bool {
-        self.get(Self::DELETE_SOFT_MASK)
-    }
-    /// Returns `true` if rendering is currently inside a non-isolated transparency group.
-    #[must_use]
-    pub const fn in_non_isolated_group(self) -> bool {
-        self.get(Self::IN_NON_ISOLATED_GROUP)
-    }
-    /// Returns `true` if rendering is currently inside a knockout transparency group.
-    #[must_use]
-    pub const fn in_knockout_group(self) -> bool {
-        self.get(Self::IN_KNOCKOUT_GROUP)
-    }
-    /// Returns `true` if fill overprinting is enabled for the current state.
-    #[must_use]
-    pub const fn fill_overprint(self) -> bool {
-        self.get(Self::FILL_OVERPRINT)
-    }
-    /// Returns `true` if stroke overprinting is enabled for the current state.
-    #[must_use]
-    pub const fn stroke_overprint(self) -> bool {
-        self.get(Self::STROKE_OVERPRINT)
-    }
-    /// Returns `true` if overprinting uses additive (rather than subtractive) compositing.
-    #[must_use]
-    pub const fn overprint_additive(self) -> bool {
-        self.get(Self::OVERPRINT_ADDITIVE)
-    }
-
-    /// Sets whether pattern alpha should be multiplied into the stroke/fill alpha.
-    pub const fn set_multiply_pattern_alpha(&mut self, v: bool) {
-        self.set(Self::MULTIPLY_PATTERN_ALPHA, v);
-    }
-    /// Sets whether stroke adjustment (pixel-grid hinting for thin lines) is active.
-    pub const fn set_stroke_adjust(&mut self, v: bool) {
-        self.set(Self::STROKE_ADJUST, v);
-    }
     /// Sets whether the soft mask should be deleted on the next state restore.
     pub const fn set_delete_soft_mask(&mut self, v: bool) {
-        self.set(Self::DELETE_SOFT_MASK, v);
-    }
-    /// Sets whether rendering is inside a non-isolated transparency group.
-    pub const fn set_in_non_isolated_group(&mut self, v: bool) {
-        self.set(Self::IN_NON_ISOLATED_GROUP, v);
-    }
-    /// Sets whether rendering is inside a knockout transparency group.
-    pub const fn set_in_knockout_group(&mut self, v: bool) {
-        self.set(Self::IN_KNOCKOUT_GROUP, v);
-    }
-    /// Sets whether fill overprinting is enabled.
-    pub const fn set_fill_overprint(&mut self, v: bool) {
-        self.set(Self::FILL_OVERPRINT, v);
-    }
-    /// Sets whether stroke overprinting is enabled.
-    pub const fn set_stroke_overprint(&mut self, v: bool) {
-        self.set(Self::STROKE_OVERPRINT, v);
-    }
-    /// Sets whether overprinting uses additive compositing.
-    pub const fn set_overprint_additive(&mut self, v: bool) {
-        self.set(Self::OVERPRINT_ADDITIVE, v);
+        if v {
+            self.bits |= Self::DELETE_SOFT_MASK;
+        } else {
+            self.bits &= !Self::DELETE_SOFT_MASK;
+        }
     }
 }
 
@@ -207,50 +113,6 @@ pub struct GraphicsState {
 
     /// Boolean flags (replaces individual bool fields to satisfy `struct_excessive_bools`).
     pub flags: StateFlags,
-}
-
-// Convenience accessors mirroring the old public bool fields.
-impl GraphicsState {
-    /// Returns `true` if pattern alpha should be multiplied into the stroke/fill alpha.
-    #[must_use]
-    pub const fn multiply_pattern_alpha(&self) -> bool {
-        self.flags.multiply_pattern_alpha()
-    }
-    /// Returns `true` if stroke adjustment (pixel-grid hinting for thin lines) is enabled.
-    #[must_use]
-    pub const fn stroke_adjust(&self) -> bool {
-        self.flags.stroke_adjust()
-    }
-    /// Returns `true` if the soft mask should be deleted on the next state restore.
-    #[must_use]
-    pub const fn delete_soft_mask(&self) -> bool {
-        self.flags.delete_soft_mask()
-    }
-    /// Returns `true` if rendering is currently inside a non-isolated transparency group.
-    #[must_use]
-    pub const fn in_non_isolated_group(&self) -> bool {
-        self.flags.in_non_isolated_group()
-    }
-    /// Returns `true` if rendering is currently inside a knockout transparency group.
-    #[must_use]
-    pub const fn in_knockout_group(&self) -> bool {
-        self.flags.in_knockout_group()
-    }
-    /// Returns `true` if fill overprinting is enabled for the current state.
-    #[must_use]
-    pub const fn fill_overprint(&self) -> bool {
-        self.flags.fill_overprint()
-    }
-    /// Returns `true` if stroke overprinting is enabled for the current state.
-    #[must_use]
-    pub const fn stroke_overprint(&self) -> bool {
-        self.flags.stroke_overprint()
-    }
-    /// Returns `true` if overprinting uses additive (rather than subtractive) compositing.
-    #[must_use]
-    pub const fn overprint_additive(&self) -> bool {
-        self.flags.overprint_additive()
-    }
 }
 
 impl GraphicsState {
@@ -685,33 +547,6 @@ mod tests {
         for i in 0u8..=255 {
             assert_eq!(s.cmyk_transfer[0].apply(i), i, "cmyk C[{i}]");
         }
-    }
-
-    /// All eight `StateFlags` bit-mask constants must be distinct powers of two
-    /// that together cover all 8 bits of a `u8`.
-    #[test]
-    fn state_flags_bit_positions_are_distinct() {
-        let masks = [
-            StateFlags::MULTIPLY_PATTERN_ALPHA,
-            StateFlags::STROKE_ADJUST,
-            StateFlags::DELETE_SOFT_MASK,
-            StateFlags::IN_NON_ISOLATED_GROUP,
-            StateFlags::IN_KNOCKOUT_GROUP,
-            StateFlags::FILL_OVERPRINT,
-            StateFlags::STROKE_OVERPRINT,
-            StateFlags::OVERPRINT_ADDITIVE,
-        ];
-        // All distinct
-        for (i, a) in masks.iter().enumerate() {
-            for (j, b) in masks.iter().enumerate() {
-                if i != j {
-                    assert_eq!(a & b, 0, "masks[{i}] and masks[{j}] share a bit");
-                }
-            }
-        }
-        // Together they cover all 8 bits
-        let union: u8 = masks.iter().fold(0, |acc, m| acc | m);
-        assert_eq!(union, 0xFF, "not all 8 bits are covered");
     }
 
     /// In debug builds, constructing a GraphicsState with zero width must panic.
