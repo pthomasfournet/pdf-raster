@@ -5,6 +5,7 @@ use super::super::gstate::{ctm_multiply, ctm_transform};
 use super::{MAX_PATTERN_DEPTH, MAX_TILE_PX, PageRenderer, components_to_color};
 use crate::resources::{ColorSpace, PageResources};
 use color::Rgb8;
+use pdf::Document;
 use raster::{Bitmap, TiledPattern};
 
 /// Resolve an uncoloured-tiling-pattern tint to a [`RasterColor`].
@@ -15,10 +16,10 @@ use raster::{Bitmap, TiledPattern};
 /// convert through `b`; otherwise we fall back to the legacy component-count
 /// heuristic (1 → Gray, 3 → RGB, 4 → CMYK) — handles malformed PDFs that
 /// skip the base or set `cs /Pattern` bare.
-fn resolve_pattern_tint(fill_cs: &ColorSpace, components: &[f64]) -> RasterColor {
+fn resolve_pattern_tint(doc: &Document, fill_cs: &ColorSpace, components: &[f64]) -> RasterColor {
     if let ColorSpace::Pattern { base: Some(base) } = fill_cs {
         if components.len() == base.ncomponents() {
-            return RasterColor::from_bytes(base.convert_to_rgb(components));
+            return RasterColor::from_bytes(base.convert_to_rgb(doc, components));
         }
         log::debug!(
             "pdf_interp: pattern tint comp count {} mismatches base CS expected {} — using heuristic",
@@ -67,6 +68,7 @@ impl PageRenderer<'_> {
         // base or use a bare `/Pattern` cs.
         let tint = if desc.paint_type == 2 && !gs.fill_pattern_components.is_empty() {
             Some(resolve_pattern_tint(
+                self.resources.doc(),
                 &gs.fill_color_space,
                 &gs.fill_pattern_components,
             ))
@@ -197,16 +199,18 @@ impl PageRenderer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::empty_doc;
 
     #[test]
     fn pattern_tint_devicergb_base_passes_through() {
         // Verifies the DeviceRGB base path doesn't regress vs the heuristic.
         // The Lab test below proves the new path is actually taken (since
         // the heuristic would mis-interpret a Lab tint as RGB).
+        let doc = empty_doc();
         let fill_cs = ColorSpace::Pattern {
             base: Some(Box::new(ColorSpace::DeviceRgb)),
         };
-        let tint = resolve_pattern_tint(&fill_cs, &[1.0, 0.0, 0.0]);
+        let tint = resolve_pattern_tint(&doc, &fill_cs, &[1.0, 0.0, 0.0]);
         assert_eq!(tint.as_slice(), &[255, 0, 0]);
     }
 
@@ -214,10 +218,11 @@ mod tests {
     fn pattern_tint_lab_base_routes_through_lab_conversion() {
         // Three-component tint that the heuristic would interpret as RGB,
         // but Lab interprets very differently.  L=50,a=0,b=0 ≈ mid-grey.
+        let doc = empty_doc();
         let fill_cs = ColorSpace::Pattern {
             base: Some(Box::new(ColorSpace::Lab { dict_id: None })),
         };
-        let tint = resolve_pattern_tint(&fill_cs, &[50.0, 0.0, 0.0]);
+        let tint = resolve_pattern_tint(&doc, &fill_cs, &[50.0, 0.0, 0.0]);
         // sRGB-encoded mid-grey from L*=50 is ~119 (gamma-correct).
         let &[r, g, b] = tint.as_slice() else {
             panic!("RasterColor must produce a 3-byte slice");
@@ -231,8 +236,9 @@ mod tests {
     #[test]
     fn pattern_tint_falls_back_when_no_base() {
         // No base on the Pattern (malformed PDF) → heuristic path.
+        let doc = empty_doc();
         let fill_cs = ColorSpace::Pattern { base: None };
-        let tint = resolve_pattern_tint(&fill_cs, &[0.5, 0.5, 0.5]);
+        let tint = resolve_pattern_tint(&doc, &fill_cs, &[0.5, 0.5, 0.5]);
         // components_to_color heuristic: 3 components → RGB(0.5, 0.5, 0.5).
         assert_eq!(tint.as_slice(), &[128, 128, 128]);
     }
@@ -240,30 +246,33 @@ mod tests {
     #[test]
     fn pattern_tint_falls_back_on_count_mismatch() {
         // Base says RGB (3 components) but caller supplies 1 → heuristic.
+        let doc = empty_doc();
         let fill_cs = ColorSpace::Pattern {
             base: Some(Box::new(ColorSpace::DeviceRgb)),
         };
-        let tint = resolve_pattern_tint(&fill_cs, &[0.5]);
+        let tint = resolve_pattern_tint(&doc, &fill_cs, &[0.5]);
         // Heuristic: 1 component → Gray(0.5) = mid-grey.
         assert_eq!(tint.as_slice(), &[128, 128, 128]);
     }
 
     #[test]
     fn pattern_tint_devicegray_base_one_component() {
+        let doc = empty_doc();
         let fill_cs = ColorSpace::Pattern {
             base: Some(Box::new(ColorSpace::DeviceGray)),
         };
-        let tint = resolve_pattern_tint(&fill_cs, &[1.0]);
+        let tint = resolve_pattern_tint(&doc, &fill_cs, &[1.0]);
         assert_eq!(tint.as_slice(), &[255, 255, 255]);
     }
 
     #[test]
     fn pattern_tint_devicecmyk_base_four_components() {
+        let doc = empty_doc();
         let fill_cs = ColorSpace::Pattern {
             base: Some(Box::new(ColorSpace::DeviceCmyk)),
         };
         // (0,0,0,1) = full black.
-        let tint = resolve_pattern_tint(&fill_cs, &[0.0, 0.0, 0.0, 1.0]);
+        let tint = resolve_pattern_tint(&doc, &fill_cs, &[0.0, 0.0, 0.0, 1.0]);
         assert_eq!(tint.as_slice(), &[0, 0, 0]);
     }
 }

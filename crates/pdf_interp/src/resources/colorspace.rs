@@ -150,6 +150,11 @@ impl ColorSpace {
     /// `comps` must have exactly [`ncomponents`](Self::ncomponents)
     /// elements; any mismatch falls back to opaque black.
     ///
+    /// `doc` is required so the conversion can dereference lazy
+    /// `ObjectId` fields on parameterised variants (ICC profile streams,
+    /// Separation/DeviceN tint functions, Indexed palette lookups).
+    /// Pass the page's document; the borrow is read-only.
+    ///
     /// # Variant behaviour
     ///
     /// - `DeviceGray/Rgb/Cmyk`: direct conversion via the existing
@@ -169,7 +174,8 @@ impl ColorSpace {
     /// - `Separation` / `DeviceN`: per current image-pipeline policy,
     ///   approximate as gray with `1 - tint[0]` (tint 0 = full ink = dark).
     #[must_use]
-    pub fn convert_to_rgb(&self, comps: &[f64]) -> [u8; 3] {
+    pub fn convert_to_rgb(&self, doc: &Document, comps: &[f64]) -> [u8; 3] {
+        let _ = doc; // unused at present; future variants will dereference lazy IDs.
         if comps.len() != self.ncomponents() {
             log::debug!(
                 "colorspace: {:?} expects {} components, got {}",
@@ -686,55 +692,63 @@ mod tests {
 
     #[test]
     fn convert_devicegray_full_range() {
-        assert_eq!(ColorSpace::DeviceGray.convert_to_rgb(&[0.0]), [0, 0, 0]);
+        let doc = empty_doc();
         assert_eq!(
-            ColorSpace::DeviceGray.convert_to_rgb(&[1.0]),
+            ColorSpace::DeviceGray.convert_to_rgb(&doc, &[0.0]),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            ColorSpace::DeviceGray.convert_to_rgb(&doc, &[1.0]),
             [255, 255, 255],
         );
         assert_eq!(
-            ColorSpace::DeviceGray.convert_to_rgb(&[0.5]),
+            ColorSpace::DeviceGray.convert_to_rgb(&doc, &[0.5]),
             [128, 128, 128], // gray_to_u8 rounds 0.5*255 = 127.5 → 128
         );
     }
 
     #[test]
     fn convert_devicergb_passes_through() {
+        let doc = empty_doc();
         assert_eq!(
-            ColorSpace::DeviceRgb.convert_to_rgb(&[1.0, 0.0, 0.0]),
+            ColorSpace::DeviceRgb.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]),
             [255, 0, 0],
         );
         assert_eq!(
-            ColorSpace::DeviceRgb.convert_to_rgb(&[0.0, 1.0, 0.0]),
+            ColorSpace::DeviceRgb.convert_to_rgb(&doc, &[0.0, 1.0, 0.0]),
             [0, 255, 0],
         );
     }
 
     #[test]
     fn convert_devicecmyk_uses_naive_conversion() {
+        let doc = empty_doc();
         // (0, 0, 0, 0) = white in CMYK.
         assert_eq!(
-            ColorSpace::DeviceCmyk.convert_to_rgb(&[0.0, 0.0, 0.0, 0.0]),
+            ColorSpace::DeviceCmyk.convert_to_rgb(&doc, &[0.0, 0.0, 0.0, 0.0]),
             [255, 255, 255],
         );
         // (1, 1, 1, 1) = black.
         assert_eq!(
-            ColorSpace::DeviceCmyk.convert_to_rgb(&[1.0, 1.0, 1.0, 1.0]),
+            ColorSpace::DeviceCmyk.convert_to_rgb(&doc, &[1.0, 1.0, 1.0, 1.0]),
             [0, 0, 0],
         );
     }
 
     #[test]
     fn convert_lab_black_is_black() {
+        let doc = empty_doc();
         // L*=0 ≡ black; a*/b* irrelevant.
-        let black = ColorSpace::Lab { dict_id: None }.convert_to_rgb(&[0.0, 0.0, 0.0]);
+        let black = ColorSpace::Lab { dict_id: None }.convert_to_rgb(&doc, &[0.0, 0.0, 0.0]);
         assert_eq!(black, [0, 0, 0]);
     }
 
     #[test]
     fn convert_lab_white_is_white() {
+        let doc = empty_doc();
         // L*=100, a*=b*=0 ≡ D65 white.  sRGB encoding may not be exactly 255
         // due to floating-point rounding; allow ±2 LSB.
-        let [r, g, b] = ColorSpace::Lab { dict_id: None }.convert_to_rgb(&[100.0, 0.0, 0.0]);
+        let [r, g, b] = ColorSpace::Lab { dict_id: None }.convert_to_rgb(&doc, &[100.0, 0.0, 0.0]);
         assert!(
             r >= 253 && g >= 253 && b >= 253,
             "expected ~white, got [{r},{g},{b}]"
@@ -743,6 +757,7 @@ mod tests {
 
     #[test]
     fn convert_iccbased_falls_back_by_n() {
+        let doc = empty_doc();
         let icc1 = ColorSpace::IccBased {
             n: 1,
             stream_id: None,
@@ -755,38 +770,44 @@ mod tests {
             n: 4,
             stream_id: None,
         };
-        assert_eq!(icc1.convert_to_rgb(&[1.0]), [255, 255, 255]);
-        assert_eq!(icc3.convert_to_rgb(&[1.0, 0.0, 0.0]), [255, 0, 0]);
-        assert_eq!(icc4.convert_to_rgb(&[0.0, 0.0, 0.0, 1.0]), [0, 0, 0]);
+        assert_eq!(icc1.convert_to_rgb(&doc, &[1.0]), [255, 255, 255]);
+        assert_eq!(icc3.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]), [255, 0, 0]);
+        assert_eq!(icc4.convert_to_rgb(&doc, &[0.0, 0.0, 0.0, 1.0]), [0, 0, 0]);
     }
 
     #[test]
     fn convert_separation_inverts_tint_as_gray() {
+        let doc = empty_doc();
         // Image-pipeline policy: tint 0 = full ink = dark.
         let sep = ColorSpace::Separation {
             alternate: Box::new(ColorSpace::DeviceCmyk),
             tint_dict_id: None,
         };
-        assert_eq!(sep.convert_to_rgb(&[0.0]), [255, 255, 255]); // no ink
-        assert_eq!(sep.convert_to_rgb(&[1.0]), [0, 0, 0]); // full ink
+        assert_eq!(sep.convert_to_rgb(&doc, &[0.0]), [255, 255, 255]); // no ink
+        assert_eq!(sep.convert_to_rgb(&doc, &[1.0]), [0, 0, 0]); // full ink
     }
 
     #[test]
     fn convert_wrong_component_count_falls_back_to_black() {
+        let doc = empty_doc();
         // DeviceRgb wants 3 components; passing 1 must not panic.
-        assert_eq!(ColorSpace::DeviceRgb.convert_to_rgb(&[0.5]), [0, 0, 0]);
-        assert_eq!(ColorSpace::DeviceGray.convert_to_rgb(&[]), [0, 0, 0]);
         assert_eq!(
-            ColorSpace::DeviceCmyk.convert_to_rgb(&[0.5, 0.5]),
+            ColorSpace::DeviceRgb.convert_to_rgb(&doc, &[0.5]),
+            [0, 0, 0]
+        );
+        assert_eq!(ColorSpace::DeviceGray.convert_to_rgb(&doc, &[]), [0, 0, 0]);
+        assert_eq!(
+            ColorSpace::DeviceCmyk.convert_to_rgb(&doc, &[0.5, 0.5]),
             [0, 0, 0],
         );
     }
 
     #[test]
     fn convert_pattern_returns_black() {
+        let doc = empty_doc();
         // Pattern is never directly convertible to RGB.
         assert_eq!(
-            ColorSpace::Pattern { base: None }.convert_to_rgb(&[]),
+            ColorSpace::Pattern { base: None }.convert_to_rgb(&doc, &[]),
             [0, 0, 0],
         );
     }
