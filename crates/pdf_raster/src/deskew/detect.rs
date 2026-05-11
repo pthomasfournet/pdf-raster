@@ -266,6 +266,10 @@ mod tests {
 
     /// Tiny image below the minimum size returns 0.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "find_skew_deg returns the literal 0.0 sentinel for sub-minimum images; epsilon would mask a regression where it accidentally returned an actual computed angle"
+    )]
     fn tiny_image_returns_zero() {
         let img = Bitmap::<Gray8>::new(4, 4, 1, false);
         assert_eq!(find_skew_deg(&img), 0.0);

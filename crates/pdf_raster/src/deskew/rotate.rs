@@ -441,8 +441,12 @@ mod tests {
         // Write a checkerboard pattern.
         for y in 0..64u32 {
             let row = src.row_bytes_mut(y);
-            for x in 0..64usize {
-                row[x] = if (x + y as usize) % 2 == 0 { 0 } else { 128 };
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = if (x + y as usize).is_multiple_of(2) {
+                    0
+                } else {
+                    128
+                };
             }
         }
         let rotated = rotate_cpu(&src, 0.0);
@@ -465,8 +469,15 @@ mod tests {
         let mut src = Bitmap::<Gray8>::new(64, 64, 1, false);
         for y in 0..64u32 {
             let row = src.row_bytes_mut(y);
-            for x in 0..64usize {
-                row[x] = ((x * 4) % 256) as u8;
+            for (x, px) in row.iter_mut().enumerate() {
+                // x ≤ 63 so x * 4 ≤ 252; well below u8::MAX, no truncation.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "x ≤ 63 so x * 4 ≤ 252 < 256; fits u8 trivially"
+                )]
+                {
+                    *px = (x * 4) as u8;
+                }
             }
         }
         let rotated = rotate_cpu(&src, 360.0);
@@ -476,7 +487,7 @@ mod tests {
             let sr = &src.row_bytes(y)[4..60];
             let dr = &rotated.row_bytes(y)[4..60];
             for (&a, &b) in sr.iter().zip(dr.iter()) {
-                max_diff = max_diff.max((a as i32 - b as i32).abs());
+                max_diff = max_diff.max((i32::from(a) - i32::from(b)).abs());
             }
         }
         assert!(max_diff <= 2, "360° rotation max diff {max_diff} > 2");
@@ -539,6 +550,55 @@ mod tests {
         assert!(max_diff <= 2, "GPU 0° rotation max diff {max_diff} > 2");
     }
 
+    /// Structural shape test for `rotate_gpu` — runs without a CUDA device.
+    ///
+    /// On a no-GPU machine, `rotate_gpu` returns `Err`; on a GPU machine it
+    /// returns `Ok` with a bitmap matching the source dimensions.  This test
+    /// accepts both outcomes but verifies the dimensions when the call
+    /// succeeds.
+    ///
+    /// Pins the four whole-function-body replacement mutants
+    /// (`Ok(Bitmap::new())`, `Ok(Bitmap::from_iter(...))`, etc.) that
+    /// otherwise survive: each substitutes an empty / default Bitmap with
+    /// dimensions ≠ source, which the size assertion catches even without
+    /// a CUDA device. Pixel-content parity is covered by
+    /// `gpu_vs_cpu_rotation_parity` under the `gpu-validation` gate.
+    #[test]
+    #[cfg(feature = "gpu-deskew")]
+    fn rotate_gpu_preserves_dimensions_or_errors() {
+        let mut src = Bitmap::<Gray8>::new(64, 64, 1, false);
+        for y in 0..64u32 {
+            let row = src.row_bytes_mut(y);
+            for (x, px) in row.iter_mut().enumerate() {
+                // x + y < 128, fits u8 trivially; bytemuck-equivalent cast.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "x ≤ 63 and y ≤ 63 so x + y ≤ 126; well below u8::MAX"
+                )]
+                {
+                    *px = (x + y as usize) as u8;
+                }
+            }
+        }
+        // No CUDA device → Err is the expected outcome; only the Ok arm needs
+        // assertions (and is where cargo-mutants exercises rotate_gpu).
+        if let Ok(out) = rotate_gpu(&src, 1.0) {
+            assert_eq!(
+                out.width, src.width,
+                "rotate_gpu must return a bitmap with the source width"
+            );
+            assert_eq!(
+                out.height, src.height,
+                "rotate_gpu must return a bitmap with the source height"
+            );
+            assert_eq!(
+                out.data().len(),
+                (src.width as usize) * (src.height as usize),
+                "rotate_gpu output buffer must have width*height bytes (tightly packed)"
+            );
+        }
+    }
+
     /// Timing smoke-test: `rotate_cpu` on an 8.4 MP image (2900×2900) should
     /// complete in < 5 ms on modern hardware.  The test always passes — the time
     /// is printed for manual inspection.  Run with `--nocapture` to see it.
@@ -555,7 +615,14 @@ mod tests {
         for y in 0..h {
             let row = src.row_bytes_mut(y);
             for (x, px) in row.iter_mut().enumerate() {
-                *px = ((x + y as usize * 3) % 256) as u8;
+                // % 256 keeps the value in [0, 255]; cast is exact.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "modulo 256 keeps the value in [0, u8::MAX]; cast is exact"
+                )]
+                {
+                    *px = ((x + y as usize * 3) % 256) as u8;
+                }
             }
         }
 
