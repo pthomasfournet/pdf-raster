@@ -1336,24 +1336,24 @@ impl<'doc> PageRenderer<'doc> {
         // skips the image cleanly instead of letting the safe slice index
         // below panic in the inner loop.  One CMP per image; well below
         // noise.
-        let expected_len = img_width_usize
-            .checked_mul(img.height as usize)
-            .and_then(|n| n.checked_mul(img.color_space.bytes_per_pixel()));
-        let Some(expected_len) = expected_len else {
-            log::warn!(
-                "blit_image: image dimensions overflow usize ({}×{}×{} bpp) — skipping",
-                img.width,
-                img.height,
-                img.color_space.bytes_per_pixel(),
-            );
-            return;
-        };
-        if img_bytes.len() < expected_len {
-            log::warn!(
-                "blit_image: decoder produced short buffer ({} bytes, expected {expected_len}) — skipping",
-                img_bytes.len(),
-            );
-            return;
+        let bpp = img.color_space.bytes_per_pixel();
+        match check_image_bytes_len(img.width, img.height, bpp, img_bytes.len()) {
+            Ok(_) => {}
+            Err(ImageLenError::DimensionOverflow) => {
+                log::warn!(
+                    "blit_image: image dimensions overflow usize ({}×{}×{bpp} bpp) — skipping",
+                    img.width,
+                    img.height,
+                );
+                return;
+            }
+            Err(ImageLenError::ShortBuffer { expected }) => {
+                log::warn!(
+                    "blit_image: decoder produced short buffer ({} bytes, expected {expected}) — skipping",
+                    img_bytes.len(),
+                );
+                return;
+            }
         }
 
         let data = self.bitmap.data_mut();
@@ -1673,6 +1673,35 @@ const fn int_to_join(v: i32) -> LineJoin {
     }
 }
 
+/// Reason `blit_image`'s decoder-contract check rejected an image.
+#[derive(Debug, PartialEq, Eq)]
+enum ImageLenError {
+    /// `width × height × bpp` overflows `usize`.
+    DimensionOverflow,
+    /// Buffer is shorter than the declared dimensions require.
+    ShortBuffer { expected: usize },
+}
+
+/// Validates the decoder contract `actual_len >= width × height × bpp` and
+/// returns the expected length on success.  Pulled out of `blit_image` so the
+/// two guard branches (overflow, short buffer) are unit-testable without
+/// constructing a `PageRenderer`.
+fn check_image_bytes_len(
+    width: u32,
+    height: u32,
+    bpp: usize,
+    actual_len: usize,
+) -> Result<usize, ImageLenError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp))
+        .ok_or(ImageLenError::DimensionOverflow)?;
+    if actual_len < expected {
+        return Err(ImageLenError::ShortBuffer { expected });
+    }
+    Ok(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1713,5 +1742,42 @@ mod tests {
     fn suggested_dpi_none_when_no_images() {
         let diag = PageDiagnostics::default(); // source_ppi_hint is None
         assert_eq!(diag.suggested_dpi(150.0, 300.0), None);
+    }
+
+    // ── check_image_bytes_len ──────────────────────────────────────────────
+
+    #[test]
+    fn check_image_bytes_len_accepts_exact() {
+        // 2 × 2 × Rgb (bpp=3) → expected 12 bytes.
+        assert_eq!(check_image_bytes_len(2, 2, 3, 12), Ok(12));
+    }
+
+    #[test]
+    fn check_image_bytes_len_accepts_over_long_buffer() {
+        // Over-long buffers are fine — only short buffers are rejected.
+        assert_eq!(check_image_bytes_len(2, 2, 3, 15), Ok(12));
+    }
+
+    #[test]
+    fn check_image_bytes_len_rejects_short_buffer() {
+        assert_eq!(
+            check_image_bytes_len(2, 2, 3, 6),
+            Err(ImageLenError::ShortBuffer { expected: 12 }),
+        );
+    }
+
+    #[test]
+    fn check_image_bytes_len_rejects_dimension_overflow() {
+        // u32::MAX × u32::MAX × 3 overflows usize on 64-bit targets.
+        assert_eq!(
+            check_image_bytes_len(u32::MAX, u32::MAX, 3, 0),
+            Err(ImageLenError::DimensionOverflow),
+        );
+    }
+
+    #[test]
+    fn check_image_bytes_len_one_by_one_gray() {
+        // 1 × 1 × Gray (bpp=1) → expected 1 byte.
+        assert_eq!(check_image_bytes_len(1, 1, 1, 1), Ok(1));
     }
 }
