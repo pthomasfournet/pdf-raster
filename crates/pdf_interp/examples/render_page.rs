@@ -1,6 +1,10 @@
 //! Render a single PDF page to a PPM file using the native render stack.
 //!
-//! Usage: cargo run -p pdf_interp --example render_page -- <pdf> [page] [dpi] [out.ppm]
+//! Usage: `cargo run -p pdf_interp --example render_page -- <pdf> [page] [dpi] [out.ppm]`
+
+/// Maximum pixel dimension per axis.  Matches `pdf_raster::MAX_PX_DIMENSION`;
+/// the example doesn't depend on that crate so the value is duplicated here.
+const MAX_PX: f64 = 32_768.0;
 
 fn main() {
     let _ = env_logger::try_init();
@@ -17,7 +21,10 @@ fn main() {
         .next()
         .unwrap_or_else(|| "/tmp/render_out.ppm".to_string());
 
-    let doc = pdf_interp::open(&pdf).expect("open PDF");
+    let doc = pdf_interp::open(&pdf).unwrap_or_else(|e| {
+        eprintln!("error: failed to open {pdf}: {e}");
+        std::process::exit(1);
+    });
     let total = pdf_interp::page_count(&doc);
     println!("Opened {pdf}: {total} pages");
 
@@ -40,12 +47,29 @@ fn main() {
     );
 
     let scale = dpi / 72.0;
-    let w = (geom.width_pts * scale).round() as u32;
-    let h = (geom.height_pts * scale).round() as u32;
-    if w == 0 || h == 0 {
-        eprintln!("error: page {page} has degenerate dimensions ({w}×{h} px at {dpi} dpi)");
+    // Bound the dimensions before `as u32` so a malformed PageGeometry or an
+    // extreme DPI can't silently saturate to u32::MAX.
+    let w_f = (geom.width_pts * scale).round();
+    let h_f = (geom.height_pts * scale).round();
+    if !w_f.is_finite()
+        || !h_f.is_finite()
+        || w_f <= 0.0
+        || h_f <= 0.0
+        || w_f > MAX_PX
+        || h_f > MAX_PX
+    {
+        eprintln!(
+            "error: page {page} dimensions out of range ({w_f}×{h_f} px at {dpi} dpi; \
+             max {MAX_PX} per axis)"
+        );
         std::process::exit(1);
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounds-checked above: w_f and h_f are finite, > 0, <= MAX_PX (32768)"
+    )]
+    let (w, h) = (w_f as u32, h_f as u32);
 
     let ops = pdf_interp::parse_page(&doc, page).unwrap_or_else(|e| {
         eprintln!("error: failed to parse page {page}: {e}");

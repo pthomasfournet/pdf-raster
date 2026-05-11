@@ -6,10 +6,16 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "tests/fixtures/input.pdf".to_string());
-    let doc = pdf_interp::open(&path).expect("open");
+    let doc = pdf_interp::open(&path).unwrap_or_else(|e| {
+        eprintln!("error: failed to open {path}: {e}");
+        std::process::exit(1);
+    });
     let total = pdf_interp::page_count(&doc);
     println!("Pages: {total}");
-    let ops = pdf_interp::parse_page(&doc, 1).expect("parse page 1");
+    let ops = pdf_interp::parse_page(&doc, 1).unwrap_or_else(|e| {
+        eprintln!("error: failed to parse page 1: {e}");
+        std::process::exit(1);
+    });
     println!("Page 1: {} operators", ops.len());
     for op in ops.iter().take(20) {
         println!("  {op:?}");

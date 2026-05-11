@@ -6,10 +6,16 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "tests/fixtures/input.pdf".to_string());
-    let doc = pdf_interp::open(&path).unwrap();
+    let doc = pdf_interp::open(&path).unwrap_or_else(|e| {
+        eprintln!("error: failed to open {path}: {e}");
+        std::process::exit(1);
+    });
     let n = pdf_interp::page_count(&doc);
     for p in 1..=n {
-        let ops = pdf_interp::parse_page(&doc, p).unwrap();
+        let ops = pdf_interp::parse_page(&doc, p).unwrap_or_else(|e| {
+            eprintln!("error: failed to parse page {p}: {e}");
+            std::process::exit(1);
+        });
         let dark_fills: Vec<_> = ops
             .iter()
             .filter(|o| {
