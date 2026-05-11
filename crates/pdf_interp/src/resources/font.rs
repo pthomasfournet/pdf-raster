@@ -242,16 +242,10 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
 /// `FontDescriptor` sub-dict, not the parent font dict — this helper handles
 /// the indirect-reference resolution that `extract_widths` does not need.
 fn extract_missing_width(doc: &Document, dict: &Dictionary) -> i32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "PDF glyph advance widths are always in [0, 4096]; safe to cast to i32"
-    )]
-    {
-        resolve_fd(doc, dict)
-            .as_ref()
-            .and_then(|fd| fd.get_i64(b"MissingWidth"))
-            .map_or(0, |v| v as i32)
-    }
+    resolve_fd(doc, dict)
+        .as_ref()
+        .and_then(|fd| fd.get_i64(b"MissingWidth"))
+        .map_or(0, pdf_width_to_i32)
 }
 
 // ── Kind classification ───────────────────────────────────────────────────────
@@ -327,6 +321,28 @@ fn read_stream(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<Vec<u8>>
 
 // ── Advance-width extraction ──────────────────────────────────────────────────
 
+/// Clamp a PDF integer width value to `i32`, saturating on overflow.
+///
+/// PDF advance-width values come from adversarial input and are not bound
+/// by the spec to any particular range; the `Widths` array is `[i64]` at the
+/// lopdf layer.  Real font widths sit in `[0, 4096]` (thousandths-of-em, font
+/// sizes never exceed 1000em in practice), so any i64 that fits in i32 is the
+/// real answer.  Out-of-range values are pathological and we clamp instead of
+/// wrapping with `as i32` — a malformed `MissingWidth: i64::MIN` would
+/// otherwise silently propagate to text-matrix arithmetic.
+///
+/// Used by every PDF-width parse site: `Widths` array elements, `MissingWidth`,
+/// `DW` (Type 0 default width), and Type 0 `W` array entries.
+#[must_use]
+pub(crate) fn pdf_width_to_i32(v: i64) -> i32 {
+    match i32::try_from(v) {
+        Ok(w) => w,
+        // Saturation direction depends on the sign of the overflow; v < 0 ⇒ underflow.
+        Err(_) if v < 0 => i32::MIN,
+        Err(_) => i32::MAX,
+    }
+}
+
 /// Extract `(FirstChar, Widths[])` from the font dict.
 ///
 /// Returns `(0, vec![])` if either key is absent.
@@ -341,16 +357,12 @@ fn extract_widths(dict: &Dictionary) -> (u32, Vec<i32>) {
         .filter(|&v| v >= 0)
         .map_or(0u32, |v| v as u32);
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "PDF glyph advance widths are always in [0, 4096]; safe to cast to i32"
-    )]
     let widths = dict
         .get(b"Widths")
         .and_then(Object::as_array)
         .map(|arr| {
             arr.iter()
-                .map(|o| o.as_i64().map_or(0, |v| v as i32))
+                .map(|o| o.as_i64().map_or(0, pdf_width_to_i32))
                 .collect()
         })
         .unwrap_or_default();
@@ -752,11 +764,7 @@ fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32
 /// `[first_cid, [w0, w1, …]]` (the `c [w...]` variant only; the `c1 c2 w`
 /// range variant is also handled).
 fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "DW is a glyph advance in design units, always small; safe to i32"
-    )]
-    let dw = dict.get_i64(b"DW").map_or(1000, |v| v as i32);
+    let dw = dict.get_i64(b"DW").map_or(1000, pdf_width_to_i32);
 
     let Some(w_arr) = dict.get(b"W").and_then(Object::as_array) else {
         return (dw, vec![]);
@@ -791,13 +799,9 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
         match &w_arr[i] {
             // `first_cid [w0 w1 …]` form.
             Object::Array(ws) => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "PDF glyph widths are in [0, 4096]"
-                )]
                 let widths: Vec<i32> = ws
                     .iter()
-                    .map(|o| o.as_i64().map_or(0, |v| v as i32))
+                    .map(|o| o.as_i64().map_or(0, pdf_width_to_i32))
                     .collect();
                 segments.push((first_cid, widths));
                 i += 1;
@@ -821,11 +825,7 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
                 if i >= w_arr.len() {
                     break;
                 }
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "PDF glyph width in [0, 4096]"
-                )]
-                let w = w_arr[i].as_i64().map_or(0, |v| v as i32);
+                let w = w_arr[i].as_i64().map_or(0, pdf_width_to_i32);
                 i += 1;
 
                 if last_cid >= first_cid && last_cid - first_cid < 0x1_0000 {
@@ -995,6 +995,25 @@ mod tests {
         // None signals to the caller to fall back to the FreeType face.
         let d = descriptor_with_widths(0, vec![], 0);
         assert_eq!(d.width_for_code(65), None);
+    }
+
+    #[test]
+    fn pdf_width_to_i32_in_range_pass_through() {
+        assert_eq!(pdf_width_to_i32(0), 0);
+        assert_eq!(pdf_width_to_i32(500), 500);
+        assert_eq!(pdf_width_to_i32(-1000), -1000);
+        assert_eq!(pdf_width_to_i32(i64::from(i32::MAX)), i32::MAX);
+        assert_eq!(pdf_width_to_i32(i64::from(i32::MIN)), i32::MIN);
+    }
+
+    #[test]
+    fn pdf_width_to_i32_saturates_on_overflow() {
+        // Adversarial input must clamp, not wrap.  An i64::MAX width that
+        // wraps with `as i32` would become -1, silently corrupting text.
+        assert_eq!(pdf_width_to_i32(i64::MAX), i32::MAX);
+        assert_eq!(pdf_width_to_i32(i64::MIN), i32::MIN);
+        assert_eq!(pdf_width_to_i32(i64::from(i32::MAX) + 1), i32::MAX);
+        assert_eq!(pdf_width_to_i32(i64::from(i32::MIN) - 1), i32::MIN);
     }
 
     #[test]
