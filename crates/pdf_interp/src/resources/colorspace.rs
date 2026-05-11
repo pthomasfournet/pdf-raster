@@ -974,6 +974,23 @@ mod tests {
         // an IccBased CS with n=3, and verify that primary colours
         // round-trip through the moxcms sRGB→sRGB transform.  Identity-up-
         // to-LSB confirms the actual code path (not the fallback) runs.
+        //
+        // Tolerance: ±2 LSB covers the worst case of (a) 8-bit input
+        // quantisation, (b) profile encode/decode rounding through the
+        // moxcms parametric curve, and (c) the final 8-bit output cast.
+        // Tighter than ±2 risks intermittent failures across moxcms
+        // releases; looser invites false positives.
+        const TOL: u8 = 2;
+        fn channels_match(got: [u8; 3], expected: [u8; 3], label: &str) {
+            for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+                let diff = g.abs_diff(e);
+                assert!(
+                    diff <= TOL,
+                    "{label}: channel {i} got {g}, expected {e}±{TOL} (diff {diff})"
+                );
+            }
+        }
+
         let icc_bytes = moxcms::ColorProfile::new_srgb()
             .encode()
             .expect("moxcms must encode its own sRGB profile");
@@ -982,25 +999,32 @@ mod tests {
             n: 3,
             stream_id: Some((2, 0)),
         };
-        // Pure red → ~[255, 0, 0] within sRGB transform rounding.
-        let red = icc.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]);
-        assert!(
-            red[0] >= 253 && red[1] <= 2 && red[2] <= 2,
-            "sRGB→sRGB pure red expected ~[255,0,0], got {red:?}"
+
+        // Primary colours round-trip through sRGB→sRGB as near-identity.
+        channels_match(
+            icc.convert_to_rgb(&doc, &[1.0, 0.0, 0.0]),
+            [255, 0, 0],
+            "pure red",
         );
-        // Pure green.
-        let green = icc.convert_to_rgb(&doc, &[0.0, 1.0, 0.0]);
-        assert!(
-            green[0] <= 2 && green[1] >= 253 && green[2] <= 2,
-            "sRGB→sRGB pure green expected ~[0,255,0], got {green:?}"
+        channels_match(
+            icc.convert_to_rgb(&doc, &[0.0, 1.0, 0.0]),
+            [0, 255, 0],
+            "pure green",
+        );
+        channels_match(
+            icc.convert_to_rgb(&doc, &[0.0, 0.0, 1.0]),
+            [0, 0, 255],
+            "pure blue",
         );
         // Mid grey (0.5, 0.5, 0.5).  sRGB encodes 0.5-linear ≈ 188 but the
         // input is *already* sRGB-encoded; identity should keep it at
-        // ~128 modulo transform rounding.
+        // ~128 modulo transform rounding.  Additionally assert neutrality
+        // — moxcms shouldn't introduce a colour cast on grey inputs.
         let grey = icc.convert_to_rgb(&doc, &[0.5, 0.5, 0.5]);
+        channels_match(grey, [128, 128, 128], "mid grey");
         assert!(
-            (125..=131).contains(&grey[0]) && grey[0] == grey[1] && grey[1] == grey[2],
-            "sRGB→sRGB mid-grey expected ~[128,128,128], got {grey:?}"
+            grey[0] == grey[1] && grey[1] == grey[2],
+            "sRGB→sRGB grey must stay neutral, got {grey:?}",
         );
     }
 
