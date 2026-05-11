@@ -7,7 +7,6 @@
 //! **Integer blend math**
 //! - [`div255`] — fast approximate division by 255
 //! - [`lerp_u8`] — bilinear interpolation between two bytes
-//! - `clip255` (private) — clamp u32 to \[0, 255\]; used by [`cmyk_to_rgb`]
 //!
 //! **Color-space conversion (u8 domain)**
 //! - [`cmyk_to_rgb`] — simple subtractive CMYK → RGB
@@ -87,19 +86,6 @@ pub fn lerp_u8(a: u8, b: u8, t: u32) -> u8 {
     div255(u32::from(a) * (256 - t) + u32::from(b) * t)
 }
 
-/// Clamp a `u32` to \[0, 255\] and return as `u8`.
-///
-/// Equivalent to `x.min(255) as u8`.
-///
-/// # Output range
-///
-/// Always \[0, 255\].
-#[inline]
-fn clip255(x: u32) -> u8 {
-    // x.min(255) guarantees the value fits in u8; the cast is lossless.
-    x.min(255) as u8
-}
-
 // ── Color space conversion ────────────────────────────────────────────────────
 
 /// CMYK → RGB using the simple subtractive model.
@@ -129,12 +115,13 @@ fn clip255(x: u32) -> u8 {
 #[must_use]
 pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
     let kk = u32::from(k);
-    // saturating_sub clamps at 0 when (ink + key) > 255, correctly
-    // representing full ink coverage. The result is always ≤ 255, so
-    // clip255 is lossless here (it only handles the u32 → u8 narrowing).
-    let red = clip255(255u32.saturating_sub(u32::from(c) + kk));
-    let green = clip255(255u32.saturating_sub(u32::from(m) + kk));
-    let blue = clip255(255u32.saturating_sub(u32::from(y) + kk));
+    // `255u32.saturating_sub(...)` yields a value in [0, 255], so the
+    // u32 → u8 narrowing always succeeds; `unwrap_or(255)` is an
+    // unreachable defensive fallback that documents the invariant
+    // without adding a `#[expect(clippy::cast_possible_truncation)]`.
+    let red = u8::try_from(255u32.saturating_sub(u32::from(c) + kk)).unwrap_or(255);
+    let green = u8::try_from(255u32.saturating_sub(u32::from(m) + kk)).unwrap_or(255);
+    let blue = u8::try_from(255u32.saturating_sub(u32::from(y) + kk)).unwrap_or(255);
     (red, green, blue)
 }
 
@@ -142,12 +129,10 @@ pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
 ///
 /// Max product is `255 × 255 + 127 = 65 152`, which divides to 255 — fits `u8`.
 #[inline]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "((255-ink)*(255-k)+127)/255 ≤ 255, always fits u8"
-)]
 fn reflectance_blend(ink: u8, inv_k: u32) -> u8 {
-    ((u32::from(255 - ink) * inv_k + 127) / 255) as u8
+    // Bounded by `((255−ink)×(255−k)+127)/255 ≤ 255`; `unwrap_or(255)` is
+    // unreachable defensive fallback documenting the invariant.
+    u8::try_from((u32::from(255 - ink) * inv_k + 127) / 255).unwrap_or(255)
 }
 
 /// CMYK → RGB via the reflectance formula: `R = (255−C)×(255−K)/255` (rounded).
@@ -178,7 +163,9 @@ pub fn cmyk_to_rgb_reflectance(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
 
 /// Convert a normalised PDF value \[0.0, 1.0\] to a `u8` byte.
 ///
-/// Clamps then rounds; NaN maps to 0 (via the clamp lower-bound).
+/// Clamps then rounds. `f64::clamp(NaN, 0.0, 1.0)` returns `NaN` (clamp does
+/// not sanitise NaN); the subsequent `as u8` cast then saturates `NaN` to 0
+/// per Rust's float-to-int rules, so NaN inputs map to 0.
 /// Used for PDF colour operators where channel components are normalised floats.
 #[inline]
 #[must_use]
@@ -415,16 +402,20 @@ mod tests {
 
     /// Non-finite inputs must not invoke UB and must return a defined sentinel.
     #[test]
-    fn splash_floor_ceil_non_finite() {
-        // +∞
+    fn splash_floor_ceil_round_non_finite() {
+        // +∞ — INFINITY + 0.5 is still INFINITY, so splash_round goes to i32::MAX.
         assert_eq!(splash_floor(f64::INFINITY), i32::MAX);
         assert_eq!(splash_ceil(f64::INFINITY), i32::MAX);
+        assert_eq!(splash_round(f64::INFINITY), i32::MAX);
         // −∞
         assert_eq!(splash_floor(f64::NEG_INFINITY), i32::MIN);
         assert_eq!(splash_ceil(f64::NEG_INFINITY), i32::MIN);
-        // NaN — treated as non-positive (returns i32::MIN)
+        assert_eq!(splash_round(f64::NEG_INFINITY), i32::MIN);
+        // NaN — treated as non-positive (returns i32::MIN). NaN + 0.5 is NaN
+        // so splash_round also returns i32::MIN.
         assert_eq!(splash_floor(f64::NAN), i32::MIN);
         assert_eq!(splash_ceil(f64::NAN), i32::MIN);
+        assert_eq!(splash_round(f64::NAN), i32::MIN);
     }
 
     // ── gray_to_u8 ────────────────────────────────────────────────────────────
@@ -441,6 +432,13 @@ mod tests {
         assert_eq!(gray_to_u8(2.0), 255);
     }
 
+    /// NaN must map to 0 — `f64::clamp` returns NaN unchanged, then Rust's
+    /// float-to-int saturation maps NaN → 0.
+    #[test]
+    fn gray_nan_is_zero() {
+        assert_eq!(gray_to_u8(f64::NAN), 0);
+    }
+
     // ── cmyk_to_rgb_bytes ─────────────────────────────────────────────────────
 
     #[test]
@@ -451,6 +449,16 @@ mod tests {
     #[test]
     fn cmyk_bytes_white() {
         assert_eq!(cmyk_to_rgb_bytes(0.0, 0.0, 0.0, 0.0), [255, 255, 255]);
+    }
+
+    /// NaN inputs in the formula `1 − min(c+k, 1)` go through `f64::min`,
+    /// which returns the non-NaN argument (`1.0`), so `1 − 1 = 0` lands in
+    /// the affected channel. With `k = NaN`, every channel's expression
+    /// involves the NaN, so every output byte is 0.
+    #[test]
+    fn cmyk_bytes_nan_channel_is_zero() {
+        assert_eq!(cmyk_to_rgb_bytes(f64::NAN, 0.0, 0.0, 0.0), [0, 255, 255]);
+        assert_eq!(cmyk_to_rgb_bytes(0.0, 0.0, 0.0, f64::NAN), [0, 0, 0]);
     }
 
     // ── cmyk_to_rgb_reflectance ───────────────────────────────────────────────
