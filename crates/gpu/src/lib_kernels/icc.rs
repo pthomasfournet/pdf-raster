@@ -131,6 +131,10 @@ impl GpuCtx {
     /// # Errors
     ///
     /// Returns the underlying CUDA error if the launch fails.
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining; chain output is intentionally discarded"
+    )]
     pub(crate) fn launch_icc_matrix_async(
         &self,
         d_cmyk: &CudaSlice<u8>,
@@ -140,11 +144,9 @@ impl GpuCtx {
         let cfg = launch_cfg(n_pixels as usize);
         let stream = &self.stream;
         let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_matrix);
-        let _ = builder.arg(d_cmyk);
-        let _ = builder.arg(d_rgb);
-        let _ = builder.arg(&n_pixels);
+        builder.arg(d_cmyk).arg(d_rgb).arg(&n_pixels);
         // SAFETY: 3 args match icc_cmyk_matrix PTX signature exactly.
-        let _ = unsafe { builder.launch(cfg) }?;
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 
@@ -155,6 +157,10 @@ impl GpuCtx {
     /// # Errors
     ///
     /// Returns the underlying CUDA error if the launch fails.
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining; chain output is intentionally discarded"
+    )]
     pub(crate) fn launch_icc_clut_async(
         &self,
         d_cmyk: &CudaSlice<u8>,
@@ -166,13 +172,14 @@ impl GpuCtx {
         let cfg = launch_cfg(n_pixels as usize);
         let stream = &self.stream;
         let mut builder = stream.launch_builder(&self.kernels.icc_cmyk_clut);
-        let _ = builder.arg(d_cmyk);
-        let _ = builder.arg(d_rgb);
-        let _ = builder.arg(d_clut);
-        let _ = builder.arg(&grid_n);
-        let _ = builder.arg(&n_pixels);
+        builder
+            .arg(d_cmyk)
+            .arg(d_rgb)
+            .arg(d_clut)
+            .arg(&grid_n)
+            .arg(&n_pixels);
         // SAFETY: 5 args match icc_cmyk_clut PTX signature exactly.
-        let _ = unsafe { builder.launch(cfg) }?;
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 }

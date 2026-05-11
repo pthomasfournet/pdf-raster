@@ -216,6 +216,10 @@ impl GpuCtx {
         clippy::too_many_arguments,
         reason = "kernel arg count is fixed by the PTX signature; grouping into a struct would just hide the mapping"
     )]
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining; chain output is intentionally discarded"
+    )]
     pub(crate) fn launch_blit_image_async(
         &self,
         d_src: &CudaSlice<u8>,
@@ -255,24 +259,25 @@ impl GpuCtx {
         let dst_h = i32::try_from(dst_dims.1).map_err(|_| BlitError::DimensionsTooLarge)?;
 
         let mut builder = stream.launch_builder(&self.kernels.blit_image);
-        let _ = builder.arg(d_src);
-        let _ = builder.arg(&src_w);
-        let _ = builder.arg(&src_h);
-        let _ = builder.arg(&layout_code);
-        let _ = builder.arg(d_dst);
-        let _ = builder.arg(&dst_w);
-        let _ = builder.arg(&dst_h);
-        let _ = builder.arg(&bbox.x0);
-        let _ = builder.arg(&bbox.y0);
-        let _ = builder.arg(&bbox.x1);
-        let _ = builder.arg(&bbox.y1);
-        let _ = builder.arg(&d_inv_ctm);
-        let _ = builder.arg(&page_h);
+        builder
+            .arg(d_src)
+            .arg(&src_w)
+            .arg(&src_h)
+            .arg(&layout_code)
+            .arg(d_dst)
+            .arg(&dst_w)
+            .arg(&dst_h)
+            .arg(&bbox.x0)
+            .arg(&bbox.y0)
+            .arg(&bbox.x1)
+            .arg(&bbox.y1)
+            .arg(&d_inv_ctm)
+            .arg(&page_h);
 
         // SAFETY: kernel signature in kernels/blit_image.cu matches
         // the argument list above; bounds are validated by the
         // checked casts on src_w/src_h/dst_w/dst_h.
-        let _ = unsafe { builder.launch(cfg) }.map_err(BlitError::cuda)?;
+        unsafe { builder.launch(cfg) }.map_err(BlitError::cuda)?;
         // Don't synchronise here — let the caller batch multiple
         // blits and download the buffer once at end-of-page.
         Ok(())

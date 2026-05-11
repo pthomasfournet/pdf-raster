@@ -134,6 +134,10 @@ impl GpuCtx {
         clippy::too_many_arguments,
         reason = "all args mirror the PTX kernel signature; grouping would obscure the mapping"
     )]
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining; chain output is intentionally discarded"
+    )]
     pub(crate) fn launch_aa_fill_async(
         &self,
         d_segs: &CudaSlice<u8>,
@@ -160,16 +164,17 @@ impl GpuCtx {
         let eo_int: i32 = i32::from(eo);
         let stream = &self.stream;
         let mut builder = stream.launch_builder(&self.kernels.aa_fill);
-        let _ = builder.arg(d_segs);
-        let _ = builder.arg(&n_segs);
-        let _ = builder.arg(&x_min);
-        let _ = builder.arg(&y_min);
-        let _ = builder.arg(&width);
-        let _ = builder.arg(&height);
-        let _ = builder.arg(&eo_int);
-        let _ = builder.arg(d_coverage);
+        builder
+            .arg(d_segs)
+            .arg(&n_segs)
+            .arg(&x_min)
+            .arg(&y_min)
+            .arg(&width)
+            .arg(&height)
+            .arg(&eo_int)
+            .arg(d_coverage);
         // SAFETY: kernel arguments match the PTX signature; bounds verified above.
-        let _ = unsafe { builder.launch(cfg) }?;
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 }

@@ -73,6 +73,10 @@ impl GpuCtx {
     /// # Errors
     ///
     /// Returns the underlying CUDA error if the launch fails.
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining; chain output is intentionally discarded"
+    )]
     pub(crate) fn launch_composite_async(
         &self,
         d_src: &CudaSlice<u8>,
@@ -82,11 +86,9 @@ impl GpuCtx {
         let cfg = launch_cfg(n_pixels as usize);
         let stream = &self.stream;
         let mut builder = stream.launch_builder(&self.kernels.composite_rgba8);
-        let _ = builder.arg(d_src);
-        let _ = builder.arg(d_dst);
-        let _ = builder.arg(&n_pixels);
+        builder.arg(d_src).arg(d_dst).arg(&n_pixels);
         // SAFETY: 3 args match composite_rgba8 PTX signature; n_pixels is u32.
-        let _ = unsafe { builder.launch(cfg) }?;
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 }

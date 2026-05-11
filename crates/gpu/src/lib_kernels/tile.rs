@@ -110,6 +110,10 @@ impl GpuCtx {
         clippy::too_many_arguments,
         reason = "all args mirror the PTX kernel signature; grouping would obscure the mapping"
     )]
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining; chain output is intentionally discarded"
+    )]
     pub(crate) fn launch_tile_fill_async(
         &self,
         d_records: &CudaSlice<u8>,
@@ -131,17 +135,18 @@ impl GpuCtx {
         let eo_int: i32 = i32::from(eo);
         let stream = &self.stream;
         let mut builder = stream.launch_builder(&self.kernels.tile_fill);
-        let _ = builder.arg(d_records);
-        let _ = builder.arg(d_tile_starts);
-        let _ = builder.arg(d_tile_counts);
-        let _ = builder.arg(&grid_w);
-        let _ = builder.arg(&width);
-        let _ = builder.arg(&height);
-        let _ = builder.arg(&eo_int);
-        let _ = builder.arg(d_coverage);
+        builder
+            .arg(d_records)
+            .arg(d_tile_starts)
+            .arg(d_tile_counts)
+            .arg(&grid_w)
+            .arg(&width)
+            .arg(&height)
+            .arg(&eo_int)
+            .arg(d_coverage);
         // SAFETY: kernel arguments match the PTX signature exactly (8 args, no
         // x_min/y_min — coords are tile-local from build_tile_records).
-        let _ = unsafe { builder.launch(cfg) }?;
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 }
