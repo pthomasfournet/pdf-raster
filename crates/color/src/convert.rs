@@ -52,7 +52,7 @@ pub fn div255(x: u32) -> u8 {
     // 65535 + 255 + 128 = 65918, which fits in u32. The right-shift by 8
     // gives at most 257; clamping to 255 makes the cast to u8 always safe.
     let shifted = (x + (x >> 8) + 0x80) >> 8;
-    // SAFETY: shifted ≤ 257 after clamping ≤ 255, so the `as u8` is lossless.
+    // `shifted ≤ 257` before clamping; `.min(255)` makes the `as u8` cast lossless.
     shifted.min(255) as u8
 }
 
@@ -113,16 +113,15 @@ pub fn lerp_u8(a: u8, b: u8, t: u32) -> u8 {
 ///   inputs per PDF §10.3.3 (`R = 1−min(1, C+K)`), for PDF colour operators.
 #[inline]
 #[must_use]
-pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
-    let kk = u32::from(k);
-    // `255u32.saturating_sub(...)` yields a value in [0, 255], so the
-    // u32 → u8 narrowing always succeeds; `unwrap_or(255)` is an
-    // unreachable defensive fallback that documents the invariant
-    // without adding a `#[expect(clippy::cast_possible_truncation)]`.
-    let red = u8::try_from(255u32.saturating_sub(u32::from(c) + kk)).unwrap_or(255);
-    let green = u8::try_from(255u32.saturating_sub(u32::from(m) + kk)).unwrap_or(255);
-    let blue = u8::try_from(255u32.saturating_sub(u32::from(y) + kk)).unwrap_or(255);
-    (red, green, blue)
+pub const fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
+    // Chained `u8::saturating_sub` stays in `u8` space — once a channel
+    // saturates to 0, the second subtraction is a no-op, so the result
+    // equals `255u32.saturating_sub(c + k)` clamped to `u8`.
+    (
+        255u8.saturating_sub(c).saturating_sub(k),
+        255u8.saturating_sub(m).saturating_sub(k),
+        255u8.saturating_sub(y).saturating_sub(k),
+    )
 }
 
 /// Blend one ink channel against the key: `((255−ink) × (255−k) + 127) / 255`.
@@ -130,9 +129,11 @@ pub fn cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> (u8, u8, u8) {
 /// Max product is `255 × 255 + 127 = 65 152`, which divides to 255 — fits `u8`.
 #[inline]
 fn reflectance_blend(ink: u8, inv_k: u32) -> u8 {
-    // Bounded by `((255−ink)×(255−k)+127)/255 ≤ 255`; `unwrap_or(255)` is
-    // unreachable defensive fallback documenting the invariant.
-    u8::try_from((u32::from(255 - ink) * inv_k + 127) / 255).unwrap_or(255)
+    // `(255−ink)×(255−k) ≤ 65025` and `+127` then `/255` keeps the result
+    // in `[0, 255]`. `.expect` matches the workspace convention for proving
+    // small-domain u32→u8 narrowings (see `color::transfer`, `raster::state`).
+    u8::try_from((u32::from(255 - ink) * inv_k + 127) / 255)
+        .expect("reflectance_blend: ((255−ink)×inv_k+127)/255 ≤ 255")
 }
 
 /// CMYK → RGB via the reflectance formula: `R = (255−C)×(255−K)/255` (rounded).
