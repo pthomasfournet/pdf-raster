@@ -183,6 +183,17 @@ const MAX_FORM_DEPTH: u32 = 32;
 /// the pattern parameters.
 const MAX_TILE_PX: f64 = 4096.0;
 
+/// Maximum nesting depth for tiling patterns.
+///
+/// `render_pattern_tile` spawns a fresh `PageRenderer` for each tile, so the
+/// `form_depth` Form-XObject guard doesn't apply.  Without an independent
+/// cap, a self-referential or cyclic pattern chain (`scn /A f` inside
+/// pattern A's own content stream) would recurse until stack overflow.
+/// Real-world patterns nest 0–1 deep; 4 is a conservative bound that still
+/// allows hatch-of-hatch decorative uses without supporting attacker-crafted
+/// cycles.
+const MAX_PATTERN_DEPTH: u32 = 4;
+
 /// Renders a decoded operator sequence onto a `Bitmap<Rgb8>`.
 pub struct PageRenderer<'doc> {
     /// Target pixel buffer.
@@ -208,6 +219,10 @@ pub struct PageRenderer<'doc> {
     pub(super) resources: PageResources<'doc>,
     /// Current Form `XObject` nesting depth (0 = top-level page).
     form_depth: u32,
+    /// Current tiling-pattern nesting depth (0 = top-level page).  Spawned
+    /// tile renderers carry this incremented; capped at `MAX_PATTERN_DEPTH`
+    /// to break self-referential pattern cycles (see `resolve_fill_pattern`).
+    pub(super) pattern_depth: u32,
     /// Accumulated page diagnostics, populated during rendering.
     diag: PageDiagnostics,
     /// Per-filter blit counts used to compute `diag.dominant_filter`.
@@ -366,6 +381,7 @@ impl<'doc> PageRenderer<'doc> {
             font_cache,
             resources,
             form_depth: 0,
+            pattern_depth: 0,
             diag: PageDiagnostics::default(),
             filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),

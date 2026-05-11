@@ -2,7 +2,7 @@
 
 use super::super::color::RasterColor;
 use super::super::gstate::{ctm_multiply, ctm_transform};
-use super::{MAX_TILE_PX, PageRenderer, components_to_color};
+use super::{MAX_PATTERN_DEPTH, MAX_TILE_PX, PageRenderer, components_to_color};
 use crate::resources::PageResources;
 use color::Rgb8;
 use raster::{Bitmap, TiledPattern};
@@ -15,6 +15,19 @@ impl PageRenderer<'_> {
         reason = "tile dimensions are capped at 4096 and clamped to positive; phase coords are page-bounded; safe casts"
     )]
     pub(super) fn resolve_fill_pattern(&self, name: &[u8]) -> Option<TiledPattern> {
+        // Break self-referential / cyclic pattern chains.  Each tile spawns a
+        // fresh PageRenderer with its own pattern_depth seeded one above the
+        // parent (see render_pattern_tile below), so reaching the cap means a
+        // pattern's content stream re-invokes a pattern and we'd otherwise
+        // recurse to stack overflow on adversarial input.
+        if self.pattern_depth >= MAX_PATTERN_DEPTH {
+            log::warn!(
+                "pdf_interp: Pattern /{} nesting depth {MAX_PATTERN_DEPTH} exceeded — skipping",
+                String::from_utf8_lossy(name),
+            );
+            return None;
+        }
+
         let desc = self.resources.tiling_pattern(name)?;
 
         // Compose pattern matrix with current CTM to get pattern-space → device-space.
@@ -125,6 +138,11 @@ impl PageRenderer<'_> {
                 return Bitmap::new(tile_w, tile_h, 1, false);
             }
         };
+        // Propagate pattern_depth so a pattern stream that recursively
+        // invokes another pattern (or itself) hits MAX_PATTERN_DEPTH instead
+        // of unbounded stack recursion.  saturating_add guards against the
+        // (impossible) overflow.
+        tile_renderer.pattern_depth = self.pattern_depth.saturating_add(1);
 
         // Override the CTM to map pattern space → tile device space.
         let gs = tile_renderer.gstate.current_mut();
