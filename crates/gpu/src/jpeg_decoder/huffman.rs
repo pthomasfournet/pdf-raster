@@ -12,6 +12,8 @@ use crate::backend::{BackendError, GpuBackend, Result};
 use crate::jpeg::CanonicalCodebook;
 use crate::jpeg_decoder::PackedBitstream;
 use crate::jpeg_decoder::phase1_oracle::SubsequenceState;
+#[cfg(feature = "gpu-validation")]
+use crate::jpeg_decoder::phase2_oracle::{Phase2Outcome, retry_bound as phase2_retry_bound};
 
 /// Flatten a slice of canonical Huffman codebooks into the GPU layout:
 /// `u32[num_components * 65536]`, each entry packing
@@ -131,27 +133,6 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
     Ok(out)
 }
 
-/// Outcome of the Phase 2 dispatcher's bounded retry loop.
-///
-/// Mirrors `phase2_oracle::Phase2Outcome` exactly so test parity
-/// assertions can compare them by value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(feature = "gpu-validation")]
-enum Phase2DispatchOutcome {
-    /// All subseqs synced; final `s_info` returned out-of-band.
-    Converged { iterations: u32 },
-    /// Retry bound exhausted without convergence.
-    SyncBoundExceeded { bound: u32 },
-}
-
-/// Maximum number of Phase 2 sync-and-advance passes before giving
-/// up. Matches `phase2_oracle::retry_bound`.
-#[cfg(feature = "gpu-validation")]
-const fn phase2_retry_bound(num_subsequences: usize) -> u32 {
-    let pow2_exp = num_subsequences.next_power_of_two().trailing_zeros();
-    2u32.saturating_mul(pow2_exp)
-}
-
 /// One-shot dispatch of Phase 1 + Phase 2 (bounded retry sync loop).
 ///
 /// Allocates device buffers, uploads inputs, runs Phase 1, then loops
@@ -172,12 +153,9 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     stream: &PackedBitstream,
     codebooks: &[CanonicalCodebook],
     subsequence_bits: u32,
-) -> Result<(Vec<SubsequenceState>, Phase2DispatchOutcome)> {
+) -> Result<(Vec<SubsequenceState>, Phase2Outcome)> {
     if stream.length_bits == 0 {
-        return Ok((
-            Vec::new(),
-            Phase2DispatchOutcome::Converged { iterations: 0 },
-        ));
+        return Ok((Vec::new(), Phase2Outcome::Converged { iterations: 0 }));
     }
     if subsequence_bits == 0 {
         return Err(BackendError::msg(
@@ -232,7 +210,7 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     // Phase 2 — bounded retry loop.
     let bound = phase2_retry_bound(num_subsequences as usize);
     let mut flags_host = vec![0u32; num_subsequences as usize];
-    let mut outcome = Phase2DispatchOutcome::SyncBoundExceeded { bound };
+    let mut outcome = Phase2Outcome::SyncBoundExceeded { bound };
     for iter in 0..=bound {
         backend.begin_page()?;
         backend.record_huffman(HuffmanParams {
@@ -253,7 +231,7 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
         backend.wait_download(handle)?;
 
         if flags_host.iter().all(|&f| f == 1) {
-            outcome = Phase2DispatchOutcome::Converged { iterations: iter };
+            outcome = Phase2Outcome::Converged { iterations: iter };
             break;
         }
     }
@@ -393,7 +371,7 @@ mod tests {
         // 16 subseqs.
         assert_eq!(s_info.len(), 16);
         // Pre-synced stream — first pass sees all flags = 1.
-        assert_eq!(outcome, Phase2DispatchOutcome::Converged { iterations: 0 });
+        assert_eq!(outcome, Phase2Outcome::Converged { iterations: 0 });
     }
 
     /// Phase 2 dispatcher matches the CPU oracle: run both on the
@@ -568,6 +546,6 @@ mod vulkan_tests {
         let (vk_s, vk_o) = dispatch_phase1_then_phase2(&vk, &stream, &book, 128).expect("vulkan");
         assert_eq!(cuda_o, vk_o, "outcome mismatch");
         assert_eq!(cuda_s, vk_s, "s_info mismatch");
-        assert_eq!(cuda_o, Phase2DispatchOutcome::Converged { iterations: 0 });
+        assert_eq!(cuda_o, Phase2Outcome::Converged { iterations: 0 });
     }
 }
