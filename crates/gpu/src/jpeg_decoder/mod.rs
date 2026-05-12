@@ -11,7 +11,11 @@
 //! synthetic-stream oracle used by cross-backend bit-identity tests.
 
 mod bitstream;
+mod codetable;
 mod error;
 
 pub use bitstream::{PackedBitstream, pack_be_words};
+pub use codetable::{
+    FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
+};
 pub use error::JpegGpuError;
