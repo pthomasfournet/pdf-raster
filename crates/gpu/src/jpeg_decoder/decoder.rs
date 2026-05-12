@@ -27,6 +27,11 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
         Self { backend }
     }
 
+    /// Borrow the underlying backend.
+    pub const fn backend(&self) -> &B {
+        &self.backend
+    }
+
     /// Decode a baseline JFIF JPEG into a device-resident RGBA8 image.
     ///
     /// # Errors
@@ -325,5 +330,80 @@ mod tests {
         let img = dec.decode(bytes).expect("decode");
         assert_eq!(img.width, 16);
         assert_eq!(img.height, 16);
+    }
+
+    /// Download device pixels and compare to a zune-jpeg reference decode.
+    ///
+    /// Tolerance: peak absolute error ≤ 1 LSB per channel, mean absolute
+    /// error ≤ 0.02 LSB — matches the IEEE 1180-1990 quantisation error
+    /// budget for the IDCT.
+    fn assert_within_ieee1180(gpu_rgba: &[u8], zune_rgba: &[u8], label: &str) {
+        assert_eq!(
+            gpu_rgba.len(),
+            zune_rgba.len(),
+            "{label}: pixel buffer length mismatch"
+        );
+        let mut peak = 0u8;
+        let mut sum: u64 = 0;
+        for (&g, &r) in gpu_rgba.iter().zip(zune_rgba.iter()) {
+            let diff = g.abs_diff(r);
+            if diff > peak {
+                peak = diff;
+            }
+            sum += u64::from(diff);
+        }
+        let mean = sum as f64 / gpu_rgba.len() as f64;
+        assert!(
+            peak <= 1,
+            "{label}: peak error {peak} > 1 LSB (IEEE 1180)"
+        );
+        assert!(
+            mean <= 0.02,
+            "{label}: mean error {mean:.4} > 0.02 LSB (IEEE 1180)"
+        );
+    }
+
+    /// Decode `bytes` with zune-jpeg in RGBA8 and return the flat pixel buffer.
+    fn zune_decode_rgba(bytes: &[u8]) -> Vec<u8> {
+        use zune_jpeg::zune_core::bytestream::ZCursor;
+        use zune_jpeg::zune_core::colorspace::ColorSpace;
+        use zune_jpeg::zune_core::options::DecoderOptions;
+        use zune_jpeg::JpegDecoder;
+        let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+        let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
+        dec.decode().expect("zune-jpeg decode")
+    }
+
+    /// Download RGBA8 bytes from a `DeviceImage` via `download_async`.
+    fn download_image(backend: &CudaBackend, img: &DeviceImage<CudaBackend>) -> Vec<u8> {
+        let n = (img.width as usize) * (img.height as usize) * 4;
+        let mut buf = vec![0u8; n];
+        let handle = backend
+            .download_async(&img.buffer, &mut buf)
+            .expect("download_async");
+        backend.wait_download(handle).expect("wait_download");
+        buf
+    }
+
+    #[test]
+    fn real_jpeg_q95_pixel_diff_within_ieee1180() {
+        let bytes = include_bytes!("../../../../tests/fixtures/jpeg/q95_scan.jpg");
+        let backend = CudaBackend::new().expect("CUDA backend");
+        let dec = JpegGpuDecoder::new(backend);
+        let img = dec.decode(bytes).expect("decode q95_scan.jpg");
+        let gpu_rgba = download_image(dec.backend(), &img);
+        let zune_rgba = zune_decode_rgba(bytes);
+        assert_within_ieee1180(&gpu_rgba, &zune_rgba, "q95_scan.jpg");
+    }
+
+    #[test]
+    fn real_jpeg_q20_pixel_diff_within_ieee1180() {
+        let bytes = include_bytes!("../../../../tests/fixtures/jpeg/q20.jpg");
+        let backend = CudaBackend::new().expect("CUDA backend");
+        let dec = JpegGpuDecoder::new(backend);
+        let img = dec.decode(bytes).expect("decode q20.jpg");
+        let gpu_rgba = download_image(dec.backend(), &img);
+        let zune_rgba = zune_decode_rgba(bytes);
+        assert_within_ieee1180(&gpu_rgba, &zune_rgba, "q20.jpg");
     }
 }

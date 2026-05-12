@@ -68,6 +68,9 @@ gpu-allocator = { version = "0.28", optional = true, default-features = false, f
 [dev-dependencies]
 # Disk-tier tests want isolated cache dirs.
 tempfile = { workspace = true }
+# Pixel-level oracle for JPEG decode parity tests (already resolved in
+# the workspace lockfile via raster/image transitive deps).
+zune-jpeg = "0.5"
 
 # unsafe_code must be "allow" here because cudarc requires unsafe blocks.
 # We do not inherit workspace lints so we can override unsafe_code.

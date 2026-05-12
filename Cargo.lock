@@ -540,6 +540,7 @@ dependencies = [
  "gpu-allocator",
  "log",
  "tempfile",
+ "zune-jpeg",
 ]
 
 [[package]]
