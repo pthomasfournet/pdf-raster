@@ -410,49 +410,84 @@ mod tests {
         );
     }
 
-    /// The fast path (`composite_aa_rgb8_opaque` via `(v+255)>>8`) and the
-    /// general no-alpha path (`render_span_aa_inner` via
-    /// `color::convert::div255`'s exact `(v + v>>8 + 0x80) >> 8`) must agree
-    /// to within 1 LSB per channel on every gate-eligible input.
-    ///
-    /// This pins the cross-path invariant that the deferred v0.9.2 audit
-    /// (`audit/2026-05-11-avx512-fastpath-vs-general-byte-equality.md`)
-    /// flagged: each path's *internal* byte values are pinned by sibling
-    /// tests, but a regression that swapped one `div255` shape for the
-    /// other — or that mis-classified an identity-LUT call as needing the
-    /// general path, or vice-versa — could silently shift output by 1 LSB
-    /// and only be caught by the pixel-diff integration suite against
-    /// pdftoppm.
-    ///
-    /// Strategy:
-    /// 1. Build a deterministic corpus of `(color, a_input, shape, dst)`
-    ///    tuples that span the gate-firing domain (full opacity, partial,
-    ///    zero; full/partial/zero coverage; saturated/mid-range/dark
-    ///    destination bytes).
-    /// 2. For each tuple, run the fast path via `render_span_aa::<Rgb8>`
-    ///    with `dst_alpha = None` and an identity transfer (so the gate
-    ///    fires).
-    /// 3. Compute the corresponding general-path reference using
-    ///    `color::convert::div255` directly — the same algebra as the
-    ///    `None` arm of `render_span_aa_inner` at `aa.rs:192-207`, only
-    ///    `apply_transfer_in_place` is a no-op under the identity LUT, so
-    ///    it can be skipped.
-    /// 4. Assert `|fast[i] - reference[i]| <= 1` for every byte.
-    ///
-    /// Why `<= 1` and not `==`: the two `div255` formulas round
-    /// differently. The fast path's `(v + 255) >> 8` is correct
-    /// to within ±1 LSB; the general path's `(v + v>>8 + 0x80) >> 8` is
-    /// exact. The difference can be 1 LSB on specific `(c_dst, c_src,
-    /// a_src)` triples (e.g. `inv=128, c_dst=255, a_src=127, c_src=255`:
-    /// numerator 65025, fast=255, exact=255 — same; but
-    /// `inv=128, c_dst=1, a_src=127, c_src=1`: num=255, fast=1, exact=1 —
-    /// also same; the divergence shows up on numerators near 256k
-    /// boundaries). What matters for downstream correctness is the
-    /// ceiling, not exactness.
-    ///
-    /// Span length 23 = LANE(16) + 7: wider than the fast-path's LANE-chunked
-    /// branch so the chunked + scalar-tail loops both fire.
-    const ONE_LSB_CORPUS_SPAN: usize = 23;
+    // ── Cross-path 1-LSB byte-equality fixture ───────────────────────────────
+    //
+    // The fast path (`composite_aa_rgb8_opaque` via `(v+255)>>8`) and the
+    // general no-alpha path (`render_span_aa_inner` via
+    // `color::convert::div255`'s exact `(v + v>>8 + 0x80) >> 8`) must agree
+    // to within 1 LSB per channel on every gate-eligible input.
+    //
+    // This pins the cross-path invariant that the deferred v0.9.2 audit
+    // (audit/2026-05-11-avx512-fastpath-vs-general-byte-equality.md) flagged:
+    // each path's *internal* byte values are pinned by sibling tests, but a
+    // regression that swapped one `div255` shape for the other — or that
+    // mis-classified an identity-LUT call as needing the general path, or
+    // vice-versa — could silently shift output by 1 LSB and only be caught
+    // by the pixel-diff integration suite against pdftoppm.
+    //
+    // Strategy:
+    //   1. Build a deterministic corpus of (color, a_input, shape, dst)
+    //      tuples that span the gate-firing domain.
+    //   2. Run the fast path via `render_span_aa::<Rgb8>` with
+    //      `dst_alpha = None` and an identity transfer (so the gate fires).
+    //   3. Compute the general-path reference using the exact
+    //      `color::convert::div255` — same algebra as the `None` arm of
+    //      `render_span_aa_inner`, with the identity transfer step elided.
+    //   4. Assert `|fast[i] - reference[i]| <= 1` for every byte.
+    //
+    // Why `<= 1` and not `==`: the two `div255` formulas round differently.
+    // The fast path's `(v + 255) >> 8` is the upper-rounding approximation
+    // (correct within ±1 LSB); the general path's `(v + v>>8 + 0x80) >> 8`
+    // is the exact (banker's) form.  A concrete divergence at numerator
+    // `v = 100`:
+    //     fast  = (100 + 255) >> 8 = 355 >> 8 = 1
+    //     exact = (100 +   0 + 128) >> 8 = 228 >> 8 = 0
+    // — 1 LSB apart.  The corpus below produces this and similar
+    // divergences on alternating-shape × low-`a_input` cases.  What
+    // matters for downstream correctness is the ceiling, not exactness.
+
+    /// Span lengths the corpus iterates over.  Covers:
+    /// * `7`  — pure scalar tail (count < LANE), no chunked branch.
+    /// * `16` — exactly one LANE chunk, zero tail.
+    /// * `17` — one LANE chunk + 1-byte tail (chunk-tail boundary).
+    /// * `23` — one LANE chunk + 7-byte tail (typical mixed-mode width).
+    const ONE_LSB_SPAN_LENGTHS: [usize; 4] = [7, 16, 17, 23];
+
+    // ── Corpus pattern generators (free `fn` items, no allocation) ────────────
+
+    fn shape_full(_: usize) -> u8 {
+        255
+    }
+    fn shape_zero(_: usize) -> u8 {
+        0
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "i ∈ [0, max span = 23) * 11 ≤ 242 fits u8"
+    )]
+    fn shape_ramp(i: usize) -> u8 {
+        (i * 11) as u8
+    }
+    fn shape_alt(i: usize) -> u8 {
+        if i.is_multiple_of(2) { 255 } else { 64 }
+    }
+
+    fn dst_black(_: usize) -> u8 {
+        0
+    }
+    fn dst_white(_: usize) -> u8 {
+        255
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "(i * 7) % 256 fits u8 by construction"
+    )]
+    fn dst_ramp(i: usize) -> u8 {
+        ((i * 7) % 256) as u8
+    }
+    fn dst_alt(i: usize) -> u8 {
+        if i.is_multiple_of(2) { 0 } else { 200 }
+    }
 
     /// Run the gate-eligible (no alpha plane, identity transfer) fast path
     /// over `initial`, returning the result. The test's "ground truth" leg
@@ -462,12 +497,10 @@ mod tests {
         let mut pipe = aa_pipe();
         pipe.a_input = a_input;
         let src = PipeSrc::Solid(color.as_slice());
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_possible_wrap,
-            reason = "ONE_LSB_CORPUS_SPAN = 23 fits i32 trivially"
-        )]
-        let x1 = (ONE_LSB_CORPUS_SPAN - 1) as i32;
+        let count = shape.len();
+        assert!(count >= 1, "render_span_aa requires count >= 1");
+        let x1: i32 = i32::try_from(count - 1)
+            .expect("ONE_LSB_SPAN_LENGTHS values must fit in i32 for render_span_aa's x0..=x1 API");
         render_span_aa::<Rgb8>(&pipe, &src, &mut dst, None, shape, 0, x1, 0);
         dst
     }
@@ -532,7 +565,7 @@ mod tests {
         );
 
         // Corpus: cross-product of representative source colours, alpha
-        // inputs, shape patterns, and initial destinations.
+        // inputs, shape patterns, initial destinations, and span lengths.
         let colours: [[u8; 3]; 5] = [
             [0, 0, 0],       // black
             [255, 255, 255], // white
@@ -541,54 +574,36 @@ mod tests {
             [128, 128, 128], // 50%-grey
         ];
         let a_inputs: [u8; 4] = [0, 1, 128, 255];
-        // Shape patterns: full coverage, zero, ramp, alternating.
-        let shape_patterns: [Box<dyn Fn(usize) -> u8>; 4] = [
-            Box::new(|_| 255),
-            Box::new(|_| 0),
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "i ∈ [0,23] * 11 ≤ 253 fits u8"
-            )]
-            Box::new(|i| (i * 11) as u8),
-            Box::new(|i| if i % 2 == 0 { 255 } else { 64 }),
-        ];
-        // Initial destinations: black, white, ramp, alternating.
-        let dst_patterns: [Box<dyn Fn(usize) -> u8>; 4] = [
-            Box::new(|_| 0),
-            Box::new(|_| 255),
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "i ∈ [0, COUNT*3) * 7 mod 256 fits u8"
-            )]
-            Box::new(|i| ((i * 7) % 256) as u8),
-            Box::new(|i| if i % 2 == 0 { 0 } else { 200 }),
-        ];
+        let shape_patterns: [fn(usize) -> u8; 4] = [shape_full, shape_zero, shape_ramp, shape_alt];
+        let dst_patterns: [fn(usize) -> u8; 4] = [dst_black, dst_white, dst_ramp, dst_alt];
 
         let mut total_cases = 0usize;
         let mut total_bytes_at_one_lsb = 0usize;
 
-        for &color in &colours {
-            for &a_input in &a_inputs {
-                for sh_fn in &shape_patterns {
-                    for dst_fn in &dst_patterns {
-                        let shape: Vec<u8> = (0..ONE_LSB_CORPUS_SPAN).map(&**sh_fn).collect();
-                        let initial: Vec<u8> =
-                            (0..ONE_LSB_CORPUS_SPAN * 3).map(&**dst_fn).collect();
-                        let fast = run_fast_path(color, a_input, &shape, &initial);
-                        let exact = run_exact_reference(color, a_input, &shape, &initial);
-                        total_bytes_at_one_lsb +=
-                            assert_within_one_lsb(&fast, &exact, color, a_input, &shape, &initial);
-                        total_cases += 1;
+        for &count in &ONE_LSB_SPAN_LENGTHS {
+            for &color in &colours {
+                for &a_input in &a_inputs {
+                    for &sh_fn in &shape_patterns {
+                        for &dst_fn in &dst_patterns {
+                            let shape: Vec<u8> = (0..count).map(sh_fn).collect();
+                            let initial: Vec<u8> = (0..count * 3).map(dst_fn).collect();
+                            let fast = run_fast_path(color, a_input, &shape, &initial);
+                            let exact = run_exact_reference(color, a_input, &shape, &initial);
+                            total_bytes_at_one_lsb += assert_within_one_lsb(
+                                &fast, &exact, color, a_input, &shape, &initial,
+                            );
+                            total_cases += 1;
+                        }
                     }
                 }
             }
         }
 
-        // Sanity: the corpus should actually exercise the 1-LSB divergence
-        // somewhere, otherwise the test is silently equivalent to byte
-        // equality and the deferred audit's premise was wrong.  Empirically
-        // this corpus produces ≥1 byte at diff=1; if it stops doing so, the
-        // corpus needs widening before we trust the ≤1 LSB ceiling.
+        // Trip-wire: the corpus must actually exercise the 1-LSB
+        // divergence somewhere, otherwise the test is silently equivalent
+        // to byte equality and the deferred audit's premise was wrong.
+        // Empirically this corpus produces ≥1 byte at diff=1; if it stops
+        // doing so, widen the corpus before trusting the ≤1 LSB ceiling.
         assert!(
             total_bytes_at_one_lsb > 0,
             "corpus of {total_cases} cases produced no 1-LSB divergence — \
