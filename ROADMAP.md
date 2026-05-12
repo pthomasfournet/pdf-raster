@@ -225,10 +225,15 @@ workspace; ~700 net lines removed.**
 
 - The 4-way × 2-mode scaling combinatorics in `raster::image`
   (4 directional `scale_kernel_{y,x}{up,down}` functions, ~220 LOC of
-  near-duplicate box-filter code) is a candidate for a generic
-  `scale_kernel<XDir, YDir>` once a second resampling kernel
-  (e.g. Lanczos) lands and forces a shared abstraction.  Open audit
-  report: `audit/2026-05-11-scale-kernel-generic-direction.md`.
+  near-duplicate box-filter code) is **resolved by Phase 10 task 4**
+  (GPU bicubic image scaling via Vulkan `VK_EXT_filter_cubic` +
+  CUDA texture-object sampler). The second "resampling kernel" lives
+  on a different backend layer, not in a CPU `trait Direction`
+  generic over box-filter — backend dispatch via the existing
+  `GpuBackend` trait is the right factoring. CPU box kernels stay
+  as-is for the headless / no-GPU fallback. See
+  `docs/superpowers/specs/2026-05-07-phase-10-vulkan-compute-backend.md`
+  → "Task 4 — GPU bicubic image scaling" for the design.
 
 *(Four earlier deferred items have shipped or were already covered
 in this release: `PageIter` 4-billion-iter spin → fixed by the
