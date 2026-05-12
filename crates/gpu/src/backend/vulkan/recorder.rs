@@ -459,6 +459,46 @@ impl PageRecorder {
         )
     }
 
+    /// Record one phase of the parallel-Huffman JPEG decoder.
+    ///
+    /// Push-constant layout (must match `parallel_huffman.slang`'s
+    /// `PushParams` cbuffer): `length_bits`, `subsequence_bits`,
+    /// `num_subsequences`, `num_components` — 4 × u32 = 16 bytes.
+    /// Storage bindings: 0 = bitstream, 1 = codebook, 2 = `s_info`.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(super) fn record_huffman(
+        &self,
+        p: params::HuffmanParams<'_, super::VulkanBackend>,
+    ) -> Result<()> {
+        // One thread per subsequence, 256 threads per workgroup (must
+        // match the .slang's numthreads declaration + CUDA's
+        // PHASE1_THREADS).
+        const PHASE1_THREADS: u32 = 256;
+
+        use super::pipeline::KernelId;
+        use crate::backend::params::HuffmanPhase;
+
+        let num_subsequences = p.num_subsequences();
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&p.length_bits.to_ne_bytes());
+        push[4..8].copy_from_slice(&p.subsequence_bits.to_ne_bytes());
+        push[8..12].copy_from_slice(&num_subsequences.to_ne_bytes());
+        push[12..16].copy_from_slice(&p.num_components.to_ne_bytes());
+
+        let kernel = match p.phase {
+            HuffmanPhase::Phase1IntraSync => KernelId::Phase1IntraSync,
+        };
+        let groups = (num_subsequences.div_ceil(PHASE1_THREADS), 1, 1);
+
+        self.dispatch_kernel(
+            kernel,
+            &[p.bitstream.handle(), p.codebook.handle(), p.s_info.handle()],
+            &[p.bitstream.size(), p.codebook.size(), p.s_info.size()],
+            &push,
+            groups,
+        )
+    }
+
     pub(super) fn record_blit_image(
         &self,
         p: params::BlitParams<'_, super::VulkanBackend>,

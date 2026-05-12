@@ -234,3 +234,122 @@ mod tests {
         assert_eq!(flat[0x8000], 0);
     }
 }
+
+#[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
+mod vulkan_tests {
+    use super::*;
+    use crate::backend::cuda::CudaBackend;
+    use crate::backend::vulkan::VulkanBackend;
+    use crate::jpeg_decoder::phase1_oracle::phase1_walk;
+    use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
+
+    fn try_vulkan() -> Option<VulkanBackend> {
+        VulkanBackend::new().ok()
+    }
+
+    fn try_cuda() -> Option<CudaBackend> {
+        CudaBackend::new().ok()
+    }
+
+    /// Run the kernel on both backends + the CPU oracle for every
+    /// subsequence; assert byte-identical state across all three.
+    fn cross_backend_parity(
+        stream: &PackedBitstream,
+        tables: &[CanonicalCodebook],
+        subseq_bits: u32,
+    ) {
+        let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+            eprintln!("skipping: need both CUDA and Vulkan");
+            return;
+        };
+        let gpu_cuda =
+            dispatch_phase1_intra_sync(&cuda, stream, tables, subseq_bits).expect("cuda dispatch");
+        let gpu_vk =
+            dispatch_phase1_intra_sync(&vk, stream, tables, subseq_bits).expect("vulkan dispatch");
+        let num_subseq = stream.length_bits.div_ceil(subseq_bits);
+        for seq_idx in 0..num_subseq {
+            let start_bit = seq_idx * subseq_bits;
+            let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
+            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit);
+            let i = seq_idx as usize;
+            assert_eq!(gpu_cuda[i], cpu, "subseq {seq_idx}: CUDA vs CPU");
+            assert_eq!(gpu_vk[i], cpu, "subseq {seq_idx}: Vulkan vs CPU");
+            assert_eq!(gpu_cuda[i], gpu_vk[i], "subseq {seq_idx}: CUDA vs Vulkan");
+        }
+    }
+
+    /// Vulkan-only parity check (skipped if Vulkan is unavailable but
+    /// CUDA is — keeps the test useful on Vulkan-only hosts).
+    fn vulkan_vs_cpu(stream: &PackedBitstream, tables: &[CanonicalCodebook], subseq_bits: u32) {
+        let Some(vk) = try_vulkan() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        let gpu = dispatch_phase1_intra_sync(&vk, stream, tables, subseq_bits).expect("vulkan");
+        let num_subseq = stream.length_bits.div_ceil(subseq_bits);
+        for seq_idx in 0..num_subseq {
+            let start_bit = seq_idx * subseq_bits;
+            let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
+            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit);
+            assert_eq!(gpu[seq_idx as usize], cpu, "subseq {seq_idx} Vulkan vs CPU");
+        }
+    }
+
+    #[test]
+    fn phase1_single_subsequence_vulkan_vs_cpu() {
+        let stream = book4_stream(&[0x00; 100]);
+        let book = [book4_codebook()];
+        vulkan_vs_cpu(&stream, &book, 256);
+    }
+
+    #[test]
+    fn phase1_many_subsequences_vulkan_vs_cpu() {
+        let stream = book4_stream(&[0x00; 1000]);
+        let book = [book4_codebook()];
+        vulkan_vs_cpu(&stream, &book, 128);
+    }
+
+    #[test]
+    fn phase1_mixed_symbols_vulkan_vs_cpu() {
+        let symbols: Vec<u8> = (0..1000u32).map(|i| (i % 4) as u8).collect();
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        vulkan_vs_cpu(&stream, &book, 128);
+    }
+
+    #[test]
+    fn phase1_multi_component_vulkan_vs_cpu() {
+        let stream = book4_stream(&[0x00; 200]);
+        let book = [book4_codebook(), book4_codebook(), book4_codebook()];
+        vulkan_vs_cpu(&stream, &book, 64);
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_single_subsequence() {
+        let stream = book4_stream(&[0x00; 100]);
+        let book = [book4_codebook()];
+        cross_backend_parity(&stream, &book, 256);
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_many_subsequences() {
+        let stream = book4_stream(&[0x00; 1000]);
+        let book = [book4_codebook()];
+        cross_backend_parity(&stream, &book, 128);
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_mixed_symbols() {
+        let symbols: Vec<u8> = (0..1000u32).map(|i| (i % 4) as u8).collect();
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        cross_backend_parity(&stream, &book, 128);
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_multi_component() {
+        let stream = book4_stream(&[0x00; 200]);
+        let book = [book4_codebook(), book4_codebook(), book4_codebook()];
+        cross_backend_parity(&stream, &book, 64);
+    }
+}

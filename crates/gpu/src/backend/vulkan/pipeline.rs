@@ -50,6 +50,10 @@ pub(super) enum KernelId {
     /// Blelloch scan, scatter phase.
     #[cfg(feature = "gpu-jpeg-huffman")]
     ScanScatter,
+    /// Parallel-Huffman Phase 1 (intra-sequence sync). One pipeline
+    /// today; Phase 2 / Phase 4 join when their kernels land.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    Phase1IntraSync,
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
@@ -59,7 +63,7 @@ pub(super) enum KernelId {
 /// at build time: if `slot_index()` ever returns a value
 /// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
-const NUM_KERNELS: usize = 9;
+const NUM_KERNELS: usize = 10;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
 
@@ -81,6 +85,7 @@ const _: () = {
     assert!(KernelId::ScanPerWorkgroup.slot_index() < NUM_KERNELS);
     assert!(KernelId::ScanBlockSums.slot_index() < NUM_KERNELS);
     assert!(KernelId::ScanScatter.slot_index() < NUM_KERNELS);
+    assert!(KernelId::Phase1IntraSync.slot_index() < NUM_KERNELS);
 };
 
 impl KernelId {
@@ -98,6 +103,10 @@ impl KernelId {
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::ScanPerWorkgroup | Self::ScanBlockSums | Self::ScanScatter => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/blelloch_scan.spv"))
+            }
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase1IntraSync => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/parallel_huffman.spv"))
             }
         }
     }
@@ -140,6 +149,8 @@ impl KernelId {
             Self::ScanBlockSums => 7,
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::ScanScatter => 8,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase1IntraSync => 9,
         }
     }
 
@@ -159,6 +170,8 @@ impl KernelId {
             Self::ScanBlockSums => "scan_block_sums",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::ScanScatter => "scan_scatter",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase1IntraSync => "phase1_intra_sync",
         }
     }
 
@@ -186,6 +199,11 @@ impl KernelId {
             // (data, block_sums) — len_elems travels as push constant
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::ScanPerWorkgroup | Self::ScanBlockSums | Self::ScanScatter => 2,
+            // (bitstream, codebook, s_info) — length_bits +
+            // subsequence_bits + num_subsequences + num_components
+            // travel as push constants (16 bytes total).
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase1IntraSync => 3,
         }
     }
 }

@@ -205,12 +205,16 @@ impl GpuBackend for VulkanBackend {
         ))
     }
 
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn record_huffman(&self, params: params::HuffmanParams<'_, Self>) -> Result<()> {
+        params.validate(self)?;
+        self.recorder.record_huffman(params)
+    }
+
+    #[cfg(not(feature = "gpu-jpeg-huffman"))]
     fn record_huffman(&self, _params: params::HuffmanParams<'_, Self>) -> Result<()> {
-        // TODO: wire the parallel_huffman SPIR-V through the
-        // descriptor-set + pipeline-cache plumbing (mirrors the
-        // record_scan path).
         Err(crate::backend::BackendError::msg(
-            "VulkanBackend::record_huffman: kernel not yet wired in",
+            "VulkanBackend::record_huffman: gpu-jpeg-huffman feature is not enabled",
         ))
     }
 
