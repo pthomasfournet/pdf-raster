@@ -37,18 +37,38 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
     /// # Errors
     /// Returns `JpegGpuError` if the input is not a supported baseline JPEG,
     /// if coefficient extraction fails, or if any GPU operation fails.
-    pub fn decode(
-        &self,
-        jpeg_bytes: &[u8],
-    ) -> std::result::Result<DeviceImage<B>, JpegGpuError> {
+    pub fn decode(&self, jpeg_bytes: &[u8]) -> std::result::Result<DeviceImage<B>, JpegGpuError> {
         let prep = prepare_jpeg(jpeg_bytes)?;
+
+        // Reject subsampled input: the IDCT kernel assumes 4:4:4 (all components
+        // share the same 8×8 block grid). Non-unity sampling factors produce the
+        // wrong chroma block layout and corrupt output silently.
+        for comp in &prep.components {
+            if comp.h_sampling != 1 || comp.v_sampling != 1 {
+                return Err(JpegGpuError::UnsupportedSubsampling {
+                    component: comp.id,
+                    h: comp.h_sampling,
+                    v: comp.v_sampling,
+                });
+            }
+        }
+
         let (coef_flat, dc_flat, qt_flat, num_qtables) =
             extract_coefficients(&prep).map_err(JpegGpuError::HeaderParse)?;
 
         let width = u32::from(prep.width);
         let height = u32::from(prep.height);
-        let num_components = u32::try_from(prep.components.len())
-            .map_err(|_| JpegGpuError::UnsupportedComponents(255))?;
+        let nc = prep.components.len();
+        if nc != 1 && nc != 3 {
+            return Err(JpegGpuError::UnsupportedComponents(
+                u8::try_from(nc).unwrap_or(u8::MAX),
+            ));
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "nc is 1 or 3 (checked above); trivially fits in u32"
+        )]
+        let num_components = nc as u32;
         let blocks_wide = width.div_ceil(8);
         let blocks_high = height.div_ceil(8);
 
@@ -143,8 +163,14 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
 /// - `dc_values`: `num_components × blocks_per_comp` i32 (absolute DC from pre-pass)
 /// - `qtables`: `num_qtables × 64` i32 in natural (row-major) order
 /// - `num_qtables`: count of populated quantisation table slots
-#[expect(clippy::type_complexity, reason = "4-tuple private fn return; a named struct is overkill here")]
-#[expect(clippy::too_many_lines, reason = "AC walk + DC copy + QT copy; split would obscure the single-pass structure")]
+#[expect(
+    clippy::type_complexity,
+    reason = "4-tuple private fn return; a named struct is overkill here"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "AC walk + DC copy + QT copy; split would obscure the single-pass structure"
+)]
 fn extract_coefficients(
     prep: &JpegPreparedInput,
 ) -> std::result::Result<(Vec<i32>, Vec<i32>, Vec<i32>, u32), String> {
@@ -240,9 +266,14 @@ fn extract_coefficients(
                         })?;
                         jpeg_extend(raw.cast_signed(), size)
                     };
-                    if coef_base + zz < coef_flat.len() {
-                        coef_flat[coef_base + zz] = ac_val;
+                    if coef_base + zz >= coef_flat.len() {
+                        return Err(format!(
+                            "coefficient overflow: coef_base={coef_base} zz={zz} \
+                             coef_flat.len()={} (mcu={mcu} comp={ci})",
+                            coef_flat.len()
+                        ));
                     }
+                    coef_flat[coef_base + zz] = ac_val;
                     zz += 1;
                 }
             }
@@ -251,38 +282,55 @@ fn extract_coefficients(
 
     // DC values: pre-resolved absolute DC chain from the pre-pass.
     let mut dc_flat = vec![0i32; num_comp * blocks_per_comp];
-    for (ci, dc_vec) in prep.dc_values.per_component.iter().enumerate() {
-        if ci >= num_comp {
-            break;
-        }
+    for (ci, dc_vec) in prep
+        .dc_values
+        .per_component
+        .iter()
+        .take(num_comp)
+        .enumerate()
+    {
         let base = ci * blocks_per_comp;
         for (bi, &dc) in dc_vec.iter().enumerate() {
-            if base + bi < dc_flat.len() {
-                dc_flat[base + bi] = dc;
+            let idx = base + bi;
+            if idx >= dc_flat.len() {
+                return Err(format!(
+                    "dc_values overflow: comp={ci} block={bi} idx={idx} \
+                     dc_flat.len()={}",
+                    dc_flat.len()
+                ));
             }
+            dc_flat[idx] = dc;
         }
     }
 
-    // Quantisation tables: natural order, one 64-entry array per table slot.
-    let num_qtables_usize = prep
-        .quant_tables
-        .iter()
-        .filter(|qt| qt.is_some())
-        .count()
-        .max(1);
-    let num_qtables = u32::try_from(num_qtables_usize)
-        .unwrap_or(u32::MAX);
-    let mut qt_flat = vec![0i32; num_qtables_usize * 64];
+    // Quantisation tables: pack populated slots densely, preserving slot order.
+    // The kernel selects qt_sel=0 for luma and qt_sel=1 (clamped) for chroma, so
+    // tables must be dense with luma-table first.  JFIF always uses slot 0 (luma)
+    // and slot 1 (chroma), so iterating in slot order and compacting gives the
+    // correct dense layout.
+    let mut qt_flat = Vec::<i32>::with_capacity(4 * 64);
     for (qt_idx, qt) in prep.quant_tables.iter().enumerate() {
         if let Some(qt) = qt {
-            let base = qt_idx * 64;
-            if base + 64 <= qt_flat.len() {
-                for (i, &v) in qt.values.iter().enumerate() {
-                    qt_flat[base + i] = i32::from(v);
-                }
+            if qt.values.len() != 64 {
+                return Err(format!(
+                    "quant table {qt_idx} has {} entries (expected 64)",
+                    qt.values.len()
+                ));
+            }
+            for &v in &qt.values {
+                qt_flat.push(i32::from(v));
             }
         }
     }
+    if qt_flat.is_empty() {
+        return Err("no quantisation tables in JPEG".to_owned());
+    }
+    // At most 4 slots in a JPEG, so qt_flat.len() / 64 ≤ 4, always fits in u32.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "qt_flat has at most 4*64 entries; quotient is at most 4, fits in u32"
+    )]
+    let num_qtables = (qt_flat.len() / 64) as u32;
 
     Ok((coef_flat, dc_flat, qt_flat, num_qtables))
 }
@@ -353,10 +401,7 @@ mod tests {
             sum += u64::from(diff);
         }
         let mean = sum as f64 / gpu_rgba.len() as f64;
-        assert!(
-            peak <= 1,
-            "{label}: peak error {peak} > 1 LSB (IEEE 1180)"
-        );
+        assert!(peak <= 1, "{label}: peak error {peak} > 1 LSB (IEEE 1180)");
         assert!(
             mean <= 0.02,
             "{label}: mean error {mean:.4} > 0.02 LSB (IEEE 1180)"
@@ -365,10 +410,10 @@ mod tests {
 
     /// Decode `bytes` with zune-jpeg in RGBA8 and return the flat pixel buffer.
     fn zune_decode_rgba(bytes: &[u8]) -> Vec<u8> {
+        use zune_jpeg::JpegDecoder;
         use zune_jpeg::zune_core::bytestream::ZCursor;
         use zune_jpeg::zune_core::colorspace::ColorSpace;
         use zune_jpeg::zune_core::options::DecoderOptions;
-        use zune_jpeg::JpegDecoder;
         let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
         let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
         dec.decode().expect("zune-jpeg decode")

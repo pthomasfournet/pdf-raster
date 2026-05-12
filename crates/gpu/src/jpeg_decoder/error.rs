@@ -21,6 +21,18 @@ pub enum JpegGpuError {
     /// (e.g. CMYK 4-component) is rejected here.
     UnsupportedComponents(u8),
 
+    /// JPEG uses chroma subsampling (non-4:4:4). The IDCT kernel assumes
+    /// all components share the same 8×8 block grid; subsampled input
+    /// requires upscaling before dispatch, which is not yet implemented.
+    UnsupportedSubsampling {
+        /// Component identifier from SOF0 (1=Y, 2=Cb, 3=Cr by JFIF convention).
+        component: u8,
+        /// Horizontal sampling factor from SOF0 (must be 1 for 4:4:4).
+        h: u8,
+        /// Vertical sampling factor from SOF0 (must be 1 for 4:4:4).
+        v: u8,
+    },
+
     /// CPU pre-pass (header parse / SOS scan / unstuff) failed before
     /// the GPU dispatch ran. The carried string is the underlying
     /// error formatted via `Display`.
@@ -62,6 +74,11 @@ impl fmt::Display for JpegGpuError {
             Self::UnsupportedComponents(n) => write!(
                 f,
                 "JPEG has unsupported component layout: {n} components, expected 1 or 3"
+            ),
+            Self::UnsupportedSubsampling { component, h, v } => write!(
+                f,
+                "JPEG component {component} uses {h}×{v} sampling; \
+                 only 4:4:4 (all factors = 1) is supported"
             ),
             Self::HeaderParse(s) => write!(f, "CPU pre-pass header parse failed: {s}"),
             Self::InvalidHuffmanTables(s) => {
