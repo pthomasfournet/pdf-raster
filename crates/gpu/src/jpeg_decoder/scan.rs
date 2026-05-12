@@ -192,3 +192,96 @@ mod tests {
         assert_eq!(got, want);
     }
 }
+
+#[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
+mod vulkan_tests {
+    use super::*;
+    use crate::backend::cuda::CudaBackend;
+    use crate::backend::vulkan::VulkanBackend;
+
+    fn cpu_exclusive_scan(input: &[u32]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut acc = 0u32;
+        for &v in input {
+            out.push(acc);
+            acc = acc.wrapping_add(v);
+        }
+        out
+    }
+
+    fn try_vulkan() -> Option<VulkanBackend> {
+        VulkanBackend::new().ok()
+    }
+
+    fn try_cuda() -> Option<CudaBackend> {
+        CudaBackend::new().ok()
+    }
+
+    /// Same input through both backends; outputs must be byte-identical.
+    /// Skipped if either backend can't initialise on this host.
+    fn cross_backend_parity(input: &[u32]) {
+        let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+            eprintln!("skipping: need both CUDA and Vulkan");
+            return;
+        };
+        let cuda_out = dispatch_blelloch_scan(&cuda, input).expect("cuda ok");
+        let vk_out = dispatch_blelloch_scan(&vk, input).expect("vulkan ok");
+        let cpu = cpu_exclusive_scan(input);
+        assert_eq!(cuda_out, cpu, "CUDA diverges from CPU oracle");
+        assert_eq!(vk_out, cpu, "Vulkan diverges from CPU oracle");
+        assert_eq!(cuda_out, vk_out, "CUDA and Vulkan disagree");
+    }
+
+    #[test]
+    fn vulkan_within_one_tile_matches_cpu() {
+        let Some(b) = try_vulkan() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        let input: Vec<u32> = (1..=512).collect();
+        let got = dispatch_blelloch_scan(&b, &input).expect("ok");
+        assert_eq!(got, cpu_exclusive_scan(&input));
+    }
+
+    #[test]
+    fn vulkan_multiple_tiles_match_cpu() {
+        let Some(b) = try_vulkan() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        let input: Vec<u32> = (1..=4096).collect();
+        let got = dispatch_blelloch_scan(&b, &input).expect("ok");
+        assert_eq!(got, cpu_exclusive_scan(&input));
+    }
+
+    #[test]
+    fn vulkan_partial_final_tile_matches_cpu() {
+        let Some(b) = try_vulkan() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        let input: Vec<u32> = (1..=3000).collect();
+        let got = dispatch_blelloch_scan(&b, &input).expect("ok");
+        assert_eq!(got, cpu_exclusive_scan(&input));
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_within_one_tile() {
+        cross_backend_parity(&(1..=512).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_multiple_tiles() {
+        cross_backend_parity(&(1..=4096).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_partial_final_tile() {
+        cross_backend_parity(&(1..=3000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cuda_vs_vulkan_uniform_zeros() {
+        cross_backend_parity(&vec![0u32; 2048]);
+    }
+}

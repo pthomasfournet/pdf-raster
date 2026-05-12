@@ -425,6 +425,47 @@ impl PageRecorder {
         )
     }
 
+    /// Record one Blelloch scan phase. Each call records one
+    /// `vkCmdDispatch` plus the compute→compute memory barrier that
+    /// `dispatch_kernel` always emits. Callers run all three phases
+    /// (`PerWorkgroup` → `BlockSums` → `ScatterBlockSums`) back-to-
+    /// back; the barriers between them make phase N+1 observe phase
+    /// N's writes.
+    ///
+    /// `len_elems` is the only push constant; `data` and `block_sums`
+    /// are bound as storage buffers (bindings 0 and 1).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(super) fn record_scan(
+        &self,
+        p: params::ScanParams<'_, super::VulkanBackend>,
+    ) -> Result<()> {
+        use super::pipeline::KernelId;
+        use crate::backend::params::{SCAN_WORKGROUP_SIZE, ScanPhase};
+
+        let len_elems = p.len_elems;
+        let push: [u8; 4] = len_elems.to_ne_bytes();
+
+        // Per-phase grid + kernel selection. block_sums runs as a
+        // single workgroup over the (≤ SCAN_MAX_BLOCKS) tile-sums
+        // array; per-workgroup + scatter dispatch one workgroup per
+        // tile of 1024 elements.
+        let tile = 2 * SCAN_WORKGROUP_SIZE;
+        let block_count = len_elems.div_ceil(tile);
+        let (kernel, groups) = match p.phase {
+            ScanPhase::PerWorkgroup => (KernelId::ScanPerWorkgroup, (block_count, 1, 1)),
+            ScanPhase::BlockSums => (KernelId::ScanBlockSums, (1, 1, 1)),
+            ScanPhase::ScatterBlockSums => (KernelId::ScanScatter, (block_count, 1, 1)),
+        };
+
+        self.dispatch_kernel(
+            kernel,
+            &[p.data.handle(), p.block_sums.handle()],
+            &[p.data.size(), p.block_sums.size()],
+            &push,
+            groups,
+        )
+    }
+
     pub(super) fn record_blit_image(
         &self,
         p: params::BlitParams<'_, super::VulkanBackend>,

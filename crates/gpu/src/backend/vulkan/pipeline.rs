@@ -30,7 +30,7 @@ use crate::backend::{BackendError, Result};
 use super::device::DeviceCtx;
 use super::error::vk_err;
 
-/// Identifier for one of the six compute kernels.
+/// Identifier for one of the compute kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum KernelId {
     Composite,
@@ -39,7 +39,25 @@ pub(super) enum KernelId {
     TileFill,
     IccClut,
     BlitImage,
+    /// Blelloch scan, per-workgroup phase. Same SPIR-V as the other
+    /// two scan phases (`blelloch_scan.spv` has 3 entry points); the
+    /// pipeline is compiled with this specific entry.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    ScanPerWorkgroup,
+    /// Blelloch scan, single-workgroup block-sums phase.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    ScanBlockSums,
+    /// Blelloch scan, scatter phase.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    ScanScatter,
 }
+
+/// Total number of kernel slots, used to size the `OnceLock` array.
+/// Adding a kernel variant requires bumping this in lockstep.
+#[cfg(feature = "gpu-jpeg-huffman")]
+const NUM_KERNELS: usize = 9;
+#[cfg(not(feature = "gpu-jpeg-huffman"))]
+const NUM_KERNELS: usize = 6;
 
 impl KernelId {
     /// SPIR-V blob for this kernel, baked into the binary at build time.
@@ -53,16 +71,53 @@ impl KernelId {
             Self::TileFill => include_bytes!(concat!(env!("OUT_DIR"), "/tile_fill.spv")),
             Self::IccClut => include_bytes!(concat!(env!("OUT_DIR"), "/icc_clut.spv")),
             Self::BlitImage => include_bytes!(concat!(env!("OUT_DIR"), "/blit_image.spv")),
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanPerWorkgroup | Self::ScanBlockSums | Self::ScanScatter => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/blelloch_scan.spv"))
+            }
         }
     }
 
-    /// SPIR-V entry-point name.  `slangc` renames every entry point to
-    /// `"main"` regardless of the source function name (no flag suppresses
-    /// this in the LunarG-bundled 2025.7.1 slangc), so all kernels share
-    /// the same `"main"` name in the .spv binary.  The `-entry` arg in
-    /// build.rs picks *which* function ends up as `"main"` for kernels
-    /// that have multiple entry points (`icc_clut.slang`'s matrix vs CLUT).
-    const ENTRY_POINT: &'static CStr = c"main";
+    /// SPIR-V entry-point name.
+    ///
+    /// `slangc` renames the entry to `"main"` only when `-entry NAME`
+    /// is passed at compile time; without `-entry` slangc honours the
+    /// `[shader(...)]` attributes and preserves the source function
+    /// names in the SPIR-V `OpEntryPoint` op. The Blelloch scan was
+    /// compiled multi-entry (build.rs `slang_entry` → `None`) so its
+    /// three pipelines must look up by source name.
+    pub(super) const fn entry_point(self) -> &'static CStr {
+        match self {
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanPerWorkgroup => c"scan_per_workgroup",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanBlockSums => c"scan_block_sums",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanScatter => c"scan_scatter",
+            // Every other kernel was compiled with `-entry`, so its
+            // entry point is renamed to `main` in the SPIR-V.
+            _ => c"main",
+        }
+    }
+
+    /// Index into the `slots` array. Must be unique per variant and
+    /// `< NUM_KERNELS`.
+    const fn slot_index(self) -> usize {
+        match self {
+            Self::Composite => 0,
+            Self::ApplySoftMask => 1,
+            Self::AaFill => 2,
+            Self::TileFill => 3,
+            Self::IccClut => 4,
+            Self::BlitImage => 5,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanPerWorkgroup => 6,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanBlockSums => 7,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanScatter => 8,
+        }
+    }
 
     /// Human-readable kernel name for diagnostics.  Matches the source
     /// filename (and the function name in the .cu / .slang).
@@ -74,17 +129,23 @@ impl KernelId {
             Self::TileFill => "tile_fill",
             Self::IccClut => "icc_cmyk_clut",
             Self::BlitImage => "blit_image",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanPerWorkgroup => "scan_per_workgroup",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanBlockSums => "scan_block_sums",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanScatter => "scan_scatter",
         }
     }
 
     /// Number of `STORAGE_BUFFER` descriptors in set 0.
     ///
     /// Order matches the Slang signature so the recorder binds in the
-    /// same order it builds the descriptor write list.
-    #[expect(
-        clippy::match_same_arms,
-        reason = "each variant gets its own arm + buffer-list comment so future kernel additions surface the right binding count next to the relevant kernel"
-    )]
+    /// same order it builds the descriptor write list. Same-count
+    /// variants stay on separate arms with per-arm comments so future
+    /// kernel additions surface their binding count next to the
+    /// relevant kernel name (the clippy `match_same_arms` lint is
+    /// silent here because the scan triplet uses a single OR pattern).
     const fn n_storage_buffers(self) -> u32 {
         match self {
             // (src, dst)
@@ -99,6 +160,9 @@ impl KernelId {
             Self::IccClut => 3,
             // (src, dst_rgba) — inv_ctm and other scalars travel as push constants
             Self::BlitImage => 2,
+            // (data, block_sums) — len_elems travels as push constant
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanPerWorkgroup | Self::ScanBlockSums | Self::ScanScatter => 2,
         }
     }
 }
@@ -117,9 +181,9 @@ struct CompiledKernel {
 /// across runs by persisting driver-internal pipeline state to a file.
 pub(super) struct PipelineCache {
     device: Arc<DeviceCtx>,
-    /// Slots indexed by `KernelId as usize`.  `OnceLock` so the first
+    /// Slots indexed by `KernelId::slot_index()`. `OnceLock` so the first
     /// caller initialises and the rest read; thread-safe by construction.
-    slots: [std::sync::OnceLock<CompiledKernel>; 6],
+    slots: [std::sync::OnceLock<CompiledKernel>; NUM_KERNELS],
     /// Driver-side pipeline cache — populated from disk at startup if a
     /// matching file exists, written back at Drop.  Vulkan validates the
     /// cache header (driver UUID etc.) so a cache from a different driver
@@ -169,7 +233,7 @@ impl PipelineCache {
     /// the loser's pipeline is destroyed before we return.
     /// TODO: switch to `OnceLock::get_or_try_init` once stable (rust-lang/rust#109737).
     fn get(&self, id: KernelId) -> Result<&CompiledKernel> {
-        let slot = &self.slots[id as usize];
+        let slot = &self.slots[id.slot_index()];
         if let Some(c) = slot.get() {
             return Ok(c);
         }
@@ -261,7 +325,7 @@ impl PipelineCache {
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
-            .name(KernelId::ENTRY_POINT);
+            .name(id.entry_point());
         let pipeline_info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout)];
