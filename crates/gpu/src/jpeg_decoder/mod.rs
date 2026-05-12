@@ -29,6 +29,8 @@ mod huffman;
 mod phase1_oracle;
 #[cfg(test)]
 mod phase2_oracle;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub(crate) mod quality;
 mod scan;
 
 pub use bitstream::{PackedBitstream, pack_be_words};
@@ -38,6 +40,8 @@ pub use codetable::{
 pub use cpu_prepass::{JpegPreparedInput, build_mcu_schedule, prepare_jpeg};
 pub use error::JpegGpuError;
 pub use jpeg_framing::{JpegFramingError, decode_scan_symbols};
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub use quality::pick_subsequence_size;
 pub use scan::dispatch_blelloch_scan;
 
 #[cfg(test)]
