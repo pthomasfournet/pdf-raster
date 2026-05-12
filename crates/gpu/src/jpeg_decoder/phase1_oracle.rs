@@ -381,15 +381,6 @@ pub(super) fn phase1_jpeg_walk_snapshot(
             n = n.saturating_add(1);
         }
 
-        // Snapshot: first symbol whose advance crosses count_to.
-        if !snapshotted && p_before < count_to && p >= count_to {
-            snap_p = p;
-            snap_n = n;
-            snap_block = block_in_mcu;
-            snap_z = z_in_block;
-            snapshotted = true;
-        }
-
         // Advance z_in_block (mirrors kernel's end-of-block rotate).
         if is_dc {
             z_in_block = 1;
@@ -433,6 +424,17 @@ pub(super) fn phase1_jpeg_walk_snapshot(
         if z_in_block == 64 {
             block_in_mcu = (block_in_mcu + 1) % blocks_per_mcu;
             z_in_block = 0;
+        }
+
+        // Snapshot: first symbol whose advance crosses count_to,
+        // captured after the full z_in_block + block_in_mcu rotation —
+        // matching the kernel's post-rotation state write.
+        if !snapshotted && p_before < count_to && p >= count_to {
+            snap_p = p;
+            snap_n = n;
+            snap_block = block_in_mcu;
+            snap_z = z_in_block;
+            snapshotted = true;
         }
     }
 
