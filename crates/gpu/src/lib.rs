@@ -35,6 +35,9 @@ pub mod blit;
 #[cfg(feature = "cache")]
 pub mod cache;
 
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub mod jpeg_decoder;
+
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub mod decode_queue;
 mod fill;

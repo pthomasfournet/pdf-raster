@@ -44,6 +44,11 @@ cache = ["dep:blake3", "dep:dashmap"]
 # at build time via `slangc` (LunarG SDK), pulls in `ash` for runtime
 # Vulkan, and exposes `VulkanBackend` implementing `GpuBackend`.
 vulkan = ["dep:ash", "dep:gpu-allocator"]
+# Custom parallel-Huffman GPU JPEG decoder (Weißenberger & Schmidt 2021).
+# CPU-only scaffolding today (bitstream pack, codetable build, scalar
+# reference decoder, synthetic oracle); GPU dispatch lands once the
+# Phase 10 backend trait admits it.
+gpu-jpeg-huffman = []
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }
