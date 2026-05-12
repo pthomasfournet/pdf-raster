@@ -12,12 +12,14 @@
 
 mod bitstream;
 mod codetable;
+mod cpu_reference;
 mod error;
 
 pub use bitstream::{PackedBitstream, pack_be_words};
 pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
+pub use cpu_reference::decode_scalar;
 pub use error::JpegGpuError;
 
 #[cfg(test)]
