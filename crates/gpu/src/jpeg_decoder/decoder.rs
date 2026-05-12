@@ -302,6 +302,16 @@ const fn jpeg_extend(value: i32, nbits: u8) -> i32 {
     }
 }
 
+/// Test-only re-export of the private `extract_coefficients` so sibling
+/// test modules (e.g., `cpu_prepass` DRI tests) can call it without
+/// duplicating the coefficient-extraction logic.
+#[cfg(test)]
+pub(crate) fn extract_coefficients_pub(
+    prep: &crate::jpeg_decoder::cpu_prepass::JpegPreparedInput,
+) -> std::result::Result<(Vec<i32>, Vec<i32>, Vec<i32>, u32), String> {
+    extract_coefficients(prep)
+}
+
 #[cfg(all(test, feature = "gpu-validation"))]
 mod tests {
     use super::*;
@@ -311,7 +321,7 @@ mod tests {
     fn decoder_decodes_grayscale_jpeg_on_cuda() {
         let backend = CudaBackend::new().expect("CUDA backend");
         let dec = JpegGpuDecoder::new(backend);
-        let bytes = crate::jpeg_decoder::tests::fixtures::GRAY_16X16_JPEG;
+        let bytes = crate::jpeg::test_fixtures::GRAY_16X16_JPEG;
         let img = dec.decode(bytes).expect("decode");
         assert_eq!(img.width, 16);
         assert_eq!(img.height, 16);

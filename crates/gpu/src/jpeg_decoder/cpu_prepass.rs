@@ -534,4 +534,75 @@ mod tests {
             assert_eq!(ac_sel, u32::from(prep.ac_selectors[comp_idx as usize]));
         }
     }
+
+    // ── DRI (restart interval) tests ─────────────────────────────────────
+
+    /// Build a JPEG byte stream with a DRI marker injected before the SOS.
+    ///
+    /// `GRAY_16X16_JPEG` has its SOS at offset 147.  Inserting 6 bytes of
+    /// DRI segment (`FF DD 00 04 hi lo`) at that point produces a valid
+    /// JPEG stream that `prepare_jpeg` must accept — the scan data is
+    /// unchanged, so the only difference is that `restart_interval` is set.
+    fn gray_16x16_with_dri(interval: u16) -> Vec<u8> {
+        const SOS_OFFSET: usize = 147;
+        let base = GRAY_16X16_JPEG;
+        let dri = [
+            0xFF, 0xDD,           // DRI marker
+            0x00, 0x04,           // length = 4
+            (interval >> 8) as u8,
+            (interval & 0xFF) as u8,
+        ];
+        let mut out = Vec::with_capacity(base.len() + dri.len());
+        out.extend_from_slice(&base[..SOS_OFFSET]);
+        out.extend_from_slice(&dri);
+        out.extend_from_slice(&base[SOS_OFFSET..]);
+        out
+    }
+
+    #[test]
+    fn prepare_jpeg_reads_dri_1() {
+        let bytes = gray_16x16_with_dri(1);
+        let prep = prepare_jpeg(&bytes).expect("DRI=1 must prepare");
+        assert_eq!(prep.restart_interval, 1);
+        assert_eq!(prep.width, 16);
+        assert_eq!(prep.height, 16);
+    }
+
+    #[test]
+    fn prepare_jpeg_reads_dri_8() {
+        let bytes = gray_16x16_with_dri(8);
+        let prep = prepare_jpeg(&bytes).expect("DRI=8 must prepare");
+        assert_eq!(prep.restart_interval, 8);
+    }
+
+    #[test]
+    fn prepare_jpeg_reads_dri_64() {
+        let bytes = gray_16x16_with_dri(64);
+        let prep = prepare_jpeg(&bytes).expect("DRI=64 must prepare");
+        assert_eq!(prep.restart_interval, 64);
+    }
+
+    #[test]
+    fn dri_jpeg_extract_coefficients_succeeds() {
+        // DRI does not affect the bitstream — RST markers are stripped by
+        // the unstuffing pass.  Coefficient extraction must succeed on all
+        // three intervals and produce the same coefficients as the no-DRI
+        // baseline (the scan payload is byte-identical).
+        let baseline = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        let (base_coef, base_dc, base_qt, base_nq) =
+            super::super::decoder::extract_coefficients_pub(&baseline)
+                .expect("baseline extract");
+
+        for interval in [1u16, 8, 64] {
+            let bytes = gray_16x16_with_dri(interval);
+            let prep = prepare_jpeg(&bytes).unwrap();
+            let (coef, dc, qt, nq) =
+                super::super::decoder::extract_coefficients_pub(&prep)
+                    .expect("DRI extract");
+            assert_eq!(coef, base_coef, "DRI={interval}: coefficients differ");
+            assert_eq!(dc, base_dc,   "DRI={interval}: dc_values differ");
+            assert_eq!(qt, base_qt,   "DRI={interval}: qtables differ");
+            assert_eq!(nq, base_nq,   "DRI={interval}: num_qtables differ");
+        }
+    }
 }
