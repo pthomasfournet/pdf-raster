@@ -513,6 +513,33 @@ impl PageRecorder {
                     groups,
                 )
             }
+            HuffmanPhase::Phase4Redecode => {
+                let offsets = p
+                    .offsets
+                    .expect("validate() proved offsets is Some for Phase4Redecode");
+                let symbols_out = p
+                    .symbols_out
+                    .expect("validate() proved symbols_out is Some for Phase4Redecode");
+                self.dispatch_kernel(
+                    KernelId::Phase4Redecode,
+                    &[
+                        p.bitstream.handle(),
+                        p.codebook.handle(),
+                        p.s_info.handle(),
+                        offsets.handle(),
+                        symbols_out.handle(),
+                    ],
+                    &[
+                        p.bitstream.size(),
+                        p.codebook.size(),
+                        p.s_info.size(),
+                        offsets.size(),
+                        symbols_out.size(),
+                    ],
+                    &push,
+                    groups,
+                )
+            }
         }
     }
 

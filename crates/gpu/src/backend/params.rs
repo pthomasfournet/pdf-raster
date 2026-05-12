@@ -400,6 +400,13 @@ pub enum HuffmanPhase {
     /// `sync_flags[i] = 0`. The host loops this dispatch until all
     /// flags are 1 or the retry bound is exhausted.
     Phase2InterSync,
+    /// One thread per subsequence; re-walks the subseq's owned
+    /// region `[prev.p, me.p)` and writes each decoded symbol to
+    /// `symbols_out[offsets[seq_idx] + local_n]`. Requires
+    /// `offsets` and `symbols_out` to be `Some` (Phase 3's
+    /// exclusive-scan output + a buffer sized to the total symbol
+    /// count).
+    Phase4Redecode,
 }
 
 /// Parameters for one phase of the parallel-Huffman JPEG decoder.
@@ -418,6 +425,11 @@ pub enum HuffmanPhase {
 /// - When `phase == Phase2InterSync`: `sync_flags` must be `Some`
 ///   with device capacity ≥ `num_subsequences * 4` bytes (one u32
 ///   flag per subsequence). For Phase 1 the field is ignored.
+/// - When `phase == Phase4Redecode`: both `offsets` and `symbols_out`
+///   must be `Some`. `offsets` ≥ `num_subsequences * 4` bytes.
+///   `symbols_out` must hold at least `total_symbols * 4` bytes;
+///   callers compute `total_symbols` from the Phase 3 exclusive scan
+///   total plus the last subseq's `n`.
 pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// Packed bitstream as big-endian u32 words.
     pub bitstream: &'a B::DeviceBuffer,
@@ -429,14 +441,29 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     pub s_info: &'a B::DeviceBuffer,
     /// Per-subseq sync flag (1 = synced with right neighbour,
     /// 0 = unsynced and advanced this pass). Required for
-    /// `Phase2InterSync`; ignored for `Phase1IntraSync`.
+    /// `Phase2InterSync`; ignored for other phases.
     pub sync_flags: Option<&'a B::DeviceBuffer>,
+    /// Exclusive-scan output from Phase 3 (`u32[num_subsequences]`):
+    /// `offsets[i]` is the base index into `symbols_out` where
+    /// subseq `i`'s emitted symbols are written. Required for
+    /// `Phase4Redecode`; ignored for other phases.
+    pub offsets: Option<&'a B::DeviceBuffer>,
+    /// Final decoded symbol stream (`u32[total_symbols]`). Required
+    /// for `Phase4Redecode`; ignored for other phases. Caller sizes
+    /// it from Phase 3's scan total + last subseq's `n`.
+    pub symbols_out: Option<&'a B::DeviceBuffer>,
     /// Exact bit count of `bitstream`.
     pub length_bits: u32,
     /// Subsequence size (Wei §III); 128 / 512 / 1024 in practice.
     pub subsequence_bits: u32,
     /// Number of Huffman tables (one per component for the MVP).
     pub num_components: u32,
+    /// Total symbol count = exclusive scan of `s_info[*].n` total +
+    /// `s_info[num_subseq-1].n`. Used only by `Phase4Redecode` to
+    /// validate `symbols_out` capacity; the kernel itself doesn't
+    /// read this value (it bounds each thread's write count via
+    /// `me.p` instead).
+    pub total_symbols: u32,
     /// Which phase of the parallel-Huffman algorithm this dispatch
     /// executes.
     pub phase: HuffmanPhase,
@@ -528,6 +555,33 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
             if backend.device_buffer_len(flags) < flags_bytes {
                 return Err(invariant(
                     "sync_flags buffer is smaller than num_subsequences * 4 bytes",
+                ));
+            }
+        }
+
+        if matches!(self.phase, HuffmanPhase::Phase4Redecode) {
+            let Some(offsets) = self.offsets else {
+                return Err(invariant("Phase4Redecode requires offsets to be Some"));
+            };
+            let Some(symbols_out) = self.symbols_out else {
+                return Err(invariant("Phase4Redecode requires symbols_out to be Some"));
+            };
+            // offsets: 1 u32 per subsequence.
+            let offsets_bytes = (self.num_subsequences() as usize)
+                .checked_mul(4)
+                .ok_or_else(|| invariant("offsets byte count overflows usize"))?;
+            if backend.device_buffer_len(offsets) < offsets_bytes {
+                return Err(invariant(
+                    "offsets buffer is smaller than num_subsequences * 4 bytes",
+                ));
+            }
+            // symbols_out: 1 u32 per decoded symbol.
+            let symbols_bytes = (self.total_symbols as usize)
+                .checked_mul(4)
+                .ok_or_else(|| invariant("symbols_out byte count overflows usize"))?;
+            if backend.device_buffer_len(symbols_out) < symbols_bytes {
+                return Err(invariant(
+                    "symbols_out buffer is smaller than total_symbols * 4 bytes",
                 ));
             }
         }

@@ -306,6 +306,26 @@ impl PageRecorder {
                     )
                     .map_err(be)
             }
+            params::HuffmanPhase::Phase4Redecode => {
+                let offsets = p
+                    .offsets
+                    .expect("validate() proved offsets is Some for Phase4Redecode");
+                let symbols_out = p
+                    .symbols_out
+                    .expect("validate() proved symbols_out is Some for Phase4Redecode");
+                self.ctx
+                    .launch_phase4_redecode_async(
+                        p.bitstream,
+                        p.codebook,
+                        p.s_info,
+                        offsets,
+                        symbols_out,
+                        p.length_bits,
+                        num_subsequences,
+                        p.num_components,
+                    )
+                    .map_err(be)
+            }
         }
     }
 

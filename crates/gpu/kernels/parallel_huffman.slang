@@ -34,6 +34,12 @@
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint4> s_info_out;
 // Phase 2 only — bound at slot 3 in the Phase 2 descriptor layout.
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> sync_flags;
+// Phase 4 only — bound at slots 4 + 5 in the Phase 4 descriptor
+// layout. `offsets[i]` is the exclusive-scan base where subseq i
+// writes its symbols; `symbols_out` receives the final decoded
+// symbol stream.
+[[vk::binding(4, 0)]] StructuredBuffer<uint> offsets;
+[[vk::binding(5, 0)]] RWStructuredBuffer<uint> symbols_out;
 
 [[vk::push_constant]]
 cbuffer PushParams {
@@ -127,6 +133,73 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     }
 
     s_info_out[seq_idx] = state;
+}
+
+/// Phase 4 re-decode + write.
+///
+/// One thread per subsequence. Re-walks the subseq's owned region
+/// `[prev.p, me.p)`, decoding each symbol and writing it to
+/// `symbols_out[offsets[seq_idx] + local_idx]`. Predecessor state
+/// comes from `s_info_out[seq_idx - 1]` (or the fresh start for
+/// `seq_idx == 0`).
+///
+/// Per-region accounting was fixed in Phase 1+2, so `me.n` equals
+/// the number of symbols this thread will emit — caller can size
+/// `symbols_out` from the exclusive scan total + last subseq's n.
+[shader("compute")][numthreads(256, 1, 1)]
+void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
+    uint seq_idx = tid.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+
+    uint4 me = s_info_out[seq_idx];
+    uint end_p = me.x;
+
+    // Predecessor's end-of-walk state — that's where my owned region
+    // begins. Subseq 0 starts fresh at (p=0, c=0, z=0).
+    uint4 state;
+    if (seq_idx == 0u) {
+        state = uint4(0u, 0u, 0u, 0u);
+    } else {
+        uint4 prev = s_info_out[seq_idx - 1];
+        // Inherit prev's (p, c, z); reset n to 0 so it counts only
+        // this thread's emissions.
+        state = uint4(prev.x, 0u, prev.z, prev.w);
+    }
+
+    uint base = offsets[seq_idx];
+
+    // Loop bound matches Phase 1's: at most one symbol every
+    // (code_bits + value_bits) >= 1 bits. +1 protects a degenerate
+    // codebook.
+    uint max_iters = (end_p > state.x ? end_p - state.x : 0u) + 1u;
+    for (uint iter = 0u; iter < max_iters; iter++) {
+        if (state.x >= end_p) {
+            break;
+        }
+        // Inline single-symbol decode + emit. Mirrors
+        // try_decode_one_symbol_kernel but captures the symbol value.
+        uint peek = peek16_kernel(state.x);
+        uint entry = codebook[state.z * 65536u + peek];
+        uint num_bits = (entry >> 8u) & 0xFFu;
+        if (num_bits == 0u) {
+            break;
+        }
+        uint symbol = entry & 0xFFu;
+        uint value_bits = symbol & 0x0Fu;
+        uint advance = num_bits + value_bits;
+        if (state.x + advance > length_bits) {
+            break;
+        }
+        symbols_out[base + state.y] = symbol;
+        state.x += advance;
+        state.y += 1u;
+        state.w = (state.w + 1u) & 63u;
+        if (state.w == 0u) {
+            state.z = (state.z + 1u) % num_components;
+        }
+    }
 }
 
 [shader("compute")][numthreads(256, 1, 1)]

@@ -56,6 +56,9 @@ pub(super) enum KernelId {
     /// Parallel-Huffman Phase 2 (inter-sequence sync, bounded retry).
     #[cfg(feature = "gpu-jpeg-huffman")]
     Phase2InterSync,
+    /// Parallel-Huffman Phase 4 (re-decode + write final symbols).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    Phase4Redecode,
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
@@ -65,7 +68,7 @@ pub(super) enum KernelId {
 /// at build time: if `slot_index()` ever returns a value
 /// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
-const NUM_KERNELS: usize = 11;
+const NUM_KERNELS: usize = 12;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
 
@@ -89,6 +92,7 @@ const _: () = {
     assert!(KernelId::ScanScatter.slot_index() < NUM_KERNELS);
     assert!(KernelId::Phase1IntraSync.slot_index() < NUM_KERNELS);
     assert!(KernelId::Phase2InterSync.slot_index() < NUM_KERNELS);
+    assert!(KernelId::Phase4Redecode.slot_index() < NUM_KERNELS);
 };
 
 impl KernelId {
@@ -108,7 +112,7 @@ impl KernelId {
                 include_bytes!(concat!(env!("OUT_DIR"), "/blelloch_scan.spv"))
             }
             #[cfg(feature = "gpu-jpeg-huffman")]
-            Self::Phase1IntraSync | Self::Phase2InterSync => {
+            Self::Phase1IntraSync | Self::Phase2InterSync | Self::Phase4Redecode => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/parallel_huffman.spv"))
             }
         }
@@ -134,6 +138,8 @@ impl KernelId {
             Self::Phase1IntraSync => c"phase1_intra_sync",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase2InterSync => c"phase2_inter_sync",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase4Redecode => c"phase4_redecode",
             // Every other kernel was compiled with `-entry`, so its
             // entry point is renamed to `main` in the SPIR-V.
             _ => c"main",
@@ -160,6 +166,8 @@ impl KernelId {
             Self::Phase1IntraSync => 9,
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase2InterSync => 10,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase4Redecode => 11,
         }
     }
 
@@ -183,6 +191,8 @@ impl KernelId {
             Self::Phase1IntraSync => "phase1_intra_sync",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase2InterSync => "phase2_inter_sync",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase4Redecode => "phase4_redecode",
         }
     }
 
@@ -219,6 +229,14 @@ impl KernelId {
             // push constants as Phase 1.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase2InterSync => 4,
+            // (bitstream, codebook, s_info, offsets, symbols_out) —
+            // length_bits + num_subsequences + num_components travel
+            // as push constants (12 bytes — subsequence_bits unused).
+            // The descriptor layout reuses the Phase 1/2 push constant
+            // size (16 bytes) for simplicity; the kernel just ignores
+            // the trailing 4 bytes.
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase4Redecode => 5,
         }
     }
 }

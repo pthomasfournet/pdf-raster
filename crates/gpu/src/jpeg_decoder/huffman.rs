@@ -108,9 +108,12 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
         codebook: &codebook_buf,
         s_info: &s_info_buf,
         sync_flags: None,
+        offsets: None,
+        symbols_out: None,
         length_bits,
         subsequence_bits,
         num_components,
+        total_symbols: 0,
         phase: HuffmanPhase::Phase1IntraSync,
     })?;
     let fence = backend.submit_page()?;
@@ -199,9 +202,12 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
         codebook: &codebook_buf,
         s_info: &s_info_buf,
         sync_flags: None,
+        offsets: None,
+        symbols_out: None,
         length_bits,
         subsequence_bits,
         num_components,
+        total_symbols: 0,
         phase: HuffmanPhase::Phase1IntraSync,
     })?;
     let fence = backend.submit_page()?;
@@ -218,9 +224,12 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
             codebook: &codebook_buf,
             s_info: &s_info_buf,
             sync_flags: Some(&sync_flags_buf),
+            offsets: None,
+            symbols_out: None,
             length_bits,
             subsequence_bits,
             num_components,
+            total_symbols: 0,
             phase: HuffmanPhase::Phase2InterSync,
         })?;
         let fence = backend.submit_page()?;
@@ -248,6 +257,190 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     backend.free_device(sync_flags_buf);
 
     Ok((s_info_out, outcome))
+}
+
+/// One-shot dispatch of all four phases: 1 → 2 → 3 → 4.
+///
+/// Encodes the synthetic test path end-to-end. Returns the final
+/// decoded symbol stream (u32 per symbol; the kernel writes a u8
+/// value but the buffer is u32-strided to match the Slang/CUDA
+/// signature).
+///
+/// Algorithm:
+/// - Phase 1: per-subseq intra-walk → `s_info`.
+/// - Phase 2: bounded sync loop → fixes up `s_info[i].p` and `.n`.
+/// - Phase 3: exclusive scan over `s_info[i].n` → `offsets`. Done
+///   host-side here (the values are tiny — one u32 per subseq);
+///   production callers should use `dispatch_phase3_offsets` to
+///   keep the scan on device.
+/// - Phase 4: per-subseq re-decode from `[prev.p, me.p)`, writing
+///   each symbol to `symbols_out[offsets[i] + local_n]`.
+///
+/// Test/oracle path only — production callers should drive the
+/// trait directly to keep buffers alive across pages.
+///
+/// # Errors
+/// Returns `BackendError` if any alloc/upload/dispatch/download
+/// fails, or if Phase 2 fails to converge within the retry bound.
+#[cfg(feature = "gpu-validation")]
+fn dispatch_phase1_through_phase4<B: GpuBackend>(
+    backend: &B,
+    stream: &PackedBitstream,
+    codebooks: &[CanonicalCodebook],
+    subsequence_bits: u32,
+) -> Result<Vec<u32>> {
+    if stream.length_bits == 0 {
+        return Ok(Vec::new());
+    }
+    if subsequence_bits == 0 {
+        return Err(BackendError::msg(
+            "dispatch_phase1_through_phase4: subsequence_bits must be > 0",
+        ));
+    }
+    if codebooks.is_empty() {
+        return Err(BackendError::msg(
+            "dispatch_phase1_through_phase4: at least one codebook required",
+        ));
+    }
+
+    let num_components = u32::try_from(codebooks.len()).map_err(|_| {
+        BackendError::msg(format!(
+            "more codebooks ({}) than fit in u32",
+            codebooks.len()
+        ))
+    })?;
+    let length_bits = stream.length_bits;
+    let num_subsequences = length_bits.div_ceil(subsequence_bits);
+
+    let bitstream_words = (length_bits.div_ceil(32) as usize) + 1;
+    let bitstream_bytes = bitstream_words * 4;
+    let codebook_flat = build_gpu_codebook(codebooks);
+    let codebook_bytes = codebook_flat.len() * 4;
+    let s_info_bytes = (num_subsequences as usize) * std::mem::size_of::<SubsequenceState>();
+    let flags_bytes = (num_subsequences as usize) * 4;
+    let offsets_bytes = flags_bytes;
+
+    let bitstream_buf = backend.alloc_device_zeroed(bitstream_bytes)?;
+    let codebook_buf = backend.alloc_device(codebook_bytes)?;
+    let s_info_buf = backend.alloc_device(s_info_bytes)?;
+    let sync_flags_buf = backend.alloc_device(flags_bytes)?;
+    let offsets_buf = backend.alloc_device(offsets_bytes)?;
+
+    let _up1 = backend.upload_async(&bitstream_buf, bytemuck::cast_slice(&stream.words))?;
+    let _up2 = backend.upload_async(&codebook_buf, bytemuck::cast_slice(&codebook_flat))?;
+
+    // Phase 1.
+    backend.begin_page()?;
+    backend.record_huffman(HuffmanParams {
+        bitstream: &bitstream_buf,
+        codebook: &codebook_buf,
+        s_info: &s_info_buf,
+        sync_flags: None,
+        offsets: None,
+        symbols_out: None,
+        length_bits,
+        subsequence_bits,
+        num_components,
+        total_symbols: 0,
+        phase: HuffmanPhase::Phase1IntraSync,
+    })?;
+    let fence = backend.submit_page()?;
+    backend.wait_page(fence)?;
+
+    // Phase 2.
+    let bound = phase2_retry_bound(num_subsequences as usize);
+    let mut flags_host = vec![0u32; num_subsequences as usize];
+    let mut converged = false;
+    for _iter in 0..=bound {
+        backend.begin_page()?;
+        backend.record_huffman(HuffmanParams {
+            bitstream: &bitstream_buf,
+            codebook: &codebook_buf,
+            s_info: &s_info_buf,
+            sync_flags: Some(&sync_flags_buf),
+            offsets: None,
+            symbols_out: None,
+            length_bits,
+            subsequence_bits,
+            num_components,
+            total_symbols: 0,
+            phase: HuffmanPhase::Phase2InterSync,
+        })?;
+        let fence = backend.submit_page()?;
+        backend.wait_page(fence)?;
+
+        let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut flags_host);
+        let handle = backend.download_async(&sync_flags_buf, dst)?;
+        backend.wait_download(handle)?;
+
+        if flags_host.iter().all(|&f| f == 1) {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        backend.free_device(bitstream_buf);
+        backend.free_device(codebook_buf);
+        backend.free_device(s_info_buf);
+        backend.free_device(sync_flags_buf);
+        backend.free_device(offsets_buf);
+        return Err(BackendError::msg(
+            "dispatch_phase1_through_phase4: Phase 2 did not converge within retry bound",
+        ));
+    }
+
+    // Download s_info to compute Phase 3 offsets host-side and
+    // determine the total symbol count for sizing symbols_out.
+    let mut s_info_host =
+        vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
+    let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut s_info_host);
+    let handle = backend.download_async(&s_info_buf, dst)?;
+    backend.wait_download(handle)?;
+
+    let mut offsets_host = Vec::with_capacity(num_subsequences as usize);
+    let mut acc: u32 = 0;
+    for s in &s_info_host {
+        offsets_host.push(acc);
+        acc = acc.wrapping_add(s.n);
+    }
+    let total_symbols = acc;
+
+    let _up3 = backend.upload_async(&offsets_buf, bytemuck::cast_slice(&offsets_host))?;
+
+    let symbols_bytes = (total_symbols as usize) * 4;
+    let symbols_buf = backend.alloc_device_zeroed(symbols_bytes)?;
+
+    // Phase 4.
+    backend.begin_page()?;
+    backend.record_huffman(HuffmanParams {
+        bitstream: &bitstream_buf,
+        codebook: &codebook_buf,
+        s_info: &s_info_buf,
+        sync_flags: None,
+        offsets: Some(&offsets_buf),
+        symbols_out: Some(&symbols_buf),
+        length_bits,
+        subsequence_bits,
+        num_components,
+        total_symbols,
+        phase: HuffmanPhase::Phase4Redecode,
+    })?;
+    let fence = backend.submit_page()?;
+    backend.wait_page(fence)?;
+
+    let mut symbols_host = vec![0u32; total_symbols as usize];
+    let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut symbols_host);
+    let handle = backend.download_async(&symbols_buf, dst)?;
+    backend.wait_download(handle)?;
+
+    backend.free_device(bitstream_buf);
+    backend.free_device(codebook_buf);
+    backend.free_device(s_info_buf);
+    backend.free_device(sync_flags_buf);
+    backend.free_device(offsets_buf);
+    backend.free_device(symbols_buf);
+
+    Ok(symbols_host)
 }
 
 /// Phase 3: exclusive prefix-sum of per-subsequence symbol counts.
@@ -519,6 +712,66 @@ mod tests {
         let gpu_off = dispatch_phase3_offsets(&b, &s_info).expect("phase3");
         assert_eq!(gpu_off, cpu_off);
     }
+
+    /// End-to-end: encode synthetic symbols → run Phases 1..4 on GPU
+    /// → verify the decoded symbol stream matches the input.
+    ///
+    /// Uniform symbol stream (all 0x00 → code "00"): every subseq's
+    /// own region is a clean integer number of length-2 codewords,
+    /// no straddling. This is the simplest possible end-to-end test.
+    #[test]
+    fn end_to_end_uniform_stream_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let symbols: Vec<u8> = vec![0x00; 1024];
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        let decoded = dispatch_phase1_through_phase4(&b, &stream, &book, 128).expect("e2e");
+
+        assert_eq!(decoded.len(), symbols.len(), "symbol count mismatch");
+        let got: Vec<u8> = decoded
+            .iter()
+            .map(|&v| u8::try_from(v & 0xFF).expect("symbol fits u8"))
+            .collect();
+        assert_eq!(got, symbols, "decoded stream diverges from input");
+    }
+
+    /// End-to-end on **mixed** codeword lengths (lengths 2 + 3).
+    /// MVP Phase 2's `(c, z)` sync predicate can need O(subseq_bits)
+    /// advance steps on this corpus, exceeding the `2 * log2(n)`
+    /// retry bound. Documented limitation; the test expects either
+    /// Convergence (and validates the round-trip) or the
+    /// SyncBoundExceeded BackendError. Robust sync is a follow-up
+    /// in the post-MVP corpus work.
+    #[test]
+    fn end_to_end_mixed_codeword_lengths_cuda_documented_limitation() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let symbols: Vec<u8> = (0..1000u32).map(|i| (i % 4) as u8).collect();
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        match dispatch_phase1_through_phase4(&b, &stream, &book, 128) {
+            Ok(decoded) => {
+                let got: Vec<u8> = decoded
+                    .iter()
+                    .map(|&v| u8::try_from(v & 0xFF).expect("symbol fits u8"))
+                    .collect();
+                assert_eq!(got, symbols, "decoded stream diverges from input");
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("Phase 2 did not converge"),
+                    "unexpected error: {msg}"
+                );
+                eprintln!("mixed-stream Phase 2 convergence is a documented MVP limitation: {msg}");
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
@@ -693,5 +946,31 @@ mod vulkan_tests {
         assert_eq!(cuda_off, cpu_off, "CUDA diverges from CPU oracle");
         assert_eq!(vk_off, cpu_off, "Vulkan diverges from CPU oracle");
         assert_eq!(cuda_off, vk_off, "CUDA and Vulkan disagree");
+    }
+
+    /// End-to-end Phases 1..4 on both backends; the decoded symbol
+    /// streams must be byte-identical and equal to the original
+    /// input. Uniform-length corpus stays within Phase 2's MVP retry
+    /// bound on both backends.
+    #[test]
+    fn end_to_end_uniform_cuda_vs_vulkan() {
+        let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+            eprintln!("skipping: need both CUDA and Vulkan");
+            return;
+        };
+        let symbols: Vec<u8> = vec![0x00; 1024];
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        let cuda_decoded =
+            dispatch_phase1_through_phase4(&cuda, &stream, &book, 128).expect("cuda e2e");
+        let vk_decoded =
+            dispatch_phase1_through_phase4(&vk, &stream, &book, 128).expect("vulkan e2e");
+
+        assert_eq!(cuda_decoded, vk_decoded, "CUDA and Vulkan diverge");
+        let got: Vec<u8> = cuda_decoded
+            .iter()
+            .map(|&v| u8::try_from(v & 0xFF).expect("symbol fits u8"))
+            .collect();
+        assert_eq!(got, symbols, "decoded stream diverges from input");
     }
 }

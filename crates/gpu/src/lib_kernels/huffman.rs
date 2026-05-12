@@ -107,4 +107,54 @@ impl GpuCtx {
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
+
+    /// Async launch of the Phase 4 re-decode + write kernel.
+    ///
+    /// One thread per subsequence. Re-walks the subseq's owned region
+    /// `[prev.p, me.p)` and emits each decoded symbol to
+    /// `symbols_out[offsets[seq_idx] + local_n]`.
+    ///
+    /// # Errors
+    /// Returns the underlying CUDA error if the kernel launch fails.
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "args mirror the .cu signature; grouping into a struct would just shuffle the bytes"
+    )]
+    pub(crate) fn launch_phase4_redecode_async(
+        &self,
+        bitstream: &CudaSlice<u8>,
+        codebook: &CudaSlice<u8>,
+        s_info: &CudaSlice<u8>,
+        offsets: &CudaSlice<u8>,
+        symbols_out: &CudaSlice<u8>,
+        length_bits: u32,
+        num_subsequences: u32,
+        num_components: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1),
+            block_dim: (HUFFMAN_PHASE1_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let stream = &self.stream;
+        let mut builder = stream.launch_builder(&self.kernels.phase4_redecode);
+        builder
+            .arg(bitstream)
+            .arg(codebook)
+            .arg(s_info)
+            .arg(offsets)
+            .arg(symbols_out)
+            .arg(&length_bits)
+            .arg(&num_subsequences)
+            .arg(&num_components);
+        // SAFETY: arg count + types match the PTX phase4_redecode
+        // signature; buffer capacities validated by HuffmanParams.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
 }

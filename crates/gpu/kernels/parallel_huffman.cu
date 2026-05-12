@@ -120,6 +120,63 @@ extern "C" __global__ void phase1_intra_sync(
     s_info_out[seq_idx] = out;
 }
 
+// Phase 4: re-decode + write. One thread per subsequence. Re-walks
+// the owned region `[prev.p, me.p)` and writes each symbol to
+// `symbols_out[offsets[seq_idx] + local_n]`. Predecessor state
+// comes from s_info[seq_idx-1] (or fresh start for seq_idx == 0).
+//
+// Per-region accounting was fixed in Phase 1+2 so `me.n` equals the
+// number of symbols this thread emits.
+extern "C" __global__ void phase4_redecode(
+    const unsigned int* __restrict__ bitstream,
+    const unsigned int* __restrict__ codebook,
+    const uint4* __restrict__ s_info,
+    const unsigned int* __restrict__ offsets,
+    unsigned int* __restrict__ symbols_out,
+    unsigned int length_bits,
+    unsigned int num_subsequences,
+    unsigned int num_components
+) {
+    unsigned int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+
+    uint4 me = s_info[seq_idx];
+    unsigned int end_p = me.x;
+
+    // (p, n, c, z) packed into uint4 (x, y, z, w).
+    unsigned int p, n, c, z;
+    if (seq_idx == 0u) {
+        p = 0u; n = 0u; c = 0u; z = 0u;
+    } else {
+        uint4 prev = s_info[seq_idx - 1];
+        p = prev.x; n = 0u; c = prev.z; z = prev.w;
+    }
+
+    unsigned int base = offsets[seq_idx];
+
+    unsigned int max_iters = ((end_p > p) ? (end_p - p) : 0u) + 1u;
+    for (unsigned int iter = 0u; iter < max_iters; iter++) {
+        if (p >= end_p) break;
+        unsigned int peek = peek16_kernel(bitstream, p);
+        unsigned int entry = codebook[c * CODEBOOK_ENTRIES + peek];
+        unsigned int num_bits = (entry >> 8u) & 0xFFu;
+        if (num_bits == 0u) break;
+        unsigned int symbol = entry & 0xFFu;
+        unsigned int value_bits = symbol & 0x0Fu;
+        unsigned int advance = num_bits + value_bits;
+        if (p + advance > length_bits) break;
+        symbols_out[base + n] = symbol;
+        p += advance;
+        n += 1u;
+        z = (z + 1u) & 63u;
+        if (z == 0u) {
+            c = (c + 1u) % num_components;
+        }
+    }
+}
+
 // Phase 2: one thread per subsequence. Checks whether `s_info[i]`
 // is "synced" with `s_info[i+1]` (same c and z, and i's walk reached
 // i+1's start). If synced, writes flags[i] = 1. Otherwise advances
