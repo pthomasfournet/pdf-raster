@@ -19,3 +19,8 @@ pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
 pub use error::JpegGpuError;
+
+#[cfg(test)]
+pub(crate) mod tests {
+    pub mod synthetic;
+}
