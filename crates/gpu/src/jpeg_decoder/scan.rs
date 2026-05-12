@@ -82,13 +82,17 @@ pub fn dispatch_blelloch_scan<B: GpuBackend>(backend: &B, input: &[u32]) -> Resu
 /// Lives outside the per-test module so the CUDA-only and the
 /// Vulkan + cross-backend test modules can both import it.
 #[cfg(all(test, feature = "gpu-validation"))]
-mod test_helpers {
+pub(super) mod test_helpers {
     use crate::backend::cuda::CudaBackend;
 
     /// CPU exclusive-scan reference, used as the oracle for every
     /// scan parity test. `wrapping_add` matches the GPU kernel's u32
     /// arithmetic (no overflow trap; the test inputs stay small).
-    pub(super) fn cpu_exclusive_scan(input: &[u32]) -> Vec<u32> {
+    ///
+    /// Promoted to `pub(in crate::jpeg_decoder)` so the Phase 3
+    /// dispatcher tests (`huffman::tests`) can use the same oracle
+    /// rather than re-implementing the loop inline.
+    pub(in crate::jpeg_decoder) fn cpu_exclusive_scan(input: &[u32]) -> Vec<u32> {
         let mut out = Vec::with_capacity(input.len());
         let mut acc = 0u32;
         for &v in input {

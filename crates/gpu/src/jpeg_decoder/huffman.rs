@@ -513,13 +513,7 @@ mod tests {
             dispatch_phase1_then_phase2(&b, &stream, &book, 128).expect("phase1+2");
 
         let counts: Vec<u32> = s_info.iter().map(|s| s.n).collect();
-        let mut cpu_off = Vec::with_capacity(counts.len());
-        let mut acc = 0u32;
-        for c in &counts {
-            cpu_off.push(acc);
-            acc = acc.wrapping_add(*c);
-        }
-
+        let cpu_off = crate::jpeg_decoder::scan::test_helpers::cpu_exclusive_scan(&counts);
         let gpu_off = dispatch_phase3_offsets(&b, &s_info).expect("phase3");
         assert_eq!(gpu_off, cpu_off);
     }
@@ -678,17 +672,19 @@ mod vulkan_tests {
             dispatch_phase1_then_phase2(&cuda, &stream, &book, 128).expect("cuda phase1+2");
         let (vk_s, _) =
             dispatch_phase1_then_phase2(&vk, &stream, &book, 128).expect("vulkan phase1+2");
+        // Pin upstream agreement before pinning Phase 3 — otherwise a
+        // Phase 1/2 divergence on the mixed corpus would surface as a
+        // confusing "Vulkan diverges from CPU oracle" (the CPU oracle
+        // is built from CUDA's counts).
+        assert_eq!(
+            cuda_s, vk_s,
+            "Phase 1+2 must agree before Phase 3 can be compared"
+        );
         let cuda_off = dispatch_phase3_offsets(&cuda, &cuda_s).expect("cuda phase3");
         let vk_off = dispatch_phase3_offsets(&vk, &vk_s).expect("vulkan phase3");
 
-        // CPU exclusive-scan reference over the (already-agreed) `n`s.
         let counts: Vec<u32> = cuda_s.iter().map(|s| s.n).collect();
-        let mut cpu_off = Vec::with_capacity(counts.len());
-        let mut acc = 0u32;
-        for c in &counts {
-            cpu_off.push(acc);
-            acc = acc.wrapping_add(*c);
-        }
+        let cpu_off = crate::jpeg_decoder::scan::test_helpers::cpu_exclusive_scan(&counts);
 
         assert_eq!(cuda_off, cpu_off, "CUDA diverges from CPU oracle");
         assert_eq!(vk_off, cpu_off, "Vulkan diverges from CPU oracle");
