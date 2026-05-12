@@ -24,6 +24,8 @@ mod error;
 mod huffman;
 #[cfg(test)]
 mod phase1_oracle;
+#[cfg(test)]
+mod phase2_oracle;
 mod scan;
 
 pub use bitstream::{PackedBitstream, pack_be_words};

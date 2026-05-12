@@ -74,6 +74,55 @@ pub(super) enum Phase1Stop {
     PrefixMiss,
 }
 
+/// Outcome of a single decode-and-advance step from `state`.
+///
+/// `Advanced` returns the updated state. The two miss / truncation
+/// variants match the kernel's two early-exit conditions and let the
+/// caller decide whether to stop (Phase 1's walk) or skip (Phase 2's
+/// inter-sync, which leaves `state.p` unchanged on miss).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StepOutcome {
+    /// One symbol decoded; `state` is the post-advance state.
+    Advanced(SubsequenceState),
+    /// 16-bit peek matched no codeword in `tables[state.c]`.
+    PrefixMiss,
+    /// Decoded codeword would run past `bitstream.length_bits`.
+    LengthBits,
+}
+
+/// Decode exactly one Huffman symbol starting at `state.p`, returning
+/// the post-advance state or a typed miss/truncation outcome.
+///
+/// Same per-symbol arithmetic as `phase1_walk`'s inner loop; lifted
+/// out so Phase 2's inter-sync oracle (which advances one symbol per
+/// retry pass) can share the codepath.
+pub(super) fn try_decode_one_symbol(
+    state: SubsequenceState,
+    bitstream: &PackedBitstream,
+    tables: &[CanonicalCodebook],
+) -> StepOutcome {
+    let length_bits = bitstream.length_bits;
+    let peek = peek16(bitstream, u64::from(state.p));
+    let entry = tables[state.c as usize].lookup(peek);
+    if entry.num_bits == 0 {
+        return StepOutcome::PrefixMiss;
+    }
+    let advance = u32::from(entry.num_bits) + u32::from(entry.symbol & 0x0F);
+    if state.p + advance > length_bits {
+        return StepOutcome::LengthBits;
+    }
+    let num_components =
+        u32::try_from(tables.len()).expect("more codetables than fit in u32 — caller bug");
+    let mut next = state;
+    next.p += advance;
+    next.n = next.n.saturating_add(1);
+    next.z = (next.z + 1) % 64;
+    if next.z == 0 {
+        next.c = (next.c + 1) % num_components;
+    }
+    StepOutcome::Advanced(next)
+}
+
 /// Run the Phase 1 intra-sync decode for one subsequence.
 ///
 /// The caller supplies `tables` indexed by component. `start_bit`
@@ -98,56 +147,20 @@ pub(super) fn phase1_walk(
         !tables.is_empty(),
         "phase1_walk requires at least one codetable"
     );
-    // tables.len() comes from a `&[CanonicalCodebook]` whose length
-    // is bounded by the number of JPEG components (at most 4) in
-    // every realistic caller. The u32 fit is total, but we use
-    // try_from to fail loud if a test ever passes 2^32 tables.
-    let num_components =
-        u32::try_from(tables.len()).expect("more codetables than fit in u32 — caller bug");
-    let length_bits = bitstream.length_bits;
-
     let mut state = SubsequenceState {
         p: start_bit,
         n: 0,
         c: 0,
         z: 0,
     };
-
     loop {
         if state.p >= hard_limit {
             return (state, Phase1Stop::HardLimit);
         }
-        // Peek 16 bits at the current position; the codetable is a
-        // 65 536-entry LUT keyed by that prefix.
-        let peek = peek16(bitstream, u64::from(state.p));
-        let table = &tables[state.c as usize];
-        let entry = table.lookup(peek);
-        if entry.num_bits == 0 {
-            // No codeword matches this prefix — kernel's miss path.
-            return (state, Phase1Stop::PrefixMiss);
-        }
-        let code_bits = u32::from(entry.num_bits);
-        // The kernel's MVP advance: code_bits + value_bits, where
-        // value_bits is the low nibble of the symbol. Matches the
-        // `decode_one_symbol` math in the plan's parallel_huffman.slang.
-        let value_bits = u32::from(entry.symbol & 0x0F);
-        let advance = code_bits + value_bits;
-
-        if state.p + advance > length_bits {
-            // Codeword + value bits would run past the end of the
-            // stream. The kernel's outer `while (state.p < hard_limit)`
-            // would still admit this iteration (because state.p < hard_limit
-            // before the advance), but the resulting state.p would land
-            // past length_bits with garbage in the value bits. Match the
-            // kernel's pragmatic behaviour: stop without consuming.
-            return (state, Phase1Stop::LengthBits);
-        }
-
-        state.p += advance;
-        state.n = state.n.saturating_add(1);
-        state.z = (state.z + 1) % 64;
-        if state.z == 0 {
-            state.c = (state.c + 1) % num_components;
+        match try_decode_one_symbol(state, bitstream, tables) {
+            StepOutcome::Advanced(next) => state = next,
+            StepOutcome::PrefixMiss => return (state, Phase1Stop::PrefixMiss),
+            StepOutcome::LengthBits => return (state, Phase1Stop::LengthBits),
         }
     }
 }
