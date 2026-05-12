@@ -37,26 +37,23 @@ use crate::jpeg_decoder::phase1_oracle::{StepOutcome, SubsequenceState, try_deco
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase2Outcome {
     /// Every subseq is synced with its right neighbour. `iterations`
-    /// records how many full passes were needed (0 for a Phase-1
-    /// output that's already synced).
+    /// is the 0-based index of the pass that found every pair
+    /// aligned — so a pre-synced Phase 1 output returns `0`, and a
+    /// stream that needed one advance pass returns `1`.
     Converged { iterations: u32 },
     /// Retry bound exhausted without convergence. Returned after
-    /// `bound` passes; the `s_info` state is left at whatever the
+    /// `bound + 1` passes; the `s_info` state is left at whatever the
     /// last pass produced.
     SyncBoundExceeded { bound: u32 },
 }
 
 /// Maximum number of sync-and-advance passes before giving up.
-/// `2 * ceil(log2(max(num_subsequences, 1)))`, matching the plan.
+///
+/// `2 * ceil(log2(n))` per the plan. `next_power_of_two(0) = 1` and
+/// `next_power_of_two(1) = 1`, both with `trailing_zeros() = 0`, so
+/// the math returns `0` cleanly for `n ≤ 1` without a special case.
 #[must_use]
 pub(super) fn retry_bound(num_subsequences: usize) -> u32 {
-    if num_subsequences <= 1 {
-        return 0;
-    }
-    // ceil(log2(n)) = n.next_power_of_two().trailing_zeros() when
-    // n is itself a power of two, else +0 on the floor. The standard
-    // trick of `n.next_power_of_two().trailing_zeros()` gives the
-    // exponent of the next power of two — equal to ceil(log2(n)).
     let pow2_exp = num_subsequences.next_power_of_two().trailing_zeros();
     2u32.saturating_mul(pow2_exp)
 }
@@ -252,15 +249,13 @@ mod tests {
         let stream = book4_stream(&[0x00; 1000]);
         let book = [book4_codebook()];
         let mut s_info = build_phase1_s_info(&stream, &book, 128);
-        // Stagger every subseq's z by 32 — opposite phase. After one
-        // advance, each subseq's z moves by 1, so the relative phase
-        // stays at 32. Bound = 2 * ceil(log2(16)) = 8 iterations.
-        let n = s_info.len();
+        // Force each subseq to a distinct z so no neighbour pair
+        // aligns. After one advance, each subseq's z moves by 1, so
+        // the relative phase stays constant. Bound for 16 subseqs is
+        // 2 * ceil(log2(16)) = 8 passes.
         for (i, s) in s_info.iter_mut().enumerate() {
-            // Force each subseq to a distinct z so no neighbour pair aligns.
-            s.z = u32::try_from(i).unwrap() & 63;
+            s.z = u32::try_from(i).expect("test fixture: 16 fits u32") & 63;
         }
-        let _ = n;
         let r = phase2_run_to_sync(&mut s_info, &stream, &book, 128);
         assert!(
             matches!(r, Phase2Outcome::SyncBoundExceeded { .. }),
