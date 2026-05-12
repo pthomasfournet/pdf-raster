@@ -18,15 +18,14 @@
 //! - `c` — current component (0..`num_components`).
 //! - `z` — current zig-zag index within the 64-coefficient block.
 //!
-//! ## MVP simplification (matches the kernel)
+//! ## JPEG framing
 //!
-//! Real JPEG AC encoding is run-length: each AC symbol carries a
-//! `(run, size)` pair where `run` is the number of zero coefficients
-//! to skip before the next nonzero one. The MVP kernel ignores AC
-//! framing and advances `z += 1` per decoded symbol, rolling over to
-//! `(z=0, c=(c+1) % num_components)` on the 64-symbol boundary. This
-//! oracle matches the kernel's simplification — it is NOT a real
-//! JPEG decoder.
+//! `phase1_jpeg_walk_snapshot` mirrors the CUDA kernel's
+//! `try_decode_one_jpeg_symbol_device` symbol-by-symbol, including real
+//! AC run-length framing (EOB 0x00, ZRL 0xF0, run+size otherwise) and
+//! the DC-slot/AC-slot discrimination via `z_in_block`.
+//! `phase1_walk` / `phase1_walk_snapshot` are the *synthetic*-stream
+//! equivalents used by the original cross-subsequence oracle tests.
 
 #![cfg(test)]
 
@@ -72,6 +71,12 @@ pub(super) enum Phase1Stop {
     /// 16-bit peek matched no codeword in the active table — the
     /// kernel returns a miss sentinel and breaks.
     PrefixMiss,
+    /// DC category byte exceeded 11 — spec-illegal stream.
+    BadDcCategory,
+    /// AC size nibble exceeded 10 — spec-illegal stream.
+    BadAcSize,
+    /// AC run/ZRL advance pushed `z_in_block` past 64 — spec-illegal stream.
+    AcOverflow,
 }
 
 /// Outcome of a single decode-and-advance step from `state`.
@@ -235,28 +240,36 @@ pub(super) fn phase1_walk_snapshot(
 
 /// CPU oracle for the JPEG-framed Phase 1 intra-sync walk.
 ///
-/// Simulates the `jpeg_phase1_intra_sync` kernel for one subsequence,
-/// producing the boundary-snapshot `(p, n, c, z)` state the GPU writes
-/// to `s_info[seq_idx]`.
+/// Mirrors `jpeg_phase1_intra_sync` (CUDA) / `phase1_jpeg_intra_sync` (Slang)
+/// symbol-by-symbol, producing the boundary-snapshot `(p, n, c, z)` state
+/// the GPU writes to `s_info[seq_idx]`.
 ///
-/// The JPEG-framed state machine differs from the synthetic one:
-/// - `c` = component index, derived from the MCU schedule (`entry &
-///   0xFF`).
-/// - `z` = current block index within the MCU (`block_in_mcu`),
-///   cycling `0..blocks_per_mcu`.
-/// - Per block: one DC symbol (Huffman code + `category` raw bits
-///   consumed) followed by AC symbols until EOB (0x00) or slot 63.
-///   `n` increments for each symbol emitted if its first bit is
-///   `< count_to`.
+/// State layout — identical to the kernel's `uint4`:
+/// - `state.p` (`uint4.x`) — absolute bit position.
+/// - `state.n` (`uint4.y`) — symbols counted where first bit `< count_to`.
+/// - `state.c` (`uint4.z`) — `block_in_mcu` (0..`blocks_per_mcu-1`).
+/// - `state.z` (`uint4.w`) — `z_in_block` (0 = DC slot, 1..63 = AC slots,
+///   64 = end-of-block sentinel that triggers block rotation).
 ///
-/// On any decode error (prefix-miss, length-bits, bad DC category,
-/// bad AC size, AC overflow) the walk stops early and returns the
-/// pre-failure state, matching the kernel's `break` behaviour.
+/// The per-symbol loop mirrors `try_decode_one_jpeg_symbol_device` exactly:
+/// - `z_in_block == 0`: DC slot — look up DC codebook, consume
+///   `num_bits + category` bits, set `z_in_block := 1`.
+/// - `z_in_block >= 1`: AC slot — look up AC codebook; EOB sets
+///   `z_in_block := 64`; ZRL adds 16; run+size adds `run + 1`.
+///   AC overflow (`z_in_block > 64`) is a spec-illegal stream.
+/// - When `z_in_block == 64`, rotate `block_in_mcu` and reset
+///   `z_in_block := 0`.
 ///
-/// The caller must supply codebooks in the same flat layout as
-/// `build_gpu_codebook_refs` — i.e., `ac_codebooks[component]` is the
-/// AC table for the component at that schedule slot, and similarly for
-/// DC.
+/// The snapshot fires on the first symbol whose advance crosses
+/// `count_to`, capturing the post-advance state.
+///
+/// On any decode error the walk stops early and returns the pre-advance
+/// state, matching the kernel's `break` behaviour.
+///
+/// Codebook slices must be per-component (length == number of active scan
+/// components), matching the layout produced by
+/// `JpegPreparedInput::dc_codebooks_for_dispatch()` /
+/// `ac_codebooks_for_dispatch()`.
 pub(super) fn phase1_jpeg_walk_snapshot(
     bitstream: &PackedBitstream,
     dc_codebooks: &[&crate::jpeg::CanonicalCodebook],
@@ -273,17 +286,19 @@ pub(super) fn phase1_jpeg_walk_snapshot(
     let length_bits = bitstream.length_bits;
     let mut p = start_bit;
     let mut n = 0u32;
-    // Initial block_in_mcu / component from schedule slot 0.
-    let first_entry = mcu_schedule[0];
+    // block_in_mcu → state.c (uint4.z); z_in_block → state.z (uint4.w).
     let mut block_in_mcu = 0u32;
-    let mut c = (first_entry & 0xFF) as u32;
+    let mut z_in_block = 0u32; // 0 = DC slot; 1..63 = AC; 64 = end-of-block
 
     let mut snap_p = p;
     let mut snap_n = n;
     let mut snap_block = block_in_mcu;
-    let mut snap_c = c;
+    let mut snap_z = z_in_block;
     let mut snapshotted = false;
 
+    // max_iters bounds the loop safely: each symbol consumes ≥ 1 bit,
+    // so (hard_limit - start_bit) + 1 iterations suffice even for
+    // 1-bit codewords.
     let max_iters = hard_limit.saturating_sub(start_bit) + 1;
     for _ in 0..max_iters {
         if p >= hard_limit {
@@ -291,169 +306,133 @@ pub(super) fn phase1_jpeg_walk_snapshot(
         }
         let p_before = p;
 
-        // ── DC slot ──────────────────────────────────────────────────
+        // Read DC or AC selector from the current block's schedule entry.
         let entry = mcu_schedule[block_in_mcu as usize];
         let dc_sel = ((entry >> 8) & 0xFF) as usize;
         let ac_sel = ((entry >> 16) & 0xFF) as usize;
-        c = (entry & 0xFF) as u32;
 
-        // Decode DC Huffman codeword.
-        if p >= hard_limit {
-            break;
-        }
+        let is_dc = z_in_block == 0;
         let peek = peek16(bitstream, u64::from(p));
-        let dc_entry = dc_codebooks[dc_sel].lookup(peek);
-        if dc_entry.num_bits == 0 {
+        let lut_entry = if is_dc {
+            dc_codebooks[dc_sel].lookup(peek)
+        } else {
+            ac_codebooks[ac_sel].lookup(peek)
+        };
+
+        if lut_entry.num_bits == 0 {
             return (
                 SubsequenceState {
                     p,
                     n,
-                    c,
-                    z: block_in_mcu,
+                    c: block_in_mcu,
+                    z: z_in_block,
                 },
                 Phase1Stop::PrefixMiss,
             );
         }
-        let category = dc_entry.symbol;
-        if category > 11 {
-            return (
-                SubsequenceState {
-                    p,
-                    n,
-                    c,
-                    z: block_in_mcu,
-                },
-                Phase1Stop::LengthBits,
-            );
-        }
-        let dc_advance = u32::from(dc_entry.num_bits) + u32::from(category);
-        if p + dc_advance > length_bits {
-            return (
-                SubsequenceState {
-                    p,
-                    n,
-                    c,
-                    z: block_in_mcu,
-                },
-                Phase1Stop::LengthBits,
-            );
-        }
-        let count_this = p < count_to;
-        p += dc_advance;
-        if count_this {
-            n = n.saturating_add(1);
-        }
-        // Snapshot: first symbol whose advance crosses count_to.
-        if !snapshotted && p_before < count_to && p >= count_to {
-            snap_p = p;
-            snap_n = n;
-            snap_block = block_in_mcu;
-            snap_c = c;
-            snapshotted = true;
-        }
-        if p >= hard_limit {
-            break;
-        }
 
-        // ── AC slots ─────────────────────────────────────────────────
-        let mut ac_pos = 1u8;
-        while ac_pos < 64 {
-            if p >= hard_limit {
-                break;
-            }
-            let p_before_ac = p;
-            let peek = peek16(bitstream, u64::from(p));
-            let ac_entry = ac_codebooks[ac_sel].lookup(peek);
-            if ac_entry.num_bits == 0 {
+        let symbol = lut_entry.symbol;
+        let value_bits = if is_dc {
+            let category = symbol;
+            if category > 11 {
                 return (
                     SubsequenceState {
                         p,
                         n,
-                        c,
-                        z: block_in_mcu,
+                        c: block_in_mcu,
+                        z: z_in_block,
                     },
-                    Phase1Stop::PrefixMiss,
+                    Phase1Stop::BadDcCategory,
                 );
             }
-            let symbol = ac_entry.symbol;
+            u32::from(category)
+        } else {
             let size = symbol & 0x0F;
             if size > 10 {
                 return (
                     SubsequenceState {
                         p,
                         n,
-                        c,
-                        z: block_in_mcu,
+                        c: block_in_mcu,
+                        z: z_in_block,
                     },
-                    Phase1Stop::LengthBits,
+                    Phase1Stop::BadAcSize,
                 );
             }
-            let ac_advance = u32::from(ac_entry.num_bits) + u32::from(size);
-            if p + ac_advance > length_bits {
-                return (
-                    SubsequenceState {
-                        p,
-                        n,
-                        c,
-                        z: block_in_mcu,
-                    },
-                    Phase1Stop::LengthBits,
-                );
-            }
-            let count_this_ac = p < count_to;
-            p += ac_advance;
-            if count_this_ac {
-                n = n.saturating_add(1);
-            }
-            if !snapshotted && p_before_ac < count_to && p >= count_to {
-                snap_p = p;
-                snap_n = n;
-                snap_block = block_in_mcu;
-                snap_c = c;
-                snapshotted = true;
-            }
-            if symbol == 0x00 {
-                // EOB: rest of block is zero.
-                break;
-            }
-            if symbol == 0xF0 {
-                // ZRL: 16 zeros.
-                ac_pos = ac_pos.saturating_add(16);
-                if ac_pos > 64 {
+            u32::from(size)
+        };
+
+        let advance = u32::from(lut_entry.num_bits) + value_bits;
+        if p + advance > length_bits {
+            return (
+                SubsequenceState {
+                    p,
+                    n,
+                    c: block_in_mcu,
+                    z: z_in_block,
+                },
+                Phase1Stop::LengthBits,
+            );
+        }
+
+        let count_this = p < count_to;
+        p += advance;
+        if count_this {
+            n = n.saturating_add(1);
+        }
+
+        // Snapshot: first symbol whose advance crosses count_to.
+        if !snapshotted && p_before < count_to && p >= count_to {
+            snap_p = p;
+            snap_n = n;
+            snap_block = block_in_mcu;
+            snap_z = z_in_block;
+            snapshotted = true;
+        }
+
+        // Advance z_in_block (mirrors kernel's end-of-block rotate).
+        if is_dc {
+            z_in_block = 1;
+        } else {
+            let next_z = if symbol == 0x00 {
+                64 // EOB
+            } else if symbol == 0xF0 {
+                let nz = z_in_block + 16; // ZRL
+                if nz > 64 {
                     return (
                         SubsequenceState {
                             p,
                             n,
-                            c,
-                            z: block_in_mcu,
+                            c: block_in_mcu,
+                            z: z_in_block,
                         },
-                        Phase1Stop::HardLimit,
+                        Phase1Stop::AcOverflow,
                     );
                 }
-                continue;
-            }
-            let run = symbol >> 4;
-            ac_pos = ac_pos.saturating_add(run).saturating_add(1);
-            if ac_pos > 64 {
-                return (
-                    SubsequenceState {
-                        p,
-                        n,
-                        c,
-                        z: block_in_mcu,
-                    },
-                    Phase1Stop::HardLimit,
-                );
-            }
+                nz
+            } else {
+                let run = u32::from(symbol >> 4);
+                let nz = z_in_block + run + 1;
+                if nz > 64 {
+                    return (
+                        SubsequenceState {
+                            p,
+                            n,
+                            c: block_in_mcu,
+                            z: z_in_block,
+                        },
+                        Phase1Stop::AcOverflow,
+                    );
+                }
+                nz
+            };
+            z_in_block = next_z;
         }
 
-        // Advance to next block in MCU, rolling over at blocks_per_mcu.
-        block_in_mcu = (block_in_mcu + 1) % blocks_per_mcu;
-        // Update c from next block's schedule entry.
-        c = (mcu_schedule[block_in_mcu as usize] & 0xFF) as u32;
-
-        if !snapshotted && p >= hard_limit {
-            break;
+        // End-of-block: rotate block_in_mcu and reset z_in_block.
+        if z_in_block == 64 {
+            block_in_mcu = (block_in_mcu + 1) % blocks_per_mcu;
+            z_in_block = 0;
         }
     }
 
@@ -461,15 +440,15 @@ pub(super) fn phase1_jpeg_walk_snapshot(
         SubsequenceState {
             p: snap_p,
             n: snap_n,
-            c: snap_c,
-            z: snap_block,
+            c: snap_block,
+            z: snap_z,
         }
     } else {
         SubsequenceState {
             p,
             n,
-            c,
-            z: block_in_mcu,
+            c: block_in_mcu,
+            z: z_in_block,
         }
     };
     (snap, Phase1Stop::HardLimit)

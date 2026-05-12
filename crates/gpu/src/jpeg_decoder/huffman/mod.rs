@@ -22,39 +22,31 @@ use crate::jpeg_decoder::phase1_oracle::SubsequenceState;
 #[cfg(feature = "gpu-validation")]
 use crate::jpeg_decoder::phase2_oracle::{Phase2Outcome, retry_bound as phase2_retry_bound};
 
-/// Flatten a slice of canonical Huffman codebooks into the GPU layout:
-/// `u32[num_components * 65536]`, each entry packing
-/// `(num_bits << 8) | symbol`.
+/// Flatten an iterator of `&CanonicalCodebook` into the GPU layout:
+/// `u32[num_components * 65536]`, each entry packing `(num_bits << 8) | symbol`.
 ///
-/// `num_bits == 0` (no codeword matches the prefix) is preserved
-/// verbatim — the kernel uses that as its miss sentinel.
-#[must_use]
-fn build_gpu_codebook(codebooks: &[CanonicalCodebook]) -> Vec<u32> {
+/// `num_bits == 0` (no codeword matches the prefix) is preserved verbatim —
+/// the kernel uses that as its miss sentinel.
+fn flatten_codebooks<'a>(
+    codebooks: impl ExactSizeIterator<Item = &'a CanonicalCodebook>,
+) -> Vec<u32> {
     let mut out = Vec::with_capacity(codebooks.len() * HUFFMAN_CODEBOOK_ENTRIES);
     for book in codebooks {
         for entry in book.table() {
-            let packed = (u32::from(entry.num_bits) << 8) | u32::from(entry.symbol);
-            out.push(packed);
+            out.push((u32::from(entry.num_bits) << 8) | u32::from(entry.symbol));
         }
     }
     out
 }
 
-/// Flatten a slice of codebook *references* — the shape returned by
-/// [`JpegPreparedInput::ac_codebooks_for_dispatch`] / `dc_codebooks_for_dispatch`.
-///
-/// Same layout as `build_gpu_codebook`; differs only in the input type so
-/// callers can avoid a `.cloned().collect::<Vec<_>>()` copy of 128 KB tables.
+#[must_use]
+fn build_gpu_codebook(codebooks: &[CanonicalCodebook]) -> Vec<u32> {
+    flatten_codebooks(codebooks.iter())
+}
+
 #[must_use]
 fn build_gpu_codebook_refs(codebooks: &[&CanonicalCodebook]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(codebooks.len() * HUFFMAN_CODEBOOK_ENTRIES);
-    for book in codebooks {
-        for entry in book.table() {
-            let packed = (u32::from(entry.num_bits) << 8) | u32::from(entry.symbol);
-            out.push(packed);
-        }
-    }
-    out
+    flatten_codebooks(codebooks.iter().copied())
 }
 
 /// One-shot JPEG Phase 1 dispatch using real JPEG framing.
@@ -62,11 +54,6 @@ fn build_gpu_codebook_refs(codebooks: &[&CanonicalCodebook]) -> Vec<u32> {
 /// Builds the MCU schedule + flat codebook buffers from `prep`, uploads
 /// them alongside the entropy bitstream, runs `JpegPhase1IntraSync`,
 /// downloads the per-subsequence state, and frees all device buffers.
-///
-/// Closes the audit finding in `audit/dispatcher-codebook-signature-mismatch.md`:
-/// `JpegPreparedInput::*_for_dispatch()` returns `Vec<&CanonicalCodebook>`;
-/// this function consumes those refs via `build_gpu_codebook_refs` so no
-/// clone of the 128 KB tables is needed.
 ///
 /// # Errors
 /// Returns `BackendError` for any alloc / upload / dispatch / download
@@ -87,13 +74,9 @@ fn dispatch_jpeg_phase1_intra_sync<B: GpuBackend>(
         ));
     }
 
-    // Build host-side schedule + validate selector bounds (closes
-    // audit/mcu-schedule-selector-validation.md).
     let (mcu_sched_host, blocks_per_mcu) =
         build_mcu_schedule(prep).map_err(|e| BackendError::msg(format!("{e}")))?;
 
-    // Flatten AC and DC codebooks from the dispatch helpers — no clone
-    // of the 128 KB tables (closes dispatcher-codebook-signature-mismatch.md).
     let ac_refs = prep.ac_codebooks_for_dispatch();
     let dc_refs = prep.dc_codebooks_for_dispatch();
     let ac_flat = build_gpu_codebook_refs(&ac_refs);

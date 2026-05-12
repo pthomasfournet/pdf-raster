@@ -258,7 +258,6 @@ fn pack_unstuffed_bitstream(unstuffed: &[u8]) -> Result<PackedBitstream, JpegGpu
 pub fn build_mcu_schedule(prep: &JpegPreparedInput) -> Result<(Vec<u32>, u32), JpegGpuError> {
     let num_components = prep.components.len();
     let num_comp_u32 = u32::try_from(num_components).expect("components.len() ≤ 4");
-    let scan_components = num_components;
 
     let mut schedule: Vec<u32> = Vec::new();
     for (k, fc) in prep.components.iter().enumerate() {
@@ -274,7 +273,7 @@ pub fn build_mcu_schedule(prep: &JpegPreparedInput) -> Result<(Vec<u32>, u32), J
             )));
         }
 
-        let bpm: u8 = if scan_components == 1 {
+        let bpm: u8 = if num_components == 1 {
             1
         } else {
             fc.h_sampling
@@ -510,13 +509,15 @@ mod tests {
 
     #[test]
     fn mcu_schedule_entry_encodes_correct_fields() {
-        // Verify the bit-field packing: component_idx in bits 0..8,
+        // Verify bit-field packing: component_idx in bits 0..8,
         // dc_sel in bits 8..16, ac_sel in bits 16..24.
-        // For grayscale with selectors 0 the check above covers it.
-        // Manufacture a 2-component scenario by hand (bypassing prepare_jpeg)
-        // to test non-zero selectors.
         let prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
         let (sched, bpm) = build_mcu_schedule(&prep).unwrap();
+        assert_eq!(
+            bpm as usize,
+            sched.len(),
+            "blocks_per_mcu == schedule length"
+        );
         for entry in &sched {
             let comp_idx = entry & 0xFF;
             let dc_sel = (entry >> 8) & 0xFF;
@@ -528,6 +529,5 @@ mod tests {
             assert_eq!(dc_sel, u32::from(prep.dc_selectors[comp_idx as usize]));
             assert_eq!(ac_sel, u32::from(prep.ac_selectors[comp_idx as usize]));
         }
-        let _ = bpm;
     }
 }
