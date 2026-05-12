@@ -139,7 +139,7 @@ pub(super) fn phase2_run_to_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jpeg_decoder::phase1_oracle::phase1_walk;
+    use crate::jpeg_decoder::phase1_oracle::phase1_walk_snapshot;
     use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     /// Build a Phase 1 output by running `phase1_walk` per subsequence.
@@ -156,7 +156,7 @@ mod tests {
                 let hard_limit = bitstream.length_bits.min(start_bit + 2 * subsequence_bits);
                 let count_to = bitstream.length_bits.min(start_bit + subsequence_bits);
                 let (state, _stop) =
-                    phase1_walk(bitstream, tables, start_bit, hard_limit, count_to);
+                    phase1_walk_snapshot(bitstream, tables, start_bit, hard_limit, count_to);
                 state
             })
             .collect()

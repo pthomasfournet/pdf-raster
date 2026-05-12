@@ -180,6 +180,59 @@ pub(super) fn phase1_walk(
     }
 }
 
+/// Run Phase 1's decode walk and return the **boundary snapshot**:
+/// the (p, n, c, z) state captured at the first decode whose
+/// post-advance `p` crosses `count_to`. This is what the GPU
+/// Phase 1 kernel writes to `s_info[seq_idx]`; using it for the
+/// oracle keeps per-phase parity tests aligned with the kernel.
+///
+/// If the walk reaches `hard_limit` without ever crossing
+/// `count_to` (e.g., stream ended before this subseq's boundary),
+/// returns the walk's terminal state — the last subseq's snapshot
+/// is the terminal state by construction, and Phase 2's trivial
+/// last-subseq sync test depends only on the walker reaching
+/// `length_bits`.
+///
+/// Same signature as `phase1_walk`; the only difference is the
+/// `state` reported on `HardLimit`. Stops other than `HardLimit`
+/// (PrefixMiss / LengthBits) are reported with the walker's pre-
+/// failure state, matching `phase1_walk`'s behaviour.
+pub(super) fn phase1_walk_snapshot(
+    bitstream: &PackedBitstream,
+    tables: &[CanonicalCodebook],
+    start_bit: u32,
+    hard_limit: u32,
+    count_to: u32,
+) -> (SubsequenceState, Phase1Stop) {
+    assert!(
+        !tables.is_empty(),
+        "phase1_walk_snapshot requires at least one codetable"
+    );
+    let mut state = SubsequenceState {
+        p: start_bit,
+        n: 0,
+        c: 0,
+        z: 0,
+    };
+    let mut snapshot: Option<SubsequenceState> = None;
+    loop {
+        if state.p >= hard_limit {
+            return (snapshot.unwrap_or(state), Phase1Stop::HardLimit);
+        }
+        let p_before = state.p;
+        match try_decode_one_symbol(state, bitstream, tables, count_to) {
+            StepOutcome::Advanced(next) => {
+                state = next;
+                if snapshot.is_none() && p_before < count_to && state.p >= count_to {
+                    snapshot = Some(state);
+                }
+            }
+            StepOutcome::PrefixMiss => return (state, Phase1Stop::PrefixMiss),
+            StepOutcome::LengthBits => return (state, Phase1Stop::LengthBits),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

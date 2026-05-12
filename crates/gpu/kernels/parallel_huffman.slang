@@ -127,6 +127,13 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     // (p, n, c, z) packed into uint4 as (x, y, z, w).
     uint4 state = uint4(start_bit, 0u, 0u, 0u);
 
+    // Snapshot state at the first decode that crosses into the next
+    // subseq's region. Phase 4 of subseq (seq_idx + 1) inherits this
+    // as its starting state. See the CUDA mirror for the full
+    // rationale.
+    uint4 snapshot = state;
+    bool snapshotted = false;
+
     // Loop bound: at most one symbol every (code_bits + value_bits)
     // bits, and code_bits >= 1 — so at most `hard_limit - start_bit`
     // symbols. The +1 caps a buggy codebook (entry => 0 advance);
@@ -137,25 +144,38 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
         if (state.x >= hard_limit) {
             break;
         }
+        uint p_before = state.x;
         if (!try_decode_one_symbol_kernel(state, subseq_end_bit, symbol_sink)) {
             break;
         }
+        if (!snapshotted && p_before < subseq_end_bit && state.x >= subseq_end_bit) {
+            snapshot = state;
+            snapshotted = true;
+        }
     }
 
-    s_info_out[seq_idx] = state;
+    if (!snapshotted) {
+        snapshot = state;
+    }
+
+    s_info_out[seq_idx] = snapshot;
 }
 
 /// Phase 4 re-decode + write.
 ///
 /// One thread per subsequence. Re-walks the subseq's owned region
-/// `[prev.p, me.p)`, decoding each symbol and writing it to
-/// `symbols_out[offsets[seq_idx] + local_idx]`. Predecessor state
-/// comes from `s_info_out[seq_idx - 1]` (or the fresh start for
-/// `seq_idx == 0`).
+/// using the predecessor's boundary snapshot as the starting state
+/// and this subseq's own snapshot as the end position. Writes each
+/// decoded symbol to `symbols_out[offsets[seq_idx] + local_idx]`.
 ///
-/// Per-region accounting was fixed in Phase 1+2, so `me.n` equals
-/// the number of symbols this thread will emit — caller can size
-/// `symbols_out` from the exclusive scan total + last subseq's n.
+/// `s_info_out[seq_idx]` is the boundary snapshot Phase 1 captured
+/// for subseq seq_idx — the state at the first decode crossing into
+/// subseq (seq_idx+1)'s region. Subseq seq_idx's owned region thus
+/// spans `[s_info_out[seq_idx - 1].x, s_info_out[seq_idx].x)`;
+/// subseq 0 starts fresh at `(p=0, c=0, z=0)`. The snapshots
+/// decompose the stream into disjoint per-thread regions that cover
+/// it exactly — Phase 3's offsets + Phase 4's writes both depend
+/// on this.
 [shader("compute")][numthreads(256, 1, 1)]
 void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
     uint seq_idx = tid.x;
@@ -166,8 +186,8 @@ void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
     uint4 me = s_info_out[seq_idx];
     uint end_p = me.x;
 
-    // Predecessor's end-of-walk state — that's where my owned region
-    // begins. Subseq 0 starts fresh at (p=0, c=0, z=0).
+    // Predecessor's snapshot — that's where my owned region begins.
+    // Subseq 0 starts fresh at (p=0, c=0, z=0).
     uint4 state;
     if (seq_idx == 0u) {
         state = uint4(0u, 0u, 0u, 0u);

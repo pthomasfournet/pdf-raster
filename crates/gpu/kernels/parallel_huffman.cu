@@ -79,9 +79,25 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     return 1u;
 }
 
-// Phase 1: one thread per subsequence; writes (p, n, c, z) to
-// s_info_out[seq_idx]. s_info_out is laid out as uint4 = (p, n, c, z)
-// per subsequence.
+// Phase 1: one thread per subsequence; writes a "boundary snapshot"
+// to s_info_out[seq_idx]. The snapshot is the (p, n, c, z) state at
+// the first decode that crosses into the next subsequence's region
+// (i.e., the first `p_before_advance < subseq_end_bit && p_after_advance >= subseq_end_bit`).
+//
+// Why a snapshot rather than the over-walk's end state: Phase 4 of
+// subseq (seq_idx+1) inherits from `s_info_out[seq_idx]` to know
+// where decoding resumes and what (c, z) it's resuming at. If
+// `s_info_out[seq_idx]` stored the over-walk's END state (way past
+// the boundary), subseq (seq_idx+1) would start decoding from too
+// far in. The snapshot is the precise handoff point.
+//
+// Phase 2's sync predicate also operates on snapshots: subseq i
+// is synced with subseq (i+1) when subseq i's snapshot equals subseq
+// (i+1)'s START state. The original-Wei algorithm uses the over-walk
+// end state for sync; we snapshot instead because it composes
+// cleanly with Phase 4's needs. The sync predicate still works
+// (snapshot's (c, z) equals subseq (i+1)'s walker's (c, z) at the
+// same boundary when both agree on the codeword alignment).
 extern "C" __global__ void phase1_intra_sync(
     const unsigned int* __restrict__ bitstream,
     const unsigned int* __restrict__ codebook,
@@ -108,34 +124,75 @@ extern "C" __global__ void phase1_intra_sync(
     unsigned int c = 0u;
     unsigned int z = 0u;
 
+    // Snapshot state — captured on the first decode whose
+    // *post-advance* p crosses subseq_end_bit. If no such crossing
+    // happens (stream ends before this subseq's boundary), the
+    // snapshot is the final walk state.
+    unsigned int snap_p = p;
+    unsigned int snap_n = n;
+    unsigned int snap_c = c;
+    unsigned int snap_z = z;
+    unsigned int snapshotted = 0u;
+
     unsigned int max_iters = (hard_limit - start_bit) + 1u;
     unsigned int symbol_sink;  // Phase 1 doesn't emit; the helper writes here and we ignore it.
     for (unsigned int iter = 0u; iter < max_iters; iter++) {
         if (p >= hard_limit) break;
+        unsigned int p_before = p;
         if (try_decode_one_symbol_device(
                 bitstream, codebook, length_bits, num_components, subseq_end_bit,
                 &p, &n, &c, &z, &symbol_sink) == 0u) {
             break;
         }
+        // First decode that crosses into the next subseq's region
+        // (p_before was inside, p is now at or past). Capture the
+        // post-advance state — that's where (seq_idx + 1) resumes.
+        if (snapshotted == 0u && p_before < subseq_end_bit && p >= subseq_end_bit) {
+            snap_p = p;
+            snap_n = n;
+            snap_c = c;
+            snap_z = z;
+            snapshotted = 1u;
+        }
+    }
+
+    // No boundary crossing (stream ended inside this subseq's region
+    // before subseq_end_bit). Use the walk's terminal state as the
+    // snapshot — subseq (seq_idx + 1) won't exist in that case, so
+    // the snapshot value only feeds Phase 2's last-subseq trivial-
+    // sync test.
+    if (snapshotted == 0u) {
+        snap_p = p;
+        snap_n = n;
+        snap_c = c;
+        snap_z = z;
     }
 
     uint4 out;
-    out.x = p;
-    out.y = n;
-    out.z = c;
-    out.w = z;
+    out.x = snap_p;
+    out.y = snap_n;
+    out.z = snap_c;
+    out.w = snap_z;
     s_info_out[seq_idx] = out;
 }
 
 // Phase 4: re-decode + write. One thread per subsequence. Re-walks
-// the owned region `[prev.p, me.p)` and writes each symbol to
-// `symbols_out[offsets[seq_idx] + local_n]`. Predecessor state
-// comes from s_info[seq_idx-1] (or fresh start for seq_idx == 0).
+// the subseq's owned region using the predecessor's boundary
+// snapshot as the starting (p, c, z) and the subseq's own snapshot
+// as the end position. Writes each decoded symbol to
+// `symbols_out[offsets[seq_idx] + local_n]`.
 //
-// Per-region accounting was fixed in Phase 1+2 so `me.n` equals the
-// number of symbols this thread emits — but the kernel also bounds-
-// checks each write against `total_symbols` so adversarial / buggy
-// upstream output can't corrupt host memory past symbols_out's end.
+// `s_info[i]` is the boundary snapshot Phase 1 captured for subseq
+// i — the (p, c, z) at the first decode crossing into subseq (i+1)'s
+// region. Subseq i's owned region thus spans [s_info[i-1].p, s_info[i].p);
+// subseq 0 starts fresh at (p=0, c=0, z=0). This decomposes the
+// stream into disjoint per-thread regions that cover it exactly,
+// which is what Phase 3's offset arithmetic + Phase 4's write
+// arithmetic both rely on.
+//
+// The kernel also bounds-checks each write against `total_symbols`
+// so adversarial / buggy upstream output can't corrupt host memory
+// past symbols_out's end.
 extern "C" __global__ void phase4_redecode(
     const unsigned int* __restrict__ bitstream,
     const unsigned int* __restrict__ codebook,
@@ -143,6 +200,7 @@ extern "C" __global__ void phase4_redecode(
     const unsigned int* __restrict__ offsets,
     unsigned int* __restrict__ symbols_out,
     unsigned int length_bits,
+    unsigned int subsequence_bits,
     unsigned int total_symbols,
     unsigned int num_subsequences,
     unsigned int num_components
@@ -154,6 +212,10 @@ extern "C" __global__ void phase4_redecode(
 
     uint4 me = s_info[seq_idx];
     unsigned int end_p = me.x;
+    // Unused now that we read end_p directly from the snapshot,
+    // but kept in the launch signature for callers (Vulkan recorder
+    // also passes it through the shared push struct).
+    (void)subsequence_bits;
 
     // (p, n, c, z) packed into uint4 (x, y, z, w).
     unsigned int p, n, c, z;

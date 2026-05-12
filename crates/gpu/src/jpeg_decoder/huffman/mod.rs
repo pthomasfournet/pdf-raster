@@ -7,6 +7,12 @@
 //! the trait's `record_huffman` directly to keep buffers alive across
 //! pages.
 
+// Per-phase parity tests live in this file's `mod tests` /
+// `mod vulkan_tests`; the 10-vector spec acceptance corpus lives in
+// the sibling `corpus.rs`.
+#[cfg(all(test, feature = "gpu-validation"))]
+mod corpus;
+
 use crate::backend::params::{HUFFMAN_CODEBOOK_ENTRIES, HuffmanParams, HuffmanPhase};
 use crate::backend::{BackendError, GpuBackend, Result};
 use crate::jpeg::CanonicalCodebook;
@@ -489,7 +495,7 @@ mod tests {
     use super::*;
     use crate::backend::cuda::CudaBackend;
     use crate::jpeg::headers::{DhtClass, JpegHuffmanTable};
-    use crate::jpeg_decoder::phase1_oracle::phase1_walk;
+    use crate::jpeg_decoder::phase1_oracle::phase1_walk_snapshot;
     use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     fn try_cuda() -> Option<CudaBackend> {
@@ -517,7 +523,8 @@ mod tests {
             let start_bit = seq_idx * subseq_bits;
             let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
             let count_to = stream.length_bits.min(start_bit + subseq_bits);
-            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit, count_to);
+            let (cpu, _stop) =
+                phase1_walk_snapshot(stream, tables, start_bit, hard_limit, count_to);
             assert_eq!(
                 gpu[seq_idx as usize], cpu,
                 "subsequence {seq_idx} GPU vs CPU state mismatch"
@@ -630,7 +637,8 @@ mod tests {
                 let start_bit = i * 128;
                 let hard_limit = stream.length_bits.min(start_bit + 2 * 128);
                 let count_to = stream.length_bits.min(start_bit + 128);
-                let (state, _stop) = phase1_walk(&stream, &book, start_bit, hard_limit, count_to);
+                let (state, _stop) =
+                    phase1_walk_snapshot(&stream, &book, start_bit, hard_limit, count_to);
                 state
             })
             .collect();
@@ -794,7 +802,7 @@ mod vulkan_tests {
     use super::*;
     use crate::backend::cuda::CudaBackend;
     use crate::backend::vulkan::VulkanBackend;
-    use crate::jpeg_decoder::phase1_oracle::phase1_walk;
+    use crate::jpeg_decoder::phase1_oracle::phase1_walk_snapshot;
     use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     fn try_vulkan() -> Option<VulkanBackend> {
@@ -825,7 +833,8 @@ mod vulkan_tests {
             let start_bit = seq_idx * subseq_bits;
             let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
             let count_to = stream.length_bits.min(start_bit + subseq_bits);
-            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit, count_to);
+            let (cpu, _stop) =
+                phase1_walk_snapshot(stream, tables, start_bit, hard_limit, count_to);
             let i = seq_idx as usize;
             assert_eq!(gpu_cuda[i], cpu, "subseq {seq_idx}: CUDA vs CPU");
             assert_eq!(gpu_vk[i], cpu, "subseq {seq_idx}: Vulkan vs CPU");
@@ -846,7 +855,8 @@ mod vulkan_tests {
             let start_bit = seq_idx * subseq_bits;
             let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
             let count_to = stream.length_bits.min(start_bit + subseq_bits);
-            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit, count_to);
+            let (cpu, _stop) =
+                phase1_walk_snapshot(stream, tables, start_bit, hard_limit, count_to);
             assert_eq!(gpu[seq_idx as usize], cpu, "subseq {seq_idx} Vulkan vs CPU");
         }
     }
