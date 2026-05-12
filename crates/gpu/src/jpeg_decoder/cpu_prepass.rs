@@ -17,7 +17,7 @@
 
 use crate::jpeg::headers::{JpegFrameComponent, JpegScanHeader};
 use crate::jpeg::{
-    CanonicalCodebook, CpuPrepassError, CpuPrepassOutput, DcValues, JpegHeaderError,
+    CanonicalCodebook, CpuPrepassError, CpuPrepassOutput, DcValues, DhtClass, JpegHeaderError,
     JpegQuantTable, run_cpu_prepass,
 };
 use crate::jpeg_decoder::{JpegGpuError, PackedBitstream, pack_be_words};
@@ -87,7 +87,7 @@ impl JpegPreparedInput {
     /// hand-mutated after `prepare_jpeg` returned.
     #[must_use]
     pub fn ac_codebooks_for_dispatch(&self) -> Vec<&CanonicalCodebook> {
-        materialise_codebook_slice(&self.ac_codebooks, &self.ac_selectors, "AC")
+        materialise_codebook_slice(&self.ac_codebooks, &self.ac_selectors, DhtClass::Ac)
     }
 
     /// Materialise the per-component DC codebook references for the
@@ -101,20 +101,23 @@ impl JpegPreparedInput {
     /// construction time.
     #[must_use]
     pub fn dc_codebooks_for_dispatch(&self) -> Vec<&CanonicalCodebook> {
-        materialise_codebook_slice(&self.dc_codebooks, &self.dc_selectors, "DC")
+        materialise_codebook_slice(&self.dc_codebooks, &self.dc_selectors, DhtClass::Dc)
     }
 }
 
 fn materialise_codebook_slice<'a>(
     codebooks: &'a [Option<CanonicalCodebook>; 4],
     selectors: &[u8],
-    class_label: &'static str,
+    class: DhtClass,
 ) -> Vec<&'a CanonicalCodebook> {
     selectors
         .iter()
         .map(|&sel| {
             codebooks[usize::from(sel)].as_ref().unwrap_or_else(|| {
-                panic!("{class_label} selector {sel} populated at prepare_jpeg time")
+                panic!(
+                    "{} selector {sel} populated at prepare_jpeg time",
+                    class.name()
+                )
             })
         })
         .collect()
@@ -126,18 +129,32 @@ fn materialise_codebook_slice<'a>(
 ///
 /// * [`JpegGpuError::Progressive`] — the JPEG is not baseline DCT (SOF2
 ///   progressive, SOF3 lossless, or other non-baseline variants).
-/// * [`JpegGpuError::UnsupportedComponents`] — the SOF declared a component
-///   count other than 1 (grayscale) or 3 (YCbCr).  4-component CMYK is
-///   parsed by the CPU pre-pass but not yet wired through the GPU path.
-/// * [`JpegGpuError::HeaderParse`] — any other pre-pass failure (malformed
-///   headers, byte-unstuffing aborted on unexpected marker, Huffman table
-///   overflow, DC chain corrupt).  The display of the underlying error is
-///   preserved in the message so the caller can log it.
+/// * [`JpegGpuError::UnsupportedComponents`] — the SOF declared a
+///   component count outside `{1, 3}`.  Valid JPEG covers 1 (grayscale),
+///   2 (rare two-component), 3 (YCbCr / RGB), and 4 (CMYK); the GPU path
+///   only wires 1 and 3 today. The same variant also fires when the SOS
+///   header's component count disagrees with the SOF — those would
+///   silently produce wrong dispatch slices.
+/// * [`JpegGpuError::InvalidHuffmanTables`] — the SOS references a DC
+///   or AC selector for which no DHT was loaded, or the DHT itself was
+///   structurally invalid (code-space overflow, length mismatch).
+/// * [`JpegGpuError::HeaderParse`] — any other pre-pass failure
+///   (malformed headers, byte-unstuffing aborted on unexpected marker,
+///   DC chain corrupt, unstuffed segment too long to address in u32
+///   bits). The display of the underlying error is preserved in the
+///   message so the caller can log it.
 pub fn prepare_jpeg(jpeg_bytes: &[u8]) -> Result<JpegPreparedInput, JpegGpuError> {
     let prep = match run_cpu_prepass(jpeg_bytes) {
         Ok(out) => out,
         Err(CpuPrepassError::Header(JpegHeaderError::NotBaseline)) => {
             return Err(JpegGpuError::Progressive);
+        }
+        Err(
+            e @ (CpuPrepassError::Codebook { .. } | CpuPrepassError::MissingHuffmanTable { .. }),
+        ) => {
+            // Codebook / missing-table failures map to the typed Huffman
+            // variant so callers don't have to substring-match.
+            return Err(JpegGpuError::InvalidHuffmanTables(e.to_string()));
         }
         Err(e) => return Err(JpegGpuError::HeaderParse(e.to_string())),
     };
@@ -145,10 +162,20 @@ pub fn prepare_jpeg(jpeg_bytes: &[u8]) -> Result<JpegPreparedInput, JpegGpuError
     if prep.components != 1 && prep.components != 3 {
         return Err(JpegGpuError::UnsupportedComponents(prep.components));
     }
+    // SOS may declare a different number of scan components than SOF
+    // (typically the parser already aligns them, but non-interleaved
+    // baseline JPEGs would surface as a mismatch — the dispatcher would
+    // then build wrong-length selector vectors). Refuse rather than
+    // produce a garbage prep.
+    if prep.scan.component_count != prep.components {
+        return Err(JpegGpuError::UnsupportedComponents(
+            prep.scan.component_count,
+        ));
+    }
 
-    let dc_selectors = collect_scan_selectors(&prep, ScanClass::Dc)?;
-    let ac_selectors = collect_scan_selectors(&prep, ScanClass::Ac)?;
-    let bitstream = pack_unstuffed_bitstream(&prep.unstuffed);
+    let dc_selectors = collect_scan_selectors(&prep, DhtClass::Dc)?;
+    let ac_selectors = collect_scan_selectors(&prep, DhtClass::Ac)?;
+    let bitstream = pack_unstuffed_bitstream(&prep.unstuffed)?;
     let components = prep.active_frame_components().to_vec();
 
     let CpuPrepassOutput {
@@ -185,27 +212,25 @@ pub fn prepare_jpeg(jpeg_bytes: &[u8]) -> Result<JpegPreparedInput, JpegGpuError
 /// boundary; the kernel stops decoding at per-MCU EOB before reaching the
 /// tail, so the entire byte buffer is meaningful as far as the bitstream
 /// container is concerned.
-fn pack_unstuffed_bitstream(unstuffed: &[u8]) -> PackedBitstream {
+///
+/// # Errors
+///
+/// Returns [`JpegGpuError::HeaderParse`] if `unstuffed.len() * 8` overflows
+/// `u32` (would require a > 512 MB entropy segment — practically only a
+/// hand-crafted adversarial input). The kernel's `length_bits` field is
+/// `u32`; a `usize` overflow there would silently truncate and produce
+/// garbage symbols, so we refuse rather than truncate.
+fn pack_unstuffed_bitstream(unstuffed: &[u8]) -> Result<PackedBitstream, JpegGpuError> {
     let length_bits = u32::try_from(unstuffed.len())
         .ok()
         .and_then(|n| n.checked_mul(8))
-        .expect("unstuffed length in bits must fit in u32 (JPEG max scan size << 2^32)");
-    pack_be_words(unstuffed, length_bits)
-}
-
-#[derive(Clone, Copy)]
-enum ScanClass {
-    Dc,
-    Ac,
-}
-
-impl ScanClass {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Dc => "DC",
-            Self::Ac => "AC",
-        }
-    }
+        .ok_or_else(|| {
+            JpegGpuError::HeaderParse(format!(
+                "unstuffed entropy segment is {} bytes; length-bits would overflow u32",
+                unstuffed.len(),
+            ))
+        })?;
+    Ok(pack_be_words(unstuffed, length_bits))
 }
 
 /// Collect the DC or AC selector each scan component references, checking
@@ -218,20 +243,20 @@ impl ScanClass {
 /// invariant violation rather than panicking.
 fn collect_scan_selectors(
     prep: &CpuPrepassOutput,
-    class: ScanClass,
+    class: DhtClass,
 ) -> Result<Vec<u8>, JpegGpuError> {
     let count = usize::from(prep.scan.component_count);
     let mut out = Vec::with_capacity(count);
     for sc in &prep.scan.components[..count] {
         let (selector, codebooks) = match class {
-            ScanClass::Dc => (sc.dc_table, &prep.dc_codebooks),
-            ScanClass::Ac => (sc.ac_table, &prep.ac_codebooks),
+            DhtClass::Dc => (sc.dc_table, &prep.dc_codebooks),
+            DhtClass::Ac => (sc.ac_table, &prep.ac_codebooks),
         };
         if codebooks[usize::from(selector)].is_none() {
             return Err(JpegGpuError::InvalidHuffmanTables(format!(
                 "scan component id={} references {} selector {} but no codebook was built",
                 sc.id,
-                class.label(),
+                class.name(),
                 selector,
             )));
         }
@@ -297,6 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn prepare_routes_codebook_error_to_invalid_huffman_tables() {
+        // Hand-rolled JPEG with a DHT that overflows the 1-bit code space
+        // (DC table 0 declares 3 length-1 codes, only 2 fit). The CPU
+        // pre-pass returns CpuPrepassError::Codebook; the wrapper must
+        // surface that as the typed InvalidHuffmanTables — callers should
+        // not have to substring-match the message.
+        let mut data: Vec<u8> = vec![0xFF, 0xD8];
+        // DQT, table 0, 64 zeros.
+        data.extend_from_slice(&[0xFF, 0xDB, 0x00, 67, 0]);
+        data.extend_from_slice(&[0u8; 64]);
+        // SOF0, 1 component.
+        data.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 11, 8, 0x00, 0x10, 0x00, 0x10, 1, 1, 0x11, 0x00,
+        ]);
+        // DHT DC table 0: 3 length-1 codes (overflow).
+        let mut dht = vec![0xFF, 0xC4, 0x00, 22, 0x00];
+        dht.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dht.extend_from_slice(&[0, 1, 2]);
+        data.extend_from_slice(&dht);
+        // DHT AC table 0: one length-1 code, value 0.
+        data.extend_from_slice(&[
+            0xFF, 0xC4, 0x00, 20, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        // SOS + one entropy byte + EOI.
+        data.extend_from_slice(&[0xFF, 0xDA, 0x00, 8, 1, 1, 0x00, 0, 0x3F, 0x00, 0x80]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+
+        let err = prepare_jpeg(&data).expect_err("invalid DHT must fail");
+        assert!(
+            matches!(err, JpegGpuError::InvalidHuffmanTables(_)),
+            "expected InvalidHuffmanTables, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn selectors_match_scan_header_in_order_for_both_classes() {
         // Selectors flatten in scan-component order; the dispatch slice
         // dereferences to the same logical codebook as the source array.
@@ -312,16 +372,14 @@ mod tests {
             &prep.ac_codebooks_for_dispatch(),
             &raw.ac_codebooks,
             scan_components,
-            "AC",
-            |sc| sc.ac_table,
+            DhtClass::Ac,
         );
         check_dispatch_slice(
             &prep.dc_selectors,
             &prep.dc_codebooks_for_dispatch(),
             &raw.dc_codebooks,
             scan_components,
-            "DC",
-            |sc| sc.dc_table,
+            DhtClass::Dc,
         );
     }
 
@@ -330,11 +388,13 @@ mod tests {
         dispatch: &[&CanonicalCodebook],
         source_codebooks: &[Option<CanonicalCodebook>; 4],
         scan_components: &[crate::jpeg::headers::JpegScanComponent],
-        class_label: &'static str,
-        selector_of: impl Fn(&crate::jpeg::headers::JpegScanComponent) -> u8,
+        class: DhtClass,
     ) {
         for (i, sc) in scan_components.iter().enumerate() {
-            let selector = selector_of(sc);
+            let selector = match class {
+                DhtClass::Dc => sc.dc_table,
+                DhtClass::Ac => sc.ac_table,
+            };
             assert_eq!(prep_selectors[i], selector);
             // CanonicalCodebook has no PartialEq; compare packed tables —
             // a deterministic function of the DHT, so byte equality is
@@ -343,7 +403,8 @@ mod tests {
             assert_eq!(
                 dispatch[i].table(),
                 expected.table(),
-                "{class_label} dispatch slot {i} (id={}, selector={selector}) wrong",
+                "{} dispatch slot {i} (id={}, selector={selector}) wrong",
+                class.name(),
                 sc.id,
             );
         }
