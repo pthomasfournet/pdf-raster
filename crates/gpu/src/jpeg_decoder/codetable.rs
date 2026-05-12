@@ -190,16 +190,7 @@ pub fn build_gpu_codetable(table: &JpegHuffmanTable) -> Result<GpuCodetable, Jpe
 mod tests {
     use super::*;
     use crate::jpeg::headers::DhtClass;
-
-    fn book4_dc() -> JpegHuffmanTable {
-        // 4 symbols at lengths {2, 2, 3, 3}. Canonical codes: 00, 01, 100, 101.
-        JpegHuffmanTable {
-            class: DhtClass::Dc,
-            table_id: 0,
-            num_codes: [0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            values: vec![0x00, 0x01, 0x02, 0x03],
-        }
-    }
+    use crate::jpeg_decoder::tests::fixtures::book4_table as book4_dc;
 
     #[test]
     fn quick_entry_pack_roundtrip() {

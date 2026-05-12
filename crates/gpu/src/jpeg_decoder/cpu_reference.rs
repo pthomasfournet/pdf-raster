@@ -59,20 +59,8 @@ mod tests {
     use super::*;
     use crate::jpeg::headers::DhtClass;
     use crate::jpeg::{CanonicalCodebook, JpegHuffmanTable};
+    use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_table};
     use crate::jpeg_decoder::tests::synthetic::encode_symbols;
-
-    fn book4_table() -> JpegHuffmanTable {
-        JpegHuffmanTable {
-            class: DhtClass::Dc,
-            table_id: 0,
-            num_codes: [0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            values: vec![0x00, 0x01, 0x02, 0x03],
-        }
-    }
-
-    fn book4_canonical() -> CanonicalCodebook {
-        CanonicalCodebook::build(&book4_table()).expect("valid")
-    }
 
     #[test]
     fn roundtrip_short_stream() {
@@ -83,7 +71,7 @@ mod tests {
             words: enc.words_be,
             length_bits: enc.length_bits,
         };
-        let got = decode_scalar(&book4_canonical(), &stream);
+        let got = decode_scalar(&book4_codebook(), &stream);
         assert_eq!(got, original);
     }
 
@@ -96,7 +84,7 @@ mod tests {
             words: enc.words_be,
             length_bits: enc.length_bits,
         };
-        let got = decode_scalar(&book4_canonical(), &stream);
+        let got = decode_scalar(&book4_codebook(), &stream);
         assert_eq!(got, original);
     }
 
@@ -106,7 +94,7 @@ mod tests {
             words: vec![],
             length_bits: 0,
         };
-        let got = decode_scalar(&book4_canonical(), &stream);
+        let got = decode_scalar(&book4_codebook(), &stream);
         assert!(got.is_empty());
     }
 

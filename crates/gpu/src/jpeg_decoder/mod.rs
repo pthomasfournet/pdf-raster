@@ -35,5 +35,6 @@ pub use scan::dispatch_blelloch_scan;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub mod fixtures;
     pub mod synthetic;
 }

@@ -114,16 +114,11 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
     backend.wait_page(fence)?;
 
     // Download directly into a Vec<SubsequenceState> view, skipping
-    // the Vec<u8> → cast → to_vec double-copy.
-    let mut out = vec![
-        SubsequenceState {
-            p: 0,
-            n: 0,
-            c: 0,
-            z: 0
-        };
-        num_subsequences as usize
-    ];
+    // the Vec<u8> → cast → to_vec double-copy. SubsequenceState is
+    // Pod+Zeroable so `bytemuck::zeroed::<T>()` is the canonical
+    // zero-value rather than a field-by-field literal.
+    let mut out =
+        vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
     let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut out);
     let handle = backend.download_async(&s_info_buf, dst)?;
     backend.wait_download(handle)?;
@@ -140,30 +135,11 @@ mod tests {
     use super::*;
     use crate::backend::cuda::CudaBackend;
     use crate::jpeg::headers::{DhtClass, JpegHuffmanTable};
-    use crate::jpeg_decoder::pack_be_words;
     use crate::jpeg_decoder::phase1_oracle::phase1_walk;
-    use crate::jpeg_decoder::tests::synthetic::encode_symbols;
-
-    fn book4_table() -> JpegHuffmanTable {
-        JpegHuffmanTable {
-            class: DhtClass::Dc,
-            table_id: 0,
-            num_codes: [0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            values: vec![0x00, 0x01, 0x02, 0x03],
-        }
-    }
-
-    fn book4_codebook() -> CanonicalCodebook {
-        CanonicalCodebook::build(&book4_table()).unwrap()
-    }
+    use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     fn try_cuda() -> Option<CudaBackend> {
         CudaBackend::new().ok()
-    }
-
-    fn stream_from(symbols: &[u8]) -> PackedBitstream {
-        let enc = encode_symbols(&book4_table(), symbols);
-        pack_be_words(bytemuck::cast_slice(&enc.words_be), enc.length_bits)
     }
 
     /// Run the kernel + run the CPU oracle for every subsequence;
@@ -198,7 +174,7 @@ mod tests {
     fn phase1_single_subsequence_matches_cpu() {
         // 100 length-2 codewords = 200 bits in one 256-bit subsequence.
         let symbols = vec![0x00; 100];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         assert_phase1_parity(&stream, &book, 256);
     }
@@ -206,7 +182,7 @@ mod tests {
     #[test]
     fn phase1_two_subsequences_match_cpu() {
         let symbols = vec![0x00; 128];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         assert_phase1_parity(&stream, &book, 128);
     }
@@ -214,7 +190,7 @@ mod tests {
     #[test]
     fn phase1_many_subsequences_match_cpu() {
         let symbols = vec![0x00; 1000];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         assert_phase1_parity(&stream, &book, 128);
     }
@@ -223,7 +199,7 @@ mod tests {
     fn phase1_mixed_symbols_match_cpu() {
         // Mixed codeword lengths exercise both length-2 and length-3 codes.
         let symbols: Vec<u8> = (0..1000u32).map(|i| (i % 4) as u8).collect();
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         assert_phase1_parity(&stream, &book, 128);
     }
@@ -231,7 +207,7 @@ mod tests {
     #[test]
     fn phase1_multi_component_match_cpu() {
         let symbols = vec![0x00; 200];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         // Three components — z rolls over every 64 symbols,
         // c walks 0 → 1 → 2 → 0.
         let book = [book4_codebook(), book4_codebook(), book4_codebook()];

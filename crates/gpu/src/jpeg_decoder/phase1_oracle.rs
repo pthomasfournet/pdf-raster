@@ -3,8 +3,7 @@
 //!
 //! Walks a single subsequence on the CPU, producing the same
 //! `(p, n, c, z)` end-state the GPU kernel will produce for that
-//! thread. Used as the cross-backend bit-identity oracle for A7
-//! (the kernel) and A8 (the host-side dispatcher).
+//! thread. Used as the cross-backend bit-identity oracle.
 //!
 //! ## Algorithm shape
 //!
@@ -27,7 +26,7 @@
 //! framing and advances `z += 1` per decoded symbol, rolling over to
 //! `(z=0, c=(c+1) % num_components)` on the 64-symbol boundary. This
 //! oracle matches the kernel's simplification — it is NOT a real
-//! JPEG decoder. Real JPEG framing lands in the B-phase tasks.
+//! JPEG decoder.
 
 #![cfg(test)]
 
@@ -157,37 +156,12 @@ pub(super) fn phase1_walk(
 mod tests {
     use super::*;
     use crate::jpeg::headers::{DhtClass, JpegHuffmanTable};
-    use crate::jpeg_decoder::pack_be_words;
-    use crate::jpeg_decoder::tests::synthetic::encode_symbols;
-
-    /// 4-symbol Huffman book: codes 00, 01, 100, 101 (lengths 2, 2, 3, 3).
-    /// Symbols are 0x00 .. 0x03, so all have `value_bits` = 0 (since
-    /// the low nibble of the symbol is the size). That makes the
-    /// per-symbol bit advance exactly `code_bits` — easy to reason
-    /// about.
-    fn book4() -> JpegHuffmanTable {
-        JpegHuffmanTable {
-            class: DhtClass::Dc,
-            table_id: 0,
-            num_codes: [0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            values: vec![0x00, 0x01, 0x02, 0x03],
-        }
-    }
-
-    fn book4_codebook() -> CanonicalCodebook {
-        CanonicalCodebook::build(&book4()).unwrap()
-    }
-
-    /// Encode `symbols` against `book4` and pack into a stream.
-    fn stream_from(symbols: &[u8]) -> PackedBitstream {
-        let enc = encode_symbols(&book4(), symbols);
-        pack_be_words(bytemuck::cast_slice(&enc.words_be), enc.length_bits)
-    }
+    use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     #[test]
     fn walks_one_symbol_advances_correctly() {
         // Stream = one symbol 0x00 (code "00", 2 bits).
-        let stream = stream_from(&[0x00]);
+        let stream = book4_stream(&[0x00]);
         let book = [book4_codebook()];
         let (state, stop) = phase1_walk(&stream, &book, 0, 2);
         assert_eq!(stop, Phase1Stop::HardLimit);
@@ -202,7 +176,7 @@ mod tests {
         // 64 length-2 codewords (all symbol 0x00). z should wrap to 0
         // and c should advance to 1 if there's a second codetable.
         let symbols = vec![0x00; 64];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook(), book4_codebook()];
         let (state, _) = phase1_walk(&stream, &book, 0, 128);
         assert_eq!(state.n, 64);
@@ -215,7 +189,7 @@ mod tests {
         // Same as above but only one component — c stays at 0 because
         // (0 + 1) % 1 == 0.
         let symbols = vec![0x00; 64];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         let (state, _) = phase1_walk(&stream, &book, 0, 128);
         assert_eq!(state.n, 64);
@@ -228,7 +202,7 @@ mod tests {
         // 5 length-2 symbols = 10 bits. hard_limit = 6 bits.
         // Decoder should consume 3 symbols (6 bits) then exit.
         let symbols = vec![0x00; 5];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         let (state, stop) = phase1_walk(&stream, &book, 0, 6);
         assert_eq!(stop, Phase1Stop::HardLimit);
@@ -241,7 +215,7 @@ mod tests {
         // 4 length-2 symbols = 8 bits. Start at bit 2; should
         // consume 3 symbols (bits 2..=7) then hit hard_limit at 8.
         let symbols = vec![0x00; 4];
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         let (state, _) = phase1_walk(&stream, &book, 2, 8);
         assert_eq!(state.p, 8);
@@ -335,7 +309,7 @@ mod tests {
         // 200-bit stream, walk it 0..200 in one shot, then walk
         // 0..100 + 100..200 in two pieces, compare.
         let symbols = vec![0x00; 100]; // 100 length-2 codewords = 200 bits
-        let stream = stream_from(&symbols);
+        let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
         let length_bits = stream.length_bits;
         assert_eq!(length_bits, 200);

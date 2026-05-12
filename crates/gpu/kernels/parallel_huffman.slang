@@ -19,7 +19,7 @@
 //
 // Real JPEG AC framing tracks (run, size) per symbol. The MVP advances
 // `z += 1` per decoded symbol, rolling over `c` on the 64-symbol
-// boundary. Production-grade AC framing lands in the B-phase tasks.
+// boundary. Production-grade AC framing is a follow-up.
 
 [[vk::binding(0, 0)]] StructuredBuffer<uint> bitstream;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> codebook;

@@ -446,6 +446,22 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
         if self.num_components == 0 {
             return Err(invariant("num_components must be ≥ 1"));
         }
+        // Kernel computes `sync_target = start_bit + 2 * subsequence_bits`
+        // in u32. With start_bit bounded by length_bits, the worst case
+        // is `length_bits + 2 * subsequence_bits` (and that's only when
+        // sync_target sits past the end of the stream, which it always
+        // does for the last few subsequences). Reject inputs that would
+        // wrap u32; the kernel's `min(length_bits, sync_target)` would
+        // otherwise produce a garbage hard_limit.
+        if self
+            .length_bits
+            .checked_add(2u32.saturating_mul(self.subsequence_bits))
+            .is_none()
+        {
+            return Err(invariant(
+                "length_bits + 2 * subsequence_bits overflows u32; kernel sync_target would wrap",
+            ));
+        }
 
         // bitstream capacity: words = ceil(length_bits/32), plus one
         // trailing word for peek16's two-word read.

@@ -1,7 +1,11 @@
 // Parallel-Huffman JPEG decoder kernels — CUDA mirror of
 // parallel_huffman.slang. See the Slang for algorithm-level comments.
+//
+// Block size is the grid-dim argument supplied at launch by
+// `lib_kernels::huffman::PHASE1_THREADS`; the kernel itself reads
+// threadIdx via the standard CUDA intrinsics and doesn't pin the
+// block size in source.
 
-#define BLOCK_SIZE 256u
 #define CODEBOOK_ENTRIES 65536u
 
 // Peek 16 bits MSB-first starting at absolute `bit_pos`. Mirrors
