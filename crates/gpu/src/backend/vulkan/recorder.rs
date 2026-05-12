@@ -464,7 +464,8 @@ impl PageRecorder {
     /// Push-constant layout (must match `parallel_huffman.slang`'s
     /// `PushParams` cbuffer): `length_bits`, `subsequence_bits`,
     /// `num_subsequences`, `num_components` — 4 × u32 = 16 bytes.
-    /// Storage bindings: 0 = bitstream, 1 = codebook, 2 = `s_info`.
+    /// Storage bindings: 0 = bitstream, 1 = codebook, 2 = `s_info`,
+    /// and (Phase 2 only) 3 = `sync_flags`.
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub(super) fn record_huffman(
         &self,
@@ -480,18 +481,39 @@ impl PageRecorder {
         push[8..12].copy_from_slice(&num_subsequences.to_ne_bytes());
         push[12..16].copy_from_slice(&p.num_components.to_ne_bytes());
 
-        let kernel = match p.phase {
-            HuffmanPhase::Phase1IntraSync => KernelId::Phase1IntraSync,
-        };
         let groups = (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1);
 
-        self.dispatch_kernel(
-            kernel,
-            &[p.bitstream.handle(), p.codebook.handle(), p.s_info.handle()],
-            &[p.bitstream.size(), p.codebook.size(), p.s_info.size()],
-            &push,
-            groups,
-        )
+        match p.phase {
+            HuffmanPhase::Phase1IntraSync => self.dispatch_kernel(
+                KernelId::Phase1IntraSync,
+                &[p.bitstream.handle(), p.codebook.handle(), p.s_info.handle()],
+                &[p.bitstream.size(), p.codebook.size(), p.s_info.size()],
+                &push,
+                groups,
+            ),
+            HuffmanPhase::Phase2InterSync => {
+                let flags = p
+                    .sync_flags
+                    .expect("validate() proved sync_flags is Some for Phase2InterSync");
+                self.dispatch_kernel(
+                    KernelId::Phase2InterSync,
+                    &[
+                        p.bitstream.handle(),
+                        p.codebook.handle(),
+                        p.s_info.handle(),
+                        flags.handle(),
+                    ],
+                    &[
+                        p.bitstream.size(),
+                        p.codebook.size(),
+                        p.s_info.size(),
+                        flags.size(),
+                    ],
+                    &push,
+                    groups,
+                )
+            }
+        }
     }
 
     pub(super) fn record_blit_image(

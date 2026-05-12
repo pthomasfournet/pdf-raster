@@ -159,6 +159,9 @@ pub(crate) struct GpuKernels {
     /// JPEG Huffman Phase 1 (intra-sequence sync).
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub(crate) phase1_intra_sync: CudaFunction,
+    /// JPEG Huffman Phase 2 (inter-sequence sync, bounded retry).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) phase2_inter_sync: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -255,6 +258,8 @@ impl GpuCtx {
                 scan_scatter: load(PTX_BLELLOCH_SCAN, "scan_scatter")?,
                 #[cfg(feature = "gpu-jpeg-huffman")]
                 phase1_intra_sync: load(PTX_PARALLEL_HUFFMAN, "phase1_intra_sync")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                phase2_inter_sync: load(PTX_PARALLEL_HUFFMAN, "phase2_inter_sync")?,
             },
         })
     }

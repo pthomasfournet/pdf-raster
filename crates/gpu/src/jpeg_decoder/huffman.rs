@@ -105,6 +105,7 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
         bitstream: &bitstream_buf,
         codebook: &codebook_buf,
         s_info: &s_info_buf,
+        sync_flags: None,
         length_bits,
         subsequence_bits,
         num_components,
@@ -128,6 +129,147 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
     backend.free_device(s_info_buf);
 
     Ok(out)
+}
+
+/// Outcome of the Phase 2 dispatcher's bounded retry loop.
+///
+/// Mirrors `phase2_oracle::Phase2Outcome` exactly so test parity
+/// assertions can compare them by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "gpu-validation")]
+enum Phase2DispatchOutcome {
+    /// All subseqs synced; final `s_info` returned out-of-band.
+    Converged { iterations: u32 },
+    /// Retry bound exhausted without convergence.
+    SyncBoundExceeded { bound: u32 },
+}
+
+/// Maximum number of Phase 2 sync-and-advance passes before giving
+/// up. Matches `phase2_oracle::retry_bound`.
+#[cfg(feature = "gpu-validation")]
+const fn phase2_retry_bound(num_subsequences: usize) -> u32 {
+    let pow2_exp = num_subsequences.next_power_of_two().trailing_zeros();
+    2u32.saturating_mul(pow2_exp)
+}
+
+/// One-shot dispatch of Phase 1 + Phase 2 (bounded retry sync loop).
+///
+/// Allocates device buffers, uploads inputs, runs Phase 1, then loops
+/// Phase 2 dispatches until all subseqs report `sync_flags[i] = 1` or
+/// the retry bound is exhausted. Returns the final `s_info` either
+/// way; the outcome tells the caller whether convergence happened.
+///
+/// Test/oracle path only — production callers should drive the trait
+/// directly to keep buffers alive across pages.
+///
+/// # Errors
+/// Returns `BackendError` if any alloc/upload/dispatch/download
+/// fails. Bound-exceeded is reported via the outcome, not as an
+/// error.
+#[cfg(feature = "gpu-validation")]
+fn dispatch_phase1_then_phase2<B: GpuBackend>(
+    backend: &B,
+    stream: &PackedBitstream,
+    codebooks: &[CanonicalCodebook],
+    subsequence_bits: u32,
+) -> Result<(Vec<SubsequenceState>, Phase2DispatchOutcome)> {
+    if stream.length_bits == 0 {
+        return Ok((
+            Vec::new(),
+            Phase2DispatchOutcome::Converged { iterations: 0 },
+        ));
+    }
+    if subsequence_bits == 0 {
+        return Err(BackendError::msg(
+            "dispatch_phase1_then_phase2: subsequence_bits must be > 0",
+        ));
+    }
+    if codebooks.is_empty() {
+        return Err(BackendError::msg(
+            "dispatch_phase1_then_phase2: at least one codebook required",
+        ));
+    }
+
+    let num_components = u32::try_from(codebooks.len()).map_err(|_| {
+        BackendError::msg(format!(
+            "more codebooks ({}) than fit in u32",
+            codebooks.len()
+        ))
+    })?;
+    let length_bits = stream.length_bits;
+    let num_subsequences = length_bits.div_ceil(subsequence_bits);
+
+    let bitstream_words = (length_bits.div_ceil(32) as usize) + 1;
+    let bitstream_bytes = bitstream_words * 4;
+    let codebook_flat = build_gpu_codebook(codebooks);
+    let codebook_bytes = codebook_flat.len() * 4;
+    let s_info_bytes = (num_subsequences as usize) * std::mem::size_of::<SubsequenceState>();
+    let flags_bytes = (num_subsequences as usize) * 4;
+
+    let bitstream_buf = backend.alloc_device_zeroed(bitstream_bytes)?;
+    let codebook_buf = backend.alloc_device(codebook_bytes)?;
+    let s_info_buf = backend.alloc_device(s_info_bytes)?;
+    let sync_flags_buf = backend.alloc_device(flags_bytes)?;
+
+    let _up1 = backend.upload_async(&bitstream_buf, bytemuck::cast_slice(&stream.words))?;
+    let _up2 = backend.upload_async(&codebook_buf, bytemuck::cast_slice(&codebook_flat))?;
+
+    // Phase 1 — one pass.
+    backend.begin_page()?;
+    backend.record_huffman(HuffmanParams {
+        bitstream: &bitstream_buf,
+        codebook: &codebook_buf,
+        s_info: &s_info_buf,
+        sync_flags: None,
+        length_bits,
+        subsequence_bits,
+        num_components,
+        phase: HuffmanPhase::Phase1IntraSync,
+    })?;
+    let fence = backend.submit_page()?;
+    backend.wait_page(fence)?;
+
+    // Phase 2 — bounded retry loop.
+    let bound = phase2_retry_bound(num_subsequences as usize);
+    let mut flags_host = vec![0u32; num_subsequences as usize];
+    let mut outcome = Phase2DispatchOutcome::SyncBoundExceeded { bound };
+    for iter in 0..=bound {
+        backend.begin_page()?;
+        backend.record_huffman(HuffmanParams {
+            bitstream: &bitstream_buf,
+            codebook: &codebook_buf,
+            s_info: &s_info_buf,
+            sync_flags: Some(&sync_flags_buf),
+            length_bits,
+            subsequence_bits,
+            num_components,
+            phase: HuffmanPhase::Phase2InterSync,
+        })?;
+        let fence = backend.submit_page()?;
+        backend.wait_page(fence)?;
+
+        let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut flags_host);
+        let handle = backend.download_async(&sync_flags_buf, dst)?;
+        backend.wait_download(handle)?;
+
+        if flags_host.iter().all(|&f| f == 1) {
+            outcome = Phase2DispatchOutcome::Converged { iterations: iter };
+            break;
+        }
+    }
+
+    let mut s_info_out =
+        vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
+    let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut s_info_out);
+    let handle = backend.download_async(&s_info_buf, dst)?;
+    backend.wait_download(handle)?;
+
+    backend.free_device(bitstream_buf);
+    backend.free_device(codebook_buf);
+    backend.free_device(s_info_buf);
+    backend.free_device(sync_flags_buf);
+
+    Ok((s_info_out, outcome))
 }
 
 #[cfg(all(test, feature = "gpu-validation"))]
@@ -232,6 +374,64 @@ mod tests {
         assert_eq!(flat[0x7FFF], 298);
         // Prefixes ≥ 0x8000 → no codeword, num_bits=0.
         assert_eq!(flat[0x8000], 0);
+    }
+
+    /// Phase 2 dispatcher: well-formed stream (`length_bits` is an
+    /// exact multiple of `subsequence_bits`) converges on the first
+    /// pass. Phase 1's output is already pre-synced.
+    #[test]
+    fn phase2_well_formed_stream_converges_immediately_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // 1024 length-2 codewords = 2048 bits, 16 subseqs of 128 bits.
+        let stream = book4_stream(&[0x00; 1024]);
+        let book = [book4_codebook()];
+        let (s_info, outcome) =
+            dispatch_phase1_then_phase2(&b, &stream, &book, 128).expect("dispatch");
+        // 16 subseqs.
+        assert_eq!(s_info.len(), 16);
+        // Pre-synced stream — first pass sees all flags = 1.
+        assert_eq!(outcome, Phase2DispatchOutcome::Converged { iterations: 0 });
+    }
+
+    /// Phase 2 dispatcher matches the CPU oracle: run both on the
+    /// same input, the final `s_info` should be byte-identical.
+    #[test]
+    fn phase2_matches_cpu_oracle_well_formed_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let stream = book4_stream(&[0x00; 1024]);
+        let book = [book4_codebook()];
+
+        // GPU: Phase 1 + Phase 2.
+        let (gpu_s_info, _outcome) =
+            dispatch_phase1_then_phase2(&b, &stream, &book, 128).expect("dispatch");
+
+        // CPU: Phase 1 + Phase 2 in the same shape.
+        let mut cpu_s_info: Vec<SubsequenceState> = (0u32..16)
+            .map(|i| {
+                let start_bit = i * 128;
+                let hard_limit = stream.length_bits.min(start_bit + 2 * 128);
+                let (state, _stop) = phase1_walk(&stream, &book, start_bit, hard_limit);
+                state
+            })
+            .collect();
+        let cpu_outcome = crate::jpeg_decoder::phase2_oracle::phase2_run_to_sync(
+            &mut cpu_s_info,
+            &stream,
+            &book,
+            128,
+        );
+        assert!(matches!(
+            cpu_outcome,
+            crate::jpeg_decoder::phase2_oracle::Phase2Outcome::Converged { .. }
+        ));
+
+        assert_eq!(gpu_s_info, cpu_s_info);
     }
 }
 
@@ -351,5 +551,23 @@ mod vulkan_tests {
         let stream = book4_stream(&[0x00; 200]);
         let book = [book4_codebook(), book4_codebook(), book4_codebook()];
         cross_backend_parity(&stream, &book, 64);
+    }
+
+    /// Phase 2 dispatcher: well-formed stream converges on both
+    /// backends and produces byte-identical `s_info`.
+    #[test]
+    fn phase2_well_formed_stream_cuda_vs_vulkan() {
+        let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+            eprintln!("skipping: need both CUDA and Vulkan");
+            return;
+        };
+        let stream = book4_stream(&[0x00; 1024]);
+        let book = [book4_codebook()];
+        let (cuda_s, cuda_o) =
+            dispatch_phase1_then_phase2(&cuda, &stream, &book, 128).expect("cuda");
+        let (vk_s, vk_o) = dispatch_phase1_then_phase2(&vk, &stream, &book, 128).expect("vulkan");
+        assert_eq!(cuda_o, vk_o, "outcome mismatch");
+        assert_eq!(cuda_s, vk_s, "s_info mismatch");
+        assert_eq!(cuda_o, Phase2DispatchOutcome::Converged { iterations: 0 });
     }
 }

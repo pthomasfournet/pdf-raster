@@ -56,4 +56,55 @@ impl GpuCtx {
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
+
+    /// Async launch of one Phase 2 (inter-sequence sync) pass.
+    ///
+    /// Reads `s_info` + writes `s_info` (in-place advance) and
+    /// `sync_flags` (one u32 per subseq; 1 = synced, 0 = unsynced
+    /// and advanced this pass). Host loops the dispatch until all
+    /// flags are 1 or the retry bound is exhausted.
+    ///
+    /// # Errors
+    /// Returns the underlying CUDA error if the kernel launch fails.
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "args mirror the .cu signature; grouping into a struct would just shuffle the bytes"
+    )]
+    pub(crate) fn launch_phase2_inter_sync_async(
+        &self,
+        bitstream: &CudaSlice<u8>,
+        codebook: &CudaSlice<u8>,
+        s_info: &CudaSlice<u8>,
+        sync_flags: &CudaSlice<u8>,
+        length_bits: u32,
+        subsequence_bits: u32,
+        num_subsequences: u32,
+        num_components: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1),
+            block_dim: (HUFFMAN_PHASE1_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let stream = &self.stream;
+        let mut builder = stream.launch_builder(&self.kernels.phase2_inter_sync);
+        builder
+            .arg(bitstream)
+            .arg(codebook)
+            .arg(s_info)
+            .arg(sync_flags)
+            .arg(&length_bits)
+            .arg(&subsequence_bits)
+            .arg(&num_subsequences)
+            .arg(&num_components);
+        // SAFETY: arg count + types match the PTX phase2_inter_sync
+        // signature; buffer capacities validated by HuffmanParams.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
 }

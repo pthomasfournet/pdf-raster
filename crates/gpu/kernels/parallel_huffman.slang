@@ -8,14 +8,22 @@
 // `hard_limit` (= `min(length_bits, (i + 2) * subsequence_bits)`).
 // The kernel then writes the final state to `s_info_out[i]`.
 //
+// ## Phase 2 algorithm (Weißenberger & Schmidt 2021 §III-C)
+//
+// One thread per subsequence. Reads `s_info[i]` and `s_info[i+1]`,
+// tests whether `(c, z)` agree and `s_info[i].p >= (i+1) *
+// subsequence_bits`. If aligned: writes `flags[i] = 1`. Otherwise:
+// advances `s_info[i]` by one symbol, writes `flags[i] = 0`. Host
+// loops the dispatch until all flags are 1 or the retry bound is
+// exhausted.
+//
 // ## Codebook layout
 //
 // `codebook` is a `u32[num_components * 65 536]` flat buffer. Each
 // entry packs `(num_bits << 8) | symbol`. Thread reads entry at
-// `codebook[c * 65 536 + peek16]`. `num_bits == 0` = no match
-// (the kernel breaks the loop; matches `CanonicalCodebook`'s sentinel).
+// `codebook[c * 65 536 + peek16]`. `num_bits == 0` = no match.
 //
-// ## MVP simplification (matches phase1_oracle::phase1_walk)
+// ## MVP simplification (matches phase1_oracle / phase2_oracle)
 //
 // Real JPEG AC framing tracks (run, size) per symbol. The MVP advances
 // `z += 1` per decoded symbol, rolling over `c` on the 64-symbol
@@ -24,6 +32,8 @@
 [[vk::binding(0, 0)]] StructuredBuffer<uint> bitstream;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> codebook;
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint4> s_info_out;
+// Phase 2 only — bound at slot 3 in the Phase 2 descriptor layout.
+[[vk::binding(3, 0)]] RWStructuredBuffer<uint> sync_flags;
 
 [[vk::push_constant]]
 cbuffer PushParams {
@@ -44,11 +54,38 @@ uint peek16_kernel(uint bit_pos) {
     uint hi = bitstream[word_idx];
     uint lo = bitstream[word_idx + 1];
 
-    // Build (hi << 32) | lo in a uint64, then >> (48 - bit_in_word)
-    // and mask to 16 bits. Slang exposes uint64_t for this — same
-    // path the spec text uses, lifted into a helper.
     uint64_t combined = (uint64_t(hi) << 32) | uint64_t(lo);
     return uint((combined >> (48u - bit_in_word)) & 0xFFFFu);
+}
+
+/// Try to decode one Huffman symbol starting at `state.p`, returning
+/// `true` if the state was advanced. On failure (prefix-miss or
+/// length-bits truncation) `state` is left unchanged and the caller
+/// can detect the miss without checkpoint arithmetic.
+///
+/// Shared by Phase 1 (loops until hard_limit) and Phase 2 (calls
+/// once per unsynced subseq per pass).
+bool try_decode_one_symbol_kernel(inout uint4 state) {
+    uint peek = peek16_kernel(state.x);
+    uint entry = codebook[state.z * 65536u + peek];
+    uint num_bits = (entry >> 8u) & 0xFFu;
+    if (num_bits == 0u) {
+        return false;
+    }
+    uint symbol = entry & 0xFFu;
+    uint value_bits = symbol & 0x0Fu;
+    uint advance = num_bits + value_bits;
+    if (state.x + advance > length_bits) {
+        return false;
+    }
+    state.x += advance;
+    state.y += 1u;
+    // state.w is the zig-zag index (6-bit); state.z is the component.
+    state.w = (state.w + 1u) & 63u;
+    if (state.w == 0u) {
+        state.z = (state.z + 1u) % num_components;
+    }
+    return true;
 }
 
 [shader("compute")][numthreads(256, 1, 1)]
@@ -62,45 +99,55 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     uint sync_target = start_bit + 2u * subsequence_bits;
     uint hard_limit = min(length_bits, sync_target);
 
-    uint p = start_bit;
-    uint n = 0u;
-    uint c = 0u;
-    uint z = 0u;
+    // (p, n, c, z) packed into uint4 as (x, y, z, w).
+    uint4 state = uint4(start_bit, 0u, 0u, 0u);
 
-    // Loop bound: at most one symbol every code_bits + value_bits bits.
-    // code_bits >= 1, so at most `hard_limit - start_bit` iterations.
-    // For safety in the face of a buggy codebook (entry => 0 advance),
-    // cap iterations at `hard_limit - start_bit + 1` symbols — any
-    // working codebook terminates well below this.
+    // Loop bound: at most one symbol every (code_bits + value_bits)
+    // bits, and code_bits >= 1 — so at most `hard_limit - start_bit`
+    // symbols. The +1 caps a buggy codebook (entry => 0 advance);
+    // working codebooks terminate well below this.
     uint max_iters = (hard_limit - start_bit) + 1u;
     for (uint iter = 0u; iter < max_iters; iter++) {
-        if (p >= hard_limit) {
+        if (state.x >= hard_limit) {
             break;
         }
-        uint peek = peek16_kernel(p);
-        uint entry = codebook[c * 65536u + peek];
-        uint num_bits = (entry >> 8u) & 0xFFu;
-        if (num_bits == 0u) {
-            // PrefixMiss — no codeword matches this prefix.
+        if (!try_decode_one_symbol_kernel(state)) {
             break;
-        }
-        uint symbol = entry & 0xFFu;
-        uint value_bits = symbol & 0x0Fu;
-        uint advance = num_bits + value_bits;
-
-        // Guard against running past length_bits mid-codeword.
-        if (p + advance > length_bits) {
-            break;
-        }
-
-        p += advance;
-        n += 1u;
-        // z is a 6-bit zig-zag index; mask compiles to one op.
-        z = (z + 1u) & 63u;
-        if (z == 0u) {
-            c = (c + 1u) % num_components;
         }
     }
 
-    s_info_out[seq_idx] = uint4(p, n, c, z);
+    s_info_out[seq_idx] = state;
+}
+
+[shader("compute")][numthreads(256, 1, 1)]
+void phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
+    uint seq_idx = tid.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+    // Last subseq has no right neighbour — trivially synced.
+    if (seq_idx + 1u == num_subsequences) {
+        sync_flags[seq_idx] = 1u;
+        return;
+    }
+
+    uint4 me = s_info_out[seq_idx];
+    uint4 nxt = s_info_out[seq_idx + 1];
+    uint nxt_start_p = (seq_idx + 1u) * subsequence_bits;
+
+    // SubsequenceState.{p,n,c,z} maps to uint4.{x,y,z,w}.
+    bool in_range = me.x >= nxt_start_p;
+    bool aligned = me.z == nxt.z && me.w == nxt.w;
+
+    if (in_range && aligned) {
+        sync_flags[seq_idx] = 1u;
+        return;
+    }
+
+    // Not synced — advance me by one symbol, write back, mark unsynced.
+    // The advance is permitted to fail; on miss the state stays put
+    // and we'll spin this subseq until the host's retry bound.
+    bool _ignored = try_decode_one_symbol_kernel(me);
+    s_info_out[seq_idx] = me;
+    sync_flags[seq_idx] = 0u;
 }

@@ -289,6 +289,23 @@ impl PageRecorder {
                     p.num_components,
                 )
                 .map_err(be),
+            params::HuffmanPhase::Phase2InterSync => {
+                let sync_flags = p
+                    .sync_flags
+                    .expect("validate() proved sync_flags is Some for Phase2InterSync");
+                self.ctx
+                    .launch_phase2_inter_sync_async(
+                        p.bitstream,
+                        p.codebook,
+                        p.s_info,
+                        sync_flags,
+                        p.length_bits,
+                        p.subsequence_bits,
+                        num_subsequences,
+                        p.num_components,
+                    )
+                    .map_err(be)
+            }
         }
     }
 

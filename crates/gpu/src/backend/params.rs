@@ -393,6 +393,13 @@ pub enum HuffmanPhase {
     /// (seq_idx + 2) * subsequence_bits)`, writing the final
     /// `(p, n, c, z)` state into `s_info[seq_idx]`.
     Phase1IntraSync,
+    /// One thread per subsequence; checks whether `s_info[i]` is
+    /// synced with `s_info[i+1]` (matching `c` and `z`, and `i`'s
+    /// walk reached `i+1`'s start). Writes `sync_flags[i] = 1` on
+    /// match, else advances `s_info[i]` by one symbol and writes
+    /// `sync_flags[i] = 0`. The host loops this dispatch until all
+    /// flags are 1 or the retry bound is exhausted.
+    Phase2InterSync,
 }
 
 /// Parameters for one phase of the parallel-Huffman JPEG decoder.
@@ -408,6 +415,9 @@ pub enum HuffmanPhase {
 /// - `s_info` device capacity ≥ `num_subsequences * 16` bytes,
 ///   where `num_subsequences = ceil(length_bits / subsequence_bits)`
 ///   (one `uint4 = (p, n, c, z)` per subsequence).
+/// - When `phase == Phase2InterSync`: `sync_flags` must be `Some`
+///   with device capacity ≥ `num_subsequences * 4` bytes (one u32
+///   flag per subsequence). For Phase 1 the field is ignored.
 pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// Packed bitstream as big-endian u32 words.
     pub bitstream: &'a B::DeviceBuffer,
@@ -417,6 +427,10 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     pub codebook: &'a B::DeviceBuffer,
     /// Per-subsequence output state: `uint4 = (p, n, c, z)` each.
     pub s_info: &'a B::DeviceBuffer,
+    /// Per-subseq sync flag (1 = synced with right neighbour,
+    /// 0 = unsynced and advanced this pass). Required for
+    /// `Phase2InterSync`; ignored for `Phase1IntraSync`.
+    pub sync_flags: Option<&'a B::DeviceBuffer>,
     /// Exact bit count of `bitstream`.
     pub length_bits: u32,
     /// Subsequence size (Wei §III); 128 / 512 / 1024 in practice.
@@ -501,6 +515,21 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
             return Err(invariant(
                 "s_info buffer is smaller than num_subsequences * 16 bytes",
             ));
+        }
+
+        if matches!(self.phase, HuffmanPhase::Phase2InterSync) {
+            let Some(flags) = self.sync_flags else {
+                return Err(invariant("Phase2InterSync requires sync_flags to be Some"));
+            };
+            // sync_flags: 1 u32 per subsequence.
+            let flags_bytes = (self.num_subsequences() as usize)
+                .checked_mul(4)
+                .ok_or_else(|| invariant("sync_flags byte count overflows usize"))?;
+            if backend.device_buffer_len(flags) < flags_bytes {
+                return Err(invariant(
+                    "sync_flags buffer is smaller than num_subsequences * 4 bytes",
+                ));
+            }
         }
         Ok(())
     }

@@ -75,13 +75,9 @@ fn slang_entry(kernel: &str) -> Option<&'static str> {
     match kernel {
         "icc_clut" => Some("icc_cmyk_clut"),
         // Multi-entry: slangc picks all [shader("compute")] entries
-        // when no -entry is passed. blelloch_scan has 3 entries; the
-        // SPIR-V preserves source names for each.
-        "blelloch_scan" => None,
-        // Single-entry today; flip to None when a second [shader]
-        // entry lands here (slangc renames a lone entry to "main" but
-        // preserves names when there are multiple).
-        "parallel_huffman" => Some("phase1_intra_sync"),
+        // when no -entry is passed and preserves their source names
+        // in the SPIR-V OpEntryPoint op.
+        "blelloch_scan" | "parallel_huffman" => None,
         // Default: single entry point named after the file.
         "composite_rgba8" => Some("composite_rgba8"),
         "apply_soft_mask" => Some("apply_soft_mask"),

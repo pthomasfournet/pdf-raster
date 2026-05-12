@@ -50,10 +50,12 @@ pub(super) enum KernelId {
     /// Blelloch scan, scatter phase.
     #[cfg(feature = "gpu-jpeg-huffman")]
     ScanScatter,
-    /// Parallel-Huffman Phase 1 (intra-sequence sync). One pipeline
-    /// today; Phase 2 / Phase 4 join when their kernels land.
+    /// Parallel-Huffman Phase 1 (intra-sequence sync).
     #[cfg(feature = "gpu-jpeg-huffman")]
     Phase1IntraSync,
+    /// Parallel-Huffman Phase 2 (inter-sequence sync, bounded retry).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    Phase2InterSync,
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
@@ -63,7 +65,7 @@ pub(super) enum KernelId {
 /// at build time: if `slot_index()` ever returns a value
 /// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
-const NUM_KERNELS: usize = 10;
+const NUM_KERNELS: usize = 11;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
 
@@ -86,6 +88,7 @@ const _: () = {
     assert!(KernelId::ScanBlockSums.slot_index() < NUM_KERNELS);
     assert!(KernelId::ScanScatter.slot_index() < NUM_KERNELS);
     assert!(KernelId::Phase1IntraSync.slot_index() < NUM_KERNELS);
+    assert!(KernelId::Phase2InterSync.slot_index() < NUM_KERNELS);
 };
 
 impl KernelId {
@@ -105,7 +108,7 @@ impl KernelId {
                 include_bytes!(concat!(env!("OUT_DIR"), "/blelloch_scan.spv"))
             }
             #[cfg(feature = "gpu-jpeg-huffman")]
-            Self::Phase1IntraSync => {
+            Self::Phase1IntraSync | Self::Phase2InterSync => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/parallel_huffman.spv"))
             }
         }
@@ -127,6 +130,10 @@ impl KernelId {
             Self::ScanBlockSums => c"scan_block_sums",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::ScanScatter => c"scan_scatter",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase1IntraSync => c"phase1_intra_sync",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase2InterSync => c"phase2_inter_sync",
             // Every other kernel was compiled with `-entry`, so its
             // entry point is renamed to `main` in the SPIR-V.
             _ => c"main",
@@ -151,6 +158,8 @@ impl KernelId {
             Self::ScanScatter => 8,
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase1IntraSync => 9,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase2InterSync => 10,
         }
     }
 
@@ -172,6 +181,8 @@ impl KernelId {
             Self::ScanScatter => "scan_scatter",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase1IntraSync => "phase1_intra_sync",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase2InterSync => "phase2_inter_sync",
         }
     }
 
@@ -204,6 +215,10 @@ impl KernelId {
             // travel as push constants (16 bytes total).
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase1IntraSync => 3,
+            // (bitstream, codebook, s_info, sync_flags) — same 16-byte
+            // push constants as Phase 1.
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase2InterSync => 4,
         }
     }
 }
