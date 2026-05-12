@@ -731,13 +731,26 @@ impl PageRecorder {
         // One write per binding.  We can't use a single multi-binding
         // write because each VkDescriptorBufferInfo has a different
         // .buffer field.
+        //
+        // Binding slot per buffer comes from `handles.binding_slots`,
+        // which mirrors the kernel's SPIR-V `OpDecorate Binding N`
+        // exactly. Most kernels use sequential 0..n; Phase 4 skips
+        // slot 3 (Slang shares its global resource declarations
+        // with Phase 2's `sync_flags @ binding 3`). The recorder
+        // supplies buffers in kernel-source order; `binding_slots`
+        // tells us the matching descriptor-set slot for each.
+        debug_assert_eq!(
+            buf_infos.len(),
+            handles.binding_slots.len(),
+            "binding_slots length must match the buffer count supplied by the caller",
+        );
         let writes: Vec<vk::WriteDescriptorSet<'_>> = buf_infos
             .iter()
-            .enumerate()
-            .map(|(i, info)| {
+            .zip(handles.binding_slots.iter())
+            .map(|(info, &slot)| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(u32::try_from(i).expect("binding fits u32"))
+                    .dst_binding(slot)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(std::slice::from_ref(info))
             })
@@ -777,15 +790,29 @@ impl PageRecorder {
                 .device
                 .cmd_dispatch(s.cmd, groups.0, groups.1, groups.2);
 
-            // Global compute→compute memory barrier so the next dispatch
-            // sees these writes.  Pessimistic but correct (the CUDA
-            // backend serialises the same way).
+            // Global compute→{compute, transfer} memory barrier so
+            // both the next dispatch AND any subsequent host download
+            // (which submits a transfer-queue `vkCmdCopyBuffer` against
+            // the same buffer) observe these writes. Without the
+            // TRANSFER stage in the destination mask, the in-cmd-
+            // buffer barrier covers compute→compute only and a later
+            // download submission would see a stale buffer — even
+            // though same-queue submission order guarantees execution
+            // ordering, Vulkan memory dependencies require explicit
+            // barriers for cross-cmd-buffer visibility.
+            //
+            // Pessimistic but correct (the CUDA backend serialises the
+            // same way via stream ordering + implicit memcpy fences).
             let mem_barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::COPY,
+                )
                 .dst_access_mask(
-                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    vk::AccessFlags2::SHADER_STORAGE_READ
+                        | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                        | vk::AccessFlags2::TRANSFER_READ,
                 )];
             let dep_info = vk::DependencyInfo::default().memory_barriers(&mem_barrier);
             self.device.device.cmd_pipeline_barrier2(s.cmd, &dep_info);

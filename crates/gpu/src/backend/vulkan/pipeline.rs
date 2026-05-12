@@ -196,6 +196,42 @@ impl KernelId {
         }
     }
 
+    /// Descriptor-set binding slots for this kernel's storage buffers,
+    /// in the order the recorder supplies them.
+    ///
+    /// Most kernels use sequential `0..n_storage_buffers()` slots —
+    /// `binding_slots()`'s default impl returns that range. Kernels
+    /// that **skip** an intermediate slot (e.g., Phase 4 shares the
+    /// global Slang resource declarations with Phase 2's `sync_flags`
+    /// at slot 3, but Phase 4 doesn't reference it) override the
+    /// default to declare their actual slot set.
+    ///
+    /// The SPIR-V's `OpDecorate %resource Binding N` directly drives
+    /// what `Vk{Update,CmdBind}DescriptorSets` must target. Mismatch
+    /// produces silent misbinding: kernel reads stale / wrong buffers
+    /// at runtime, no validation-layer warning unless strict slot
+    /// checking is enabled.
+    pub(super) const fn binding_slots(self) -> &'static [u32] {
+        match self {
+            // Phase 4 skips slot 3 because the shared Slang file
+            // declares `sync_flags @ binding 3` (Phase 2 only) and
+            // Slang gives Phase 4's resources the next available
+            // declared slots 4, 5, 6 rather than re-numbering down.
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase4Redecode => &[0, 1, 2, 4, 5, 6],
+            // Everyone else: sequential 0..n.
+            Self::Composite | Self::ApplySoftMask | Self::AaFill | Self::BlitImage => &[0, 1],
+            Self::TileFill => &[0, 1, 2, 3],
+            Self::IccClut => &[0, 1, 2],
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::ScanPerWorkgroup | Self::ScanBlockSums | Self::ScanScatter => &[0, 1],
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase1IntraSync => &[0, 1, 2],
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::Phase2InterSync => &[0, 1, 2, 3],
+        }
+    }
+
     /// Number of `STORAGE_BUFFER` descriptors in set 0.
     ///
     /// Order matches the Slang signature so the recorder binds in the
@@ -322,10 +358,16 @@ impl PipelineCache {
     }
 
     fn compile(&self, id: KernelId) -> Result<CompiledKernel> {
-        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = (0..id.n_storage_buffers())
-            .map(|i| {
+        // Descriptor-set layout binding slots match the kernel's
+        // SPIR-V `OpDecorate Binding N` exactly. Most kernels use
+        // sequential 0..n; Phase 4 skips slot 3 (see
+        // `KernelId::binding_slots`).
+        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = id
+            .binding_slots()
+            .iter()
+            .map(|&slot| {
                 vk::DescriptorSetLayoutBinding::default()
-                    .binding(i)
+                    .binding(slot)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -529,6 +571,9 @@ pub(super) struct PipelineHandles {
     pub(super) layout: vk::PipelineLayout,
     pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) n_storage_buffers: u32,
+    /// Slot indices the kernel binds at (length == `n_storage_buffers`).
+    /// Most kernels are sequential `0..n`; Phase 4 skips slot 3.
+    pub(super) binding_slots: &'static [u32],
 }
 
 impl PipelineCache {
@@ -540,6 +585,7 @@ impl PipelineCache {
             layout: c.pipeline_layout,
             descriptor_set_layout: c.descriptor_set_layout,
             n_storage_buffers: id.n_storage_buffers(),
+            binding_slots: id.binding_slots(),
         })
     }
 }

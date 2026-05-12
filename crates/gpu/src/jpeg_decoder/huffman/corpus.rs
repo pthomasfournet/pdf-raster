@@ -161,27 +161,27 @@ fn assert_roundtrip(
         assert_eq!(cuda_decoded, symbols, "CUDA: decoded != input");
     }
 
-    // Vulkan-side roundtrip on non-uniform-zero corpora emits all
-    // zeros — likely a Slang/SPIR-V codegen bug masked by every
-    // existing parity test using `vec![0u8; N]` as input. Tracked in
-    // `/audit/2026-05-12-vulkan-phase4-emit-failure.md`; this corpus
-    // pins the CUDA-side acceptance criteria, with the Vulkan-side
-    // gated on resolving that audit item.
-    //
-    // The adversarial vector (`expect_sync_bound_exceeded = true`)
-    // doesn't depend on emit correctness — Vulkan returns the same
-    // `SyncBoundExceeded` error as CUDA — so we still parity-check it.
+    // Cross-backend parity: Vulkan must produce the same decoded
+    // stream as CUDA on the happy path, and surface the same
+    // SyncBoundExceeded error on the adversarial path.
     #[cfg(feature = "vulkan")]
-    if let Some(vk) = try_vulkan()
-        && expect_sync_bound_exceeded
-    {
+    if let Some(vk) = try_vulkan() {
         let vk_result = run_pipeline(&vk, table, &stream, subseq_bits);
-        let vk_err = vk_result.expect_err("expected `SyncBoundExceeded` on adversarial input");
-        let msg = format!("{vk_err}");
-        assert!(
-            msg.contains("Phase 2 did not converge"),
-            "Vulkan: unexpected error: {msg}",
-        );
+        if expect_sync_bound_exceeded {
+            let vk_err = vk_result.expect_err("expected `SyncBoundExceeded` on adversarial input");
+            let msg = format!("{vk_err}");
+            assert!(
+                msg.contains("Phase 2 did not converge"),
+                "Vulkan: unexpected error: {msg}",
+            );
+        } else {
+            let vk_decoded = vk_result.expect("Vulkan roundtrip failed");
+            assert_eq!(vk_decoded, symbols, "Vulkan: decoded != input");
+            // CUDA == Vulkan byte-for-byte is the strongest contract.
+            let cuda_decoded = run_pipeline(&cuda, table, &stream, subseq_bits)
+                .expect("CUDA roundtrip rerun for parity comparison");
+            assert_eq!(cuda_decoded, vk_decoded, "CUDA vs Vulkan diverge");
+        }
     }
 }
 
@@ -198,6 +198,69 @@ const fn uniform_symbol(i: u32) -> u8 {
         2 => 0x20,
         _ => 0x30,
     }
+}
+
+/// Probe to isolate which phase Vulkan diverges from CUDA on the
+/// corpus's `book_uniform_len2 + uniform_symbol`-cycling input.
+/// Dumps Phase 1's `s_info` from both backends and asserts they
+/// agree. If they DO agree, the issue is downstream of Phase 1;
+/// if they don't, the issue is in Phase 1's snapshot write.
+#[cfg(feature = "vulkan")]
+#[test]
+fn diag_phase1_snapshot_cuda_eq_vulkan_on_corpus_input() {
+    let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+        eprintln!("skipping: need both CUDA and Vulkan");
+        return;
+    };
+    let symbols: Vec<u8> = (0..1024u32).map(uniform_symbol).collect();
+    let table = book_uniform_len2();
+    let book = [crate::jpeg::CanonicalCodebook::build(&table).expect("valid")];
+    let stream = encode_to_stream(&table, &symbols);
+
+    let cuda_s = dispatch_phase1_intra_sync(&cuda, &stream, &book, 128).expect("cuda p1");
+    let vk_s = dispatch_phase1_intra_sync(&vk, &stream, &book, 128).expect("vulkan p1");
+
+    eprintln!("CUDA s_info[0..4]:");
+    for (i, s) in cuda_s.iter().take(4).enumerate() {
+        eprintln!("  [{i}] (p={}, n={}, c={}, z={})", s.p, s.n, s.c, s.z);
+    }
+    eprintln!("Vulkan s_info[0..4]:");
+    for (i, s) in vk_s.iter().take(4).enumerate() {
+        eprintln!("  [{i}] (p={}, n={}, c={}, z={})", s.p, s.n, s.c, s.z);
+    }
+    assert_eq!(cuda_s, vk_s, "Phase 1 s_info diverges across backends");
+}
+
+/// Phase 2 + Phase 3 byte-identity on the corpus input.
+#[cfg(feature = "vulkan")]
+#[test]
+fn diag_phase2_phase3_cuda_eq_vulkan_on_corpus_input() {
+    let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+        eprintln!("skipping: need both CUDA and Vulkan");
+        return;
+    };
+    let symbols: Vec<u8> = (0..1024u32).map(uniform_symbol).collect();
+    let table = book_uniform_len2();
+    let book = [crate::jpeg::CanonicalCodebook::build(&table).expect("valid")];
+    let stream = encode_to_stream(&table, &symbols);
+
+    let (cuda_s, cuda_outcome) =
+        dispatch_phase1_then_phase2(&cuda, &stream, &book, 128).expect("cuda p1+2");
+    let (vk_s, vk_outcome) =
+        dispatch_phase1_then_phase2(&vk, &stream, &book, 128).expect("vulkan p1+2");
+    eprintln!("CUDA Phase 2 outcome: {cuda_outcome:?}");
+    eprintln!("Vulkan Phase 2 outcome: {vk_outcome:?}");
+    assert_eq!(cuda_outcome, vk_outcome, "Phase 2 outcome diverges");
+    assert_eq!(cuda_s, vk_s, "Phase 2 s_info diverges");
+
+    let cuda_off = dispatch_phase3_offsets(&cuda, &cuda_s).expect("cuda p3");
+    let vk_off = dispatch_phase3_offsets(&vk, &vk_s).expect("vulkan p3");
+    eprintln!(
+        "CUDA offsets[0..4]: {:?}",
+        &cuda_off[..4.min(cuda_off.len())]
+    );
+    eprintln!("Vulkan offsets[0..4]: {:?}", &vk_off[..4.min(vk_off.len())]);
+    assert_eq!(cuda_off, vk_off, "Phase 3 offsets diverge");
 }
 
 #[test]
