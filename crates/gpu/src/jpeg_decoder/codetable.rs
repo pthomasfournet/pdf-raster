@@ -9,7 +9,7 @@
 //! AC quantiser distributions keep ≥ 95 % of codewords ≤ 10 bits, so
 //! the slow path is rare.
 
-use crate::jpeg::{CanonicalCodebookError, JpegHuffmanTable, visit_canonical_codes};
+use crate::jpeg::{JpegHuffmanTable, validate_canonical_table, visit_canonical_codes};
 use crate::jpeg_decoder::JpegGpuError;
 
 /// Prefix bits indexed by the quick table. Must match the kernel.
@@ -113,21 +113,8 @@ pub struct GpuCodetable {
 /// form a valid canonical prefix code (empty, code-space overflow at
 /// some length, or `values.len()` mismatches `sum(num_codes)`).
 pub fn build_gpu_codetable(table: &JpegHuffmanTable) -> Result<GpuCodetable, JpegGpuError> {
-    let total_codes: usize = table.num_codes.iter().map(|&n| usize::from(n)).sum();
-    if total_codes == 0 {
-        return Err(JpegGpuError::InvalidHuffmanTables(
-            CanonicalCodebookError::Empty.to_string(),
-        ));
-    }
-    if total_codes != table.values.len() {
-        return Err(JpegGpuError::InvalidHuffmanTables(
-            CanonicalCodebookError::LengthMismatch {
-                expected: total_codes,
-                actual: table.values.len(),
-            }
-            .to_string(),
-        ));
-    }
+    validate_canonical_table(table)
+        .map_err(|e| JpegGpuError::InvalidHuffmanTables(e.to_string()))?;
 
     let mut quick = vec![QuickEntry::MISS; QUICK_TABLE_SIZE];
     let mut full = Vec::new();

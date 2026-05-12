@@ -102,6 +102,34 @@ impl std::fmt::Display for CanonicalCodebookError {
 
 impl std::error::Error for CanonicalCodebookError {}
 
+/// Validate the upfront invariants the canonical walker assumes:
+/// non-empty table, and `sum(num_codes) == values.len()` so the
+/// walk consumes the entire `values` array exactly.
+///
+/// Pulled out alongside `visit_canonical_codes` so both production
+/// callers (`CanonicalCodebook::build`, `build_gpu_codetable`) share
+/// the check shape; each maps the typed error into its own
+/// error-type wrapping. `SymbolEncoder::from_table` skips the check
+/// because its synthetic input is valid by construction.
+///
+/// # Errors
+/// Returns [`CanonicalCodebookError::Empty`] for a zero-codeword
+/// table, or [`CanonicalCodebookError::LengthMismatch`] when
+/// `sum(num_codes)` disagrees with `values.len()`.
+pub fn validate_canonical_table(table: &JpegHuffmanTable) -> Result<(), CanonicalCodebookError> {
+    let total_codes: usize = table.num_codes.iter().map(|&n| usize::from(n)).sum();
+    if total_codes == 0 {
+        return Err(CanonicalCodebookError::Empty);
+    }
+    if total_codes != table.values.len() {
+        return Err(CanonicalCodebookError::LengthMismatch {
+            expected: total_codes,
+            actual: table.values.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Visit every canonical `(length, code, symbol)` triple in `table`,
 /// in JPEG canonical order (length-ascending, code-ascending within
 /// each length).
@@ -124,11 +152,12 @@ impl std::error::Error for CanonicalCodebookError {}
 /// declared codeword counts don't form a valid prefix code.
 ///
 /// # Panics
-/// Panics if `value_idx` would exceed `table.values.len()` during
-/// the walk. The upstream `LengthMismatch` check (in
-/// `CanonicalCodebook::build` / `build_gpu_codetable`) prevents
-/// this; the panic exists to catch a future refactor that drops
-/// that check.
+/// Asserts `value_idx < table.values.len()` before each indexed read.
+/// The upstream `LengthMismatch` check in `CanonicalCodebook::build`
+/// and `build_gpu_codetable` guarantees the invariant holds; the
+/// assert exists to catch a future refactor that drops that check.
+/// `SymbolEncoder::from_table` skips the upstream check because its
+/// synthetic input is valid by construction.
 pub fn visit_canonical_codes<F>(
     table: &JpegHuffmanTable,
     mut emit: F,
@@ -136,6 +165,7 @@ pub fn visit_canonical_codes<F>(
 where
     F: FnMut(u8, u32, u8),
 {
+    let values_len = table.values.len();
     let mut value_idx: usize = 0;
     let mut code: u32 = 0;
     for length_minus_1 in 0..16u8 {
@@ -145,6 +175,15 @@ where
             if code >= (1u32 << length) {
                 return Err(CanonicalCodebookError::OverflowAtLength { length });
             }
+            // Explicit bounds check beats relying on Vec's indexing
+            // panic — the message points at the upstream invariant
+            // (`sum(num_codes) == values.len()`) that's actually wrong,
+            // not at a generic "index out of bounds in vec".
+            assert!(
+                value_idx < values_len,
+                "visit_canonical_codes: sum(num_codes) > values.len() ({values_len}) — \
+                 caller must verify the LengthMismatch invariant before invoking the visitor",
+            );
             let symbol = table.values[value_idx];
             value_idx += 1;
             emit(length, code, symbol);
@@ -170,16 +209,7 @@ impl CanonicalCodebook {
     /// which is the standard "allocator OOM" panic Rust emits and not a
     /// recoverable error from the caller's perspective.
     pub fn build(table: &JpegHuffmanTable) -> Result<Self, CanonicalCodebookError> {
-        let total_codes: usize = table.num_codes.iter().map(|&n| n as usize).sum();
-        if total_codes == 0 {
-            return Err(CanonicalCodebookError::Empty);
-        }
-        if total_codes != table.values.len() {
-            return Err(CanonicalCodebookError::LengthMismatch {
-                expected: total_codes,
-                actual: table.values.len(),
-            });
-        }
+        validate_canonical_table(table)?;
 
         // Allocate the 128 KB lookup table directly on the heap; constructing
         // it on the stack first would risk overflowing typical thread stacks.
