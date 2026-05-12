@@ -54,6 +54,15 @@ int rshift(int x, int s) {
     int bias = 1 << (s - 1);
     return (x + (x >= 0 ? bias : -bias)) >> s;
 }
+// 64-bit variant: accepts a wide intermediate product and narrows the
+// result back to int32. Used in idct_1d to prevent signed overflow when
+// multiplying fixed-point constants (up to 11585) by dequantized
+// coefficients (up to 1023 * 255 = 260 865); the product can reach
+// ~3.0 G, exceeding i32::MAX = 2.15 G.
+int rshift64(int64_t x, int s) {
+    int64_t bias = int64_t(1) << (s - 1);
+    return int((x + (x >= int64_t(0) ? bias : -bias)) >> s);
+}
 
 // Apply one 1-D 8-point IDCT to `v[0..8]` in place (LLM algorithm).
 // Output is unscaled integers; the caller cancels the 64× scale from
@@ -70,10 +79,12 @@ void idct_1d(inout int v[8]) {
     int t7  = v[7];
 
     // Stage 1 (even path — indices 0, 4, 2, 6):
+    // Multiplications use rshift64: C6/SQRT2 (up to 11585) times a dequantized
+    // coefficient (up to 260 865) can reach ~3.0 G, exceeding i32::MAX.
     int p0  = t0 + t1;
     int p1  = t0 - t1;
-    int p2  = rshift(C6 * t2 - SQRT2 * t3, FRAC_BITS);
-    int p3  = rshift(C6 * t3 + SQRT2 * t2, FRAC_BITS);
+    int p2  = rshift64(int64_t(C6) * t2 - int64_t(SQRT2) * t3, FRAC_BITS);
+    int p3  = rshift64(int64_t(C6) * t3 + int64_t(SQRT2) * t2, FRAC_BITS);
 
     int e0  = p0 + p3;
     int e1  = p1 + p2;
@@ -81,14 +92,14 @@ void idct_1d(inout int v[8]) {
     int e3  = p0 - p3;
 
     // Stage 2 (odd path — indices 1, 5, 3, 7):
-    int q0  = rshift(C1 * t4 + C3 * t6, FRAC_BITS);
-    int q1  = rshift(C3 * t4 - C1 * t6, FRAC_BITS);
-    int q2  = rshift(C1 * t5 + C3 * t7, FRAC_BITS);
-    int q3  = rshift(C3 * t5 - C1 * t7, FRAC_BITS);
+    int q0  = rshift64(int64_t(C1) * t4 + int64_t(C3) * t6, FRAC_BITS);
+    int q1  = rshift64(int64_t(C3) * t4 - int64_t(C1) * t6, FRAC_BITS);
+    int q2  = rshift64(int64_t(C1) * t5 + int64_t(C3) * t7, FRAC_BITS);
+    int q3  = rshift64(int64_t(C3) * t5 - int64_t(C1) * t7, FRAC_BITS);
 
     int o0  = q0 + q2;
     int o1  = q0 - q2;
-    int o2  = rshift(SQRT2 * (q1 - q3), FRAC_BITS);
+    int o2  = rshift64(int64_t(SQRT2) * (q1 - q3), FRAC_BITS);
     int o3  = q1 + q3;
 
     // Output combination:
