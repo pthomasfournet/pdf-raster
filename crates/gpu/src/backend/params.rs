@@ -376,10 +376,8 @@ pub const HUFFMAN_CODEBOOK_ENTRIES: usize = 65_536;
 
 /// Phase selector for [`record_huffman`](super::GpuBackend::record_huffman).
 ///
-/// Only `Phase1IntraSync` ships today; Phase 2 (inter-sequence sync)
-/// and Phase 4 (re-decode + write) land in follow-up commits.
-/// Phase 3 in the Weißenberger algorithm is the Blelloch scan and
-/// lives in [`ScanPhase`].
+/// Phase 3 of the Weißenberger algorithm is the Blelloch scan; see
+/// [`ScanPhase`] for that one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HuffmanPhase {
     /// One thread per subsequence; walks the stream from
@@ -393,14 +391,14 @@ pub enum HuffmanPhase {
 ///
 /// # Invariants enforced by `HuffmanParams::validate`
 /// - `length_bits > 0` and `subsequence_bits > 0`.
-/// - `num_subsequences == ceil(length_bits / subsequence_bits)`.
 /// - `num_components ≥ 1`.
 /// - `bitstream` device capacity ≥ `ceil(length_bits / 32) * 4` bytes,
 ///   plus one trailing word (the kernel's `peek16` reads two adjacent
 ///   words even at the stream end).
 /// - `codebook` device capacity ≥
 ///   `num_components * HUFFMAN_CODEBOOK_ENTRIES * 4` bytes.
-/// - `s_info` device capacity ≥ `num_subsequences * 16` bytes
+/// - `s_info` device capacity ≥ `num_subsequences * 16` bytes,
+///   where `num_subsequences = ceil(length_bits / subsequence_bits)`
 ///   (one `uint4 = (p, n, c, z)` per subsequence).
 pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// Packed bitstream as big-endian u32 words.
@@ -415,9 +413,6 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     pub length_bits: u32,
     /// Subsequence size (Wei §III); 128 / 512 / 1024 in practice.
     pub subsequence_bits: u32,
-    /// Number of subsequences; must equal
-    /// `ceil(length_bits / subsequence_bits)`.
-    pub num_subsequences: u32,
     /// Number of Huffman tables (one per component for the MVP).
     pub num_components: u32,
     /// Which phase of the parallel-Huffman algorithm this dispatch
@@ -426,6 +421,13 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
 }
 
 impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
+    /// Number of subsequences = `ceil(length_bits / subsequence_bits)`.
+    /// Backends use this to size the dispatch grid.
+    #[must_use]
+    pub const fn num_subsequences(&self) -> u32 {
+        self.length_bits.div_ceil(self.subsequence_bits)
+    }
+
     /// Validate the invariants documented on `HuffmanParams`.
     ///
     /// # Errors
@@ -443,11 +445,6 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
         }
         if self.num_components == 0 {
             return Err(invariant("num_components must be ≥ 1"));
-        }
-        if self.num_subsequences != self.length_bits.div_ceil(self.subsequence_bits) {
-            return Err(invariant(
-                "num_subsequences must equal ceil(length_bits / subsequence_bits)",
-            ));
         }
 
         // bitstream capacity: words = ceil(length_bits/32), plus one
@@ -473,7 +470,7 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
         }
 
         // s_info: 4 u32 = 16 bytes per subsequence.
-        let s_info_bytes = (self.num_subsequences as usize)
+        let s_info_bytes = (self.num_subsequences() as usize)
             .checked_mul(16)
             .ok_or_else(|| invariant("s_info byte count overflows usize"))?;
         if backend.device_buffer_len(self.s_info) < s_info_bytes {

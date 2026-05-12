@@ -354,11 +354,11 @@ pub trait GpuBackend: Send + Sync {
 
     /// Record one phase of the parallel-Huffman JPEG decoder.
     ///
-    /// Today the only phase is `Phase1IntraSync` — one thread per
-    /// subsequence walks the entropy-coded stream and writes a
-    /// `(p, n, c, z)` tuple into `s_info[seq_idx]`. Phase 2 and 4
-    /// land in follow-up commits; Phase 3 is the Blelloch scan (see
-    /// [`Self::record_scan`]).
+    /// One thread per subsequence walks the entropy-coded stream and
+    /// writes a `(p, n, c, z)` tuple into `s_info[seq_idx]`. Phase 3
+    /// of the Weißenberger algorithm is the Blelloch scan (see
+    /// [`Self::record_scan`]); other phases are dispatched by
+    /// selecting `params.phase`.
     ///
     /// # Errors
     /// Returns `BackendError` if the operation cannot be recorded or

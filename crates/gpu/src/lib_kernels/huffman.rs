@@ -1,10 +1,7 @@
 //! Parallel-Huffman JPEG decoder kernel dispatch.
 //!
-//! Phase 1 (intra-sequence sync) is the only entry point ships
-//! today. Phase 2 (inter-sequence sync) and Phase 4 (re-decode +
-//! write) join when their CPU oracles + kernels land — same shape
-//! (one launch helper per phase, picked by the recorder's
-//! `record_huffman` dispatch based on `HuffmanParams.phase`).
+//! Per-phase launch helpers; the recorder's `record_huffman` picks
+//! one based on `HuffmanParams.phase`.
 
 use cudarc::driver::{CudaSlice, PushKernelArg};
 

@@ -1,12 +1,5 @@
 // Parallel-Huffman JPEG decoder kernels.
 //
-// Today: Phase 1 (intra-sequence sync) only. Phase 2 (inter-sequence
-// sync) and Phase 4 (re-decode + write) land in follow-up commits;
-// Phase 3 is just the Blelloch scan in `blelloch_scan.slang`. The
-// file is multi-entry by design — `build.rs::slang_entry` returns
-// `None` for `parallel_huffman`, so slangc preserves entry-point
-// names from the `[shader(...)]` attributes.
-//
 // ## Phase 1 algorithm (Weißenberger & Schmidt 2021 §III-B)
 //
 // One thread per subsequence. Thread `i` starts at bit
@@ -14,10 +7,6 @@
 // symbol, advancing a 4-tuple state `(p, n, c, z)` until reaching a
 // `hard_limit` (= `min(length_bits, (i + 2) * subsequence_bits)`).
 // The kernel then writes the final state to `s_info_out[i]`.
-//
-// Phase 2 will check whether thread `i`'s end state matches thread
-// `i+1`'s start state (the sync property); divergence triggers a
-// re-decode loop with bounded retries.
 //
 // ## Codebook layout
 //
@@ -106,7 +95,8 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
 
         p += advance;
         n += 1u;
-        z = (z + 1u) % 64u;
+        // z is a 6-bit zig-zag index; mask compiles to one op.
+        z = (z + 1u) & 63u;
         if (z == 0u) {
             c = (c + 1u) % num_components;
         }

@@ -75,21 +75,12 @@ fn slang_entry(kernel: &str) -> Option<&'static str> {
     match kernel {
         "icc_clut" => Some("icc_cmyk_clut"),
         // Multi-entry: slangc picks all [shader("compute")] entries
-        // when no -entry is passed. blelloch_scan has 3 entries
-        // (per-workgroup / block-sums / scatter); slangc preserves
-        // their source names in the SPIR-V OpEntryPoint op.
+        // when no -entry is passed. blelloch_scan has 3 entries; the
+        // SPIR-V preserves source names for each.
         "blelloch_scan" => None,
-        // parallel_huffman is single-entry today (phase1_intra_sync)
-        // but expects to grow to multi-entry when Phase 2 / Phase 4
-        // land. While it's single-entry, slangc renames the entry
-        // to "main"; the moment a second [shader] entry is added,
-        // slangc switches to name-preservation. To keep the SPIR-V
-        // entry name stable in the host lookup, force the rename
-        // explicitly via -entry today; switch to None when the
-        // second entry lands (the change is symmetric on the
-        // Vulkan side: KernelId::entry_point() returns c"main" for
-        // single-entry slangc-renamed kernels, source name for
-        // multi-entry).
+        // Single-entry today; flip to None when a second [shader]
+        // entry lands here (slangc renames a lone entry to "main" but
+        // preserves names when there are multiple).
         "parallel_huffman" => Some("phase1_intra_sync"),
         // Default: single entry point named after the file.
         "composite_rgba8" => Some("composite_rgba8"),

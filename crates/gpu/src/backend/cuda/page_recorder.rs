@@ -275,6 +275,7 @@ impl PageRecorder {
         &self,
         p: params::HuffmanParams<'_, super::CudaBackend>,
     ) -> Result<()> {
+        let num_subsequences = p.num_subsequences();
         match p.phase {
             params::HuffmanPhase::Phase1IntraSync => self
                 .ctx
@@ -284,7 +285,7 @@ impl PageRecorder {
                     p.s_info,
                     p.length_bits,
                     p.subsequence_bits,
-                    p.num_subsequences,
+                    num_subsequences,
                     p.num_components,
                 )
                 .map_err(be),

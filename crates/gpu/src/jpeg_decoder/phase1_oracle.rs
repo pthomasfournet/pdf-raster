@@ -32,21 +32,46 @@
 #![cfg(test)]
 
 use crate::jpeg::CanonicalCodebook;
+use crate::jpeg_decoder::PackedBitstream;
 use crate::jpeg_decoder::bitstream::peek16;
-use crate::jpeg_decoder::{PackedBitstream, SubsequenceState};
+
+/// Per-subsequence decoder state.
+///
+/// Mirrors the GPU kernel's `SInfo` struct one-for-one so test
+/// assertions can compare host and device output without translation.
+/// `repr(C)` + `bytemuck::Pod` lets the dispatcher download the
+/// device buffer straight into a `Vec<SubsequenceState>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub(super) struct SubsequenceState {
+    /// Absolute bit position in `PackedBitstream`.
+    pub p: u32,
+    /// Symbols decoded since `start_bit`.
+    pub n: u32,
+    /// Current component index (0..`num_components`).
+    pub c: u32,
+    /// Current zig-zag index within the 64-coefficient block.
+    pub z: u32,
+}
+
+// SAFETY: `repr(C)` over four `u32` fields; the layout is `[u32; 4]`
+// in declaration order, so reinterpreting bytes-as-SubsequenceState
+// matches the kernel's `uint4` write.
+unsafe impl bytemuck::Zeroable for SubsequenceState {}
+unsafe impl bytemuck::Pod for SubsequenceState {}
 
 /// Reason the Phase 1 walk loop exited.
 ///
 /// Useful for diagnostics in tests; matches what the GPU kernel
 /// would observe when it falls out of its decode loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase1Stop {
+pub(super) enum Phase1Stop {
     /// Reached `hard_limit` cleanly (the normal exit).
     HardLimit,
     /// `length_bits` reached mid-decode (final bit position past stream end).
     LengthBits,
     /// 16-bit peek matched no codeword in the active table — the
-    /// kernel returns `0xFFFFFFFF` from `decode_one_symbol` and breaks.
+    /// kernel returns a miss sentinel and breaks.
     PrefixMiss,
 }
 
@@ -64,7 +89,7 @@ enum Phase1Stop {
 /// # Panics
 /// Panics if `tables` is empty (caller bug — Phase 1 always has at
 /// least one component-keyed codetable).
-fn phase1_walk(
+pub(super) fn phase1_walk(
     bitstream: &PackedBitstream,
     tables: &[CanonicalCodebook],
     start_bit: u32,

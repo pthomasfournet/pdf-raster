@@ -206,9 +206,9 @@ impl GpuBackend for VulkanBackend {
     }
 
     fn record_huffman(&self, _params: params::HuffmanParams<'_, Self>) -> Result<()> {
-        // Vulkan side lands in A7b — descriptor set layout +
-        // pipeline cache slots + record path, mirroring the A6b
-        // scan work. Trait method exists for ABI uniformity.
+        // TODO: wire the parallel_huffman SPIR-V through the
+        // descriptor-set + pipeline-cache plumbing (mirrors the
+        // record_scan path).
         Err(crate::backend::BackendError::msg(
             "VulkanBackend::record_huffman: kernel not yet wired in",
         ))

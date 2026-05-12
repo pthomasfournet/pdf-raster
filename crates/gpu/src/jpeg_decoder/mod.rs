@@ -14,6 +14,13 @@ mod codetable;
 #[cfg(test)]
 mod cpu_reference;
 mod error;
+// huffman + phase1_oracle are test-only today (oracle-comparison
+// tests against the GPU dispatcher); promote when production
+// callers integrate the Phase 1 decode path. The huffman dispatcher
+// needs a real CUDA device, hence the gpu-validation gate; the
+// SubsequenceState type it owns is also re-imported by
+// phase1_oracle, which is why that one is plain `#[cfg(test)]`.
+#[cfg(all(test, feature = "gpu-validation"))]
 mod huffman;
 #[cfg(test)]
 mod phase1_oracle;
@@ -24,7 +31,6 @@ pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
 pub use error::JpegGpuError;
-pub use huffman::{SubsequenceState, build_gpu_codebook, dispatch_phase1_intra_sync};
 pub use scan::dispatch_blelloch_scan;
 
 #[cfg(test)]
