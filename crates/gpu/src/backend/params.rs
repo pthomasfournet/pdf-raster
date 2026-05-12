@@ -452,14 +452,15 @@ impl HuffmanPhase {
 /// - `s_info` device capacity ≥ `num_subsequences * 16` bytes,
 ///   where `num_subsequences = ceil(length_bits / subsequence_bits)`
 ///   (one `uint4 = (p, n, c, z)` per subsequence).
-/// - When `phase == Phase2InterSync`: `sync_flags` must be `Some`
-///   with device capacity ≥ `num_subsequences * 4` bytes (one u32
-///   flag per subsequence). For Phase 1 the field is ignored.
-/// - When `phase == Phase4Redecode`: `offsets`, `symbols_out`, and
-///   `decode_status` must all be `Some`. `offsets` ≥
-///   `num_subsequences * 4` bytes; `symbols_out` ≥ `total_symbols * 4`
-///   bytes; `decode_status` ≥ `num_subsequences * 4` bytes (one u32
-///   per subseq encoding the kernel's exit condition — see
+/// - When `phase ∈ {Phase2InterSync, JpegPhase2InterSync}`:
+///   `sync_flags` must be `Some` with device capacity ≥
+///   `num_subsequences * 4` bytes (one u32 flag per subsequence). For
+///   the Phase 1 / Phase 4 variants the field is ignored.
+/// - When `phase ∈ {Phase4Redecode, JpegPhase4Redecode}`: `offsets`,
+///   `symbols_out`, and `decode_status` must all be `Some`. `offsets`
+///   ≥ `num_subsequences * 4` bytes; `symbols_out` ≥ `total_symbols *
+///   4` bytes; `decode_status` ≥ `num_subsequences * 4` bytes (one
+///   u32 per subseq encoding the kernel's exit condition — see
 ///   `Phase4FailureKind` for the discriminants).
 /// - When `phase.is_jpeg_framed()`: `dc_codebook` and `mcu_schedule`
 ///   must both be `Some`, and `blocks_per_mcu ≥ 1`.  `dc_codebook`
@@ -477,16 +478,19 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     pub s_info: &'a B::DeviceBuffer,
     /// Per-subseq sync flag (1 = synced with right neighbour,
     /// 0 = unsynced and advanced this pass). Required for
-    /// `Phase2InterSync`; ignored for other phases.
+    /// `Phase2InterSync` and `JpegPhase2InterSync`; ignored for the
+    /// Phase 1 / Phase 4 variants.
     pub sync_flags: Option<&'a B::DeviceBuffer>,
     /// Exclusive-scan output from Phase 3 (`u32[num_subsequences]`):
     /// `offsets[i]` is the base index into `symbols_out` where
     /// subseq `i`'s emitted symbols are written. Required for
-    /// `Phase4Redecode`; ignored for other phases.
+    /// `Phase4Redecode` and `JpegPhase4Redecode`; ignored for the
+    /// Phase 1 / Phase 2 variants.
     pub offsets: Option<&'a B::DeviceBuffer>,
     /// Final decoded symbol stream (`u32[total_symbols]`). Required
-    /// for `Phase4Redecode`; ignored for other phases. Caller sizes
-    /// it from Phase 3's scan total + last subseq's `n`.
+    /// for `Phase4Redecode` and `JpegPhase4Redecode`; ignored for
+    /// the Phase 1 / Phase 2 variants. Caller sizes it from
+    /// Phase 3's scan total + last subseq's `n`.
     pub symbols_out: Option<&'a B::DeviceBuffer>,
     /// Per-subseq exit-condition output (`u32[num_subsequences]`):
     /// `decode_status[i]` encodes the Phase 4 kernel's exit
@@ -494,8 +498,9 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// `end_p` exit, or one of the typed failure modes
     /// (`PrefixMiss`, `LengthBits`, `Incomplete`) when the helper
     /// bails mid-region. Allocate zero-filled so untouched slots
-    /// default to Ok. Required for `Phase4Redecode`; ignored for
-    /// other phases.
+    /// default to Ok. Required for `Phase4Redecode` and
+    /// `JpegPhase4Redecode`; ignored for the Phase 1 / Phase 2
+    /// variants.
     pub decode_status: Option<&'a B::DeviceBuffer>,
     /// Flat DC-class codebook for the JPEG-framed phases.  Same
     /// layout as [`Self::codebook`] (one
@@ -589,6 +594,21 @@ impl Phase4FailureKind {
     }
 }
 
+/// Diagnostic kind shared by every `HuffmanParams::validate*` branch.
+/// Hoisted out of the closure form so the helper methods can use it
+/// directly and the kind constant lives in exactly one place.
+const HUFFMAN_INVARIANT_KIND: &str = "HuffmanInvariantViolation";
+
+/// Build a typed `InvariantViolation` for the Huffman params surface.
+/// Replaces the per-method `let invariant = |detail| ...` closures so
+/// the three validation helpers share one shape.
+const fn huffman_invariant(detail: &'static str) -> super::BackendError {
+    super::BackendError::InvariantViolation {
+        kind: HUFFMAN_INVARIANT_KIND,
+        detail,
+    }
+}
+
 impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
     /// Number of subsequences = `ceil(length_bits / subsequence_bits)`.
     /// Backends use this to size the dispatch grid.
@@ -602,10 +622,7 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
     /// # Errors
     /// Returns a `BackendError::InvariantViolation` if any check fails.
     pub fn validate(&self, backend: &B) -> super::Result<()> {
-        const KIND: &str = "HuffmanInvariantViolation";
-        let invariant =
-            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
-
+        let invariant = huffman_invariant;
         if self.length_bits == 0 {
             return Err(invariant("length_bits must be > 0"));
         }
@@ -693,7 +710,7 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
         }
 
         if self.phase.is_jpeg_framed() {
-            self.validate_jpeg_framed(backend, codebook_bytes)?;
+            self.validate_jpeg_framed(backend)?;
         }
 
         Ok(())
@@ -705,9 +722,7 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
     /// `too_many_lines` threshold and so the invariants are visible
     /// as a discrete block.
     fn validate_phase4_buffers(&self, backend: &B) -> super::Result<()> {
-        const KIND: &str = "HuffmanInvariantViolation";
-        let invariant =
-            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
+        let invariant = huffman_invariant;
 
         let Some(offsets) = self.offsets else {
             return Err(invariant(
@@ -755,10 +770,13 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
     /// from [`Self::validate`] to keep the main fn under the clippy
     /// `too_many_lines` threshold and to surface the JPEG-specific
     /// invariants as a discrete block.
-    fn validate_jpeg_framed(&self, backend: &B, codebook_bytes: usize) -> super::Result<()> {
-        const KIND: &str = "HuffmanInvariantViolation";
-        let invariant =
-            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
+    ///
+    /// `codebook_bytes` is recomputed inside this helper so the caller
+    /// does not have to pre-thread it; the cost is one multiply, and
+    /// the alternative (passing it in) would let the caller silently
+    /// hand the wrong size on a future refactor.
+    fn validate_jpeg_framed(&self, backend: &B) -> super::Result<()> {
+        let invariant = huffman_invariant;
 
         if self.blocks_per_mcu == 0 {
             return Err(invariant("JPEG-framed phases require blocks_per_mcu ≥ 1"));
@@ -768,6 +786,10 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
                 "JPEG-framed phases require dc_codebook to be Some",
             ));
         };
+        let codebook_bytes = (self.num_components as usize)
+            .checked_mul(HUFFMAN_CODEBOOK_ENTRIES)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| invariant("dc_codebook byte count overflows usize"))?;
         if backend.device_buffer_len(dc) < codebook_bytes {
             return Err(invariant(
                 "dc_codebook buffer is smaller than num_components * 65536 * 4 bytes",
@@ -1299,5 +1321,59 @@ mod tests {
         params
             .validate(&FakeBackend)
             .expect("JPEG-framed phase1 with all required fields must validate");
+    }
+
+    #[test]
+    fn huffman_validate_rejects_undersized_dc_codebook() {
+        let bitstream = 36;
+        let codebook = 1 << 18;
+        let s_info = 32;
+        // dc_codebook one byte too small.
+        let dc_codebook = (1 << 18) - 1;
+        let mcu_schedule = 4;
+        let mut params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params.phase = HuffmanPhase::JpegPhase1IntraSync;
+        params.dc_codebook = Some(&dc_codebook);
+        params.mcu_schedule = Some(&mcu_schedule);
+        params.blocks_per_mcu = 1;
+        let err = params
+            .validate(&FakeBackend)
+            .expect_err("under-sized dc_codebook must be rejected");
+        match err {
+            super::super::BackendError::InvariantViolation { detail, .. } => {
+                assert!(
+                    detail.contains("dc_codebook") && detail.contains("smaller"),
+                    "expected dc_codebook size-check detail, got: {detail}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn huffman_validate_rejects_undersized_mcu_schedule() {
+        let bitstream = 36;
+        let codebook = 1 << 18;
+        let s_info = 32;
+        let dc_codebook = 1 << 18;
+        // blocks_per_mcu = 4 needs 16 bytes; provide 12.
+        let mcu_schedule = 12;
+        let mut params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params.phase = HuffmanPhase::JpegPhase1IntraSync;
+        params.dc_codebook = Some(&dc_codebook);
+        params.mcu_schedule = Some(&mcu_schedule);
+        params.blocks_per_mcu = 4;
+        let err = params
+            .validate(&FakeBackend)
+            .expect_err("under-sized mcu_schedule must be rejected");
+        match err {
+            super::super::BackendError::InvariantViolation { detail, .. } => {
+                assert!(
+                    detail.contains("mcu_schedule") && detail.contains("smaller"),
+                    "expected mcu_schedule size-check detail, got: {detail}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
     }
 }
