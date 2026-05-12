@@ -102,18 +102,17 @@ pub struct GpuCodetable {
 
 /// Build a GPU-side codetable from a parsed JPEG DHT segment.
 ///
-/// `_is_ac` is reserved for future use; today the packing is uniform
-/// across DC and AC tables (DC symbols have `(symbol >> 4) == 0` so
-/// `runlength_plus1` lands at 1).
+/// Packs DC and AC tables identically — DC symbols have
+/// `(symbol >> 4) == 0` so `runlength_plus1` lands at 1, which is the
+/// same encoding AC symbols use for "no run". The kernel branches on
+/// the table identity, not on a per-entry DC/AC flag.
 ///
 /// # Errors
 ///
 /// Returns [`JpegGpuError::InvalidHuffmanTables`] if the DHT does not
-/// form a valid canonical prefix code.
-pub fn build_gpu_codetable(
-    table: &JpegHuffmanTable,
-    _is_ac: bool,
-) -> Result<GpuCodetable, JpegGpuError> {
+/// form a valid canonical prefix code (empty, code-space overflow at
+/// some length, or `values.len()` mismatches `sum(num_codes)`).
+pub fn build_gpu_codetable(table: &JpegHuffmanTable) -> Result<GpuCodetable, JpegGpuError> {
     let total_codes: usize = table.num_codes.iter().map(|&n| usize::from(n)).sum();
     if total_codes == 0 {
         return Err(JpegGpuError::InvalidHuffmanTables(
@@ -154,9 +153,7 @@ pub fn build_gpu_codetable(
                 let base = (code << shift) as usize;
                 let span = 1usize << shift;
                 let packed = QuickEntry::pack(value_bits, length, runlength_plus1);
-                for slot in &mut quick[base..base + span] {
-                    *slot = packed;
-                }
+                quick[base..base + span].fill(packed);
             } else {
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -174,6 +171,17 @@ pub fn build_gpu_codetable(
         }
         code <<= 1;
     }
+
+    // Invariant: the upfront length check guarantees value_idx ==
+    // total_codes here. Assert in debug so any future refactor that
+    // breaks the canonical walk fails loud.
+    debug_assert_eq!(
+        value_idx,
+        table.values.len(),
+        "canonical walk consumed {value_idx} symbols but DHT had {} — \
+         loop did not cover all (num_codes, values) entries",
+        table.values.len(),
+    );
 
     Ok(GpuCodetable { quick, full })
 }
@@ -210,7 +218,7 @@ mod tests {
 
     #[test]
     fn build_short_dc_table_fills_quick_table() {
-        let tbl = build_gpu_codetable(&book4_dc(), false).expect("valid");
+        let tbl = build_gpu_codetable(&book4_dc()).expect("valid");
         assert_eq!(tbl.quick.len(), QUICK_TABLE_SIZE);
         assert!(tbl.full.is_empty(), "all codes fit in the quick table");
 
@@ -235,7 +243,7 @@ mod tests {
             num_codes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],
             values: vec![0xAB, 0xCD],
         };
-        let tbl = build_gpu_codetable(&table, true).expect("valid");
+        let tbl = build_gpu_codetable(&table).expect("valid");
         assert_eq!(tbl.full.len(), 2);
         assert_eq!(tbl.full[0].code_bits, 11);
         assert_eq!(tbl.full[0].symbol, 0xAB);
@@ -253,15 +261,17 @@ mod tests {
             num_codes: [0; 16],
             values: vec![],
         };
-        let err = build_gpu_codetable(&t, false).unwrap_err();
+        let err = build_gpu_codetable(&t).unwrap_err();
         assert!(matches!(err, JpegGpuError::InvalidHuffmanTables(_)));
     }
 
     #[test]
     fn build_rejects_length_mismatch() {
         let mut t = book4_dc();
+        // The popped value is irrelevant — we only care that the
+        // resulting `values` length no longer matches sum(num_codes).
         let _ = t.values.pop();
-        let err = build_gpu_codetable(&t, false).unwrap_err();
+        let err = build_gpu_codetable(&t).unwrap_err();
         assert!(matches!(err, JpegGpuError::InvalidHuffmanTables(_)));
     }
 
@@ -274,7 +284,7 @@ mod tests {
             num_codes: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             values: vec![0x52],
         };
-        let tbl = build_gpu_codetable(&table, true).expect("valid");
+        let tbl = build_gpu_codetable(&table).expect("valid");
         // Length-1 code "0" fills the lower half of the quick table.
         let e = tbl.quick[0];
         assert_eq!(e.value_bits(), 2);
