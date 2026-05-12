@@ -1178,6 +1178,20 @@ The Weißenberger 2018 self-synchronizing parallel Huffman algorithm is genuinel
 
 The full original spec is preserved as a developer-side research artifact; it isn't active design.
 
+**Phase A (algorithm in isolation) shipped 2026-05-12 as an OSS artifact.** Local plan: `docs/superpowers/plans/2026-05-11-gpu-jpeg-huffman-v2.md`. The 4-phase parallel-Huffman algorithm (Wei §III) runs end-to-end on synthetic streams with byte-identical CUDA + Vulkan output:
+
+- Phase 1 intra-sync, Phase 2 inter-sync (bounded retry), Phase 3 Blelloch scan, Phase 4 re-decode + write.
+- Boundary-snapshot semantics in Phase 1 — `s_info[i]` captures `(p, n, c, z)` at the first decode crossing into subseq (i+1)'s region, not the over-walk end state. Phase 4's predecessor inheritance composes cleanly off this.
+- Typed `Phase4FailureKind` per-subseq exit-condition surface — kernel writes `decode_status[i] ∈ {Ok, PrefixMiss, LengthBits, Incomplete}`, dispatcher inspects post-Phase-4 and surfaces non-Ok as typed `BackendError`. Defence-in-depth against future kernel divergence.
+- 10-vector adversarial corpus (`huffman/corpus.rs`) covering short / long / uniform / skewed / single-symbol / max-len-16 / Phase-2-retry-trigger / one-subseq / word-aligned / max-tail-padding. Pass on both backends, byte-for-byte.
+
+**Phase A acceptance criterion satisfied.** Phases B–D (real JPEG framing, integration, perf gate) remain deferred per the original Phase 8 deferral reasoning — the aggregate-throughput comparison vs. 24-thread CPU doesn't change just because the algorithm now demonstrably works.
+
+**MVP limitations carried forward** (would block production, not the OSS artifact):
+
+- Phase 2's `(c, z)` sync predicate hits its `2 × log2(n)` retry bound on mixed-codeword-length and multi-component-with-z-rollover corpora. Robust sync is a post-MVP item. Adversarial inputs surface as a typed `SyncBoundExceeded` error, never as a hang or wrong-output.
+- Test fixtures must use zero-value-bit symbols (`symbol & 0x0F == 0`) — the kernel advances `code_bits + value_bits` per decode, so a uniform-length **code** still produces a non-uniform **advance** for symbols whose low nibbles vary. Real JPEG framing doesn't have this constraint (DC tables have low-nibble = bit length intentionally; AC tables similarly), but the synthetic-fixture builder must pick symbols accordingly.
+
 ---
 
 ## Phase 9 — Device-resident image cache and GPU page buffer (IMPLEMENTATION COMPLETE — bench gate partial)
