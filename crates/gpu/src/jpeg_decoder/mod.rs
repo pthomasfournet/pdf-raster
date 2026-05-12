@@ -11,6 +11,7 @@
 
 mod bitstream;
 mod codetable;
+mod cpu_prepass;
 #[cfg(test)]
 mod cpu_reference;
 mod dispatch_util;
@@ -33,6 +34,7 @@ pub use bitstream::{PackedBitstream, pack_be_words};
 pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
+pub use cpu_prepass::{JpegPreparedInput, prepare_jpeg};
 pub use error::JpegGpuError;
 pub use scan::dispatch_blelloch_scan;
 
