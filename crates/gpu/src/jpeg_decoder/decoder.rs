@@ -96,6 +96,21 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
         let blocks_wide = width.div_ceil(8);
         let blocks_high = height.div_ceil(8);
 
+        // block_idx = comp * BW * BH + by * BW + bx; coef_base = block_idx * 64.
+        // Maximum block_idx for a 3-component JPEG: 2 * BW * BH + (BH-1)*BW + (BW-1).
+        // coef_base overflows u32 when block_idx >= 2^26 = 67_108_864.
+        // BW * BH <= 2^26 / 3 ≈ 22.4 M corresponds to ~4730 blocks per side = ~37 840 px.
+        // Reject here so the kernel never sees an overflowing index.
+        let max_block_idx = u64::from(num_components)
+            .saturating_mul(u64::from(blocks_wide))
+            .saturating_mul(u64::from(blocks_high));
+        if max_block_idx >= (1u64 << 26) {
+            return Err(JpegGpuError::Dispatch(format!(
+                "image too large for IDCT kernel: {num_components} components × \
+                 {blocks_wide}×{blocks_high} blocks exceeds the 26-bit block index limit"
+            )));
+        }
+
         self.dispatch_idct(
             &coef_flat,
             &qt_flat,

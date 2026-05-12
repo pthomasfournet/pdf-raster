@@ -172,7 +172,12 @@ void idct_dequant_colour(
     }
 
     // Flat block index within this component's block grid.
-    uint block_idx = comp * blocks_wide * blocks_high + by * blocks_wide + bx;
+    // Widened to uint64_t: for a 3-component 65535×65535 JPEG, block_idx reaches
+    // ~201 M which overflows u32; coef_base = block_idx * 64 reaches ~12.9 G.
+    // The host rejects images exceeding the 2^26-block limit before dispatch;
+    // the 64-bit arithmetic here is defence-in-depth for kernel correctness.
+    uint64_t block_idx = uint64_t(comp) * uint64_t(blocks_wide) * uint64_t(blocks_high)
+                       + uint64_t(by) * uint64_t(blocks_wide) + uint64_t(bx);
 
     // --- Step 1: dequantise and inverse zigzag into scratch[comp][row][col] ---
     // The qtable selector is 0 for Y (luma) and 1 for Cb/Cr (chroma) by JFIF convention;
@@ -180,7 +185,7 @@ void idct_dequant_colour(
     uint qt_sel = (comp == 0u) ? 0u : 1u;
     qt_sel = min(qt_sel, num_qtables - 1u);
     uint qt_base = qt_sel * 64u;
-    uint coef_base = block_idx * 64u;
+    uint64_t coef_base = block_idx * 64u;
 
     // Load all 64 zigzag coefficients for this thread's block.
     // We need the whole block to run the column IDCT, so each thread
