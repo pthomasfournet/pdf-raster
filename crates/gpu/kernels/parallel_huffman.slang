@@ -486,3 +486,51 @@ void jpeg_phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
 
     s_info_out[seq_idx] = snapshot;
 }
+
+/// JPEG-framed Phase 2 (inter-sequence sync).  Same shape as
+/// `phase2_inter_sync` but uses the JPEG state machine via
+/// `try_decode_one_jpeg_symbol_kernel`.  State semantics:
+///
+///     state.x = p              (bit position)
+///     state.y = n              (per-thread symbol count)
+///     state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+///     state.w = z_in_block     (0 .. 64)
+///
+/// Sync predicate: subseq i is synced with subseq (i+1) when its
+/// snapshot has crossed (i+1)'s start bit AND the
+/// (block_in_mcu, z_in_block) pair agrees between the two snapshots.
+/// This is the JPEG analogue of the synthetic stream's (c, z)
+/// predicate.
+[shader("compute")][numthreads(256, 1, 1)]
+void jpeg_phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
+    uint seq_idx = tid.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+    // Last subseq has no right neighbour — trivially synced.
+    if (seq_idx + 1u == num_subsequences) {
+        sync_flags[seq_idx] = 1u;
+        return;
+    }
+
+    uint4 me  = s_info_out[seq_idx];
+    uint4 nxt = s_info_out[seq_idx + 1];
+    uint nxt_start_p = (seq_idx + 1u) * subsequence_bits;
+
+    // JPEG framing: block_in_mcu is in .z; z_in_block is in .w.
+    bool in_range = me.x >= nxt_start_p;
+    bool aligned  = me.z == nxt.z && me.w == nxt.w;
+
+    if (in_range && aligned) {
+        sync_flags[seq_idx] = 1u;
+        return;
+    }
+
+    // Not synced — advance me by one JPEG symbol, write back.
+    // count_to = nxt_start_p: symbols starting before next subseq's
+    // start belong to my region; symbols past that belong to the next.
+    uint symbol_sink;
+    uint _ignored = try_decode_one_jpeg_symbol_kernel(me, nxt_start_p, symbol_sink);
+    s_info_out[seq_idx] = me;
+    sync_flags[seq_idx] = 0u;
+}

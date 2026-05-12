@@ -465,6 +465,78 @@ __device__ __forceinline__ unsigned int try_decode_one_jpeg_symbol_device(
     return DECODE_OK;
 }
 
+// JPEG-framed Phase 2 (inter-sequence sync).  Same shape as the
+// synthetic `phase2_inter_sync` but uses the JPEG state machine.
+//
+// State semantics mirror jpeg_phase1_intra_sync:
+//   state.x = p              (bit position)
+//   state.y = n              (per-thread symbol count)
+//   state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+//   state.w = z_in_block     (0 .. 64)
+//
+// Sync predicate: subseq i is synced with subseq (i+1) when
+//   i's snapshot has crossed (i+1)'s start bit (me.x >= nxt_start_p)
+//   AND block_in_mcu and z_in_block agree (me.z == nxt.z, me.w == nxt.w).
+// This is the JPEG analogue of the synthetic stream's (c, z) predicate.
+extern "C" __global__ void jpeg_phase2_inter_sync(
+    const unsigned int* __restrict__ bitstream,
+    const unsigned int* __restrict__ codebook,
+    const unsigned int* __restrict__ dc_codebook,
+    const unsigned int* __restrict__ mcu_schedule,
+    uint4* __restrict__ s_info,
+    unsigned int* __restrict__ flags,
+    unsigned int length_bits,
+    unsigned int subsequence_bits,
+    unsigned int num_subsequences,
+    unsigned int blocks_per_mcu
+) {
+    unsigned int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+    // Last subseq has no right neighbour — trivially synced.
+    if (seq_idx + 1u == num_subsequences) {
+        flags[seq_idx] = 1u;
+        return;
+    }
+
+    uint4 me = s_info[seq_idx];
+    uint4 nxt = s_info[seq_idx + 1];
+    // JPEG framing: block_in_mcu is in .z; z_in_block is in .w.
+    unsigned int me_block = me.z;
+    unsigned int me_z    = me.w;
+    unsigned int nxt_block = nxt.z;
+    unsigned int nxt_z     = nxt.w;
+    unsigned int nxt_start_p = (seq_idx + 1u) * subsequence_bits;
+
+    unsigned int in_range = (me.x >= nxt_start_p) ? 1u : 0u;
+    unsigned int aligned  = (me_block == nxt_block && me_z == nxt_z) ? 1u : 0u;
+
+    if (in_range && aligned) {
+        flags[seq_idx] = 1u;
+        return;
+    }
+
+    // Not synced — advance me by one JPEG symbol, write back.
+    unsigned int p = me.x;
+    unsigned int n = me.y;
+    unsigned int block_in_mcu = me_block;
+    unsigned int z_in_block   = me_z;
+    unsigned int symbol_sink;
+    (void)try_decode_one_jpeg_symbol_device(
+        bitstream, codebook, dc_codebook, mcu_schedule,
+        length_bits, blocks_per_mcu, nxt_start_p,
+        &p, &n, &block_in_mcu, &z_in_block, &symbol_sink);
+
+    uint4 updated;
+    updated.x = p;
+    updated.y = n;
+    updated.z = block_in_mcu;
+    updated.w = z_in_block;
+    s_info[seq_idx] = updated;
+    flags[seq_idx] = 0u;
+}
+
 // JPEG-framed Phase 1 (intra-sequence sync).  Same shape as
 // `phase1_intra_sync` but uses the JPEG state machine.
 //

@@ -64,6 +64,11 @@ pub(super) enum KernelId {
     /// (DC magnitude skip + AC run/size/EOB/ZRL framing).
     #[cfg(feature = "gpu-jpeg-huffman")]
     JpegPhase1IntraSync,
+    /// JPEG-framed Phase 2 (inter-sequence sync).  Same kernel as
+    /// `Phase2InterSync` but uses the JPEG sync predicate
+    /// (block_in_mcu + z_in_block agreement).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    JpegPhase2InterSync,
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
@@ -73,7 +78,7 @@ pub(super) enum KernelId {
 /// at build time: if `slot_index()` ever returns a value
 /// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
-const NUM_KERNELS: usize = 13;
+const NUM_KERNELS: usize = 14;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
 
@@ -99,6 +104,7 @@ const _: () = {
     assert!(KernelId::Phase2InterSync.slot_index() < NUM_KERNELS);
     assert!(KernelId::Phase4Redecode.slot_index() < NUM_KERNELS);
     assert!(KernelId::JpegPhase1IntraSync.slot_index() < NUM_KERNELS);
+    assert!(KernelId::JpegPhase2InterSync.slot_index() < NUM_KERNELS);
 };
 
 impl KernelId {
@@ -121,7 +127,8 @@ impl KernelId {
             Self::Phase1IntraSync
             | Self::Phase2InterSync
             | Self::Phase4Redecode
-            | Self::JpegPhase1IntraSync => {
+            | Self::JpegPhase1IntraSync
+            | Self::JpegPhase2InterSync => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/parallel_huffman.spv"))
             }
         }
@@ -151,6 +158,8 @@ impl KernelId {
             Self::Phase4Redecode => c"phase4_redecode",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase1IntraSync => c"jpeg_phase1_intra_sync",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase2InterSync => c"jpeg_phase2_inter_sync",
             // Every other kernel was compiled with `-entry`, so its
             // entry point is renamed to `main` in the SPIR-V.
             _ => c"main",
@@ -181,6 +190,8 @@ impl KernelId {
             Self::Phase4Redecode => 11,
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase1IntraSync => 12,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase2InterSync => 13,
         }
     }
 
@@ -208,6 +219,8 @@ impl KernelId {
             Self::Phase4Redecode => "phase4_redecode",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase1IntraSync => "jpeg_phase1_intra_sync",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase2InterSync => "jpeg_phase2_inter_sync",
         }
     }
 
@@ -241,6 +254,13 @@ impl KernelId {
             // territory).
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase1IntraSync => &[0, 1, 2, 7, 8],
+            // JpegPhase2 reads bitstream + codebook + s_info_out
+            // (slots 0..2) + sync_flags (slot 3) + dc_codebook +
+            // mcu_schedule (slots 7..8). It skips slots 4..6
+            // (offsets / symbols_out / decode_status are Phase 4
+            // territory).
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase2InterSync => &[0, 1, 2, 3, 7, 8],
             // Everyone else: sequential 0..n.
             Self::Composite | Self::ApplySoftMask | Self::AaFill | Self::BlitImage => &[0, 1],
             Self::TileFill => &[0, 1, 2, 3],
@@ -300,6 +320,10 @@ impl KernelId {
             // 24-byte push struct that all huffman phases share.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase1IntraSync => 5,
+            // (bitstream, codebook, s_info, sync_flags, dc_codebook,
+            // mcu_schedule) — JPEG-framed Phase 2, same 24-byte push.
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase2InterSync => 6,
         }
     }
 }
@@ -651,6 +675,8 @@ mod tests {
             KernelId::Phase4Redecode,
             #[cfg(feature = "gpu-jpeg-huffman")]
             KernelId::JpegPhase1IntraSync,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::JpegPhase2InterSync,
         ];
         for id in kernels {
             let slots = id.binding_slots();
@@ -692,6 +718,8 @@ mod tests {
             KernelId::Phase4Redecode,
             #[cfg(feature = "gpu-jpeg-huffman")]
             KernelId::JpegPhase1IntraSync,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::JpegPhase2InterSync,
         ];
         let mut indices: Vec<usize> = kernels.iter().map(|k| k.slot_index()).collect();
         indices.sort_unstable();

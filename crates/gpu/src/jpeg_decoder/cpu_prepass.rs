@@ -255,6 +255,11 @@ fn pack_unstuffed_bitstream(unstuffed: &[u8]) -> Result<PackedBitstream, JpegGpu
 ///
 /// Returns [`JpegGpuError::InvalidHuffmanTables`] if any selector for
 /// any block is ≥ `prep.components.len()`.
+///
+/// # Panics
+///
+/// Panics if `prep.components.len()` > `u32::MAX` or any component index
+/// exceeds 3 — neither is possible for well-formed JPEG (≤ 4 components).
 pub fn build_mcu_schedule(prep: &JpegPreparedInput) -> Result<(Vec<u32>, u32), JpegGpuError> {
     let num_components = prep.components.len();
     let num_comp_u32 = u32::try_from(num_components).expect("components.len() ≤ 4");
@@ -267,9 +272,8 @@ pub fn build_mcu_schedule(prep: &JpegPreparedInput) -> Result<(Vec<u32>, u32), J
 
         if u32::from(dc_sel) >= num_comp_u32 || u32::from(ac_sel) >= num_comp_u32 {
             return Err(JpegGpuError::InvalidHuffmanTables(format!(
-                "scan component {} references selectors (dc={dc_sel}, ac={ac_sel}) \
+                "scan component {k_u8} references selectors (dc={dc_sel}, ac={ac_sel}) \
                  ≥ num_components={num_components}",
-                k_u8,
             )));
         }
 

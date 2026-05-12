@@ -271,6 +271,10 @@ impl PageRecorder {
     /// Callers run `params.validate(&backend)` before this in the
     /// trait impl.
     #[cfg(feature = "gpu-jpeg-huffman")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each match arm is a flat kernel dispatch; extracting helpers would just add indirection without reducing total lines"
+    )]
     pub(super) fn record_huffman(
         &self,
         p: params::HuffmanParams<'_, super::CudaBackend>,
@@ -352,12 +356,33 @@ impl PageRecorder {
                     )
                     .map_err(be)
             }
-            // JPEG-framed Phase 2 + Phase 4 follow in the next B2c
-            // commits.  Typed BackendError keeps the dispatch path
-            // recoverable for callers exercising the new variants
-            // during incremental bring-up.
-            params::HuffmanPhase::JpegPhase2InterSync
-            | params::HuffmanPhase::JpegPhase4Redecode => {
+            params::HuffmanPhase::JpegPhase2InterSync => {
+                let dc = p
+                    .dc_codebook
+                    .expect("validate() proved dc_codebook is Some for JpegPhase2InterSync");
+                let sched = p
+                    .mcu_schedule
+                    .expect("validate() proved mcu_schedule is Some for JpegPhase2InterSync");
+                let sync_flags = p
+                    .sync_flags
+                    .expect("validate() proved sync_flags is Some for JpegPhase2InterSync");
+                self.ctx
+                    .launch_jpeg_phase2_inter_sync_async(
+                        p.bitstream,
+                        p.codebook,
+                        dc,
+                        sched,
+                        p.s_info,
+                        sync_flags,
+                        p.length_bits,
+                        p.subsequence_bits,
+                        num_subsequences,
+                        p.blocks_per_mcu,
+                    )
+                    .map_err(be)
+            }
+            // JPEG-framed Phase 4 follows in the next commit.
+            params::HuffmanPhase::JpegPhase4Redecode => {
                 Err(crate::backend::BackendError::msg(format!(
                     "CUDA backend: JPEG-framed phase {:?} is not yet implemented",
                     p.phase,

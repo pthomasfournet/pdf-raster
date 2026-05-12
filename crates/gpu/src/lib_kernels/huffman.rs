@@ -166,6 +166,62 @@ impl GpuCtx {
         Ok(())
     }
 
+    /// Async launch of one JPEG-framed Phase 2 (inter-sequence sync) pass.
+    ///
+    /// Reads `s_info` + writes `s_info` (in-place JPEG advance) and
+    /// `sync_flags` (one u32 per subseq; 1 = synced, 0 = unsynced
+    /// and advanced this pass). Host loops until all flags are 1 or
+    /// the retry bound is exhausted.
+    ///
+    /// # Errors
+    /// Returns the underlying CUDA error if the kernel launch fails.
+    #[expect(
+        unused_results,
+        reason = "cudarc LaunchArgs::arg returns &mut Self for chaining"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "args mirror the .cu signature; grouping into a struct would just shuffle the bytes"
+    )]
+    pub(crate) fn launch_jpeg_phase2_inter_sync_async(
+        &self,
+        bitstream: &CudaSlice<u8>,
+        codebook: &CudaSlice<u8>,
+        dc_codebook: &CudaSlice<u8>,
+        mcu_schedule: &CudaSlice<u8>,
+        s_info: &CudaSlice<u8>,
+        sync_flags: &CudaSlice<u8>,
+        length_bits: u32,
+        subsequence_bits: u32,
+        num_subsequences: u32,
+        blocks_per_mcu: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1),
+            block_dim: (HUFFMAN_PHASE1_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let stream = &self.stream;
+        let mut builder = stream.launch_builder(&self.kernels.jpeg_phase2_inter_sync);
+        builder
+            .arg(bitstream)
+            .arg(codebook)
+            .arg(dc_codebook)
+            .arg(mcu_schedule)
+            .arg(s_info)
+            .arg(sync_flags)
+            .arg(&length_bits)
+            .arg(&subsequence_bits)
+            .arg(&num_subsequences)
+            .arg(&blocks_per_mcu);
+        // SAFETY: arg count + types match the PTX entry's signature;
+        // buffer capacities were validated by `HuffmanParams::validate`
+        // before this call.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
     /// Async launch of the JPEG-framed Phase 1 intra-sequence-sync
     /// kernel.  Same dispatch grid as the synthetic
     /// [`Self::launch_phase1_intra_sync_async`]; the kernel reads

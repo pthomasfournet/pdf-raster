@@ -556,16 +556,12 @@ impl PageRecorder {
                 )
             }
             HuffmanPhase::JpegPhase1IntraSync => self.dispatch_jpeg_phase1(&p, &push, groups),
-            // JPEG-framed Phase 2 + Phase 4 follow in the next B2c
-            // commits.  Typed BackendError keeps the dispatch path
-            // recoverable for callers exercising the new variants
-            // during incremental bring-up.
-            HuffmanPhase::JpegPhase2InterSync | HuffmanPhase::JpegPhase4Redecode => {
-                Err(crate::backend::BackendError::msg(format!(
-                    "Vulkan backend: JPEG-framed phase {:?} is not yet implemented",
-                    p.phase,
-                )))
-            }
+            HuffmanPhase::JpegPhase2InterSync => self.dispatch_jpeg_phase2(&p, &push, groups),
+            // JPEG-framed Phase 4 follows in the next commit.
+            HuffmanPhase::JpegPhase4Redecode => Err(crate::backend::BackendError::msg(format!(
+                "Vulkan backend: JPEG-framed phase {:?} is not yet implemented",
+                p.phase,
+            ))),
         }
     }
 
@@ -599,6 +595,49 @@ impl PageRecorder {
                 p.bitstream.size(),
                 p.codebook.size(),
                 p.s_info.size(),
+                dc.size(),
+                sched.size(),
+            ],
+            push,
+            groups,
+        )
+    }
+
+    /// Dispatch helper for the JPEG-framed Phase 2.  Pulled out of
+    /// [`Self::record_huffman`] so the main fn stays under the clippy
+    /// `too_many_lines` threshold and the JPEG-specific buffer wiring
+    /// is visible as a discrete block.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn dispatch_jpeg_phase2(
+        &self,
+        p: &params::HuffmanParams<'_, super::VulkanBackend>,
+        push: &[u8; 24],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        let dc = p
+            .dc_codebook
+            .expect("validate() proved dc_codebook is Some for JpegPhase2InterSync");
+        let sched = p
+            .mcu_schedule
+            .expect("validate() proved mcu_schedule is Some for JpegPhase2InterSync");
+        let flags = p
+            .sync_flags
+            .expect("validate() proved sync_flags is Some for JpegPhase2InterSync");
+        self.dispatch_kernel(
+            KernelId::JpegPhase2InterSync,
+            &[
+                p.bitstream.handle(),
+                p.codebook.handle(),
+                p.s_info.handle(),
+                flags.handle(),
+                dc.handle(),
+                sched.handle(),
+            ],
+            &[
+                p.bitstream.size(),
+                p.codebook.size(),
+                p.s_info.size(),
+                flags.size(),
                 dc.size(),
                 sched.size(),
             ],
