@@ -9,7 +9,7 @@
 //! associated-type shape of `GpuBackend` rules out a dyn-trait
 //! signature.
 
-use crate::backend::params::{SCAN_WORKGROUP_SIZE, ScanParams, ScanPhase};
+use crate::backend::params::{ScanParams, ScanPhase, scan_block_count};
 use crate::backend::{BackendError, GpuBackend, Result};
 
 /// Exclusive prefix sum of `input` via the multi-workgroup Blelloch
@@ -39,9 +39,7 @@ pub fn dispatch_blelloch_scan<B: GpuBackend>(backend: &B, input: &[u32]) -> Resu
     }
 
     let data_bytes = (len_elems as usize) * 4;
-    let tile = 2 * SCAN_WORKGROUP_SIZE;
-    let block_count = len_elems.div_ceil(tile);
-    let block_sums_bytes = (block_count as usize) * 4;
+    let block_sums_bytes = (scan_block_count(len_elems) as usize) * 4;
 
     let data = backend.alloc_device(data_bytes)?;
     let block_sums = backend.alloc_device(block_sums_bytes)?;
@@ -80,12 +78,17 @@ pub fn dispatch_blelloch_scan<B: GpuBackend>(backend: &B, input: &[u32]) -> Resu
     Ok(out)
 }
 
+/// Shared test helpers — exclusive scan oracle + backend probes.
+/// Lives outside the per-test module so the CUDA-only and the
+/// Vulkan + cross-backend test modules can both import it.
 #[cfg(all(test, feature = "gpu-validation"))]
-mod tests {
-    use super::*;
+mod test_helpers {
     use crate::backend::cuda::CudaBackend;
 
-    fn cpu_exclusive_scan(input: &[u32]) -> Vec<u32> {
+    /// CPU exclusive-scan reference, used as the oracle for every
+    /// scan parity test. `wrapping_add` matches the GPU kernel's u32
+    /// arithmetic (no overflow trap; the test inputs stay small).
+    pub(super) fn cpu_exclusive_scan(input: &[u32]) -> Vec<u32> {
         let mut out = Vec::with_capacity(input.len());
         let mut acc = 0u32;
         for &v in input {
@@ -95,9 +98,17 @@ mod tests {
         out
     }
 
-    fn try_backend() -> Option<CudaBackend> {
+    /// Try to initialise a CUDA backend; `None` on hosts without a
+    /// CUDA device, signalling "skip this test cleanly".
+    pub(super) fn try_cuda() -> Option<CudaBackend> {
         CudaBackend::new().ok()
     }
+}
+
+#[cfg(all(test, feature = "gpu-validation"))]
+mod tests {
+    use super::test_helpers::{cpu_exclusive_scan, try_cuda as try_backend};
+    use super::*;
 
     #[test]
     fn empty_input_returns_empty() {
@@ -195,26 +206,12 @@ mod tests {
 
 #[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
 mod vulkan_tests {
+    use super::test_helpers::{cpu_exclusive_scan, try_cuda};
     use super::*;
-    use crate::backend::cuda::CudaBackend;
     use crate::backend::vulkan::VulkanBackend;
-
-    fn cpu_exclusive_scan(input: &[u32]) -> Vec<u32> {
-        let mut out = Vec::with_capacity(input.len());
-        let mut acc = 0u32;
-        for &v in input {
-            out.push(acc);
-            acc = acc.wrapping_add(v);
-        }
-        out
-    }
 
     fn try_vulkan() -> Option<VulkanBackend> {
         VulkanBackend::new().ok()
-    }
-
-    fn try_cuda() -> Option<CudaBackend> {
-        CudaBackend::new().ok()
     }
 
     /// Same input through both backends; outputs must be byte-identical.

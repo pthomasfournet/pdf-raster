@@ -53,11 +53,35 @@ pub(super) enum KernelId {
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
-/// Adding a kernel variant requires bumping this in lockstep.
+///
+/// Adding a kernel variant requires bumping this AND adding a
+/// `slot_index()` arm. The `const _` assertion below catches drift
+/// at build time: if `slot_index()` ever returns a value
+/// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
 const NUM_KERNELS: usize = 9;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
+
+/// Every variant's `slot_index()` must be `< NUM_KERNELS`. Drift
+/// here would surface as a runtime panic when `self.slots[idx]` is
+/// accessed; the `const _` exercise below moves the failure to
+/// build time. Each line evaluates a `const` expression that panics
+/// via `assert!` if the invariant is violated.
+const _: () = {
+    assert!(KernelId::Composite.slot_index() < NUM_KERNELS);
+    assert!(KernelId::ApplySoftMask.slot_index() < NUM_KERNELS);
+    assert!(KernelId::AaFill.slot_index() < NUM_KERNELS);
+    assert!(KernelId::TileFill.slot_index() < NUM_KERNELS);
+    assert!(KernelId::IccClut.slot_index() < NUM_KERNELS);
+    assert!(KernelId::BlitImage.slot_index() < NUM_KERNELS);
+};
+#[cfg(feature = "gpu-jpeg-huffman")]
+const _: () = {
+    assert!(KernelId::ScanPerWorkgroup.slot_index() < NUM_KERNELS);
+    assert!(KernelId::ScanBlockSums.slot_index() < NUM_KERNELS);
+    assert!(KernelId::ScanScatter.slot_index() < NUM_KERNELS);
+};
 
 impl KernelId {
     /// SPIR-V blob for this kernel, baked into the binary at build time.
@@ -144,8 +168,7 @@ impl KernelId {
     /// same order it builds the descriptor write list. Same-count
     /// variants stay on separate arms with per-arm comments so future
     /// kernel additions surface their binding count next to the
-    /// relevant kernel name (the clippy `match_same_arms` lint is
-    /// silent here because the scan triplet uses a single OR pattern).
+    /// relevant kernel name.
     const fn n_storage_buffers(self) -> u32 {
         match self {
             // (src, dst)

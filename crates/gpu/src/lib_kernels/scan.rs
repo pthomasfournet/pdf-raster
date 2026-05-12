@@ -14,11 +14,9 @@ use crate::backend::params::{SCAN_WORKGROUP_SIZE, ScanPhase};
 impl GpuCtx {
     /// Async launch of one Blelloch scan phase.
     ///
-    /// Per-phase grid sizing:
-    /// - `PerWorkgroup` / `ScatterBlockSums`: one workgroup per tile
-    ///   of 1024 elements. Grid = `ceil(len_elems / 1024)` blocks.
-    /// - `BlockSums`: exactly one workgroup over the (≤ 1024) block
-    ///   sums. Grid = 1 block.
+    /// Per-phase grid sizing is selected by `ScanPhase::dispatch_grid`
+    /// — same logic the Vulkan recorder uses, so the two backends
+    /// can't drift on the workgroup partitioning.
     ///
     /// All three phases take `(data, block_sums, len_elems)` in the
     /// same arg slot order so the host-side dispatcher rebinds
@@ -39,14 +37,8 @@ impl GpuCtx {
         len_elems: u32,
         phase: ScanPhase,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tile = 2 * SCAN_WORKGROUP_SIZE;
-        let block_count = len_elems.div_ceil(tile);
-        let grid_dim = match phase {
-            ScanPhase::PerWorkgroup | ScanPhase::ScatterBlockSums => (block_count, 1, 1),
-            ScanPhase::BlockSums => (1, 1, 1),
-        };
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim,
+            grid_dim: phase.dispatch_grid(len_elems),
             block_dim: (SCAN_WORKGROUP_SIZE, 1, 1),
             shared_mem_bytes: 0,
         };

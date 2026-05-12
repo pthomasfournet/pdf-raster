@@ -440,22 +440,15 @@ impl PageRecorder {
         p: params::ScanParams<'_, super::VulkanBackend>,
     ) -> Result<()> {
         use super::pipeline::KernelId;
-        use crate::backend::params::{SCAN_WORKGROUP_SIZE, ScanPhase};
+        use crate::backend::params::ScanPhase;
 
-        let len_elems = p.len_elems;
-        let push: [u8; 4] = len_elems.to_ne_bytes();
-
-        // Per-phase grid + kernel selection. block_sums runs as a
-        // single workgroup over the (≤ SCAN_MAX_BLOCKS) tile-sums
-        // array; per-workgroup + scatter dispatch one workgroup per
-        // tile of 1024 elements.
-        let tile = 2 * SCAN_WORKGROUP_SIZE;
-        let block_count = len_elems.div_ceil(tile);
-        let (kernel, groups) = match p.phase {
-            ScanPhase::PerWorkgroup => (KernelId::ScanPerWorkgroup, (block_count, 1, 1)),
-            ScanPhase::BlockSums => (KernelId::ScanBlockSums, (1, 1, 1)),
-            ScanPhase::ScatterBlockSums => (KernelId::ScanScatter, (block_count, 1, 1)),
+        let push: [u8; 4] = p.len_elems.to_ne_bytes();
+        let kernel = match p.phase {
+            ScanPhase::PerWorkgroup => KernelId::ScanPerWorkgroup,
+            ScanPhase::BlockSums => KernelId::ScanBlockSums,
+            ScanPhase::ScatterBlockSums => KernelId::ScanScatter,
         };
+        let groups = p.phase.dispatch_grid(p.len_elems);
 
         self.dispatch_kernel(
             kernel,

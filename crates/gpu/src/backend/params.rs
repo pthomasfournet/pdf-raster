@@ -255,6 +255,37 @@ impl ScanPhase {
             Self::ScatterBlockSums => 2,
         }
     }
+
+    /// Workgroup grid dimensions for this phase given `len_elems`.
+    ///
+    /// - `PerWorkgroup` and `ScatterBlockSums` dispatch one workgroup
+    ///   per `2 * SCAN_WORKGROUP_SIZE`-element tile (rounded up).
+    /// - `BlockSums` dispatches exactly one workgroup over the (≤
+    ///   `SCAN_MAX_BLOCKS`) tile-sums array.
+    ///
+    /// Shared by the CUDA and Vulkan recorders so the two backends
+    /// can't drift on the grid shape — the kernel-side workgroup
+    /// layout assumes this exact partitioning.
+    #[must_use]
+    pub const fn dispatch_grid(self, len_elems: u32) -> (u32, u32, u32) {
+        match self {
+            Self::PerWorkgroup | Self::ScatterBlockSums => (scan_block_count(len_elems), 1, 1),
+            Self::BlockSums => (1, 1, 1),
+        }
+    }
+}
+
+/// Number of per-workgroup tiles required to cover `len_elems`
+/// elements of the Blelloch scan. Each tile is
+/// `2 * SCAN_WORKGROUP_SIZE = 1024` elements.
+///
+/// Used by `ScanPhase::dispatch_grid` and by host dispatchers that
+/// need to size the `block_sums` buffer. Single source of truth for
+/// the partition factor.
+#[must_use]
+pub const fn scan_block_count(len_elems: u32) -> u32 {
+    let tile = 2 * SCAN_WORKGROUP_SIZE;
+    len_elems.div_ceil(tile)
 }
 
 /// Parameters for one phase of the Blelloch exclusive scan kernel.
@@ -317,8 +348,7 @@ impl<B: GpuBackend + ?Sized> ScanParams<'_, B> {
             return Err(invariant("data buffer is smaller than len_elems * 4 bytes"));
         }
 
-        let workgroup_tile = 2 * SCAN_WORKGROUP_SIZE;
-        let block_count = self.len_elems.div_ceil(workgroup_tile);
+        let block_count = scan_block_count(self.len_elems);
         if block_count > SCAN_MAX_BLOCKS {
             return Err(invariant(
                 "block_count exceeds SCAN_MAX_BLOCKS (1024); recursive scan not implemented",
