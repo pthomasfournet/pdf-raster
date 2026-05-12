@@ -10,6 +10,8 @@
 //! 2-tier codetable construction, a scalar reference decoder, and a
 //! synthetic-stream oracle used by cross-backend bit-identity tests.
 
+mod bitstream;
 mod error;
 
+pub use bitstream::{PackedBitstream, pack_be_words};
 pub use error::JpegGpuError;
