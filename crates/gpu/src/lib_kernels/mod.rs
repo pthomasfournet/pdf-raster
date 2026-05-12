@@ -7,6 +7,8 @@
 pub mod aa;
 pub mod composite;
 pub mod icc;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub mod scan;
 pub mod soft_mask;
 pub mod tile;
 

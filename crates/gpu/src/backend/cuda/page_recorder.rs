@@ -251,6 +251,22 @@ impl PageRecorder {
             .map_err(be)
     }
 
+    /// Record one Blelloch scan phase. Each call queues exactly one
+    /// kernel launch on the backend's shared stream; the host runs
+    /// all three phases (`PerWorkgroup` → `BlockSums` →
+    /// `ScatterBlockSums`) by calling `record_scan` three times with
+    /// the same params (rebinding only `phase` between calls).
+    ///
+    /// Callers are expected to have run `params.validate(&backend)`
+    /// before reaching this entry point; the trait impl in `mod.rs`
+    /// does so.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(super) fn record_scan(&self, p: params::ScanParams<'_, super::CudaBackend>) -> Result<()> {
+        self.ctx
+            .launch_scan_async(p.data, p.block_sums, p.len_elems, p.phase)
+            .map_err(be)
+    }
+
     /// Record an async zero-fill on the backend's stream via
     /// `cuMemsetD8Async`.  Same single-stream serialisation as the
     /// `launch_*_async` helpers: any later record_* call ordered after

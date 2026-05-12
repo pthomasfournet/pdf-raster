@@ -90,6 +90,8 @@ const PTX_TILE_FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/tile_fill.pt
 const PTX_ICC_CLUT: &str = include_str!(concat!(env!("OUT_DIR"), "/icc_clut.ptx"));
 #[cfg(all(not(ptx_placeholder), feature = "cache"))]
 const PTX_BLIT_IMAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/blit_image.ptx"));
+#[cfg(all(not(ptx_placeholder), feature = "gpu-jpeg-huffman"))]
+const PTX_BLELLOCH_SCAN: &str = include_str!(concat!(env!("OUT_DIR"), "/blelloch_scan.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
 pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
@@ -143,6 +145,15 @@ pub(crate) struct GpuKernels {
     pub(crate) icc_cmyk_clut: CudaFunction,
     #[cfg(feature = "cache")]
     pub(crate) blit_image: CudaFunction,
+    /// Per-workgroup Blelloch scan entry (phase 1).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) scan_per_workgroup: CudaFunction,
+    /// Single-workgroup scan of block sums (phase 2).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) scan_block_sums: CudaFunction,
+    /// Scatter scanned block sums back into tiles (phase 3).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) scan_scatter: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -231,6 +242,12 @@ impl GpuCtx {
                 icc_cmyk_clut: load(PTX_ICC_CLUT, "icc_cmyk_clut")?,
                 #[cfg(feature = "cache")]
                 blit_image: load(PTX_BLIT_IMAGE, "blit_image")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                scan_per_workgroup: load(PTX_BLELLOCH_SCAN, "scan_per_workgroup")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                scan_block_sums: load(PTX_BLELLOCH_SCAN, "scan_block_sums")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                scan_scatter: load(PTX_BLELLOCH_SCAN, "scan_scatter")?,
             },
         })
     }

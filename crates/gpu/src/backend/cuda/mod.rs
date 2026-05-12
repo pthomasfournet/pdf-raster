@@ -117,12 +117,19 @@ impl GpuBackend for CudaBackend {
         self.recorder.record_apply_soft_mask(params)
     }
 
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn record_scan(&self, params: params::ScanParams<'_, Self>) -> Result<()> {
+        params.validate(self)?;
+        self.recorder.record_scan(params)
+    }
+
+    #[cfg(not(feature = "gpu-jpeg-huffman"))]
     fn record_scan(&self, _params: params::ScanParams<'_, Self>) -> Result<()> {
-        // Kernel + recorder wiring lands with the JPEG decoder's
-        // Blelloch-scan dispatcher. Trait method exists today so
-        // every backend's surface stays in sync.
+        // The kernel only ships when the gpu-jpeg-huffman feature is
+        // enabled at build time; outside that feature the trait
+        // method exists for ABI uniformity but rejects calls loudly.
         Err(BackendError::msg(
-            "CudaBackend::record_scan: kernel not yet wired in",
+            "CudaBackend::record_scan: gpu-jpeg-huffman feature is not enabled",
         ))
     }
 
