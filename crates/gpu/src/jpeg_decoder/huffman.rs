@@ -11,6 +11,7 @@ use crate::backend::params::{HUFFMAN_CODEBOOK_ENTRIES, HuffmanParams, HuffmanPha
 use crate::backend::{BackendError, GpuBackend, Result};
 use crate::jpeg::CanonicalCodebook;
 use crate::jpeg_decoder::PackedBitstream;
+use crate::jpeg_decoder::dispatch_util::DeviceBufferGuard;
 use crate::jpeg_decoder::phase1_oracle::SubsequenceState;
 #[cfg(feature = "gpu-validation")]
 use crate::jpeg_decoder::phase2_oracle::{Phase2Outcome, retry_bound as phase2_retry_bound};
@@ -88,25 +89,26 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
     let codebook_bytes = codebook_flat.len() * 4;
     let s_info_bytes = (num_subsequences as usize) * std::mem::size_of::<SubsequenceState>();
 
-    // alloc_device_zeroed gives the trailing peek16-headroom word for
-    // free — we then upload only the stream's actual words, leaving
-    // the tail zero. Avoids a host-side Vec<u32> mirror of the full
-    // bitstream.
-    let bitstream_buf = backend.alloc_device_zeroed(bitstream_bytes)?;
-    let codebook_buf = backend.alloc_device(codebook_bytes)?;
-    let s_info_buf = backend.alloc_device(s_info_bytes)?;
+    // Guards free their buffers on Drop, so any `?` between here
+    // and the explicit `take() + free_device` at the bottom doesn't
+    // leak. alloc_zeroed gives the trailing peek16-headroom word
+    // for free — we then upload only the stream's actual words,
+    // leaving the tail zero.
+    let bitstream_buf = DeviceBufferGuard::alloc_zeroed(backend, bitstream_bytes)?;
+    let codebook_buf = DeviceBufferGuard::alloc(backend, codebook_bytes)?;
+    let s_info_buf = DeviceBufferGuard::alloc(backend, s_info_bytes)?;
 
     // Both uploads queue on the transfer queue; `submit_page` inserts
     // the cross-queue barrier before the kernel reads the buffers, so
     // explicit wait_transfer between uploads is unnecessary.
-    let _up1 = backend.upload_async(&bitstream_buf, bytemuck::cast_slice(&stream.words))?;
-    let _up2 = backend.upload_async(&codebook_buf, bytemuck::cast_slice(&codebook_flat))?;
+    let _up1 = backend.upload_async(bitstream_buf.as_ref(), bytemuck::cast_slice(&stream.words))?;
+    let _up2 = backend.upload_async(codebook_buf.as_ref(), bytemuck::cast_slice(&codebook_flat))?;
 
     backend.begin_page()?;
     backend.record_huffman(HuffmanParams {
-        bitstream: &bitstream_buf,
-        codebook: &codebook_buf,
-        s_info: &s_info_buf,
+        bitstream: bitstream_buf.as_ref(),
+        codebook: codebook_buf.as_ref(),
+        s_info: s_info_buf.as_ref(),
         sync_flags: None,
         offsets: None,
         symbols_out: None,
@@ -126,12 +128,12 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
     let mut out =
         vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
     let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut out);
-    let handle = backend.download_async(&s_info_buf, dst)?;
+    let handle = backend.download_async(s_info_buf.as_ref(), dst)?;
     backend.wait_download(handle)?;
 
-    backend.free_device(bitstream_buf);
-    backend.free_device(codebook_buf);
-    backend.free_device(s_info_buf);
+    backend.free_device(bitstream_buf.take());
+    backend.free_device(codebook_buf.take());
+    backend.free_device(s_info_buf.take());
 
     Ok(out)
 }
@@ -187,20 +189,21 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     let s_info_bytes = (num_subsequences as usize) * std::mem::size_of::<SubsequenceState>();
     let flags_bytes = (num_subsequences as usize) * 4;
 
-    let bitstream_buf = backend.alloc_device_zeroed(bitstream_bytes)?;
-    let codebook_buf = backend.alloc_device(codebook_bytes)?;
-    let s_info_buf = backend.alloc_device(s_info_bytes)?;
-    let sync_flags_buf = backend.alloc_device(flags_bytes)?;
+    // Drop-frees guards — see `dispatch_util` module doc-comment.
+    let bitstream_buf = DeviceBufferGuard::alloc_zeroed(backend, bitstream_bytes)?;
+    let codebook_buf = DeviceBufferGuard::alloc(backend, codebook_bytes)?;
+    let s_info_buf = DeviceBufferGuard::alloc(backend, s_info_bytes)?;
+    let sync_flags_buf = DeviceBufferGuard::alloc(backend, flags_bytes)?;
 
-    let _up1 = backend.upload_async(&bitstream_buf, bytemuck::cast_slice(&stream.words))?;
-    let _up2 = backend.upload_async(&codebook_buf, bytemuck::cast_slice(&codebook_flat))?;
+    let _up1 = backend.upload_async(bitstream_buf.as_ref(), bytemuck::cast_slice(&stream.words))?;
+    let _up2 = backend.upload_async(codebook_buf.as_ref(), bytemuck::cast_slice(&codebook_flat))?;
 
     // Phase 1 — one pass.
     backend.begin_page()?;
     backend.record_huffman(HuffmanParams {
-        bitstream: &bitstream_buf,
-        codebook: &codebook_buf,
-        s_info: &s_info_buf,
+        bitstream: bitstream_buf.as_ref(),
+        codebook: codebook_buf.as_ref(),
+        s_info: s_info_buf.as_ref(),
         sync_flags: None,
         offsets: None,
         symbols_out: None,
@@ -220,10 +223,10 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     for iter in 0..=bound {
         backend.begin_page()?;
         backend.record_huffman(HuffmanParams {
-            bitstream: &bitstream_buf,
-            codebook: &codebook_buf,
-            s_info: &s_info_buf,
-            sync_flags: Some(&sync_flags_buf),
+            bitstream: bitstream_buf.as_ref(),
+            codebook: codebook_buf.as_ref(),
+            s_info: s_info_buf.as_ref(),
+            sync_flags: Some(sync_flags_buf.as_ref()),
             offsets: None,
             symbols_out: None,
             length_bits,
@@ -236,7 +239,7 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
         backend.wait_page(fence)?;
 
         let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut flags_host);
-        let handle = backend.download_async(&sync_flags_buf, dst)?;
+        let handle = backend.download_async(sync_flags_buf.as_ref(), dst)?;
         backend.wait_download(handle)?;
 
         if flags_host.iter().all(|&f| f == 1) {
@@ -248,13 +251,13 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     let mut s_info_out =
         vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
     let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut s_info_out);
-    let handle = backend.download_async(&s_info_buf, dst)?;
+    let handle = backend.download_async(s_info_buf.as_ref(), dst)?;
     backend.wait_download(handle)?;
 
-    backend.free_device(bitstream_buf);
-    backend.free_device(codebook_buf);
-    backend.free_device(s_info_buf);
-    backend.free_device(sync_flags_buf);
+    backend.free_device(bitstream_buf.take());
+    backend.free_device(codebook_buf.take());
+    backend.free_device(s_info_buf.take());
+    backend.free_device(sync_flags_buf.take());
 
     Ok((s_info_out, outcome))
 }
@@ -320,21 +323,25 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     let flags_bytes = (num_subsequences as usize) * 4;
     let offsets_bytes = flags_bytes;
 
-    let bitstream_buf = backend.alloc_device_zeroed(bitstream_bytes)?;
-    let codebook_buf = backend.alloc_device(codebook_bytes)?;
-    let s_info_buf = backend.alloc_device(s_info_bytes)?;
-    let sync_flags_buf = backend.alloc_device(flags_bytes)?;
-    let offsets_buf = backend.alloc_device(offsets_bytes)?;
+    // Drop-frees guards — any `?` or early `return Err` between
+    // here and the explicit `take() + free_device` at the bottom
+    // releases the buffers automatically. The early `return Ok`
+    // on `total_symbols == 0` works the same way.
+    let bitstream_buf = DeviceBufferGuard::alloc_zeroed(backend, bitstream_bytes)?;
+    let codebook_buf = DeviceBufferGuard::alloc(backend, codebook_bytes)?;
+    let s_info_buf = DeviceBufferGuard::alloc(backend, s_info_bytes)?;
+    let sync_flags_buf = DeviceBufferGuard::alloc(backend, flags_bytes)?;
+    let offsets_buf = DeviceBufferGuard::alloc(backend, offsets_bytes)?;
 
-    let _up1 = backend.upload_async(&bitstream_buf, bytemuck::cast_slice(&stream.words))?;
-    let _up2 = backend.upload_async(&codebook_buf, bytemuck::cast_slice(&codebook_flat))?;
+    let _up1 = backend.upload_async(bitstream_buf.as_ref(), bytemuck::cast_slice(&stream.words))?;
+    let _up2 = backend.upload_async(codebook_buf.as_ref(), bytemuck::cast_slice(&codebook_flat))?;
 
     // Phase 1.
     backend.begin_page()?;
     backend.record_huffman(HuffmanParams {
-        bitstream: &bitstream_buf,
-        codebook: &codebook_buf,
-        s_info: &s_info_buf,
+        bitstream: bitstream_buf.as_ref(),
+        codebook: codebook_buf.as_ref(),
+        s_info: s_info_buf.as_ref(),
         sync_flags: None,
         offsets: None,
         symbols_out: None,
@@ -354,10 +361,10 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     for _iter in 0..=bound {
         backend.begin_page()?;
         backend.record_huffman(HuffmanParams {
-            bitstream: &bitstream_buf,
-            codebook: &codebook_buf,
-            s_info: &s_info_buf,
-            sync_flags: Some(&sync_flags_buf),
+            bitstream: bitstream_buf.as_ref(),
+            codebook: codebook_buf.as_ref(),
+            s_info: s_info_buf.as_ref(),
+            sync_flags: Some(sync_flags_buf.as_ref()),
             offsets: None,
             symbols_out: None,
             length_bits,
@@ -370,7 +377,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         backend.wait_page(fence)?;
 
         let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut flags_host);
-        let handle = backend.download_async(&sync_flags_buf, dst)?;
+        let handle = backend.download_async(sync_flags_buf.as_ref(), dst)?;
         backend.wait_download(handle)?;
 
         if flags_host.iter().all(|&f| f == 1) {
@@ -379,11 +386,6 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         }
     }
     if !converged {
-        backend.free_device(bitstream_buf);
-        backend.free_device(codebook_buf);
-        backend.free_device(s_info_buf);
-        backend.free_device(sync_flags_buf);
-        backend.free_device(offsets_buf);
         return Err(BackendError::msg(
             "dispatch_phase1_through_phase4: Phase 2 did not converge within retry bound",
         ));
@@ -394,7 +396,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     let mut s_info_host =
         vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
     let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut s_info_host);
-    let handle = backend.download_async(&s_info_buf, dst)?;
+    let handle = backend.download_async(s_info_buf.as_ref(), dst)?;
     backend.wait_download(handle)?;
 
     // Exclusive scan + total over s_info[*].n. checked_add surfaces
@@ -414,28 +416,24 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     if total_symbols == 0 {
         // Well-formed stream produced no decodable symbols. Skip
         // Phase 4 entirely (kernel + alloc would both reject 0-size).
-        backend.free_device(bitstream_buf);
-        backend.free_device(codebook_buf);
-        backend.free_device(s_info_buf);
-        backend.free_device(sync_flags_buf);
-        backend.free_device(offsets_buf);
+        // Drop on the five guards frees their buffers.
         return Ok(Vec::new());
     }
 
-    let _up3 = backend.upload_async(&offsets_buf, bytemuck::cast_slice(&offsets_host))?;
+    let _up3 = backend.upload_async(offsets_buf.as_ref(), bytemuck::cast_slice(&offsets_host))?;
 
     let symbols_bytes = (total_symbols as usize) * 4;
-    let symbols_buf = backend.alloc_device_zeroed(symbols_bytes)?;
+    let symbols_buf = DeviceBufferGuard::alloc_zeroed(backend, symbols_bytes)?;
 
     // Phase 4.
     backend.begin_page()?;
     backend.record_huffman(HuffmanParams {
-        bitstream: &bitstream_buf,
-        codebook: &codebook_buf,
-        s_info: &s_info_buf,
+        bitstream: bitstream_buf.as_ref(),
+        codebook: codebook_buf.as_ref(),
+        s_info: s_info_buf.as_ref(),
         sync_flags: None,
-        offsets: Some(&offsets_buf),
-        symbols_out: Some(&symbols_buf),
+        offsets: Some(offsets_buf.as_ref()),
+        symbols_out: Some(symbols_buf.as_ref()),
         length_bits,
         subsequence_bits,
         num_components,
@@ -447,15 +445,15 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
 
     let mut symbols_host = vec![0u32; total_symbols as usize];
     let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut symbols_host);
-    let handle = backend.download_async(&symbols_buf, dst)?;
+    let handle = backend.download_async(symbols_buf.as_ref(), dst)?;
     backend.wait_download(handle)?;
 
-    backend.free_device(bitstream_buf);
-    backend.free_device(codebook_buf);
-    backend.free_device(s_info_buf);
-    backend.free_device(sync_flags_buf);
-    backend.free_device(offsets_buf);
-    backend.free_device(symbols_buf);
+    backend.free_device(bitstream_buf.take());
+    backend.free_device(codebook_buf.take());
+    backend.free_device(s_info_buf.take());
+    backend.free_device(sync_flags_buf.take());
+    backend.free_device(offsets_buf.take());
+    backend.free_device(symbols_buf.take());
 
     Ok(symbols_host)
 }

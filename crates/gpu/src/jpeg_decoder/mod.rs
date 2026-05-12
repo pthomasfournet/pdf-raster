@@ -13,6 +13,7 @@ mod bitstream;
 mod codetable;
 #[cfg(test)]
 mod cpu_reference;
+mod dispatch_util;
 mod error;
 // huffman + phase1_oracle are test-only today (oracle-comparison
 // tests against the GPU dispatcher); promote when production

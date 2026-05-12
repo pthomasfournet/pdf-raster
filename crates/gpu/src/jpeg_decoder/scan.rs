@@ -11,6 +11,7 @@
 
 use crate::backend::params::{ScanParams, ScanPhase, scan_block_count};
 use crate::backend::{BackendError, GpuBackend, Result};
+use crate::jpeg_decoder::dispatch_util::DeviceBufferGuard;
 
 /// Exclusive prefix sum of `input` via the multi-workgroup Blelloch
 /// scan kernel.
@@ -41,11 +42,14 @@ pub fn dispatch_blelloch_scan<B: GpuBackend>(backend: &B, input: &[u32]) -> Resu
     let data_bytes = (len_elems as usize) * 4;
     let block_sums_bytes = (scan_block_count(len_elems) as usize) * 4;
 
-    let data = backend.alloc_device(data_bytes)?;
-    let block_sums = backend.alloc_device(block_sums_bytes)?;
+    // Guards free their buffers on Drop, so any `?` between here
+    // and the explicit `take() + free_device` at the bottom doesn't
+    // leak. See `dispatch_util` module doc-comment for the rationale.
+    let data = DeviceBufferGuard::alloc(backend, data_bytes)?;
+    let block_sums = DeviceBufferGuard::alloc(backend, block_sums_bytes)?;
 
     let input_bytes = bytemuck::cast_slice::<u32, u8>(input);
-    let upload_fence = backend.upload_async(&data, input_bytes)?;
+    let upload_fence = backend.upload_async(data.as_ref(), input_bytes)?;
     backend.wait_transfer(upload_fence)?;
 
     backend.begin_page()?;
@@ -55,8 +59,8 @@ pub fn dispatch_blelloch_scan<B: GpuBackend>(backend: &B, input: &[u32]) -> Resu
         ScanPhase::ScatterBlockSums,
     ] {
         backend.record_scan(ScanParams {
-            data: &data,
-            block_sums: &block_sums,
+            data: data.as_ref(),
+            block_sums: block_sums.as_ref(),
             len_elems,
             phase,
         })?;
@@ -65,11 +69,11 @@ pub fn dispatch_blelloch_scan<B: GpuBackend>(backend: &B, input: &[u32]) -> Resu
     backend.wait_page(fence)?;
 
     let mut out_bytes = vec![0u8; data_bytes];
-    let handle = backend.download_async(&data, &mut out_bytes)?;
+    let handle = backend.download_async(data.as_ref(), &mut out_bytes)?;
     backend.wait_download(handle)?;
 
-    backend.free_device(data);
-    backend.free_device(block_sums);
+    backend.free_device(data.take());
+    backend.free_device(block_sums.take());
 
     // Reinterpret the byte buffer as u32. The host is little-endian
     // x86-64; the GPU kernel writes u32 in the same byte order; no
