@@ -45,10 +45,17 @@ pub enum JpegGpuError {
     /// Inter-sequence sync (Wei §III-B) did not converge within the
     /// bounded retry count. The decoder returns this rather than
     /// hanging on an adversarial stream.
+    ///
+    /// Reserved for the Phase 2 parallel-Huffman dispatcher; not yet
+    /// reachable through the CPU coefficient extraction path.
     SyncBoundExceeded,
 
     /// Re-decode produced more coefficients than the IDCT stage can
     /// consume; the input is likely corrupt.
+    ///
+    /// Reserved for the Phase 2 parallel-Huffman dispatcher; not yet
+    /// reachable through the CPU coefficient extraction path (that path
+    /// returns [`Self::HeaderParse`] with a "coefficient overflow" message).
     CoefficientOverflow,
 
     /// The GPU backend ran out of memory while allocating decoder

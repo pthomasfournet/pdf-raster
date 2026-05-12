@@ -546,6 +546,15 @@ mod tests {
     fn gray_16x16_with_dri(interval: u16) -> Vec<u8> {
         const SOS_OFFSET: usize = 147;
         let base = GRAY_16X16_JPEG;
+        // Assert that the fixture starts a SOS marker at SOS_OFFSET so a
+        // regenerated fixture with a different layout causes a test compile
+        // failure rather than silently producing a malformed JPEG.
+        assert_eq!(
+            base[SOS_OFFSET..SOS_OFFSET + 2],
+            [0xFF, 0xDA],
+            "GRAY_16X16_JPEG SOS marker not at expected offset {SOS_OFFSET}; \
+             update SOS_OFFSET if the fixture was regenerated"
+        );
         let dri = [
             0xFF,
             0xDD, // DRI marker

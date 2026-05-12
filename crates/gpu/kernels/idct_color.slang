@@ -39,23 +39,15 @@ static const int zigzag_to_natural[64] = {
     53, 60, 61, 54, 47, 55, 62, 63
 };
 
-// LLM fixed-point constants.
-// All values are scaled by 1<<FRAC_BITS.
+// LLM fixed-point constants (scaled by 2^13).
 // Derived from Loeffler, Ligtenberg, Moschytz (1989).
-//
-// cos(k*pi/16) * sqrt(2) scaled to FRAC_BITS fractional bits.
-static const int FRAC_BITS     = 13;
-static const int HALF          = 1 << (FRAC_BITS - 1);  // 4096
+static const int FRAC_BITS = 13;
 
-// LLM 1-D IDCT butterfly constants (scaled by 2^13):
-//   C1 = cos(1*pi/16)*sqrt(2) ≈ 1.3870  × 8192 = 11363
-//   C3 = cos(3*pi/16)*sqrt(2) ≈ 1.1758  × 8192 =  9633
-//   C6 = cos(6*pi/16)*sqrt(2) ≈ 0.5412  × 8192 =  4433
-//   SQRT2 = sqrt(2)           ≈ 1.4142  × 8192 = 11585 (not used directly)
+// cos(k*pi/16) * sqrt(2) * 8192:
 static const int C1    = 11363;  // cos(pi/16)  * sqrt(2) * 8192
 static const int C3    = 9633;   // cos(3pi/16) * sqrt(2) * 8192
 static const int C6    = 4433;   // cos(6pi/16) * sqrt(2) * 8192
-static const int SQRT2 = 11585;  // sqrt(2) * 8192
+static const int SQRT2 = 11585;  // sqrt(2)               * 8192
 
 // Rounding right-shift preserving sign (T.871 round-half-away-from-zero).
 int rshift(int x, int s) {
@@ -91,7 +83,7 @@ void idct_1d(inout int v[8]) {
     // Stage 2 (odd path — indices 1, 5, 3, 7):
     int q0  = rshift(C1 * t4 + C3 * t6, FRAC_BITS);
     int q1  = rshift(C3 * t4 - C1 * t6, FRAC_BITS);
-    int q2  = rshift(C1 * t5 + C3 * t7, FRAC_BITS);  // Note: C1/C3 roles swap per LLM
+    int q2  = rshift(C1 * t5 + C3 * t7, FRAC_BITS);
     int q3  = rshift(C3 * t5 - C1 * t7, FRAC_BITS);
 
     int o0  = q0 + q2;

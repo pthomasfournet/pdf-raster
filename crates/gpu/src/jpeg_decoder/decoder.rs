@@ -40,6 +40,14 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
     pub fn decode(&self, jpeg_bytes: &[u8]) -> std::result::Result<DeviceImage<B>, JpegGpuError> {
         let prep = prepare_jpeg(jpeg_bytes)?;
 
+        // Validate component count before any allocation.
+        let nc = prep.components.len();
+        if nc != 1 && nc != 3 {
+            return Err(JpegGpuError::UnsupportedComponents(
+                u8::try_from(nc).unwrap_or(u8::MAX),
+            ));
+        }
+
         // Reject subsampled input: the IDCT kernel assumes 4:4:4 (all components
         // share the same 8×8 block grid). Non-unity sampling factors produce the
         // wrong chroma block layout and corrupt output silently.
@@ -53,17 +61,33 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
             }
         }
 
+        // Validate that quantisation tables are assigned in JFIF slot order
+        // (slot 0 = luma, slot 1 = chroma). The kernel hardcodes qt_sel=0 for
+        // the Y component and qt_sel=1 for Cb/Cr; a JPEG with reversed or
+        // non-standard table assignments would silently use the wrong tables.
+        for (ci, comp) in prep.components.iter().enumerate() {
+            let expected_slot = u8::from(ci != 0);
+            if comp.quant_selector > 1 {
+                return Err(JpegGpuError::HeaderParse(format!(
+                    "component {ci} references quantisation table slot {} (expected 0 or 1)",
+                    comp.quant_selector
+                )));
+            }
+            if comp.quant_selector != expected_slot && nc == 3 {
+                return Err(JpegGpuError::HeaderParse(format!(
+                    "component {ci} uses quantisation table slot {} but kernel expects slot \
+                     {expected_slot}; only JFIF-standard slot assignment (0=luma, 1=chroma) \
+                     is supported",
+                    comp.quant_selector
+                )));
+            }
+        }
+
         let (coef_flat, dc_flat, qt_flat, num_qtables) =
             extract_coefficients(&prep).map_err(JpegGpuError::HeaderParse)?;
 
         let width = u32::from(prep.width);
         let height = u32::from(prep.height);
-        let nc = prep.components.len();
-        if nc != 1 && nc != 3 {
-            return Err(JpegGpuError::UnsupportedComponents(
-                u8::try_from(nc).unwrap_or(u8::MAX),
-            ));
-        }
         #[expect(
             clippy::cast_possible_truncation,
             reason = "nc is 1 or 3 (checked above); trivially fits in u32"
@@ -106,13 +130,23 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
         let coef_bytes = std::mem::size_of_val(coefficients);
         let qt_bytes = std::mem::size_of_val(qtables);
         let dc_bytes = std::mem::size_of_val(dc_values);
-        let px_bytes = (width as usize) * (height as usize) * 4;
+        let px_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                JpegGpuError::Dispatch("image too large: width × height × 4 overflows".into())
+            })?;
 
         let coef_buf = DeviceBufferGuard::alloc(&self.backend, coef_bytes).map_err(be)?;
         let qt_buf = DeviceBufferGuard::alloc(&self.backend, qt_bytes).map_err(be)?;
         let dc_buf = DeviceBufferGuard::alloc(&self.backend, dc_bytes).map_err(be)?;
         let px_buf = DeviceBufferGuard::alloc_zeroed(&self.backend, px_bytes).map_err(be)?;
 
+        // Fences from upload_async are intentionally dropped: on CUDA, uploads
+        // enqueue on the same stream as the subsequent kernel launch, so stream
+        // ordering guarantees the data is visible before the kernel reads it.
+        // On Vulkan, the per-page recorder inserts the required cross-queue
+        // barriers between the transfer and compute queues.
         let _u1 = self
             .backend
             .upload_async(coef_buf.as_ref(), bytemuck::cast_slice(coefficients))
@@ -391,16 +425,28 @@ mod tests {
             zune_rgba.len(),
             "{label}: pixel buffer length mismatch"
         );
+        assert_eq!(
+            gpu_rgba.len() % 4,
+            0,
+            "{label}: buffer length not a multiple of 4"
+        );
         let mut peak = 0u8;
         let mut sum: u64 = 0;
-        for (&g, &r) in gpu_rgba.iter().zip(zune_rgba.iter()) {
-            let diff = g.abs_diff(r);
-            if diff > peak {
-                peak = diff;
+        let mut colour_count: u64 = 0;
+        // Compare only the three colour channels (R, G, B) per pixel.
+        // Alpha is unconditionally 0xFF on both sides; including it would
+        // inflate the sample count by 33% and deflate the mean error.
+        for (gp, rp) in gpu_rgba.chunks_exact(4).zip(zune_rgba.chunks_exact(4)) {
+            for (&g, &r) in gp[..3].iter().zip(rp[..3].iter()) {
+                let diff = g.abs_diff(r);
+                if diff > peak {
+                    peak = diff;
+                }
+                sum += u64::from(diff);
+                colour_count += 1;
             }
-            sum += u64::from(diff);
         }
-        let mean = sum as f64 / gpu_rgba.len() as f64;
+        let mean = sum as f64 / colour_count as f64;
         assert!(peak <= 1, "{label}: peak error {peak} > 1 LSB (IEEE 1180)");
         assert!(
             mean <= 0.02,
