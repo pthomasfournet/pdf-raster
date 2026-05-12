@@ -566,6 +566,22 @@ pub enum Phase4FailureKind {
     /// by ≥ 1 bit); kept as defense-in-depth for degenerate
     /// codebooks with zero-advance entries.
     Incomplete = 3,
+    /// JPEG-framed phases only: DC magnitude category > 11.
+    /// 8-bit baseline JPEG caps the DC bit-width at 11 per
+    /// ITU-T T.81 § F.1.2.1.1; a corrupt DC codebook can emit
+    /// 12..=255 and would direct the kernel to over-consume raw
+    /// bits.
+    BadDcCategory = 4,
+    /// JPEG-framed phases only: AC magnitude size > 10.
+    /// 8-bit baseline JPEG caps the AC bit-width at 10 per
+    /// ITU-T T.81 § F.1.2.2.1; a corrupt AC codebook (low nibble
+    /// of the symbol byte = 11..=15) would otherwise drive over-
+    /// consumption.
+    BadAcSize = 5,
+    /// JPEG-framed phases only: AC run+size or ZRL would advance
+    /// the per-block zig-zag cursor past slot 63 — spec-illegal,
+    /// catches adversarial Huffman tables.
+    AcOverflow = 6,
 }
 
 impl Phase4FailureKind {
@@ -574,10 +590,17 @@ impl Phase4FailureKind {
     /// recognise" is most safely treated as a degenerate failure.
     #[must_use]
     pub const fn from_u32(v: u32) -> Self {
+        // Unknown values fall through to `Incomplete` since "kernel
+        // produced a value the host doesn't recognise" is most safely
+        // treated as a degenerate failure rather than silently
+        // mapping to Ok or panicking.
         match v {
             0 => Self::Ok,
             1 => Self::PrefixMiss,
             2 => Self::LengthBits,
+            4 => Self::BadDcCategory,
+            5 => Self::BadAcSize,
+            6 => Self::AcOverflow,
             _ => Self::Incomplete,
         }
     }
@@ -590,6 +613,9 @@ impl Phase4FailureKind {
             Self::PrefixMiss => "PrefixMiss",
             Self::LengthBits => "LengthBits",
             Self::Incomplete => "Incomplete",
+            Self::BadDcCategory => "BadDcCategory",
+            Self::BadAcSize => "BadAcSize",
+            Self::AcOverflow => "AcOverflow",
         }
     }
 }
@@ -1138,14 +1164,24 @@ mod tests {
             Phase4FailureKind::from_u32(3),
             Phase4FailureKind::Incomplete
         );
+        assert_eq!(
+            Phase4FailureKind::from_u32(4),
+            Phase4FailureKind::BadDcCategory,
+        );
+        assert_eq!(Phase4FailureKind::from_u32(5), Phase4FailureKind::BadAcSize);
+        assert_eq!(
+            Phase4FailureKind::from_u32(6),
+            Phase4FailureKind::AcOverflow,
+        );
     }
 
     #[test]
     fn phase4_failure_kind_from_u32_maps_unknown_to_incomplete() {
         // Unknown values are most safely treated as a degenerate
         // failure rather than silently mapping to Ok or panicking.
+        // Smallest unknown is one past the last defined variant.
         assert_eq!(
-            Phase4FailureKind::from_u32(4),
+            Phase4FailureKind::from_u32(7),
             Phase4FailureKind::Incomplete
         );
         assert_eq!(
@@ -1165,13 +1201,17 @@ mod tests {
             Phase4FailureKind::PrefixMiss.label(),
             Phase4FailureKind::LengthBits.label(),
             Phase4FailureKind::Incomplete.label(),
+            Phase4FailureKind::BadDcCategory.label(),
+            Phase4FailureKind::BadAcSize.label(),
+            Phase4FailureKind::AcOverflow.label(),
         ];
+        let total = labels.len();
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(
             labels.len(),
-            4,
-            "labels must be unique for error formatting"
+            total,
+            "labels must be unique for error formatting",
         );
     }
 

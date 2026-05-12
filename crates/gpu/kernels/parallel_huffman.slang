@@ -69,6 +69,10 @@ static const uint DECODE_OK = 0u;
 static const uint DECODE_PREFIX_MISS = 1u;
 static const uint DECODE_LENGTH_BITS = 2u;
 static const uint DECODE_INCOMPLETE = 3u;
+// JPEG-framed kernels only — finer-grained failure modes.
+static const uint DECODE_BAD_DC_CATEGORY = 4u;
+static const uint DECODE_BAD_AC_SIZE = 5u;
+static const uint DECODE_AC_OVERFLOW = 6u;
 
 [[vk::push_constant]]
 cbuffer PushParams {
@@ -169,12 +173,12 @@ uint try_decode_one_jpeg_symbol_kernel(inout uint4 state, uint count_to, out uin
     // / corrupt run+size symbols.
     if (is_dc) {
         if (symbol > 11u) {
-            return DECODE_INCOMPLETE;
+            return DECODE_BAD_DC_CATEGORY;
         }
     } else {
         uint size_field = symbol & 0xFu;
         if (size_field > 10u) {
-            return DECODE_INCOMPLETE;
+            return DECODE_BAD_AC_SIZE;
         }
     }
     uint value_bits = symbol & 0x0Fu;
@@ -200,14 +204,14 @@ uint try_decode_one_jpeg_symbol_kernel(inout uint4 state, uint count_to, out uin
             // exceeds 64 is spec-illegal; refuse rather than wrap.
             uint next_w = state.w + 16u;
             if (next_w > 64u) {
-                return DECODE_INCOMPLETE;
+                return DECODE_AC_OVERFLOW;
             }
             state.w = next_w;
         } else {
             uint run = (symbol >> 4u) & 0xFu;
             uint next_w = state.w + run + 1u;
             if (next_w > 64u) {
-                return DECODE_INCOMPLETE;
+                return DECODE_AC_OVERFLOW;
             }
             state.w = next_w;
         }

@@ -35,6 +35,10 @@ __device__ __forceinline__ unsigned int peek16_kernel(
 #define DECODE_PREFIX_MISS   1u
 #define DECODE_LENGTH_BITS   2u
 #define DECODE_INCOMPLETE    3u
+// JPEG-framed kernels only — finer-grained failure modes.
+#define DECODE_BAD_DC_CATEGORY 4u
+#define DECODE_BAD_AC_SIZE     5u
+#define DECODE_AC_OVERFLOW     6u
 
 // Try to decode one Huffman symbol starting at `*p`, updating
 // `(*p, *n, *c, *z)` in place and writing the decoded symbol byte
@@ -350,4 +354,189 @@ extern "C" __global__ void phase2_inter_sync(
     updated.w = z;
     s_info[seq_idx] = updated;
     flags[seq_idx] = 0u;
+}
+
+// JPEG-framed helper: extract (dc_sel, ac_sel) from one packed
+// mcu_schedule entry.  Layout matches the Slang side exactly:
+//     bits 0..8   = component_idx  (unused on the kernel side)
+//     bits 8..16  = dc_sel
+//     bits 16..24 = ac_sel
+__device__ __forceinline__ void unpack_schedule_device(
+    const unsigned int* __restrict__ mcu_schedule,
+    unsigned int block_in_mcu,
+    unsigned int* dc_sel,
+    unsigned int* ac_sel
+) {
+    unsigned int packed = mcu_schedule[block_in_mcu];
+    *dc_sel = (packed >> 8u) & 0xFFu;
+    *ac_sel = (packed >> 16u) & 0xFFu;
+}
+
+// JPEG-framed counterpart of try_decode_one_symbol_device.
+//
+// State semantics:
+//   *p           = bit position in `bitstream`
+//   *n           = symbols emitted by this thread so far
+//   *block_in_mcu = 0 .. blocks_per_mcu - 1
+//   *z_in_block  = 0 .. 64 (inclusive end of block)
+//
+// One symbol per call. DC slot (z_in_block == 0) looks up in
+// `dc_codebook[dc_sel]`; AC slot looks up in `codebook[ac_sel]`.
+// EOB (0x00) sets z := 64; ZRL (0xF0) advances z by 16; run+size
+// advances z by run+1. Post-advance z > 64 is spec-illegal —
+// returns DECODE_AC_OVERFLOW. DC category > 11 returns
+// DECODE_BAD_DC_CATEGORY; AC size > 10 returns DECODE_BAD_AC_SIZE.
+//
+// When z_in_block reaches 64 the block rolls over modulo
+// blocks_per_mcu and z resets to 0.
+//
+// Mirrors `try_decode_one_jpeg_symbol_kernel` in the Slang file
+// byte-for-byte; a divergence between the two would surface as a
+// CUDA-vs-Vulkan output mismatch in B2d's end-to-end test.
+__device__ __forceinline__ unsigned int try_decode_one_jpeg_symbol_device(
+    const unsigned int* __restrict__ bitstream,
+    const unsigned int* __restrict__ codebook,
+    const unsigned int* __restrict__ dc_codebook,
+    const unsigned int* __restrict__ mcu_schedule,
+    unsigned int length_bits,
+    unsigned int blocks_per_mcu,
+    unsigned int count_to,
+    unsigned int* p,
+    unsigned int* n,
+    unsigned int* block_in_mcu,
+    unsigned int* z_in_block,
+    unsigned int* symbol_out
+) {
+    *symbol_out = 0u;
+    unsigned int dc_sel;
+    unsigned int ac_sel;
+    unpack_schedule_device(mcu_schedule, *block_in_mcu, &dc_sel, &ac_sel);
+
+    bool is_dc = (*z_in_block == 0u);
+    unsigned int table_base = (is_dc ? dc_sel : ac_sel) * CODEBOOK_ENTRIES;
+    unsigned int peek = peek16_kernel(bitstream, *p);
+    unsigned int entry = (is_dc ? dc_codebook[table_base + peek]
+                                : codebook[table_base + peek]);
+    unsigned int num_bits = (entry >> 8u) & 0xFFu;
+    if (num_bits == 0u) return DECODE_PREFIX_MISS;
+    unsigned int symbol = entry & 0xFFu;
+
+    // Spec caps on the magnitude size — mirror the Slang side.
+    if (is_dc) {
+        if (symbol > 11u) return DECODE_BAD_DC_CATEGORY;
+    } else {
+        unsigned int size_field = symbol & 0xFu;
+        if (size_field > 10u) return DECODE_BAD_AC_SIZE;
+    }
+    unsigned int value_bits = symbol & 0x0Fu;
+    unsigned int advance = num_bits + value_bits;
+    if (*p + advance > length_bits) return DECODE_LENGTH_BITS;
+
+    unsigned int count_this_one = (*p < count_to) ? 1u : 0u;
+    *p += advance;
+    *n += count_this_one;
+
+    if (is_dc) {
+        // DC: one symbol per block, transition to AC slot 1.
+        *z_in_block = 1u;
+    } else {
+        if (symbol == 0u) {
+            // EOB: rest of block implicitly zero.
+            *z_in_block = 64u;
+        } else if (symbol == 0xF0u) {
+            unsigned int next_w = *z_in_block + 16u;
+            if (next_w > 64u) return DECODE_AC_OVERFLOW;
+            *z_in_block = next_w;
+        } else {
+            unsigned int run = (symbol >> 4u) & 0xFu;
+            unsigned int next_w = *z_in_block + run + 1u;
+            if (next_w > 64u) return DECODE_AC_OVERFLOW;
+            *z_in_block = next_w;
+        }
+    }
+
+    // End-of-block: rotate block_in_mcu, reset z.
+    if (*z_in_block == 64u) {
+        *block_in_mcu = (*block_in_mcu + 1u) % blocks_per_mcu;
+        *z_in_block = 0u;
+    }
+
+    *symbol_out = symbol;
+    return DECODE_OK;
+}
+
+// JPEG-framed Phase 1 (intra-sequence sync).  Same shape as
+// `phase1_intra_sync` but uses the JPEG state machine.
+//
+// State semantics:
+//   state.x = p              (bit position)
+//   state.y = n              (per-thread symbol count)
+//   state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+//   state.w = z_in_block     (0 .. 64)
+extern "C" __global__ void jpeg_phase1_intra_sync(
+    const unsigned int* __restrict__ bitstream,
+    const unsigned int* __restrict__ codebook,
+    const unsigned int* __restrict__ dc_codebook,
+    const unsigned int* __restrict__ mcu_schedule,
+    uint4* __restrict__ s_info_out,
+    unsigned int length_bits,
+    unsigned int subsequence_bits,
+    unsigned int num_subsequences,
+    unsigned int blocks_per_mcu
+) {
+    unsigned int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+
+    unsigned int start_bit = seq_idx * subsequence_bits;
+    unsigned int sync_target = start_bit + 2u * subsequence_bits;
+    unsigned int hard_limit = min(length_bits, sync_target);
+    unsigned int subseq_end_bit = min(length_bits, start_bit + subsequence_bits);
+
+    unsigned int p = start_bit;
+    unsigned int n = 0u;
+    unsigned int block_in_mcu = 0u;
+    unsigned int z_in_block = 0u;
+
+    unsigned int snap_p = p;
+    unsigned int snap_n = n;
+    unsigned int snap_block = block_in_mcu;
+    unsigned int snap_z = z_in_block;
+    unsigned int snapshotted = 0u;
+
+    // Defensive max_iters mirrors the synthetic Phase 1.
+    unsigned int max_iters = ((hard_limit > start_bit) ? (hard_limit - start_bit) : 0u) + 1u;
+    unsigned int symbol_sink;
+    for (unsigned int iter = 0u; iter < max_iters; iter++) {
+        if (p >= hard_limit) break;
+        unsigned int p_before = p;
+        if (try_decode_one_jpeg_symbol_device(
+                bitstream, codebook, dc_codebook, mcu_schedule,
+                length_bits, blocks_per_mcu, subseq_end_bit,
+                &p, &n, &block_in_mcu, &z_in_block, &symbol_sink) != DECODE_OK) {
+            break;
+        }
+        if (snapshotted == 0u && p_before < subseq_end_bit && p >= subseq_end_bit) {
+            snap_p = p;
+            snap_n = n;
+            snap_block = block_in_mcu;
+            snap_z = z_in_block;
+            snapshotted = 1u;
+        }
+    }
+
+    if (snapshotted == 0u) {
+        snap_p = p;
+        snap_n = n;
+        snap_block = block_in_mcu;
+        snap_z = z_in_block;
+    }
+
+    uint4 out;
+    out.x = snap_p;
+    out.y = snap_n;
+    out.z = snap_block;
+    out.w = snap_z;
+    s_info_out[seq_idx] = out;
 }
