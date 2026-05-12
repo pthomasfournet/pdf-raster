@@ -4,6 +4,7 @@
 //! Per-page batching is recorded into a `PageRecorder`; see `page_recorder.rs`.
 
 mod page_recorder;
+mod transfer;
 
 use std::sync::Arc;
 
@@ -128,34 +129,28 @@ impl GpuBackend for CudaBackend {
         self.recorder.wait_page(fence)
     }
 
-    // Async transfer stubs.  CUDA's cache uses cudarc clone_htod /
-    // memcpy_dtoh directly today; trait-routed transfers wait for the
-    // dedicated copy-engine stream to land.  Each `unimplemented!`
-    // names the cudarc primitive callers should reach for instead.
-
-    fn upload_async(&self, _dst: &Self::DeviceBuffer, _src: &[u8]) -> Result<Self::PageFence> {
-        unimplemented!(
-            "CudaBackend::upload_async unimplemented; \
-             cache path uses cudarc `clone_htod` via gpu::cache"
-        )
+    fn upload_async(&self, dst: &Self::DeviceBuffer, src: &[u8]) -> Result<Self::PageFence> {
+        transfer::upload_async(&self.ctx, dst, src)
     }
 
     fn download_async<'a>(
         &self,
-        _src: &'a Self::DeviceBuffer,
-        _dst: &'a mut [u8],
+        src: &'a Self::DeviceBuffer,
+        dst: &'a mut [u8],
     ) -> Result<crate::backend::DownloadHandle<'a, Self>> {
-        unimplemented!(
-            "CudaBackend::download_async unimplemented; \
-             cache path uses cudarc `memcpy_dtoh` via gpu::cache"
-        )
+        let (inner, fence) = transfer::download_async(&self.ctx, src, dst)?;
+        Ok(crate::backend::DownloadHandle {
+            inner: Box::new(inner),
+            _borrow: std::marker::PhantomData,
+            fence,
+        })
     }
 
-    fn wait_download(&self, _handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
-        unimplemented!(
-            "CudaBackend::wait_download unimplemented; \
-             cache path syncs via the recorded `CudaEvent`"
-        )
+    fn wait_download(&self, mut handle: crate::backend::DownloadHandle<'_, Self>) -> Result<()> {
+        // CudaDownloadInner::finish disarms itself after the first
+        // successful wait; the post-return Drop calling finish() again
+        // is a no-op.
+        handle.inner.finish()
     }
 
     fn submit_transfer(&self) -> Result<Self::PageFence> {
