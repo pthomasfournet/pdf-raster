@@ -16,6 +16,7 @@ mod cpu_prepass;
 mod cpu_reference;
 mod dispatch_util;
 mod error;
+mod jpeg_framing;
 // huffman + phase1_oracle are test-only today (oracle-comparison
 // tests against the GPU dispatcher); promote when production
 // callers integrate the Phase 1 decode path. The huffman dispatcher
@@ -36,6 +37,7 @@ pub use codetable::{
 };
 pub use cpu_prepass::{JpegPreparedInput, prepare_jpeg};
 pub use error::JpegGpuError;
+pub use jpeg_framing::{JpegFramingError, decode_scan_symbols};
 pub use scan::dispatch_blelloch_scan;
 
 #[cfg(test)]
