@@ -31,6 +31,11 @@ use gpu::JpegQueueHandle;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
 
+// ── GPU parallel-Huffman JPEG path ───────────────────────────────────────────
+
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::backend::GpuBackend;
+
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
 #[cfg(feature = "gpu-icc")]
@@ -438,6 +443,9 @@ pub(super) fn decode_dct(
     pdf_h: u32,
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
+    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<
+        &mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>,
+    >,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
     #[cfg(feature = "cache")] cache_ctx: Option<&DctCacheCtx<'_>>,
@@ -515,9 +523,45 @@ pub(super) fn decode_dct(
         return Some(img);
     }
 
+    // ── GPU parallel-Huffman path ─────────────────────────────────────────────
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    if let Some(dec) = jpeg_gpu {
+        let area = pdf_w.saturating_mul(pdf_h);
+        if area >= super::GPU_JPEG_HUFFMAN_THRESHOLD_PX {
+            match dec.decode(data) {
+                Ok(img) => {
+                    let w = img.width;
+                    let h = img.height;
+                    let n = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+                    let mut rgba = vec![0u8; n];
+                    let downloaded = dec
+                        .backend()
+                        .download_async(&img.buffer, &mut rgba)
+                        .and_then(|fence| dec.backend().wait_download(fence));
+                    match downloaded {
+                        Ok(()) => {
+                            let rgb: Vec<u8> = rgba
+                                .chunks_exact(4)
+                                .flat_map(|px| [px[0], px[1], px[2]])
+                                .collect();
+                            return Some(ImageDescriptor {
+                                width: w,
+                                height: h,
+                                color_space: super::ImageColorSpace::Rgb,
+                                data: super::ImageData::Cpu(rgb),
+                                smask: None,
+                                filter: ImageFilter::Dct,
+                            });
+                        }
+                        Err(e) => log::debug!("GPU JPEG download failed: {e}"),
+                    }
+                }
+                Err(e) => log::debug!("GPU JPEG decode failed, falling back to CPU: {e}"),
+            }
+        }
+    }
+
     // ── CPU path ──────────────────────────────────────────────────────────────
-    // SOF peek gives us the component count with zero decoder overhead, removing
-    // the old header-only probe pass that preceded every full decode.
     let components = match jpeg_sof_components(data) {
         Some(n @ (1 | 3 | 4)) => n,
         Some(n) => {

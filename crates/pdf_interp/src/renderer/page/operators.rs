@@ -317,6 +317,8 @@ impl PageRenderer<'_> {
                     self.vaapi_jpeg_queue.as_ref(),
                     #[cfg(feature = "nvjpeg2k")]
                     self.nvjpeg2k.as_mut(),
+                    #[cfg(feature = "gpu-jpeg-huffman")]
+                    self.jpeg_gpu.as_mut(),
                     #[cfg(feature = "gpu-icc")]
                     self.gpu_ctx.as_deref(),
                     #[cfg(feature = "gpu-icc")]

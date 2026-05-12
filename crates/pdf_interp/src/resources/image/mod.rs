@@ -59,6 +59,13 @@ use gpu::nvjpeg2k::NvJpeg2kDecoder;
 #[cfg(feature = "vaapi")]
 use gpu::JpegQueueHandle;
 
+// ── GPU parallel-Huffman JPEG decoder ────────────────────────────────────────
+
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::backend::cuda::CudaBackend;
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::jpeg_decoder::JpegGpuDecoder;
+
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
 #[cfg(feature = "gpu-icc")]
@@ -105,6 +112,13 @@ pub use icc::IccClutCache;
 /// corpus 10, validating the original threshold for JPEG 2000.
 #[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub const GPU_JPEG_THRESHOLD_PX: u32 = u32::MAX;
+
+/// Minimum pixel area (width × height) for GPU parallel-Huffman JPEG decode.
+///
+/// Only 4:4:4 baseline JPEGs with 1 or 3 components are eligible.
+/// Images below this threshold always use the CPU path.
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub const GPU_JPEG_HUFFMAN_THRESHOLD_PX: u32 = 65_536;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
 ///
@@ -367,6 +381,7 @@ pub fn resolve_image(
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
+    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<&mut JpegGpuDecoder<CudaBackend>>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
     #[cfg(feature = "cache")] image_cache: Option<&std::sync::Arc<gpu::cache::DeviceImageCache>>,
@@ -445,6 +460,8 @@ pub fn resolve_image(
                 gpu,
                 #[cfg(feature = "vaapi")]
                 vaapi,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                jpeg_gpu,
                 #[cfg(feature = "gpu-icc")]
                 gpu_ctx,
                 #[cfg(feature = "gpu-icc")]

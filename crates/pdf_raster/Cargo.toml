@@ -39,6 +39,8 @@ cache = ["dep:gpu", "gpu/cache", "pdf_interp/cache"]
 # is CUDA-only today); the renderer falls back to per-page-uncached
 # JPEG decode.
 vulkan = ["dep:gpu", "gpu/vulkan", "pdf_interp/vulkan"]
+# GPU parallel-Huffman JPEG decoder.  Requires CUDA 12 and a NVIDIA GPU.
+gpu-jpeg-huffman = ["dep:gpu", "gpu/gpu-jpeg-huffman", "pdf_interp/gpu-jpeg-huffman"]
 # Enable GPU vs CPU parity tests (requires a CUDA device at test time).
 gpu-validation = ["gpu/gpu-validation"]
 # Build FreeType from source (cross-compilation, static builds).

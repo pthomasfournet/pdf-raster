@@ -21,6 +21,11 @@ use gpu::nvjpeg2k::NvJpeg2kDecoder;
 #[cfg(feature = "vaapi")]
 use gpu::JpegQueueHandle;
 
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::backend::cuda::CudaBackend;
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::jpeg_decoder::JpegGpuDecoder;
+
 #[cfg(feature = "gpu-icc")]
 use gpu::GpuCtx;
 
@@ -76,6 +81,7 @@ pub fn decode_inline_image(
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
+    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<&mut JpegGpuDecoder<CudaBackend>>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {
@@ -147,6 +153,8 @@ pub fn decode_inline_image(
                 gpu,
                 #[cfg(feature = "vaapi")]
                 vaapi,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                jpeg_gpu,
                 #[cfg(feature = "gpu-icc")]
                 gpu_ctx,
                 #[cfg(feature = "gpu-icc")]
@@ -532,6 +540,8 @@ mod tests {
             None,
             #[cfg(feature = "nvjpeg2k")]
             None,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            None,
             #[cfg(feature = "gpu-icc")]
             None,
             #[cfg(feature = "gpu-icc")]
@@ -561,6 +571,8 @@ mod tests {
             None,
             #[cfg(feature = "nvjpeg2k")]
             None,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            None,
             #[cfg(feature = "gpu-icc")]
             None,
             #[cfg(feature = "gpu-icc")]
@@ -589,6 +601,8 @@ mod tests {
                 None,
                 #[cfg(feature = "nvjpeg2k")]
                 None,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                None,
                 #[cfg(feature = "gpu-icc")]
                 None,
                 #[cfg(feature = "gpu-icc")]
@@ -613,6 +627,8 @@ mod tests {
                 #[cfg(feature = "vaapi")]
                 None,
                 #[cfg(feature = "nvjpeg2k")]
+                None,
+                #[cfg(feature = "gpu-jpeg-huffman")]
                 None,
                 #[cfg(feature = "gpu-icc")]
                 None,

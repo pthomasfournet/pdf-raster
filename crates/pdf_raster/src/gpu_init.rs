@@ -12,9 +12,9 @@
 //! `vaInitialize`) which are not safe to call concurrently.  It is also used by
 //! `crate::decode_queue::build_vaapi_queue`.
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman"))]
 use crate::BackendPolicy;
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman"))]
 use std::cell::RefCell;
 
 // ── Three-state decoder slot ──────────────────────────────────────────────────
@@ -31,7 +31,12 @@ pub enum DecoderInit<T> {
 // nvjpegCreateEx races if called concurrently; vaInitialize is serialised through
 // this lock too (used by crate::decode_queue::build_vaapi_queue).
 // Only held during construction, never during render.
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
+#[cfg(any(
+    feature = "nvjpeg",
+    feature = "nvjpeg2k",
+    feature = "vaapi",
+    feature = "gpu-jpeg-huffman",
+))]
 pub static DECODER_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Thread-local decoder slots ────────────────────────────────────────────────
@@ -153,4 +158,45 @@ pub fn release_nvjpeg2k_this_thread() {
     NVJPEG2K_DEC.with(|cell| {
         *cell.borrow_mut() = DecoderInit::Uninitialised;
     });
+}
+
+// ── GPU parallel-Huffman JPEG decoder ─────────────────────────────────────────
+
+#[cfg(feature = "gpu-jpeg-huffman")]
+thread_local! {
+    pub static JPEG_GPU_DEC: RefCell<Option<gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>> =
+        const { RefCell::new(None) };
+}
+
+/// Initialise this thread's GPU parallel-Huffman JPEG decoder if not already done.
+///
+/// Errors are non-fatal when `policy` is `Auto`; the decoder slot stays `None`
+/// and the CPU path is used instead.
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub fn ensure_jpeg_gpu_huffman(policy: BackendPolicy) -> Result<(), String> {
+    JPEG_GPU_DEC.with(|cell| {
+        if cell.borrow().is_some() {
+            return Ok(());
+        }
+        let guard = DECODER_INIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = gpu::backend::cuda::CudaBackend::new();
+        drop(guard);
+        match result {
+            Ok(backend) => {
+                *cell.borrow_mut() = Some(gpu::jpeg_decoder::JpegGpuDecoder::new(backend));
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("pdf_raster: GPU JPEG decoder unavailable ({e})");
+                if matches!(policy, BackendPolicy::ForceCuda) {
+                    Err(msg)
+                } else {
+                    log::info!("{msg}; JPEG images will be decoded on CPU for this thread");
+                    Ok(())
+                }
+            }
+        }
+    })
 }

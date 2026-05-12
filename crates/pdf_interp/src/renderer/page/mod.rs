@@ -81,10 +81,14 @@ use crate::resources::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageRes
 use gpu::GpuCtx;
 #[cfg(feature = "vaapi")]
 use gpu::JpegQueueHandle;
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::backend::cuda::CudaBackend;
 #[cfg(feature = "vulkan")]
 use gpu::backend::vulkan::VulkanBackend;
 #[cfg(feature = "cache")]
 use gpu::cache::{DeviceImageCache, DevicePageBuffer, DocId};
+#[cfg(feature = "gpu-jpeg-huffman")]
+use gpu::jpeg_decoder::JpegGpuDecoder;
 #[cfg(feature = "nvjpeg")]
 use gpu::nvjpeg::NvJpegDecoder;
 #[cfg(feature = "nvjpeg2k")]
@@ -233,6 +237,10 @@ pub struct PageRenderer<'doc> {
     /// Non-OCG `BDC`/`EMC` pairs do not touch this stack (they are `MarkedContent`
     /// no-ops).  Content is skipped whenever any entry is `false`.
     ocg_stack: Vec<bool>,
+    /// GPU parallel-Huffman JPEG decoder, present when the `gpu-jpeg-huffman`
+    /// feature is enabled.  `None` means the path is inactive.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    jpeg_gpu: Option<JpegGpuDecoder<CudaBackend>>,
     /// GPU-accelerated JPEG decoder, present when the `nvjpeg` feature is enabled
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
@@ -385,6 +393,8 @@ impl<'doc> PageRenderer<'doc> {
             diag: PageDiagnostics::default(),
             filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            jpeg_gpu: None,
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
             #[cfg(feature = "vaapi")]
@@ -405,6 +415,18 @@ impl<'doc> PageRenderer<'doc> {
     /// Attach a GPU JPEG decoder to this renderer.
     ///
     /// When set, `DCTDecode` image streams with pixel area ≥
+    /// Attach a GPU parallel-Huffman JPEG decoder to this renderer.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub fn set_jpeg_gpu(&mut self, dec: Option<JpegGpuDecoder<CudaBackend>>) {
+        self.jpeg_gpu = dec;
+    }
+
+    /// Detach and return the GPU parallel-Huffman JPEG decoder for reuse.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub const fn take_jpeg_gpu(&mut self) -> Option<JpegGpuDecoder<CudaBackend>> {
+        self.jpeg_gpu.take()
+    }
+
     /// [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are decoded on the
     /// GPU via nvJPEG rather than the CPU JPEG decoder.
     ///
@@ -956,6 +978,8 @@ impl<'doc> PageRenderer<'doc> {
             self.vaapi_jpeg_queue.as_ref(),
             #[cfg(feature = "nvjpeg2k")]
             self.nvjpeg2k.as_mut(),
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            self.jpeg_gpu.as_mut(),
             #[cfg(feature = "gpu-icc")]
             self.gpu_ctx.as_deref(),
             #[cfg(feature = "gpu-icc")]

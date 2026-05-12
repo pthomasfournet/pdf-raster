@@ -35,6 +35,8 @@ vaapi      = ["pdf_raster/vaapi"]
 cache      = ["pdf_raster/cache"]
 # Vulkan compute backend (Phase 10).  Adds `--backend vulkan` to the CLI.
 vulkan     = ["pdf_raster/vulkan"]
+# GPU parallel-Huffman JPEG decoder.
+gpu-jpeg-huffman = ["pdf_raster/gpu-jpeg-huffman"]
 
 [dependencies]
 pdf_raster  = { path = "../pdf_raster" }

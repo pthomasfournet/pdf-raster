@@ -343,6 +343,8 @@ fn decode_one(doc: &Document, doc_id: DocId, cache: &Arc<DeviceImageCache>, job:
         None,
         #[cfg(feature = "nvjpeg2k")]
         None,
+        #[cfg(feature = "gpu-jpeg-huffman")]
+        None,
         #[cfg(feature = "gpu-icc")]
         None,
         #[cfg(feature = "gpu-icc")]

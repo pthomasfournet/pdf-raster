@@ -5,7 +5,7 @@ use std::sync::Arc;
 use color::{Gray8, Rgb8};
 use raster::Bitmap;
 
-#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k"))]
+#[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman"))]
 use crate::gpu_init;
 use crate::{BackendPolicy, PageSet, RasterOptions, RenderedPage, SessionConfig};
 
@@ -643,14 +643,19 @@ fn render_page_rgb_with_geom(
 /// On `CpuOnly` this is a no-op.  On `ForceCuda`/`ForceVaapi` init failure is
 /// returned as `RasterError::BackendUnavailable` rather than silently falling back.
 #[cfg_attr(
-    not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman")),
     expect(
         clippy::unnecessary_wraps,
-        reason = "Result<()> only carries an error from the nvjpeg/nvjpeg2k init paths"
+        reason = "Result<()> only carries an error from the GPU-decoder init paths"
     )
 )]
 #[cfg_attr(
-    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")),
+    not(any(
+        feature = "nvjpeg",
+        feature = "nvjpeg2k",
+        feature = "vaapi",
+        feature = "gpu-jpeg-huffman"
+    )),
     expect(
         clippy::missing_const_for_fn,
         reason = "body collapses to a single match when no GPU-decoder feature is on"
@@ -664,14 +669,24 @@ fn lend_decoders(
     if matches!(effective_policy, BackendPolicy::CpuOnly) {
         return Ok(());
     }
-    // `session` and `renderer` are used inside `#[cfg]`-gated blocks below.
-    // `session` is only read on the vaapi path; `renderer` only on the
-    // nvjpeg/nvjpeg2k/vaapi paths. Suppress the unused-variable warning when
-    // the relevant feature is off.
     #[cfg(not(feature = "vaapi"))]
     let _ = session;
-    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi")))]
+    #[cfg(not(any(
+        feature = "nvjpeg",
+        feature = "nvjpeg2k",
+        feature = "vaapi",
+        feature = "gpu-jpeg-huffman"
+    )))]
     let _ = renderer;
+
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
+        gpu_init::ensure_jpeg_gpu_huffman(effective_policy)
+            .map_err(RasterError::BackendUnavailable)?;
+        gpu_init::JPEG_GPU_DEC.with(|cell| {
+            renderer.set_jpeg_gpu(cell.borrow_mut().take());
+        });
+    }
 
     #[cfg(feature = "nvjpeg")]
     if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
@@ -707,15 +722,19 @@ fn lend_decoders(
 /// is simply dropped with the renderer — no reclaim step is needed.  The
 /// `Arc<DecodeQueue>` in `RasterSession` keeps the worker alive across pages.
 #[cfg_attr(
-    not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
+    not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman")),
     expect(
         clippy::missing_const_for_fn,
         reason = "non-const only in GPU-decoder builds"
     )
 )]
 fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
-    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k")))]
+    #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman")))]
     let _ = renderer;
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    gpu_init::JPEG_GPU_DEC.with(|cell| {
+        *cell.borrow_mut() = renderer.take_jpeg_gpu();
+    });
     #[cfg(feature = "nvjpeg")]
     gpu_init::NVJPEG_DEC.with(|cell| {
         if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {

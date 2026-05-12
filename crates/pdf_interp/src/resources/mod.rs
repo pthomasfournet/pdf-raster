@@ -331,6 +331,9 @@ impl<'doc> PageResources<'doc> {
         #[cfg(feature = "nvjpeg")] gpu: Option<&mut gpu::nvjpeg::NvJpegDecoder>,
         #[cfg(feature = "vaapi")] vaapi: Option<&gpu::JpegQueueHandle>,
         #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut gpu::nvjpeg2k::NvJpeg2kDecoder>,
+        #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<
+            &mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>,
+        >,
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
         #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut image::IccClutCache>,
         #[cfg(feature = "cache")] image_cache: Option<
@@ -349,6 +352,8 @@ impl<'doc> PageResources<'doc> {
             vaapi,
             #[cfg(feature = "nvjpeg2k")]
             gpu_j2k,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            jpeg_gpu,
             #[cfg(feature = "gpu-icc")]
             gpu_ctx,
             #[cfg(feature = "gpu-icc")]
