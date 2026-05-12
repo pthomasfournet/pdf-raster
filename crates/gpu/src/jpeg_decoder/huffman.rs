@@ -250,6 +250,32 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
     Ok((s_info_out, outcome))
 }
 
+/// Phase 3: exclusive prefix-sum of per-subsequence symbol counts.
+///
+/// Each subsequence's `.n` (symbols decoded between its `start_bit`
+/// and the next subsequence's sync point) feeds an exclusive scan;
+/// the result is the per-subsequence base offset into the final
+/// coefficient stream — i.e., where Phase 4 should write the symbols
+/// it re-decodes from that subsequence.
+///
+/// Thin wrapper over `scan::dispatch_blelloch_scan` — the heavy
+/// lifting is already in place.
+///
+/// Empty input returns `Ok(Vec::new())`.
+///
+/// # Errors
+/// Returns the underlying `BackendError` from
+/// `dispatch_blelloch_scan` if any allocation, upload, dispatch, or
+/// download fails.
+#[cfg(feature = "gpu-validation")]
+fn dispatch_phase3_offsets<B: GpuBackend>(
+    backend: &B,
+    s_info: &[SubsequenceState],
+) -> Result<Vec<u32>> {
+    let counts: Vec<u32> = s_info.iter().map(|s| s.n).collect();
+    crate::jpeg_decoder::scan::dispatch_blelloch_scan(backend, &counts)
+}
+
 #[cfg(all(test, feature = "gpu-validation"))]
 mod tests {
     use super::*;
@@ -411,6 +437,92 @@ mod tests {
 
         assert_eq!(gpu_s_info, cpu_s_info);
     }
+
+    /// Phase 3 dispatcher: exclusive-scan over `s_info[i].n` produces
+    /// write offsets that match the CPU exclusive-scan reference.
+    /// The pre-synced stream means every subseq's `n` equals its
+    /// subsequence-bit / codeword-length ratio, but the test asserts
+    /// the scan property, not the specific count values.
+    #[test]
+    fn phase3_offsets_match_exclusive_scan_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let stream = book4_stream(&[0x00; 1024]);
+        let book = [book4_codebook()];
+        let (s_info, _outcome) =
+            dispatch_phase1_then_phase2(&b, &stream, &book, 128).expect("phase1+2");
+        let offsets = dispatch_phase3_offsets(&b, &s_info).expect("phase3");
+
+        assert_eq!(offsets.len(), s_info.len());
+        assert_eq!(offsets[0], 0, "exclusive scan starts at 0");
+        for i in 1..offsets.len() {
+            assert_eq!(
+                offsets[i],
+                offsets[i - 1] + s_info[i - 1].n,
+                "offset[{i}] = offset[{}] + n[{}]",
+                i - 1,
+                i - 1
+            );
+        }
+    }
+
+    /// Phase 3 with a single subsequence: scan returns `[0]`.
+    #[test]
+    fn phase3_single_subsequence_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        // 100 symbols of length 2 = 200 bits in one 256-bit subseq.
+        let stream = book4_stream(&[0x00; 100]);
+        let book = [book4_codebook()];
+        let (s_info, _outcome) =
+            dispatch_phase1_then_phase2(&b, &stream, &book, 256).expect("phase1+2");
+        assert_eq!(s_info.len(), 1);
+        let offsets = dispatch_phase3_offsets(&b, &s_info).expect("phase3");
+        assert_eq!(offsets, vec![0]);
+    }
+
+    /// Phase 3 with empty input is a no-op — Vec::new() round-trip.
+    #[test]
+    fn phase3_empty_input_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let offsets = dispatch_phase3_offsets(&b, &[]).expect("phase3 empty");
+        assert!(offsets.is_empty());
+    }
+
+    /// Phase 3 over Phase 2's `s_info` matches a host-side scan of
+    /// the same `.n` values. This is the contract Phase 3 must
+    /// guarantee — converting the *meaning* of `.n` to "symbols in
+    /// this subseq's own region" is Phase 4's job (re-decode pass).
+    #[test]
+    fn phase3_matches_cpu_exclusive_scan_mixed_cuda() {
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let symbols: Vec<u8> = (0..1000u32).map(|i| (i % 4) as u8).collect();
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        let (s_info, _outcome) =
+            dispatch_phase1_then_phase2(&b, &stream, &book, 128).expect("phase1+2");
+
+        let counts: Vec<u32> = s_info.iter().map(|s| s.n).collect();
+        let mut cpu_off = Vec::with_capacity(counts.len());
+        let mut acc = 0u32;
+        for c in &counts {
+            cpu_off.push(acc);
+            acc = acc.wrapping_add(*c);
+        }
+
+        let gpu_off = dispatch_phase3_offsets(&b, &s_info).expect("phase3");
+        assert_eq!(gpu_off, cpu_off);
+    }
 }
 
 #[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
@@ -547,5 +659,39 @@ mod vulkan_tests {
         assert_eq!(cuda_o, vk_o, "outcome mismatch");
         assert_eq!(cuda_s, vk_s, "s_info mismatch");
         assert_eq!(cuda_o, Phase2Outcome::Converged { iterations: 0 });
+    }
+
+    /// Phase 3 dispatcher: same input through both backends yields
+    /// byte-identical offset vectors, and both match the CPU
+    /// exclusive-scan reference.
+    #[test]
+    fn phase3_offsets_cuda_vs_vulkan() {
+        let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+            eprintln!("skipping: need both CUDA and Vulkan");
+            return;
+        };
+        // Mixed symbols to get a non-trivial `n` distribution.
+        let symbols: Vec<u8> = (0..1000u32).map(|i| (i % 4) as u8).collect();
+        let stream = book4_stream(&symbols);
+        let book = [book4_codebook()];
+        let (cuda_s, _) =
+            dispatch_phase1_then_phase2(&cuda, &stream, &book, 128).expect("cuda phase1+2");
+        let (vk_s, _) =
+            dispatch_phase1_then_phase2(&vk, &stream, &book, 128).expect("vulkan phase1+2");
+        let cuda_off = dispatch_phase3_offsets(&cuda, &cuda_s).expect("cuda phase3");
+        let vk_off = dispatch_phase3_offsets(&vk, &vk_s).expect("vulkan phase3");
+
+        // CPU exclusive-scan reference over the (already-agreed) `n`s.
+        let counts: Vec<u32> = cuda_s.iter().map(|s| s.n).collect();
+        let mut cpu_off = Vec::with_capacity(counts.len());
+        let mut acc = 0u32;
+        for c in &counts {
+            cpu_off.push(acc);
+            acc = acc.wrapping_add(*c);
+        }
+
+        assert_eq!(cuda_off, cpu_off, "CUDA diverges from CPU oracle");
+        assert_eq!(vk_off, cpu_off, "Vulkan diverges from CPU oracle");
+        assert_eq!(cuda_off, vk_off, "CUDA and Vulkan disagree");
     }
 }
