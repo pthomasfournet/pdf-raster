@@ -27,15 +27,25 @@ use crate::jpeg_decoder::{JpegGpuError, PackedBitstream, pack_be_words};
 /// Owns everything the GPU pipeline needs so the original JPEG byte slice
 /// can be released as soon as `prepare_jpeg` returns. Codebooks are kept
 /// selector-indexed (matching the JPEG wire format) rather than
-/// per-component, because YCbCr commonly shares one AC table across both
-/// chroma channels. Use [`Self::ac_codebooks_for_dispatch`] to materialise
-/// the per-component reference slice the parallel-Huffman dispatcher
-/// accepts without copying the 128 KB tables.
+/// per-component, because YCbCr commonly shares one AC or DC table across
+/// both chroma channels. Use [`Self::ac_codebooks_for_dispatch`] (or the
+/// DC counterpart) to materialise the per-component reference slice the
+/// parallel-Huffman dispatcher accepts without copying the 128 KB tables.
 #[derive(Debug)]
 pub struct JpegPreparedInput {
     /// Entropy-coded segment packed for the kernel: big-endian 32-bit
     /// words, exact `length_bits` count.
     pub bitstream: PackedBitstream,
+    /// DC Huffman codebooks indexed by table ID 0..=3.  Only slots the
+    /// scan actually references are populated.  The CPU pre-pass already
+    /// resolves the absolute DC values (see [`Self::dc_values`]); the GPU
+    /// walker carries DC codebooks only so it can step *past* each
+    /// block's DC symbol when consuming the wire bitstream.
+    pub dc_codebooks: [Option<CanonicalCodebook>; 4],
+    /// DC selector for each active scan component, in scan order.  Length
+    /// equals `components.len()`.  Each entry is an index into
+    /// [`Self::dc_codebooks`].
+    pub dc_selectors: Vec<u8>,
     /// AC Huffman codebooks indexed by table ID 0..=3.  Only slots the
     /// scan actually references are populated.
     pub ac_codebooks: [Option<CanonicalCodebook>; 4],
@@ -77,15 +87,37 @@ impl JpegPreparedInput {
     /// hand-mutated after `prepare_jpeg` returned.
     #[must_use]
     pub fn ac_codebooks_for_dispatch(&self) -> Vec<&CanonicalCodebook> {
-        self.ac_selectors
-            .iter()
-            .map(|&sel| {
-                self.ac_codebooks[usize::from(sel)]
-                    .as_ref()
-                    .expect("AC selector populated at prepare_jpeg time")
-            })
-            .collect()
+        materialise_codebook_slice(&self.ac_codebooks, &self.ac_selectors, "AC")
     }
+
+    /// Materialise the per-component DC codebook references for the
+    /// kernel's DC-skip walker.  Same shape as
+    /// [`Self::ac_codebooks_for_dispatch`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `dc_selectors` entry points at an empty slot in
+    /// [`Self::dc_codebooks`].  `prepare_jpeg` enforces population at
+    /// construction time.
+    #[must_use]
+    pub fn dc_codebooks_for_dispatch(&self) -> Vec<&CanonicalCodebook> {
+        materialise_codebook_slice(&self.dc_codebooks, &self.dc_selectors, "DC")
+    }
+}
+
+fn materialise_codebook_slice<'a>(
+    codebooks: &'a [Option<CanonicalCodebook>; 4],
+    selectors: &[u8],
+    class_label: &'static str,
+) -> Vec<&'a CanonicalCodebook> {
+    selectors
+        .iter()
+        .map(|&sel| {
+            codebooks[usize::from(sel)].as_ref().unwrap_or_else(|| {
+                panic!("{class_label} selector {sel} populated at prepare_jpeg time")
+            })
+        })
+        .collect()
 }
 
 /// Run the CPU pre-pass and lift its output into the on-GPU input shape.
@@ -114,7 +146,8 @@ pub fn prepare_jpeg(jpeg_bytes: &[u8]) -> Result<JpegPreparedInput, JpegGpuError
         return Err(JpegGpuError::UnsupportedComponents(prep.components));
     }
 
-    let ac_selectors = collect_ac_selectors(&prep)?;
+    let dc_selectors = collect_scan_selectors(&prep, ScanClass::Dc)?;
+    let ac_selectors = collect_scan_selectors(&prep, ScanClass::Ac)?;
     let bitstream = pack_unstuffed_bitstream(&prep.unstuffed);
     let components = prep.active_frame_components().to_vec();
 
@@ -122,6 +155,7 @@ pub fn prepare_jpeg(jpeg_bytes: &[u8]) -> Result<JpegPreparedInput, JpegGpuError
         width,
         height,
         quant_tables,
+        dc_codebooks,
         ac_codebooks,
         scan,
         restart_interval,
@@ -131,6 +165,8 @@ pub fn prepare_jpeg(jpeg_bytes: &[u8]) -> Result<JpegPreparedInput, JpegGpuError
 
     Ok(JpegPreparedInput {
         bitstream,
+        dc_codebooks,
+        dc_selectors,
         ac_codebooks,
         ac_selectors,
         dc_values,
@@ -157,25 +193,49 @@ fn pack_unstuffed_bitstream(unstuffed: &[u8]) -> PackedBitstream {
     pack_be_words(unstuffed, length_bits)
 }
 
-/// Collect the AC selector each scan component references, checking that
-/// the prepass actually built a codebook for it.  The returned vector has
-/// the same length as the active scan components.
+#[derive(Clone, Copy)]
+enum ScanClass {
+    Dc,
+    Ac,
+}
+
+impl ScanClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dc => "DC",
+            Self::Ac => "AC",
+        }
+    }
+}
+
+/// Collect the DC or AC selector each scan component references, checking
+/// that the prepass actually built a codebook for it.  The returned vector
+/// has the same length as the active scan components.
 ///
 /// The CPU pre-pass should never let an unreferenced selector slip into
 /// the scan header (`CpuPrepassError::MissingHuffmanTable` is returned
 /// earlier), so the typed error here is defensive — it surfaces an
 /// invariant violation rather than panicking.
-fn collect_ac_selectors(prep: &CpuPrepassOutput) -> Result<Vec<u8>, JpegGpuError> {
+fn collect_scan_selectors(
+    prep: &CpuPrepassOutput,
+    class: ScanClass,
+) -> Result<Vec<u8>, JpegGpuError> {
     let count = usize::from(prep.scan.component_count);
     let mut out = Vec::with_capacity(count);
     for sc in &prep.scan.components[..count] {
-        if prep.ac_codebooks[usize::from(sc.ac_table)].is_none() {
+        let (selector, codebooks) = match class {
+            ScanClass::Dc => (sc.dc_table, &prep.dc_codebooks),
+            ScanClass::Ac => (sc.ac_table, &prep.ac_codebooks),
+        };
+        if codebooks[usize::from(selector)].is_none() {
             return Err(JpegGpuError::InvalidHuffmanTables(format!(
-                "scan component id={} references AC selector {} but no codebook was built",
-                sc.id, sc.ac_table,
+                "scan component id={} references {} selector {} but no codebook was built",
+                sc.id,
+                class.label(),
+                selector,
             )));
         }
-        out.push(sc.ac_table);
+        out.push(selector);
     }
     Ok(out)
 }
@@ -192,14 +252,17 @@ mod tests {
         assert_eq!(prep.width, 16);
         assert_eq!(prep.height, 16);
         assert_eq!(prep.components.len(), 1);
-        // Grayscale scan references one AC selector; the dispatch slice is
-        // length-1.
+        // Grayscale scan references one AC + one DC selector; each
+        // dispatch slice is length-1.
         assert_eq!(prep.ac_selectors.len(), 1);
+        assert_eq!(prep.dc_selectors.len(), 1);
         assert_eq!(prep.ac_codebooks_for_dispatch().len(), 1);
-        // The referenced selector slot is populated; unused selectors are
-        // None.  The fixture references selector 0 (confirmed by the
-        // CPU pre-pass's own grayscale test).
+        assert_eq!(prep.dc_codebooks_for_dispatch().len(), 1);
+        // Referenced selector slots are populated; unused selectors are
+        // None.  The fixture references selector 0 on both classes
+        // (confirmed by the CPU pre-pass's own grayscale test).
         assert!(prep.ac_codebooks[usize::from(prep.ac_selectors[0])].is_some());
+        assert!(prep.dc_codebooks[usize::from(prep.dc_selectors[0])].is_some());
         // DC values for the single component are populated.
         assert_eq!(prep.dc_values.per_component.len(), 1);
         assert!(!prep.dc_values.per_component[0].is_empty());
@@ -234,26 +297,54 @@ mod tests {
     }
 
     #[test]
-    fn ac_selectors_match_scan_header_in_order() {
+    fn selectors_match_scan_header_in_order_for_both_classes() {
         // Selectors flatten in scan-component order; the dispatch slice
         // dereferences to the same logical codebook as the source array.
+        // Verify for both DC and AC.
         let prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
         let raw = run_cpu_prepass(GRAY_16X16_JPEG).unwrap();
         let scan_components = &raw.scan.components[..usize::from(raw.scan.component_count)];
+
         assert_eq!(prep.ac_selectors.len(), scan_components.len());
-        let dispatch = prep.ac_codebooks_for_dispatch();
+        assert_eq!(prep.dc_selectors.len(), scan_components.len());
+        check_dispatch_slice(
+            &prep.ac_selectors,
+            &prep.ac_codebooks_for_dispatch(),
+            &raw.ac_codebooks,
+            scan_components,
+            "AC",
+            |sc| sc.ac_table,
+        );
+        check_dispatch_slice(
+            &prep.dc_selectors,
+            &prep.dc_codebooks_for_dispatch(),
+            &raw.dc_codebooks,
+            scan_components,
+            "DC",
+            |sc| sc.dc_table,
+        );
+    }
+
+    fn check_dispatch_slice(
+        prep_selectors: &[u8],
+        dispatch: &[&CanonicalCodebook],
+        source_codebooks: &[Option<CanonicalCodebook>; 4],
+        scan_components: &[crate::jpeg::headers::JpegScanComponent],
+        class_label: &'static str,
+        selector_of: impl Fn(&crate::jpeg::headers::JpegScanComponent) -> u8,
+    ) {
         for (i, sc) in scan_components.iter().enumerate() {
-            assert_eq!(prep.ac_selectors[i], sc.ac_table);
-            let expected = raw.ac_codebooks[usize::from(sc.ac_table)].as_ref().unwrap();
+            let selector = selector_of(sc);
+            assert_eq!(prep_selectors[i], selector);
             // CanonicalCodebook has no PartialEq; compare packed tables —
             // a deterministic function of the DHT, so byte equality is
             // a sound oracle.
+            let expected = source_codebooks[usize::from(selector)].as_ref().unwrap();
             assert_eq!(
                 dispatch[i].table(),
                 expected.table(),
-                "dispatch slot {i} (id={}, ac_table={}) resolved to wrong codebook",
+                "{class_label} dispatch slot {i} (id={}, selector={selector}) wrong",
                 sc.id,
-                sc.ac_table,
             );
         }
     }

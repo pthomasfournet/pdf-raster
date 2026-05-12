@@ -45,6 +45,12 @@ pub struct CpuPrepassOutput {
     /// Quantisation tables, indexed by table ID 0..=3.  `None` slots were
     /// never loaded from a DQT segment.
     pub quant_tables: [Option<super::headers::JpegQuantTable>; 4],
+    /// Canonical Huffman lookup tables for DC decoding.  Indexed by `table_id`
+    /// (0..=1 in baseline JPEG); only entries referenced by the scan are
+    /// present.  Retained for the on-GPU bitstream walker, which has to step
+    /// past each block's DC symbol before consuming the 63 AC symbols — the
+    /// absolute DC values themselves live in [`Self::dc_values`].
+    pub dc_codebooks: [Option<CanonicalCodebook>; 4],
     /// Canonical Huffman lookup tables for AC decoding.  Indexed by `table_id`
     /// (0..=1 in baseline JPEG); only entries referenced by the scan are present.
     pub ac_codebooks: [Option<CanonicalCodebook>; 4],
@@ -182,9 +188,10 @@ pub fn run_cpu_prepass(data: &[u8]) -> Result<CpuPrepassOutput, CpuPrepassError>
     let mut rst_positions = Vec::new();
     unstuff::unstuff_into(headers.scan_data, &mut unstuffed, &mut rst_positions)?;
 
-    // Build codebooks once, hand both DC and AC sets to the DC-chain walker.
-    // AC codebooks live in CpuPrepassOutput so the parallel-Huffman kernel
-    // can reuse them without rebuilding.
+    // Build codebooks once, hand both DC and AC sets to the DC-chain
+    // walker, then keep both in CpuPrepassOutput so the parallel-Huffman
+    // kernel can reuse them without rebuilding (DC is needed to skip past
+    // the DC symbol in each block; AC is the body of the kernel's work).
     let (dc_codebooks, ac_codebooks) = build_scan_codebooks(&headers)?;
 
     let dc_values = dc_chain::resolve_dc_chain(
@@ -201,6 +208,7 @@ pub fn run_cpu_prepass(data: &[u8]) -> Result<CpuPrepassOutput, CpuPrepassError>
         components: headers.components,
         frame_components: headers.frame_components,
         quant_tables: headers.quant_tables,
+        dc_codebooks,
         ac_codebooks,
         scan: headers.scan,
         restart_interval: headers.restart_interval,
@@ -280,10 +288,12 @@ mod tests {
         // No restart interval in the fixture, so no RST positions.
         assert_eq!(out.restart_interval, 0);
         assert!(out.rst_positions.is_empty());
-        // AC codebook for selector 0 (the only one referenced by the scan)
-        // is built; selectors 1..=3 are absent.
+        // AC + DC codebooks for selector 0 (the only one referenced by
+        // the scan) are built; selectors 1..=3 are absent on each side.
         assert!(out.ac_codebooks[0].is_some());
         assert!(out.ac_codebooks[1].is_none());
+        assert!(out.dc_codebooks[0].is_some());
+        assert!(out.dc_codebooks[1].is_none());
     }
 
     #[test]
