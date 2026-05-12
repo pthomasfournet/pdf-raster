@@ -14,6 +14,10 @@ mod codetable;
 mod cpu_prepass;
 #[cfg(test)]
 mod cpu_reference;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub mod decoder;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub mod device_image;
 mod dispatch_util;
 mod error;
 mod jpeg_framing;
@@ -38,6 +42,10 @@ pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
 pub use cpu_prepass::{JpegPreparedInput, build_mcu_schedule, prepare_jpeg};
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub use decoder::JpegGpuDecoder;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub use device_image::DeviceImage;
 pub use error::JpegGpuError;
 pub use jpeg_framing::{JpegFramingError, decode_scan_symbols};
 #[cfg(feature = "gpu-jpeg-huffman")]

@@ -94,6 +94,8 @@ const PTX_BLIT_IMAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/blit_image.
 const PTX_BLELLOCH_SCAN: &str = include_str!(concat!(env!("OUT_DIR"), "/blelloch_scan.ptx"));
 #[cfg(all(not(ptx_placeholder), feature = "gpu-jpeg-huffman"))]
 const PTX_PARALLEL_HUFFMAN: &str = include_str!(concat!(env!("OUT_DIR"), "/parallel_huffman.ptx"));
+#[cfg(all(not(ptx_placeholder), feature = "gpu-jpeg-huffman"))]
+const PTX_IDCT_COLOR: &str = include_str!(concat!(env!("OUT_DIR"), "/idct_color.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
 pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
@@ -181,6 +183,11 @@ pub(crate) struct GpuKernels {
     /// the predecessor's Phase-1 snapshot instead of `(c, z)`.
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub(crate) jpeg_phase4_redecode: CudaFunction,
+    /// IDCT + dequant + colour-conversion kernel (Phase 5).
+    /// One 8×8×3 workgroup per 8×8 block; produces RGBA8 pixels from
+    /// zigzag DCT coefficients and quantisation tables.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) idct_dequant_colour: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -287,6 +294,8 @@ impl GpuCtx {
                 jpeg_phase2_inter_sync: load(PTX_PARALLEL_HUFFMAN, "jpeg_phase2_inter_sync")?,
                 #[cfg(feature = "gpu-jpeg-huffman")]
                 jpeg_phase4_redecode: load(PTX_PARALLEL_HUFFMAN, "jpeg_phase4_redecode")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                idct_dequant_colour: load(PTX_IDCT_COLOR, "idct_dequant_colour")?,
             },
         })
     }

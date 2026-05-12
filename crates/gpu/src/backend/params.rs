@@ -852,6 +852,109 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
     }
 }
 
+/// Parameters for the IDCT + dequant + colour-conversion kernel (Phase 5).
+///
+/// The kernel runs one 8×8-thread workgroup per MCU block per component and
+/// writes packed RGBA8 pixels to `pixels_rgba`.  The caller is responsible
+/// for building `coefficients` from the symbol stream, running the DC
+/// reconstruction, and packing quantisation tables in natural (row-major) order.
+///
+/// # Invariants
+/// - `width > 0`, `height > 0`, `num_components ∈ {1, 3}`
+/// - `blocks_wide == ceil(width / 8)`, `blocks_high == ceil(height / 8)`
+/// - `num_qtables ∈ {1..=4}`
+/// - `coefficients` capacity ≥ `num_components × blocks_wide × blocks_high × 64 × 4` bytes
+/// - `qtables` capacity ≥ `num_qtables × 64 × 4` bytes
+/// - `dc_values` capacity ≥ `num_components × blocks_wide × blocks_high × 4` bytes
+/// - `pixels_rgba` capacity ≥ `width × height × 4` bytes
+pub struct IdctParams<'a, B: GpuBackend + ?Sized> {
+    /// Zigzag-ordered DCT coefficients from Phase 4 (one i32 per slot).
+    /// Layout: `[comp][block_y][block_x][64]`.
+    pub coefficients: &'a B::DeviceBuffer,
+    /// Quantisation tables in natural (row-major) order.
+    /// Layout: `[qt_index][64]` as i32.
+    pub qtables: &'a B::DeviceBuffer,
+    /// Absolute DC value per block (reconstructed by host before dispatch).
+    /// Layout: `[comp][block_y][block_x]` as i32.
+    pub dc_values: &'a B::DeviceBuffer,
+    /// RGBA8 output buffer, row-major, `width × height` u32 pixels.
+    pub pixels_rgba: &'a B::DeviceBuffer,
+    /// Image width in pixels (> 0).
+    pub width: u32,
+    /// Image height in pixels (> 0).
+    pub height: u32,
+    /// Number of components: 1 (grayscale) or 3 (YCbCr).
+    pub num_components: u32,
+    /// `ceil(width / 8)`.
+    pub blocks_wide: u32,
+    /// `ceil(height / 8)`.
+    pub blocks_high: u32,
+    /// Number of quantisation tables present (1–4).
+    pub num_qtables: u32,
+}
+
+impl<B: GpuBackend + ?Sized> IdctParams<'_, B> {
+    /// Total blocks per component (`blocks_wide × blocks_high`).
+    #[must_use]
+    pub const fn blocks_per_component(&self) -> u32 {
+        self.blocks_wide * self.blocks_high
+    }
+
+    /// Validate the invariants documented on [`IdctParams`].
+    ///
+    /// # Errors
+    /// Returns a `BackendError::InvariantViolation` if any check fails.
+    pub fn validate(&self, backend: &B) -> super::Result<()> {
+        let inv = |detail: &'static str| super::BackendError::InvariantViolation {
+            kind: "IdctInvariantViolation",
+            detail,
+        };
+        if self.width == 0 {
+            return Err(inv("width must be > 0"));
+        }
+        if self.height == 0 {
+            return Err(inv("height must be > 0"));
+        }
+        if self.num_components != 1 && self.num_components != 3 {
+            return Err(inv("num_components must be 1 (grayscale) or 3 (YCbCr)"));
+        }
+        if self.blocks_wide != self.width.div_ceil(8) {
+            return Err(inv("blocks_wide must equal ceil(width / 8)"));
+        }
+        if self.blocks_high != self.height.div_ceil(8) {
+            return Err(inv("blocks_high must equal ceil(height / 8)"));
+        }
+        if self.num_qtables == 0 || self.num_qtables > 4 {
+            return Err(inv("num_qtables must be in 1..=4"));
+        }
+        let num_blocks =
+            (self.num_components as usize).saturating_mul(self.blocks_per_component() as usize);
+        let coef_bytes = num_blocks.saturating_mul(64 * 4);
+        if backend.device_buffer_len(self.coefficients) < coef_bytes {
+            return Err(inv(
+                "coefficients buffer too small for num_components × blocks × 64 × 4",
+            ));
+        }
+        let qt_bytes = (self.num_qtables as usize).saturating_mul(64 * 4);
+        if backend.device_buffer_len(self.qtables) < qt_bytes {
+            return Err(inv("qtables buffer too small for num_qtables × 64 × 4"));
+        }
+        let dc_bytes = num_blocks.saturating_mul(4);
+        if backend.device_buffer_len(self.dc_values) < dc_bytes {
+            return Err(inv(
+                "dc_values buffer too small for num_components × blocks × 4",
+            ));
+        }
+        let px_bytes = (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(4);
+        if backend.device_buffer_len(self.pixels_rgba) < px_bytes {
+            return Err(inv("pixels_rgba buffer too small for width × height × 4"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1006,9 @@ mod tests {
             unreachable!()
         }
         fn record_huffman(&self, _p: HuffmanParams<'_, Self>) -> super::super::Result<()> {
+            unreachable!()
+        }
+        fn record_idct(&self, _p: IdctParams<'_, Self>) -> super::super::Result<()> {
             unreachable!()
         }
         fn record_zero_buffer(&self, _buf: &Self::DeviceBuffer) -> super::super::Result<()> {

@@ -1,0 +1,319 @@
+//! `JpegGpuDecoder` — end-to-end JPEG → RGBA8 device image.
+//!
+//! CPU pre-pass (`prepare_jpeg`) + CPU AC coefficient extraction +
+//! GPU Phase 5 (IDCT + dequant + colour conversion).
+
+use crate::backend::params::IdctParams;
+use crate::backend::{BackendError as BackendErr, GpuBackend};
+use crate::jpeg::bitreader::BitReader;
+use crate::jpeg::headers::{JpegFrameComponent, mcu_count};
+use crate::jpeg_decoder::cpu_prepass::{JpegPreparedInput, prepare_jpeg};
+use crate::jpeg_decoder::device_image::DeviceImage;
+use crate::jpeg_decoder::dispatch_util::DeviceBufferGuard;
+use crate::jpeg_decoder::error::JpegGpuError;
+
+/// End-to-end JPEG decoder that runs IDCT on the GPU.
+///
+/// Phases 1–4 (parallel Huffman decode) are available via
+/// `dispatch_jpeg_phase1_through_phase4`; this struct uses a CPU
+/// coefficient extraction pass and dispatches only Phase 5 to the GPU.
+pub struct JpegGpuDecoder<B: GpuBackend> {
+    backend: B,
+}
+
+impl<B: GpuBackend> JpegGpuDecoder<B> {
+    /// Create a new decoder bound to `backend`.
+    pub const fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    /// Decode a baseline JFIF JPEG into a device-resident RGBA8 image.
+    ///
+    /// # Errors
+    /// Returns `JpegGpuError` if the input is not a supported baseline JPEG,
+    /// if coefficient extraction fails, or if any GPU operation fails.
+    pub fn decode(
+        &self,
+        jpeg_bytes: &[u8],
+    ) -> std::result::Result<DeviceImage<B>, JpegGpuError> {
+        let prep = prepare_jpeg(jpeg_bytes)?;
+        let (coef_flat, dc_flat, qt_flat, num_qtables) =
+            extract_coefficients(&prep).map_err(JpegGpuError::HeaderParse)?;
+
+        let width = u32::from(prep.width);
+        let height = u32::from(prep.height);
+        let num_components = u32::try_from(prep.components.len())
+            .map_err(|_| JpegGpuError::UnsupportedComponents(255))?;
+        let blocks_wide = width.div_ceil(8);
+        let blocks_high = height.div_ceil(8);
+
+        self.dispatch_idct(
+            &coef_flat,
+            &qt_flat,
+            &dc_flat,
+            width,
+            height,
+            num_components,
+            blocks_wide,
+            blocks_high,
+            num_qtables,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "10-scalar IDCT params; grouping them is IdctParams which requires a backend buffer ref"
+    )]
+    fn dispatch_idct(
+        &self,
+        coefficients: &[i32],
+        qtables: &[i32],
+        dc_values: &[i32],
+        width: u32,
+        height: u32,
+        num_components: u32,
+        blocks_wide: u32,
+        blocks_high: u32,
+        num_qtables: u32,
+    ) -> std::result::Result<DeviceImage<B>, JpegGpuError> {
+        let be = |e: BackendErr| JpegGpuError::Dispatch(e.to_string());
+
+        let coef_bytes = std::mem::size_of_val(coefficients);
+        let qt_bytes = std::mem::size_of_val(qtables);
+        let dc_bytes = std::mem::size_of_val(dc_values);
+        let px_bytes = (width as usize) * (height as usize) * 4;
+
+        let coef_buf = DeviceBufferGuard::alloc(&self.backend, coef_bytes).map_err(be)?;
+        let qt_buf = DeviceBufferGuard::alloc(&self.backend, qt_bytes).map_err(be)?;
+        let dc_buf = DeviceBufferGuard::alloc(&self.backend, dc_bytes).map_err(be)?;
+        let px_buf = DeviceBufferGuard::alloc_zeroed(&self.backend, px_bytes).map_err(be)?;
+
+        let _u1 = self
+            .backend
+            .upload_async(coef_buf.as_ref(), bytemuck::cast_slice(coefficients))
+            .map_err(be)?;
+        let _u2 = self
+            .backend
+            .upload_async(qt_buf.as_ref(), bytemuck::cast_slice(qtables))
+            .map_err(be)?;
+        let _u3 = self
+            .backend
+            .upload_async(dc_buf.as_ref(), bytemuck::cast_slice(dc_values))
+            .map_err(be)?;
+
+        self.backend.begin_page().map_err(be)?;
+        self.backend
+            .record_idct(IdctParams {
+                coefficients: coef_buf.as_ref(),
+                qtables: qt_buf.as_ref(),
+                dc_values: dc_buf.as_ref(),
+                pixels_rgba: px_buf.as_ref(),
+                width,
+                height,
+                num_components,
+                blocks_wide,
+                blocks_high,
+                num_qtables,
+            })
+            .map_err(be)?;
+        let fence = self.backend.submit_page().map_err(be)?;
+        self.backend.wait_page(fence).map_err(be)?;
+
+        self.backend.free_device(coef_buf.take());
+        self.backend.free_device(qt_buf.take());
+        self.backend.free_device(dc_buf.take());
+
+        Ok(DeviceImage {
+            buffer: px_buf.take(),
+            width,
+            height,
+        })
+    }
+}
+
+/// Reconstruct DCT coefficient arrays from `prep`.
+///
+/// Returns `(coefficients, dc_values, qtables, num_qtables)`:
+/// - `coefficients`: `num_components × blocks_per_comp × 64` i32 in zigzag order
+/// - `dc_values`: `num_components × blocks_per_comp` i32 (absolute DC from pre-pass)
+/// - `qtables`: `num_qtables × 64` i32 in natural (row-major) order
+/// - `num_qtables`: count of populated quantisation table slots
+#[expect(clippy::type_complexity, reason = "4-tuple private fn return; a named struct is overkill here")]
+#[expect(clippy::too_many_lines, reason = "AC walk + DC copy + QT copy; split would obscure the single-pass structure")]
+fn extract_coefficients(
+    prep: &JpegPreparedInput,
+) -> std::result::Result<(Vec<i32>, Vec<i32>, Vec<i32>, u32), String> {
+    let num_comp = prep.components.len();
+    let blocks_wide = usize::from(prep.width.div_ceil(8));
+    let blocks_high = usize::from(prep.height.div_ceil(8));
+    let blocks_per_comp = blocks_wide * blocks_high;
+
+    let mut coef_flat = vec![0i32; num_comp * blocks_per_comp * 64];
+
+    // Recover raw bitstream bytes for BitReader:
+    // PackedBitstream words use u32::from_be_bytes packing, so each word
+    // unpacks to bytes via to_be_bytes().
+    let raw_bytes: Vec<u8> = prep
+        .bitstream
+        .words
+        .iter()
+        .flat_map(|w| w.to_be_bytes())
+        .collect();
+    let mut bits = BitReader::new(&raw_bytes);
+
+    let totalmcus = mcu_count(prep.width, prep.height, &prep.components);
+    let mut block_counts = vec![0usize; num_comp];
+
+    for mcu in 0..totalmcus {
+        for (ci, comp) in prep.components.iter().enumerate() {
+            let dc_sel = usize::from(
+                *prep
+                    .dc_selectors
+                    .get(ci)
+                    .ok_or_else(|| format!("no dc_selector for comp {ci}"))?,
+            );
+            let ac_sel = usize::from(
+                *prep
+                    .ac_selectors
+                    .get(ci)
+                    .ok_or_else(|| format!("no ac_selector for comp {ci}"))?,
+            );
+            let dc_cb = prep.dc_codebooks[dc_sel]
+                .as_ref()
+                .ok_or_else(|| format!("missing DC codebook {dc_sel}"))?;
+            let ac_cb = prep.ac_codebooks[ac_sel]
+                .as_ref()
+                .ok_or_else(|| format!("missing AC codebook {ac_sel}"))?;
+
+            let bpm = blocks_permcu_count(*comp);
+            for _b in 0..bpm {
+                let block_idx = block_counts[ci];
+                let coef_base = (ci * blocks_per_comp + block_idx) * 64;
+                block_counts[ci] += 1;
+
+                // DC: peek + consume codeword, then read `category` magnitude bits.
+                let peek = bits.peek_u16().ok_or_else(|| {
+                    format!("bitstream empty at DC codeword (mcu={mcu} comp={ci})")
+                })?;
+                let dc_entry = dc_cb.lookup(peek);
+                bits.consume(usize::from(dc_entry.num_bits));
+                let category = dc_entry.symbol;
+                if category > 0 {
+                    let _ = bits.read_bits(usize::from(category)).ok_or_else(|| {
+                        format!("DC magnitude truncated (mcu={mcu} comp={ci} cat={category})")
+                    })?;
+                }
+
+                // AC: read each symbol + magnitude bits.
+                let mut zz = 1usize;
+                while zz < 64 {
+                    let peek = bits.peek_u16().ok_or_else(|| {
+                        format!("bitstream empty at AC (mcu={mcu} comp={ci} zz={zz})")
+                    })?;
+                    let ac_entry = ac_cb.lookup(peek);
+                    bits.consume(usize::from(ac_entry.num_bits));
+                    let sym_byte = ac_entry.symbol;
+
+                    if sym_byte == 0x00 {
+                        break; // EOB
+                    }
+                    if sym_byte == 0xF0 {
+                        zz += 16; // ZRL
+                        continue;
+                    }
+                    let run = (sym_byte >> 4) as usize;
+                    let size = sym_byte & 0x0F;
+                    zz += run;
+                    if zz >= 64 {
+                        break;
+                    }
+                    let ac_val = if size == 0 {
+                        0i32
+                    } else {
+                        let raw = bits.read_bits(usize::from(size)).ok_or_else(|| {
+                            format!("AC magnitude truncated (mcu={mcu} comp={ci} zz={zz})")
+                        })?;
+                        jpeg_extend(raw.cast_signed(), size)
+                    };
+                    if coef_base + zz < coef_flat.len() {
+                        coef_flat[coef_base + zz] = ac_val;
+                    }
+                    zz += 1;
+                }
+            }
+        }
+    }
+
+    // DC values: pre-resolved absolute DC chain from the pre-pass.
+    let mut dc_flat = vec![0i32; num_comp * blocks_per_comp];
+    for (ci, dc_vec) in prep.dc_values.per_component.iter().enumerate() {
+        if ci >= num_comp {
+            break;
+        }
+        let base = ci * blocks_per_comp;
+        for (bi, &dc) in dc_vec.iter().enumerate() {
+            if base + bi < dc_flat.len() {
+                dc_flat[base + bi] = dc;
+            }
+        }
+    }
+
+    // Quantisation tables: natural order, one 64-entry array per table slot.
+    let num_qtables_usize = prep
+        .quant_tables
+        .iter()
+        .filter(|qt| qt.is_some())
+        .count()
+        .max(1);
+    let num_qtables = u32::try_from(num_qtables_usize)
+        .unwrap_or(u32::MAX);
+    let mut qt_flat = vec![0i32; num_qtables_usize * 64];
+    for (qt_idx, qt) in prep.quant_tables.iter().enumerate() {
+        if let Some(qt) = qt {
+            let base = qt_idx * 64;
+            if base + 64 <= qt_flat.len() {
+                for (i, &v) in qt.values.iter().enumerate() {
+                    qt_flat[base + i] = i32::from(v);
+                }
+            }
+        }
+    }
+
+    Ok((coef_flat, dc_flat, qt_flat, num_qtables))
+}
+
+/// Number of 8×8 blocks this component contributes per MCU.
+/// Non-interleaved (1-component scan): always 1.
+/// Interleaved: `h_sampling` × `v_sampling`.
+const fn blocks_permcu_count(comp: JpegFrameComponent) -> usize {
+    (comp.h_sampling as usize) * (comp.v_sampling as usize)
+}
+
+/// JPEG EXTEND: sign-extend an `nbits`-wide magnitude into a signed integer.
+const fn jpeg_extend(value: i32, nbits: u8) -> i32 {
+    if nbits == 0 {
+        return 0;
+    }
+    let vt = 1i32 << (nbits - 1);
+    if value < vt {
+        value + (-1 << nbits) + 1
+    } else {
+        value
+    }
+}
+
+#[cfg(all(test, feature = "gpu-validation"))]
+mod tests {
+    use super::*;
+    use crate::backend::cuda::CudaBackend;
+
+    #[test]
+    fn decoder_decodes_grayscale_jpeg_on_cuda() {
+        let backend = CudaBackend::new().expect("CUDA backend");
+        let dec = JpegGpuDecoder::new(backend);
+        let bytes = crate::jpeg_decoder::tests::fixtures::GRAY_16X16_JPEG;
+        let img = dec.decode(bytes).expect("decode");
+        assert_eq!(img.width, 16);
+        assert_eq!(img.height, 16);
+    }
+}

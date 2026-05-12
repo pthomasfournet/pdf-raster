@@ -698,6 +698,49 @@ impl PageRecorder {
         )
     }
 
+    /// Record IDCT + dequant + colour-conversion (Phase 5).
+    ///
+    /// Push-constant layout matches `idct_color.slang`'s `PushParams`:
+    /// width, height, num_components, blocks_wide, blocks_high, num_qtables
+    /// (6 × u32 = 24 bytes).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(super) fn record_idct(
+        &self,
+        p: params::IdctParams<'_, super::VulkanBackend>,
+    ) -> Result<()> {
+        use super::pipeline::KernelId;
+
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&p.width.to_ne_bytes());
+        push[4..8].copy_from_slice(&p.height.to_ne_bytes());
+        push[8..12].copy_from_slice(&p.num_components.to_ne_bytes());
+        push[12..16].copy_from_slice(&p.blocks_wide.to_ne_bytes());
+        push[16..20].copy_from_slice(&p.blocks_high.to_ne_bytes());
+        push[20..24].copy_from_slice(&p.num_qtables.to_ne_bytes());
+
+        // One workgroup per (block_x, block_y); all 3 components handled
+        // within the workgroup's 8×8×3 threads.
+        let groups = (p.blocks_wide, p.blocks_high, 1);
+
+        self.dispatch_kernel(
+            KernelId::IdctColor,
+            &[
+                p.coefficients.handle(),
+                p.qtables.handle(),
+                p.dc_values.handle(),
+                p.pixels_rgba.handle(),
+            ],
+            &[
+                p.coefficients.size(),
+                p.qtables.size(),
+                p.dc_values.size(),
+                p.pixels_rgba.size(),
+            ],
+            &push,
+            groups,
+        )
+    }
+
     pub(super) fn record_blit_image(
         &self,
         p: params::BlitParams<'_, super::VulkanBackend>,

@@ -364,6 +364,17 @@ pub trait GpuBackend: Send + Sync {
     /// Returns `BackendError` if the operation cannot be recorded or
     /// if `params.validate(self)` fails.
     fn record_huffman(&self, params: params::HuffmanParams<'_, Self>) -> Result<()>;
+    /// Record IDCT + dequant + colour-conversion (Phase 5) into the current
+    /// page's command list.
+    ///
+    /// Dispatches one workgroup per 8×8 block per component.  The kernel
+    /// performs zigzag inverse, dequantisation, 2-D LLM IDCT, YCbCr→RGB
+    /// colour conversion (T.871/JFIF full-range), and RGBA8 packing.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the operation cannot be recorded or if
+    /// `params.validate(self)` fails.
+    fn record_idct(&self, params: params::IdctParams<'_, Self>) -> Result<()>;
     /// Record a zero-fill of `buf` into the current page's command list.
     ///
     /// Folds what [`Self::alloc_device_zeroed`] does as a separate one-shot

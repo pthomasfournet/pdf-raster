@@ -218,6 +218,19 @@ impl GpuBackend for VulkanBackend {
         ))
     }
 
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn record_idct(&self, params: params::IdctParams<'_, Self>) -> Result<()> {
+        params.validate(self)?;
+        self.recorder.record_idct(params)
+    }
+
+    #[cfg(not(feature = "gpu-jpeg-huffman"))]
+    fn record_idct(&self, _params: params::IdctParams<'_, Self>) -> Result<()> {
+        Err(crate::backend::BackendError::msg(
+            "VulkanBackend::record_idct: gpu-jpeg-huffman feature is not enabled",
+        ))
+    }
+
     fn record_zero_buffer(&self, buf: &Self::DeviceBuffer) -> Result<()> {
         self.recorder.record_zero_buffer(buf)
     }

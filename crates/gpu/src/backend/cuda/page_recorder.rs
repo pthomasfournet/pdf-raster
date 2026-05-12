@@ -417,6 +417,25 @@ impl PageRecorder {
         }
     }
 
+    /// Record IDCT + dequant + colour-conversion (Phase 5).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(super) fn record_idct(&self, p: params::IdctParams<'_, super::CudaBackend>) -> Result<()> {
+        self.ctx
+            .launch_idct_dequant_colour_async(
+                p.coefficients,
+                p.qtables,
+                p.dc_values,
+                p.pixels_rgba,
+                p.width,
+                p.height,
+                p.num_components,
+                p.blocks_wide,
+                p.blocks_high,
+                p.num_qtables,
+            )
+            .map_err(be)
+    }
+
     /// Record an async zero-fill on the backend's stream via
     /// `cuMemsetD8Async`.  Same single-stream serialisation as the
     /// `launch_*_async` helpers: any later record_* call ordered after

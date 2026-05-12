@@ -75,6 +75,11 @@ pub(super) enum KernelId {
     /// snapshot instead of `(c, z)`.
     #[cfg(feature = "gpu-jpeg-huffman")]
     JpegPhase4Redecode,
+    /// IDCT + dequant + colour-conversion kernel (Phase 5).
+    /// One 8×8×3-thread workgroup per 8×8 block; produces RGBA8 pixels
+    /// from zigzag DCT coefficients and quantisation tables.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    IdctColor,
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
@@ -84,7 +89,7 @@ pub(super) enum KernelId {
 /// at build time: if `slot_index()` ever returns a value
 /// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
-const NUM_KERNELS: usize = 15;
+const NUM_KERNELS: usize = 16;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
 
@@ -112,6 +117,7 @@ const _: () = {
     assert!(KernelId::JpegPhase1IntraSync.slot_index() < NUM_KERNELS);
     assert!(KernelId::JpegPhase2InterSync.slot_index() < NUM_KERNELS);
     assert!(KernelId::JpegPhase4Redecode.slot_index() < NUM_KERNELS);
+    assert!(KernelId::IdctColor.slot_index() < NUM_KERNELS);
 };
 
 impl KernelId {
@@ -139,6 +145,8 @@ impl KernelId {
             | Self::JpegPhase4Redecode => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/parallel_huffman.spv"))
             }
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::IdctColor => include_bytes!(concat!(env!("OUT_DIR"), "/idct_color.spv")),
         }
     }
 
@@ -204,6 +212,8 @@ impl KernelId {
             Self::JpegPhase2InterSync => 13,
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase4Redecode => 14,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::IdctColor => 15,
         }
     }
 
@@ -235,6 +245,8 @@ impl KernelId {
             Self::JpegPhase2InterSync => "jpeg_phase2_inter_sync",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase4Redecode => "jpeg_phase4_redecode",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::IdctColor => "idct_dequant_colour",
         }
     }
 
@@ -281,6 +293,9 @@ impl KernelId {
             // It skips slot 3 (sync_flags is Phase 2 only).
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase4Redecode => &[0, 1, 2, 4, 5, 6, 7, 8],
+            // (coefficients, qtables, dc_values, pixels_rgba) — sequential 0..3
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::IdctColor => &[0, 1, 2, 3],
             // Everyone else: sequential 0..n.
             Self::Composite | Self::ApplySoftMask | Self::AaFill | Self::BlitImage => &[0, 1],
             Self::TileFill => &[0, 1, 2, 3],
@@ -349,6 +364,9 @@ impl KernelId {
             // Phase 4. 8 storage buffers; same 24-byte push constant.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::JpegPhase4Redecode => 8,
+            // (coefficients, qtables, dc_values, pixels_rgba)
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::IdctColor => 4,
         }
     }
 }
@@ -704,6 +722,8 @@ mod tests {
             KernelId::JpegPhase2InterSync,
             #[cfg(feature = "gpu-jpeg-huffman")]
             KernelId::JpegPhase4Redecode,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::IdctColor,
         ];
         for id in kernels {
             let slots = id.binding_slots();
@@ -749,6 +769,8 @@ mod tests {
             KernelId::JpegPhase2InterSync,
             #[cfg(feature = "gpu-jpeg-huffman")]
             KernelId::JpegPhase4Redecode,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::IdctColor,
         ];
         let mut indices: Vec<usize> = kernels.iter().map(|k| k.slot_index()).collect();
         indices.sort_unstable();

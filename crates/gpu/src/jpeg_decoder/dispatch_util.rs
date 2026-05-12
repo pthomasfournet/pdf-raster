@@ -74,11 +74,6 @@ impl<'a, B: GpuBackend + ?Sized> DeviceBufferGuard<'a, B> {
     /// # Errors
     /// Propagates whatever `backend.alloc_device_zeroed` returns.
     //
-    // Only the test/oracle dispatchers under `huffman` need zeroed
-    // memory (the bitstream's trailing peek16-headroom word + the
-    // symbols_out buffer must start at zero). Gate matches `huffman`'s
-    // own gating so this isn't dead-code-warned in non-test builds.
-    #[cfg(all(test, feature = "gpu-validation"))]
     pub(super) fn alloc_zeroed(backend: &'a B, size: usize) -> Result<Self> {
         Ok(Self {
             backend,
