@@ -29,7 +29,7 @@
 //! metadata (matching the synthetic-stream Phase 4 contract).
 
 use crate::jpeg::CanonicalCodebook;
-use crate::jpeg::headers::JpegFrameComponent;
+use crate::jpeg::headers::{JpegFrameComponent, mcu_count};
 use crate::jpeg_decoder::{JpegGpuError, JpegPreparedInput};
 
 /// Errors emitted by [`decode_scan_symbols`].
@@ -57,13 +57,30 @@ pub enum JpegFramingError {
         /// 0-based scan-component index where the prefix-miss surfaced.
         scan_component: u8,
     },
-    /// AC run+size pair walked past coefficient slot 63 in some block.
+    /// AC run+size pair (or ZRL) walked past coefficient slot 63 in
+    /// some block.  Catches both the run+size case and the rarer
+    /// "ZRL emitted at slot ≥ 49" adversarial case the spec forbids.
     AcOverflow {
         /// 0-based MCU index where the overflow surfaced.
         mcu_index: u32,
     },
+    /// AC magnitude size > 10 (max for 8-bit baseline JPEG; the AC
+    /// symbol's low nibble is bounded to 0..=10 by the spec, but a
+    /// corrupt Huffman table could emit 11..=15).
+    BadAcSize {
+        /// 0-based MCU index where the bad size surfaced.
+        mcu_index: u32,
+        /// 0-based scan-component index where the bad size surfaced.
+        scan_component: u8,
+        /// The size as decoded from the AC Huffman table.
+        size: u8,
+    },
     /// DC magnitude category > 11 (max for 8-bit baseline JPEG).
     BadDcCategory {
+        /// 0-based MCU index where the bad category surfaced.
+        mcu_index: u32,
+        /// 0-based scan-component index where the bad category surfaced.
+        scan_component: u8,
         /// The category as decoded from the DC Huffman table.
         category: u8,
     },
@@ -104,11 +121,23 @@ impl std::fmt::Display for JpegFramingError {
             ),
             Self::AcOverflow { mcu_index } => write!(
                 f,
-                "JPEG framing: AC run+size walked past slot 63 at MCU {mcu_index}",
+                "JPEG framing: AC run+size (or ZRL) walked past slot 63 at MCU {mcu_index}",
             ),
-            Self::BadDcCategory { category } => write!(
+            Self::BadAcSize {
+                mcu_index,
+                scan_component,
+                size,
+            } => write!(
                 f,
-                "JPEG framing: DC magnitude category {category} > 11 (8-bit baseline cap)",
+                "JPEG framing: AC size {size} > 10 at MCU {mcu_index}, scan-component {scan_component} (8-bit baseline cap)",
+            ),
+            Self::BadDcCategory {
+                mcu_index,
+                scan_component,
+                category,
+            } => write!(
+                f,
+                "JPEG framing: DC category {category} > 11 at MCU {mcu_index}, scan-component {scan_component} (8-bit baseline cap)",
             ),
             Self::DegenerateSampling { scan_component } => write!(
                 f,
@@ -182,12 +211,12 @@ impl<'a> ScanWalker<'a> {
 
         let mut blocks_per_mcu = [0u8; 4];
         for (k, fc) in prep.components.iter().enumerate() {
+            // scan_components ≤ 4 by upstream validation; the cast
+            // never truncates.  Using try_from + expect lets the
+            // invariant tell us when it's broken instead of silently
+            // wrapping at u8::MAX.
+            let k_u8 = u8::try_from(k).expect("scan component index < 4");
             if fc.h_sampling == 0 || fc.v_sampling == 0 {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "scan_components ≤ 4 by upstream validation; k < 4"
-                )]
-                let k_u8 = k as u8;
                 return Err(JpegFramingError::DegenerateSampling {
                     scan_component: k_u8,
                 });
@@ -195,7 +224,9 @@ impl<'a> ScanWalker<'a> {
             blocks_per_mcu[k] = if scan_components == 1 {
                 1
             } else {
-                fc.h_sampling * fc.v_sampling
+                fc.h_sampling
+                    .checked_mul(fc.v_sampling)
+                    .expect("upstream BadSamplingFactor caps h, v ≤ 4")
             };
         }
 
@@ -222,11 +253,7 @@ impl<'a> ScanWalker<'a> {
             {
                 let dc_cb = self.dc_cbs[k];
                 let ac_cb = self.ac_cbs[k];
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "scan component index ≤ 3 by upstream validation"
-                )]
-                let k_u8 = k as u8;
+                let k_u8 = u8::try_from(k).expect("scan component index < 4");
                 for _ in 0..bpm {
                     emit_dc_symbol(&mut bits, dc_cb, &mut symbols, mcu, k_u8)?;
                     emit_ac_symbols(&mut bits, ac_cb, &mut symbols, mcu, k_u8)?;
@@ -262,7 +289,11 @@ fn emit_dc_symbol(
     bits.consume(usize::from(entry.num_bits));
     let category = entry.symbol;
     if category > 11 {
-        return Err(JpegFramingError::BadDcCategory { category });
+        return Err(JpegFramingError::BadDcCategory {
+            mcu_index: mcu,
+            scan_component,
+            category,
+        });
     }
     out.push(u32::from(category));
     if category > 0 && bits.read_bits(usize::from(category)).is_none() {
@@ -306,11 +337,28 @@ fn emit_ac_symbols(
         }
         if symbol == 0xF0 {
             // ZRL: 16-zero run.  ac_pos jumps; no raw bits follow.
+            // A ZRL whose post-advance ac_pos exceeds 64 is spec-
+            // illegal — refuse rather than silently swallow the
+            // misalignment.
             ac_pos = ac_pos.saturating_add(16);
+            if ac_pos > 64 {
+                return Err(JpegFramingError::AcOverflow { mcu_index: mcu });
+            }
             continue;
         }
         let run = symbol >> 4;
         let size = symbol & 0x0F;
+        // 8-bit baseline JPEG caps AC magnitude size at 10 bits
+        // (ITU-T T.81 § F.1.2.2.1).  Refuse 11..=15 — an adversarial
+        // Huffman table could otherwise direct the bit reader to
+        // consume up to 15 raw bits per slot.
+        if size > 10 {
+            return Err(JpegFramingError::BadAcSize {
+                mcu_index: mcu,
+                scan_component,
+                size,
+            });
+        }
         // run + 1 advances are needed before slot 64; saturating_add
         // here protects against an adversarial symbol with the high
         // nibble set such that ac_pos + run + 1 overflows u8.
@@ -327,30 +375,6 @@ fn emit_ac_symbols(
         }
     }
     Ok(())
-}
-
-/// MCU count from frame dimensions + scan-component sampling factors.
-/// Mirrors `crate::jpeg::headers::mcu_count`; duplicated here to avoid
-/// exposing a separate accessor on `JpegPreparedInput` solely for this
-/// module's use.
-fn mcu_count(width: u16, height: u16, components: &[JpegFrameComponent]) -> u32 {
-    let h_max = components
-        .iter()
-        .map(|c| c.h_sampling)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let v_max = components
-        .iter()
-        .map(|c| c.v_sampling)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let mcu_width_px = u32::from(h_max) * 8;
-    let mcu_height_px = u32::from(v_max) * 8;
-    let mcus_x = u32::from(width).div_ceil(mcu_width_px);
-    let mcus_y = u32::from(height).div_ceil(mcu_height_px);
-    mcus_x * mcus_y
 }
 
 /// MSB-first bit reader over an unstuffed JPEG entropy-coded segment.
@@ -539,6 +563,37 @@ mod tests {
                 }
             ),
             "expected RestartMarkersUnsupported(4), got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn truncated_bitstream_surfaces_unexpected_end() {
+        // Patch length_bits down to a value so small no MCU can decode
+        // even its DC.  The walker should bail with UnexpectedEnd
+        // rather than producing a short symbol stream silently.
+        let mut prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        prep.bitstream.length_bits = 4;
+        let err = decode_scan_symbols(&prep).expect_err("truncated stream must fail");
+        assert!(
+            matches!(err, JpegFramingError::UnexpectedEnd { mcu_index: 0, .. }),
+            "expected UnexpectedEnd at MCU 0, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn degenerate_sampling_factor_is_refused() {
+        let mut prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        // Force a degenerate sampling factor; upstream validation
+        // would have caught this on the JPEG bytes, but we patch
+        // after the wrapper to exercise the oracle's own defence.
+        prep.components[0].h_sampling = 0;
+        let err = decode_scan_symbols(&prep).expect_err("degenerate sampling must be refused");
+        assert!(
+            matches!(
+                err,
+                JpegFramingError::DegenerateSampling { scan_component: 0 }
+            ),
+            "expected DegenerateSampling(0), got: {err:?}",
         );
     }
 }
