@@ -48,6 +48,7 @@ const KERNELS: &[&str] = &[
     "blit_image",
     "blelloch_scan",
     "parallel_huffman",
+    "idct_color",
 ];
 
 /// Slang profile per kernel.  `aa_fill` uses subgroup ops (`WaveActiveSum`,
@@ -78,6 +79,7 @@ fn slang_entry(kernel: &str) -> Option<&'static str> {
         // when no -entry is passed and preserves their source names
         // in the SPIR-V OpEntryPoint op.
         "blelloch_scan" | "parallel_huffman" => None,
+        "idct_color" => Some("idct_dequant_colour"),
         // Default: single entry point named after the file.
         "composite_rgba8" => Some("composite_rgba8"),
         "apply_soft_mask" => Some("apply_soft_mask"),
