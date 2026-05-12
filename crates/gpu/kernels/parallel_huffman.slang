@@ -23,11 +23,20 @@
 // entry packs `(num_bits << 8) | symbol`. Thread reads entry at
 // `codebook[c * 65 536 + peek16]`. `num_bits == 0` = no match.
 //
-// ## MVP simplification (matches phase1_oracle / phase2_oracle)
+// ## Two state machines coexist in this file
 //
-// Real JPEG AC framing tracks (run, size) per symbol. The MVP advances
-// `z += 1` per decoded symbol, rolling over `c` on the 64-symbol
-// boundary. Production-grade AC framing is a follow-up.
+// - `phase1_intra_sync` / `phase2_inter_sync` / `phase4_redecode`
+//   use a synthetic-stream state machine: `z += 1` per symbol,
+//   rolling `c` over on the 64-symbol boundary.  Driven by the
+//   Phase A corpus (oracle tests under
+//   `crates/gpu/src/jpeg_decoder/huffman/corpus.rs`).
+//
+// - `jpeg_phase1_intra_sync` and its Phase 2 / Phase 4 counterparts
+//   use real JPEG framing: per block, one DC symbol (read size,
+//   skip size bits, advance to slot 1) then AC symbols until EOB
+//   (sym = 0x00) or slot 64.  ZRL (sym = 0xF0) advances by 16.
+//   Codebook selection is per-block via `mcu_schedule`; DC symbols
+//   look up in `dc_codebook`, AC in `codebook`.
 
 [[vk::binding(0, 0)]] StructuredBuffer<uint> bitstream;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> codebook;
@@ -46,6 +55,14 @@
 // overwrite with the actual code.
 [[vk::binding(6, 0)]] RWStructuredBuffer<uint> decode_status;
 
+// JPEG-framed phases only — bound at slots 7 + 8 in the JPEG kernel
+// descriptor layouts.  Same wire layout as `codebook` (one
+// HUFFMAN_CODEBOOK_ENTRIES-wide block per selector); `mcu_schedule`
+// is u32[blocks_per_mcu], each entry packing
+// `(ac_sel << 16) | (dc_sel << 8) | component_idx`.
+[[vk::binding(7, 0)]] StructuredBuffer<uint> dc_codebook;
+[[vk::binding(8, 0)]] StructuredBuffer<uint> mcu_schedule;
+
 // Status codes — must match the CUDA `DECODE_*` macros AND the
 // Rust-side `Phase4FailureKind` discriminants exactly.
 static const uint DECODE_OK = 0u;
@@ -63,6 +80,9 @@ cbuffer PushParams {
     // other phases ignore it. Zero is a valid sentinel for Phase 1/2
     // (they don't read it).
     uint total_symbols;
+    // JPEG-framed phases only — 8×8 blocks per MCU, 0 for the
+    // synthetic-stream phases.
+    uint blocks_per_mcu;
 };
 
 /// Peek 16 bits MSB-first starting at absolute `bit_pos`.
@@ -78,6 +98,107 @@ uint peek16_kernel(uint bit_pos) {
 
     uint64_t combined = (uint64_t(hi) << 32) | uint64_t(lo);
     return uint((combined >> (48u - bit_in_word)) & 0xFFFFu);
+}
+
+/// Extract `(ac_sel, dc_sel, component)` from one packed
+/// `mcu_schedule` entry. Layout (matches the Rust-side wrapper
+/// the kernel inherits via `HuffmanParams::mcu_schedule`):
+///
+///     bits 0..8   = component_idx  (0..=3)
+///     bits 8..16  = dc_sel         (0..=3)
+///     bits 16..24 = ac_sel         (0..=3)
+///
+/// Caller passes `block_in_mcu` < `blocks_per_mcu` (guaranteed by
+/// the state machine's modular update).
+void unpack_schedule(uint block_in_mcu, out uint dc_sel, out uint ac_sel) {
+    uint packed = mcu_schedule[block_in_mcu];
+    dc_sel = (packed >> 8u) & 0xFFu;
+    ac_sel = (packed >> 16u) & 0xFFu;
+}
+
+/// JPEG-framed counterpart of `try_decode_one_symbol_kernel`.
+///
+/// State semantics for the JPEG-framed phases:
+///
+///     state.x = p              (bit position in `bitstream`)
+///     state.y = n              (symbols emitted by this thread so far)
+///     state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+///     state.w = z_in_block     (0 .. 64, inclusive end of block)
+///
+/// One symbol per call:
+///   - `z_in_block == 0`: DC slot.  Look up via `dc_codebook[dc_sel]`,
+///     consume `num_bits + category` bits, advance `z_in_block := 1`.
+///   - `z_in_block >= 1`: AC slot.  Look up via `codebook[ac_sel]`,
+///     consume `num_bits + size` bits, advance per JPEG framing:
+///       sym == 0x00 (EOB): z_in_block := 64.
+///       sym == 0xF0 (ZRL): z_in_block += 16.  Refuse overflow.
+///       else:              z_in_block += run + 1.  Refuse overflow.
+///   - When `z_in_block` reaches 64, the block is done — advance
+///     `block_in_mcu` modularly and reset `z_in_block := 0`.
+///
+/// Returns the same `DECODE_*` status codes as the synthetic helper.
+/// `count_to` accounting matches the synthetic side: `state.y`
+/// increments only when the symbol *starts* below `count_to`.
+uint try_decode_one_jpeg_symbol_kernel(inout uint4 state, uint count_to, out uint symbol_out) {
+    symbol_out = 0u;
+    uint dc_sel;
+    uint ac_sel;
+    unpack_schedule(state.z, dc_sel, ac_sel);
+
+    bool is_dc = (state.w == 0u);
+    uint table_base = (is_dc ? dc_sel : ac_sel) * 65536u;
+    uint peek = peek16_kernel(state.x);
+    uint entry = (is_dc ? dc_codebook[table_base + peek] : codebook[table_base + peek]);
+    uint num_bits = (entry >> 8u) & 0xFFu;
+    if (num_bits == 0u) {
+        return DECODE_PREFIX_MISS;
+    }
+    uint symbol = entry & 0xFFu;
+    uint value_bits = symbol & 0x0Fu;
+    uint advance = num_bits + value_bits;
+    if (state.x + advance > length_bits) {
+        return DECODE_LENGTH_BITS;
+    }
+
+    uint count_this_one = (state.x < count_to) ? 1u : 0u;
+    state.x += advance;
+    state.y += count_this_one;
+
+    if (is_dc) {
+        // DC: one symbol per block, then transition to AC slot 1.
+        state.w = 1u;
+    } else {
+        // AC framing: EOB / ZRL / run+size.
+        if (symbol == 0u) {
+            // EOB: rest of block is implicitly zero.
+            state.w = 64u;
+        } else if (symbol == 0xF0u) {
+            // ZRL: 16-zero run.  A ZRL whose post-advance position
+            // exceeds 64 is spec-illegal; refuse rather than wrap.
+            uint next_w = state.w + 16u;
+            if (next_w > 64u) {
+                return DECODE_INCOMPLETE;
+            }
+            state.w = next_w;
+        } else {
+            uint run = (symbol >> 4u) & 0xFu;
+            uint next_w = state.w + run + 1u;
+            if (next_w > 64u) {
+                return DECODE_INCOMPLETE;
+            }
+            state.w = next_w;
+        }
+    }
+
+    // End-of-block: rotate `block_in_mcu` and reset z.  Done outside
+    // the DC/AC branch so a clean DC + 63 AC walk ends correctly.
+    if (state.w == 64u) {
+        state.z = (state.z + 1u) % blocks_per_mcu;
+        state.w = 0u;
+    }
+
+    symbol_out = symbol;
+    return DECODE_OK;
 }
 
 /// Try to decode one Huffman symbol starting at `state.p`, writing
@@ -282,4 +403,59 @@ void phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
     uint _ignored_status = try_decode_one_symbol_kernel(me, nxt_start_p, symbol_sink);
     s_info_out[seq_idx] = me;
     sync_flags[seq_idx] = 0u;
+}
+
+/// JPEG-framed Phase 1 (intra-sequence sync).  Same shape as
+/// `phase1_intra_sync` but uses the JPEG state machine via
+/// `try_decode_one_jpeg_symbol_kernel`.  State semantics:
+///
+///     state.x = p              (bit position)
+///     state.y = n              (per-thread symbol count)
+///     state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+///     state.w = z_in_block     (0 .. 64)
+///
+/// The Phase 2 sync predicate operates on snapshots: two threads are
+/// in agreement at the boundary when their `(block_in_mcu, z_in_block)`
+/// match, which is the natural framing equivalent of the synthetic-
+/// stream `(component, zig-zag)` agreement.
+[shader("compute")][numthreads(256, 1, 1)]
+void jpeg_phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
+    uint seq_idx = tid.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+
+    uint start_bit = seq_idx * subsequence_bits;
+    uint sync_target = start_bit + 2u * subsequence_bits;
+    uint hard_limit = min(length_bits, sync_target);
+    uint subseq_end_bit = min(length_bits, start_bit + subsequence_bits);
+
+    // (p, n, block_in_mcu, z_in_block) packed into uint4 as
+    // (x, y, z, w). block_in_mcu = 0, z_in_block = 0 at stream start.
+    uint4 state = uint4(start_bit, 0u, 0u, 0u);
+    uint4 snapshot = state;
+    bool snapshotted = false;
+
+    // Defensive max_iters mirrors the synthetic Phase 1.
+    uint max_iters = (hard_limit > start_bit ? hard_limit - start_bit : 0u) + 1u;
+    uint symbol_sink;
+    for (uint iter = 0u; iter < max_iters; iter++) {
+        if (state.x >= hard_limit) {
+            break;
+        }
+        uint p_before = state.x;
+        if (try_decode_one_jpeg_symbol_kernel(state, subseq_end_bit, symbol_sink) != DECODE_OK) {
+            break;
+        }
+        if (!snapshotted && p_before < subseq_end_bit && state.x >= subseq_end_bit) {
+            snapshot = state;
+            snapshotted = true;
+        }
+    }
+
+    if (!snapshotted) {
+        snapshot = state;
+    }
+
+    s_info_out[seq_idx] = snapshot;
 }

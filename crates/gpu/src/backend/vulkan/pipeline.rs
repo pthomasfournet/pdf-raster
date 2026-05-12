@@ -59,6 +59,11 @@ pub(super) enum KernelId {
     /// Parallel-Huffman Phase 4 (re-decode + write final symbols).
     #[cfg(feature = "gpu-jpeg-huffman")]
     Phase4Redecode,
+    /// JPEG-framed Phase 1 (intra-sequence sync).  Same kernel as
+    /// `Phase1IntraSync` but uses the JPEG state machine
+    /// (DC magnitude skip + AC run/size/EOB/ZRL framing).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    JpegPhase1IntraSync,
 }
 
 /// Total number of kernel slots, used to size the `OnceLock` array.
@@ -68,7 +73,7 @@ pub(super) enum KernelId {
 /// at build time: if `slot_index()` ever returns a value
 /// `>= NUM_KERNELS` for any variant, the build fails.
 #[cfg(feature = "gpu-jpeg-huffman")]
-const NUM_KERNELS: usize = 12;
+const NUM_KERNELS: usize = 13;
 #[cfg(not(feature = "gpu-jpeg-huffman"))]
 const NUM_KERNELS: usize = 6;
 
@@ -93,6 +98,7 @@ const _: () = {
     assert!(KernelId::Phase1IntraSync.slot_index() < NUM_KERNELS);
     assert!(KernelId::Phase2InterSync.slot_index() < NUM_KERNELS);
     assert!(KernelId::Phase4Redecode.slot_index() < NUM_KERNELS);
+    assert!(KernelId::JpegPhase1IntraSync.slot_index() < NUM_KERNELS);
 };
 
 impl KernelId {
@@ -112,7 +118,10 @@ impl KernelId {
                 include_bytes!(concat!(env!("OUT_DIR"), "/blelloch_scan.spv"))
             }
             #[cfg(feature = "gpu-jpeg-huffman")]
-            Self::Phase1IntraSync | Self::Phase2InterSync | Self::Phase4Redecode => {
+            Self::Phase1IntraSync
+            | Self::Phase2InterSync
+            | Self::Phase4Redecode
+            | Self::JpegPhase1IntraSync => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/parallel_huffman.spv"))
             }
         }
@@ -140,6 +149,8 @@ impl KernelId {
             Self::Phase2InterSync => c"phase2_inter_sync",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase4Redecode => c"phase4_redecode",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase1IntraSync => c"jpeg_phase1_intra_sync",
             // Every other kernel was compiled with `-entry`, so its
             // entry point is renamed to `main` in the SPIR-V.
             _ => c"main",
@@ -168,6 +179,8 @@ impl KernelId {
             Self::Phase2InterSync => 10,
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase4Redecode => 11,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase1IntraSync => 12,
         }
     }
 
@@ -193,6 +206,8 @@ impl KernelId {
             Self::Phase2InterSync => "phase2_inter_sync",
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase4Redecode => "phase4_redecode",
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase1IntraSync => "jpeg_phase1_intra_sync",
         }
     }
 
@@ -219,6 +234,13 @@ impl KernelId {
             // declared slots 4, 5, 6 rather than re-numbering down.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase4Redecode => &[0, 1, 2, 4, 5, 6],
+            // JpegPhase1 reads bitstream + codebook + s_info_out
+            // (slots 0..2) plus dc_codebook + mcu_schedule (slots
+            // 7..8). It does not touch slots 3..6 (sync_flags /
+            // offsets / symbols_out / decode_status are Phase 2/4
+            // territory).
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase1IntraSync => &[0, 1, 2, 7, 8],
             // Everyone else: sequential 0..n.
             Self::Composite | Self::ApplySoftMask | Self::AaFill | Self::BlitImage => &[0, 1],
             Self::TileFill => &[0, 1, 2, 3],
@@ -273,6 +295,11 @@ impl KernelId {
             // Phase4FailureKind for the encoding).
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase4Redecode => 6,
+            // (bitstream, codebook, s_info, dc_codebook, mcu_schedule)
+            // — JPEG-framed Phase 1 reads `blocks_per_mcu` from the
+            // 24-byte push struct that all huffman phases share.
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            Self::JpegPhase1IntraSync => 5,
         }
     }
 }

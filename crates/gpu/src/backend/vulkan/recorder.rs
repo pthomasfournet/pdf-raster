@@ -478,15 +478,18 @@ impl PageRecorder {
         use crate::backend::params::{HUFFMAN_PHASE1_THREADS, HuffmanPhase};
 
         let num_subsequences = p.num_subsequences();
-        // 5 × u32: length_bits, subsequence_bits, num_subsequences,
-        // num_components, total_symbols. Phase 1+2 ignore total_symbols;
-        // Phase 4 bounds-checks writes against it.
-        let mut push = [0u8; 20];
+        // 6 × u32: length_bits, subsequence_bits, num_subsequences,
+        // num_components, total_symbols, blocks_per_mcu.  Phase 1+2
+        // ignore total_symbols; Phase 4 bounds-checks writes against
+        // it.  The synthetic phases ignore blocks_per_mcu; the
+        // JPEG-framed phases use it to wrap the block-in-MCU cursor.
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&p.length_bits.to_ne_bytes());
         push[4..8].copy_from_slice(&p.subsequence_bits.to_ne_bytes());
         push[8..12].copy_from_slice(&num_subsequences.to_ne_bytes());
         push[12..16].copy_from_slice(&p.num_components.to_ne_bytes());
         push[16..20].copy_from_slice(&p.total_symbols.to_ne_bytes());
+        push[20..24].copy_from_slice(&p.blocks_per_mcu.to_ne_bytes());
 
         let groups = (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1);
 
@@ -552,18 +555,56 @@ impl PageRecorder {
                     groups,
                 )
             }
-            // JPEG-framed phases land in the type system here; the
-            // kernels will follow in the next B2c commits.  Surface a
-            // typed BackendError rather than panicking so callers
-            // exercising the new dispatch path during incremental
-            // bring-up get a recoverable failure instead of an abort.
-            HuffmanPhase::JpegPhase1IntraSync
-            | HuffmanPhase::JpegPhase2InterSync
-            | HuffmanPhase::JpegPhase4Redecode => Err(crate::backend::BackendError::msg(format!(
-                "Vulkan backend: JPEG-framed phase {:?} is not yet implemented",
-                p.phase,
-            ))),
+            HuffmanPhase::JpegPhase1IntraSync => self.dispatch_jpeg_phase1(&p, &push, groups),
+            // JPEG-framed Phase 2 + Phase 4 follow in the next B2c
+            // commits.  Typed BackendError keeps the dispatch path
+            // recoverable for callers exercising the new variants
+            // during incremental bring-up.
+            HuffmanPhase::JpegPhase2InterSync | HuffmanPhase::JpegPhase4Redecode => {
+                Err(crate::backend::BackendError::msg(format!(
+                    "Vulkan backend: JPEG-framed phase {:?} is not yet implemented",
+                    p.phase,
+                )))
+            }
         }
+    }
+
+    /// Dispatch helper for the JPEG-framed Phase 1.  Pulled out of
+    /// [`Self::record_huffman`] so the main fn stays under the clippy
+    /// `too_many_lines` threshold and the JPEG-specific buffer wiring
+    /// is visible as a discrete block.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn dispatch_jpeg_phase1(
+        &self,
+        p: &params::HuffmanParams<'_, super::VulkanBackend>,
+        push: &[u8; 24],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        let dc = p
+            .dc_codebook
+            .expect("validate() proved dc_codebook is Some for JpegPhase1IntraSync");
+        let sched = p
+            .mcu_schedule
+            .expect("validate() proved mcu_schedule is Some for JpegPhase1IntraSync");
+        self.dispatch_kernel(
+            KernelId::JpegPhase1IntraSync,
+            &[
+                p.bitstream.handle(),
+                p.codebook.handle(),
+                p.s_info.handle(),
+                dc.handle(),
+                sched.handle(),
+            ],
+            &[
+                p.bitstream.size(),
+                p.codebook.size(),
+                p.s_info.size(),
+                dc.size(),
+                sched.size(),
+            ],
+            push,
+            groups,
+        )
     }
 
     pub(super) fn record_blit_image(
