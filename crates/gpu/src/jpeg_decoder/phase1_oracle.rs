@@ -93,6 +93,12 @@ pub(super) enum StepOutcome {
 /// Decode exactly one Huffman symbol starting at `state.p`, returning
 /// the post-advance state or a typed miss/truncation outcome.
 ///
+/// `count_to` controls per-region accounting: `n` increments only if
+/// the symbol *starts* (its first bit) before `count_to`. Symbols
+/// straddling the boundary are not counted by this subseq — they
+/// belong to the next subseq's "owned region". Callers that don't
+/// care (the existing unit tests) pass `u32::MAX`.
+///
 /// Same per-symbol arithmetic as `phase1_walk`'s inner loop; lifted
 /// out so Phase 2's inter-sync oracle (which advances one symbol per
 /// retry pass) can share the codepath.
@@ -100,6 +106,7 @@ pub(super) fn try_decode_one_symbol(
     state: SubsequenceState,
     bitstream: &PackedBitstream,
     tables: &[CanonicalCodebook],
+    count_to: u32,
 ) -> StepOutcome {
     let length_bits = bitstream.length_bits;
     let peek = peek16(bitstream, u64::from(state.p));
@@ -114,8 +121,11 @@ pub(super) fn try_decode_one_symbol(
     let num_components =
         u32::try_from(tables.len()).expect("more codetables than fit in u32 — caller bug");
     let mut next = state;
+    let count_this_one = state.p < count_to;
     next.p += advance;
-    next.n = next.n.saturating_add(1);
+    if count_this_one {
+        next.n = next.n.saturating_add(1);
+    }
     next.z = (next.z + 1) % 64;
     if next.z == 0 {
         next.c = (next.c + 1) % num_components;
@@ -125,10 +135,14 @@ pub(super) fn try_decode_one_symbol(
 
 /// Run the Phase 1 intra-sync decode for one subsequence.
 ///
-/// The caller supplies `tables` indexed by component. `start_bit`
-/// is the absolute bit position the thread begins decoding at;
-/// `hard_limit` is the upper bound (typically
+/// The caller supplies `tables` indexed by component. `start_bit` is
+/// the absolute bit position the thread begins decoding at;
+/// `hard_limit` is the upper bound on `state.p` (typically
 /// `(seq_idx + 2) * subsequence_bits` clamped to `length_bits`).
+/// `count_to` is the per-region boundary for `n`: only symbols whose
+/// first bit is `< count_to` are counted in `n`. In production this is
+/// `(seq_idx + 1) * subsequence_bits` — symbols straddling the
+/// boundary belong to the next subseq's region.
 ///
 /// Returns the final `(p, n, c, z)` state plus the reason the loop
 /// terminated. The state is what the GPU kernel writes into its
@@ -142,6 +156,7 @@ pub(super) fn phase1_walk(
     tables: &[CanonicalCodebook],
     start_bit: u32,
     hard_limit: u32,
+    count_to: u32,
 ) -> (SubsequenceState, Phase1Stop) {
     assert!(
         !tables.is_empty(),
@@ -157,7 +172,7 @@ pub(super) fn phase1_walk(
         if state.p >= hard_limit {
             return (state, Phase1Stop::HardLimit);
         }
-        match try_decode_one_symbol(state, bitstream, tables) {
+        match try_decode_one_symbol(state, bitstream, tables, count_to) {
             StepOutcome::Advanced(next) => state = next,
             StepOutcome::PrefixMiss => return (state, Phase1Stop::PrefixMiss),
             StepOutcome::LengthBits => return (state, Phase1Stop::LengthBits),
@@ -176,7 +191,7 @@ mod tests {
         // Stream = one symbol 0x00 (code "00", 2 bits).
         let stream = book4_stream(&[0x00]);
         let book = [book4_codebook()];
-        let (state, stop) = phase1_walk(&stream, &book, 0, 2);
+        let (state, stop) = phase1_walk(&stream, &book, 0, 2, 2);
         assert_eq!(stop, Phase1Stop::HardLimit);
         assert_eq!(state.p, 2);
         assert_eq!(state.n, 1);
@@ -191,7 +206,7 @@ mod tests {
         let symbols = vec![0x00; 64];
         let stream = book4_stream(&symbols);
         let book = [book4_codebook(), book4_codebook()];
-        let (state, _) = phase1_walk(&stream, &book, 0, 128);
+        let (state, _) = phase1_walk(&stream, &book, 0, 128, 128);
         assert_eq!(state.n, 64);
         assert_eq!(state.z, 0);
         assert_eq!(state.c, 1);
@@ -204,7 +219,7 @@ mod tests {
         let symbols = vec![0x00; 64];
         let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
-        let (state, _) = phase1_walk(&stream, &book, 0, 128);
+        let (state, _) = phase1_walk(&stream, &book, 0, 128, 128);
         assert_eq!(state.n, 64);
         assert_eq!(state.z, 0);
         assert_eq!(state.c, 0);
@@ -217,7 +232,7 @@ mod tests {
         let symbols = vec![0x00; 5];
         let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
-        let (state, stop) = phase1_walk(&stream, &book, 0, 6);
+        let (state, stop) = phase1_walk(&stream, &book, 0, 6, 6);
         assert_eq!(stop, Phase1Stop::HardLimit);
         assert_eq!(state.p, 6);
         assert_eq!(state.n, 3);
@@ -230,7 +245,7 @@ mod tests {
         let symbols = vec![0x00; 4];
         let stream = book4_stream(&symbols);
         let book = [book4_codebook()];
-        let (state, _) = phase1_walk(&stream, &book, 2, 8);
+        let (state, _) = phase1_walk(&stream, &book, 2, 8, 8);
         assert_eq!(state.p, 8);
         assert_eq!(state.n, 3);
     }
@@ -242,7 +257,7 @@ mod tests {
             length_bits: 0,
         };
         let book = [book4_codebook()];
-        let (state, stop) = phase1_walk(&stream, &book, 0, 0);
+        let (state, stop) = phase1_walk(&stream, &book, 0, 0, 0);
         // start_bit = 0 == hard_limit = 0 → immediate HardLimit exit.
         assert_eq!(stop, Phase1Stop::HardLimit);
         assert_eq!(state.p, 0);
@@ -264,7 +279,7 @@ mod tests {
             words: vec![0x8000_0000],
             length_bits: 1,
         };
-        let (state, stop) = phase1_walk(&stream, &book, 0, 1);
+        let (state, stop) = phase1_walk(&stream, &book, 0, 1, 1);
         assert_eq!(stop, Phase1Stop::PrefixMiss);
         assert_eq!(state.n, 0);
         assert_eq!(state.p, 0);
@@ -281,7 +296,7 @@ mod tests {
             length_bits: 1,
         };
         let book = [book4_codebook()];
-        let (state, stop) = phase1_walk(&stream, &book, 0, 1);
+        let (state, stop) = phase1_walk(&stream, &book, 0, 1, 1);
         assert_eq!(stop, Phase1Stop::LengthBits);
         assert_eq!(state.n, 0);
     }
@@ -308,7 +323,7 @@ mod tests {
             words: vec![0x0000_0000],
             length_bits: 12,
         };
-        let (state, stop) = phase1_walk(&stream, &book, 0, 12);
+        let (state, stop) = phase1_walk(&stream, &book, 0, 12, 12);
         assert_eq!(stop, Phase1Stop::HardLimit);
         assert_eq!(state.p, 12, "p should advance by 4 * (1 + 2) = 12");
         assert_eq!(state.n, 4, "4 symbols decoded");
@@ -327,9 +342,10 @@ mod tests {
         let length_bits = stream.length_bits;
         assert_eq!(length_bits, 200);
 
-        let (state_full, _) = phase1_walk(&stream, &book, 0, length_bits);
-        let (state_first, _) = phase1_walk(&stream, &book, 0, 100);
-        let (state_second, _) = phase1_walk(&stream, &book, state_first.p, length_bits);
+        let (state_full, _) = phase1_walk(&stream, &book, 0, length_bits, length_bits);
+        let (state_first, _) = phase1_walk(&stream, &book, 0, 100, 100);
+        let (state_second, _) =
+            phase1_walk(&stream, &book, state_first.p, length_bits, length_bits);
 
         // n is local to each walk; the rest of the state should match
         // the full-walk's intermediate (p, c, z).

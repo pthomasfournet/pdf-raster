@@ -31,6 +31,14 @@ __device__ __forceinline__ unsigned int peek16_kernel(
 // unchanged so callers can detect the miss without checkpoint
 // arithmetic.
 //
+// `count_to` controls per-region accounting: `*n` increments only
+// when the symbol *starts* (`*p` before advance) below `count_to`.
+// Symbols straddling the boundary belong to the next subseq's
+// region and must not inflate this subseq's count — that's what
+// Phase 3's exclusive scan + Phase 4's per-thread write region rely
+// on. Phase 1 passes `start_bit + subsequence_bits`; Phase 2 passes
+// the next subseq's `start_bit`.
+//
 // Mirrors phase1_oracle::try_decode_one_symbol on the host side;
 // shared by both phase1_intra_sync (loops until hard_limit) and
 // phase2_inter_sync (calls once per unsynced subseq per pass).
@@ -39,6 +47,7 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     const unsigned int* __restrict__ codebook,
     unsigned int length_bits,
     unsigned int num_components,
+    unsigned int count_to,
     unsigned int* p,
     unsigned int* n,
     unsigned int* c,
@@ -53,8 +62,9 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     unsigned int advance = num_bits + value_bits;
     if (*p + advance > length_bits) return 0u;  // LengthBits
 
+    unsigned int count_this_one = (*p < count_to) ? 1u : 0u;
     *p += advance;
-    *n += 1u;
+    *n += count_this_one;
     // z is a 6-bit zig-zag index; mask is one PTX instruction.
     *z = (*z + 1u) & 63u;
     if (*z == 0u) {
@@ -83,6 +93,9 @@ extern "C" __global__ void phase1_intra_sync(
     unsigned int start_bit = seq_idx * subsequence_bits;
     unsigned int sync_target = start_bit + 2u * subsequence_bits;
     unsigned int hard_limit = min(length_bits, sync_target);
+    // Symbols whose first bit lands at >= subseq_end_bit belong to
+    // the next subseq's "owned" region; freeze `n` past that point.
+    unsigned int subseq_end_bit = min(length_bits, start_bit + subsequence_bits);
 
     unsigned int p = start_bit;
     unsigned int n = 0u;
@@ -93,7 +106,7 @@ extern "C" __global__ void phase1_intra_sync(
     for (unsigned int iter = 0u; iter < max_iters; iter++) {
         if (p >= hard_limit) break;
         if (try_decode_one_symbol_device(
-                bitstream, codebook, length_bits, num_components,
+                bitstream, codebook, length_bits, num_components, subseq_end_bit,
                 &p, &n, &c, &z) == 0u) {
             break;
         }
@@ -161,10 +174,11 @@ extern "C" __global__ void phase2_inter_sync(
     unsigned int n = me.y;
     unsigned int c = me_c;
     unsigned int z = me_z;
-    // Advance is permitted to fail (PrefixMiss / LengthBits); the
-    // state stays put and we'll spin in this subseq until the bound.
+    // count_to = nxt_start_p: symbols starting before the next
+    // subseq's start belong to my region; symbols starting past
+    // that don't (they belong to the next subseq).
     (void)try_decode_one_symbol_device(
-        bitstream, codebook, length_bits, num_components,
+        bitstream, codebook, length_bits, num_components, nxt_start_p,
         &p, &n, &c, &z);
 
     uint4 updated;

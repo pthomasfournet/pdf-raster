@@ -308,7 +308,8 @@ mod tests {
         for seq_idx in 0..num_subseq {
             let start_bit = seq_idx * subseq_bits;
             let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
-            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit);
+            let count_to = stream.length_bits.min(start_bit + subseq_bits);
+            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit, count_to);
             assert_eq!(
                 gpu[seq_idx as usize], cpu,
                 "subsequence {seq_idx} GPU vs CPU state mismatch"
@@ -420,7 +421,8 @@ mod tests {
             .map(|i| {
                 let start_bit = i * 128;
                 let hard_limit = stream.length_bits.min(start_bit + 2 * 128);
-                let (state, _stop) = phase1_walk(&stream, &book, start_bit, hard_limit);
+                let count_to = stream.length_bits.min(start_bit + 128);
+                let (state, _stop) = phase1_walk(&stream, &book, start_bit, hard_limit, count_to);
                 state
             })
             .collect();
@@ -554,7 +556,8 @@ mod vulkan_tests {
         for seq_idx in 0..num_subseq {
             let start_bit = seq_idx * subseq_bits;
             let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
-            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit);
+            let count_to = stream.length_bits.min(start_bit + subseq_bits);
+            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit, count_to);
             let i = seq_idx as usize;
             assert_eq!(gpu_cuda[i], cpu, "subseq {seq_idx}: CUDA vs CPU");
             assert_eq!(gpu_vk[i], cpu, "subseq {seq_idx}: Vulkan vs CPU");
@@ -574,7 +577,8 @@ mod vulkan_tests {
         for seq_idx in 0..num_subseq {
             let start_bit = seq_idx * subseq_bits;
             let hard_limit = stream.length_bits.min(start_bit + 2 * subseq_bits);
-            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit);
+            let count_to = stream.length_bits.min(start_bit + subseq_bits);
+            let (cpu, _stop) = phase1_walk(stream, tables, start_bit, hard_limit, count_to);
             assert_eq!(gpu[seq_idx as usize], cpu, "subseq {seq_idx} Vulkan vs CPU");
         }
     }

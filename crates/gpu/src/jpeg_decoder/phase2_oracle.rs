@@ -92,7 +92,14 @@ fn phase2_sync_pass(
         }
         // Not synced — advance me by one symbol. A miss leaves the
         // state unchanged; this pass is reported as still unsynced.
-        if let StepOutcome::Advanced(next) = try_decode_one_symbol(me, bitstream, tables) {
+        //
+        // `count_to = nxt_start_p`: a symbol *starting* before the
+        // next subseq's start_bit belongs to *my* region (count it
+        // in `me.n`); a symbol starting past that boundary belongs
+        // to the next subseq (do not count).
+        if let StepOutcome::Advanced(next) =
+            try_decode_one_symbol(me, bitstream, tables, nxt_start_p)
+        {
             s_info[i] = next;
         }
         unsynced += 1;
@@ -147,7 +154,9 @@ mod tests {
             .map(|i| {
                 let start_bit = i * subsequence_bits;
                 let hard_limit = bitstream.length_bits.min(start_bit + 2 * subsequence_bits);
-                let (state, _stop) = phase1_walk(bitstream, tables, start_bit, hard_limit);
+                let count_to = bitstream.length_bits.min(start_bit + subsequence_bits);
+                let (state, _stop) =
+                    phase1_walk(bitstream, tables, start_bit, hard_limit, count_to);
                 state
             })
             .collect()

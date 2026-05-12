@@ -63,9 +63,15 @@ uint peek16_kernel(uint bit_pos) {
 /// length-bits truncation) `state` is left unchanged and the caller
 /// can detect the miss without checkpoint arithmetic.
 ///
+/// `count_to` controls per-region accounting: `state.y` (= n)
+/// increments only when the symbol *starts* (state.x before advance)
+/// below `count_to`. Symbols straddling the boundary belong to the
+/// next subseq's region. Phase 1 passes `start_bit + subsequence_bits`;
+/// Phase 2 passes the next subseq's `start_bit`.
+///
 /// Shared by Phase 1 (loops until hard_limit) and Phase 2 (calls
 /// once per unsynced subseq per pass).
-bool try_decode_one_symbol_kernel(inout uint4 state) {
+bool try_decode_one_symbol_kernel(inout uint4 state, uint count_to) {
     uint peek = peek16_kernel(state.x);
     uint entry = codebook[state.z * 65536u + peek];
     uint num_bits = (entry >> 8u) & 0xFFu;
@@ -78,8 +84,9 @@ bool try_decode_one_symbol_kernel(inout uint4 state) {
     if (state.x + advance > length_bits) {
         return false;
     }
+    uint count_this_one = (state.x < count_to) ? 1u : 0u;
     state.x += advance;
-    state.y += 1u;
+    state.y += count_this_one;
     // state.w is the zig-zag index (6-bit); state.z is the component.
     state.w = (state.w + 1u) & 63u;
     if (state.w == 0u) {
@@ -98,6 +105,9 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     uint start_bit = seq_idx * subsequence_bits;
     uint sync_target = start_bit + 2u * subsequence_bits;
     uint hard_limit = min(length_bits, sync_target);
+    // Symbols whose first bit lands at >= subseq_end_bit belong to
+    // the next subseq's "owned" region; freeze `n` past that point.
+    uint subseq_end_bit = min(length_bits, start_bit + subsequence_bits);
 
     // (p, n, c, z) packed into uint4 as (x, y, z, w).
     uint4 state = uint4(start_bit, 0u, 0u, 0u);
@@ -111,7 +121,7 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
         if (state.x >= hard_limit) {
             break;
         }
-        if (!try_decode_one_symbol_kernel(state)) {
+        if (!try_decode_one_symbol_kernel(state, subseq_end_bit)) {
             break;
         }
     }
@@ -147,7 +157,9 @@ void phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
     // Not synced — advance me by one symbol, write back, mark unsynced.
     // The advance is permitted to fail; on miss the state stays put
     // and we'll spin this subseq until the host's retry bound.
-    bool _ignored = try_decode_one_symbol_kernel(me);
+    // count_to = nxt_start_p: symbols starting before the next
+    // subseq's start belong to my region.
+    bool _ignored = try_decode_one_symbol_kernel(me, nxt_start_p);
     s_info_out[seq_idx] = me;
     sync_flags[seq_idx] = 0u;
 }
