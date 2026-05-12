@@ -331,6 +331,19 @@ impl PageRecorder {
                     )
                     .map_err(be)
             }
+            // JPEG-framed phases land in the type system here; the
+            // kernels will follow in the next B2c commits.  Surface a
+            // typed BackendError rather than panicking so callers
+            // exercising the new dispatch path during incremental
+            // bring-up get a recoverable failure instead of an abort.
+            params::HuffmanPhase::JpegPhase1IntraSync
+            | params::HuffmanPhase::JpegPhase2InterSync
+            | params::HuffmanPhase::JpegPhase4Redecode => {
+                Err(crate::backend::BackendError::msg(format!(
+                    "CUDA backend: JPEG-framed phase {:?} is not yet implemented",
+                    p.phase,
+                )))
+            }
         }
     }
 

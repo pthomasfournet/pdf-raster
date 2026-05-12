@@ -407,6 +407,36 @@ pub enum HuffmanPhase {
     /// exclusive-scan output + a buffer sized to the total symbol
     /// count).
     Phase4Redecode,
+    /// JPEG-framed counterpart of `Phase1IntraSync`.  Uses real
+    /// JPEG decoding semantics — DC magnitude bits are skipped,
+    /// AC run/size pairs advance the zig-zag cursor by `run + 1`,
+    /// `EOB` (sym = 0x00) ends the block, `ZRL` (sym = 0xF0)
+    /// advances by 16.  Requires `dc_codebook` and `mcu_schedule`
+    /// to be `Some`.
+    JpegPhase1IntraSync,
+    /// JPEG-framed counterpart of `Phase2InterSync`.  Same
+    /// requirements as `JpegPhase1IntraSync` plus the
+    /// `sync_flags` buffer Phase2 needs.
+    JpegPhase2InterSync,
+    /// JPEG-framed counterpart of `Phase4Redecode`.  Emits the
+    /// per-block Huffman symbol stream (DC magnitude category +
+    /// AC run/size bytes).  Same requirements as
+    /// `JpegPhase1IntraSync` plus the Phase4 `offsets` +
+    /// `symbols_out` + `decode_status` buffers.
+    JpegPhase4Redecode,
+}
+
+impl HuffmanPhase {
+    /// True for the JPEG-framed phase variants
+    /// (`JpegPhase{1,2,4}*`).  Used by validation + dispatch to
+    /// pick the JPEG kernel path.
+    #[must_use]
+    pub const fn is_jpeg_framed(self) -> bool {
+        matches!(
+            self,
+            Self::JpegPhase1IntraSync | Self::JpegPhase2InterSync | Self::JpegPhase4Redecode,
+        )
+    }
 }
 
 /// Parameters for one phase of the parallel-Huffman JPEG decoder.
@@ -431,6 +461,11 @@ pub enum HuffmanPhase {
 ///   bytes; `decode_status` ≥ `num_subsequences * 4` bytes (one u32
 ///   per subseq encoding the kernel's exit condition — see
 ///   `Phase4FailureKind` for the discriminants).
+/// - When `phase.is_jpeg_framed()`: `dc_codebook` and `mcu_schedule`
+///   must both be `Some`, and `blocks_per_mcu ≥ 1`.  `dc_codebook`
+///   has the same flat layout as `codebook`; `mcu_schedule` is
+///   `u32[blocks_per_mcu]`, each entry packing
+///   `(ac_sel << 16) | (dc_sel << 8) | component_idx`.
 pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// Packed bitstream as big-endian u32 words.
     pub bitstream: &'a B::DeviceBuffer,
@@ -462,12 +497,30 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// default to Ok. Required for `Phase4Redecode`; ignored for
     /// other phases.
     pub decode_status: Option<&'a B::DeviceBuffer>,
+    /// Flat DC-class codebook for the JPEG-framed phases.  Same
+    /// layout as [`Self::codebook`] (one
+    /// `HUFFMAN_CODEBOOK_ENTRIES`-wide block per selector).
+    /// Required for any `phase.is_jpeg_framed()`; ignored for the
+    /// synthetic-stream phases.
+    pub dc_codebook: Option<&'a B::DeviceBuffer>,
+    /// Per-block schedule within an MCU: `u32[blocks_per_mcu]`.
+    /// Each entry encodes `(ac_sel << 16) | (dc_sel << 8) |
+    /// component_idx`, where `component_idx`, `dc_sel`, and
+    /// `ac_sel` are all 0..=3. Required for any
+    /// `phase.is_jpeg_framed()`; ignored otherwise.
+    pub mcu_schedule: Option<&'a B::DeviceBuffer>,
     /// Exact bit count of `bitstream`.
     pub length_bits: u32,
     /// Subsequence size (Wei §III); 128 / 512 / 1024 in practice.
     pub subsequence_bits: u32,
     /// Number of Huffman tables (one per component for the MVP).
     pub num_components: u32,
+    /// Number of 8×8 blocks per MCU in the JPEG-framed phases.
+    /// Equals the sum of `h_sampling * v_sampling` across active
+    /// scan components for an interleaved scan, or 1 for a
+    /// non-interleaved scan (JPEG § A.2.3). Must be ≥ 1 when
+    /// `phase.is_jpeg_framed()`; ignored otherwise (set to 0).
+    pub blocks_per_mcu: u32,
     /// Total symbol count = exclusive scan of `s_info[*].n` total +
     /// `s_info[num_subseq-1].n`. `Phase4Redecode` reads this in the
     /// kernel to bounds-check each `symbols_out` write — an
@@ -611,11 +664,17 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
             ));
         }
 
-        if matches!(self.phase, HuffmanPhase::Phase2InterSync) {
+        // Phase 2 sync_flags — required by the synthetic and
+        // JPEG-framed counterparts alike.
+        if matches!(
+            self.phase,
+            HuffmanPhase::Phase2InterSync | HuffmanPhase::JpegPhase2InterSync,
+        ) {
             let Some(flags) = self.sync_flags else {
-                return Err(invariant("Phase2InterSync requires sync_flags to be Some"));
+                return Err(invariant(
+                    "Phase2InterSync (or JpegPhase2InterSync) requires sync_flags to be Some",
+                ));
             };
-            // sync_flags: 1 u32 per subsequence.
             let flags_bytes = (self.num_subsequences() as usize)
                 .checked_mul(4)
                 .ok_or_else(|| invariant("sync_flags byte count overflows usize"))?;
@@ -626,41 +685,106 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
             }
         }
 
-        if matches!(self.phase, HuffmanPhase::Phase4Redecode) {
-            let Some(offsets) = self.offsets else {
-                return Err(invariant("Phase4Redecode requires offsets to be Some"));
-            };
-            let Some(symbols_out) = self.symbols_out else {
-                return Err(invariant("Phase4Redecode requires symbols_out to be Some"));
-            };
-            let Some(decode_status) = self.decode_status else {
-                return Err(invariant(
-                    "Phase4Redecode requires decode_status to be Some",
-                ));
-            };
-            // offsets + decode_status: 1 u32 per subsequence.
-            let per_subseq_bytes = (self.num_subsequences() as usize)
-                .checked_mul(4)
-                .ok_or_else(|| invariant("per-subseq byte count overflows usize"))?;
-            if backend.device_buffer_len(offsets) < per_subseq_bytes {
-                return Err(invariant(
-                    "offsets buffer is smaller than num_subsequences * 4 bytes",
-                ));
-            }
-            if backend.device_buffer_len(decode_status) < per_subseq_bytes {
-                return Err(invariant(
-                    "decode_status buffer is smaller than num_subsequences * 4 bytes",
-                ));
-            }
-            // symbols_out: 1 u32 per decoded symbol.
-            let symbols_bytes = (self.total_symbols as usize)
-                .checked_mul(4)
-                .ok_or_else(|| invariant("symbols_out byte count overflows usize"))?;
-            if backend.device_buffer_len(symbols_out) < symbols_bytes {
-                return Err(invariant(
-                    "symbols_out buffer is smaller than total_symbols * 4 bytes",
-                ));
-            }
+        if matches!(
+            self.phase,
+            HuffmanPhase::Phase4Redecode | HuffmanPhase::JpegPhase4Redecode,
+        ) {
+            self.validate_phase4_buffers(backend)?;
+        }
+
+        if self.phase.is_jpeg_framed() {
+            self.validate_jpeg_framed(backend, codebook_bytes)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate the Phase 4 (and `JpegPhase4Redecode`) buffer set:
+    /// `offsets`, `symbols_out`, `decode_status`.  Pulled out of
+    /// [`Self::validate`] so each branch stays under the clippy
+    /// `too_many_lines` threshold and so the invariants are visible
+    /// as a discrete block.
+    fn validate_phase4_buffers(&self, backend: &B) -> super::Result<()> {
+        const KIND: &str = "HuffmanInvariantViolation";
+        let invariant =
+            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
+
+        let Some(offsets) = self.offsets else {
+            return Err(invariant(
+                "Phase4Redecode (or JpegPhase4Redecode) requires offsets to be Some",
+            ));
+        };
+        let Some(symbols_out) = self.symbols_out else {
+            return Err(invariant(
+                "Phase4Redecode (or JpegPhase4Redecode) requires symbols_out to be Some",
+            ));
+        };
+        let Some(decode_status) = self.decode_status else {
+            return Err(invariant(
+                "Phase4Redecode (or JpegPhase4Redecode) requires decode_status to be Some",
+            ));
+        };
+        // offsets + decode_status: 1 u32 per subsequence.
+        let per_subseq_bytes = (self.num_subsequences() as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invariant("per-subseq byte count overflows usize"))?;
+        if backend.device_buffer_len(offsets) < per_subseq_bytes {
+            return Err(invariant(
+                "offsets buffer is smaller than num_subsequences * 4 bytes",
+            ));
+        }
+        if backend.device_buffer_len(decode_status) < per_subseq_bytes {
+            return Err(invariant(
+                "decode_status buffer is smaller than num_subsequences * 4 bytes",
+            ));
+        }
+        // symbols_out: 1 u32 per decoded symbol.
+        let symbols_bytes = (self.total_symbols as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invariant("symbols_out byte count overflows usize"))?;
+        if backend.device_buffer_len(symbols_out) < symbols_bytes {
+            return Err(invariant(
+                "symbols_out buffer is smaller than total_symbols * 4 bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the JPEG-framed-only invariants: [`Self::dc_codebook`],
+    /// [`Self::mcu_schedule`], [`Self::blocks_per_mcu`].  Separated
+    /// from [`Self::validate`] to keep the main fn under the clippy
+    /// `too_many_lines` threshold and to surface the JPEG-specific
+    /// invariants as a discrete block.
+    fn validate_jpeg_framed(&self, backend: &B, codebook_bytes: usize) -> super::Result<()> {
+        const KIND: &str = "HuffmanInvariantViolation";
+        let invariant =
+            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
+
+        if self.blocks_per_mcu == 0 {
+            return Err(invariant("JPEG-framed phases require blocks_per_mcu ≥ 1"));
+        }
+        let Some(dc) = self.dc_codebook else {
+            return Err(invariant(
+                "JPEG-framed phases require dc_codebook to be Some",
+            ));
+        };
+        if backend.device_buffer_len(dc) < codebook_bytes {
+            return Err(invariant(
+                "dc_codebook buffer is smaller than num_components * 65536 * 4 bytes",
+            ));
+        }
+        let Some(sched) = self.mcu_schedule else {
+            return Err(invariant(
+                "JPEG-framed phases require mcu_schedule to be Some",
+            ));
+        };
+        let sched_bytes = (self.blocks_per_mcu as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invariant("mcu_schedule byte count overflows usize"))?;
+        if backend.device_buffer_len(sched) < sched_bytes {
+            return Err(invariant(
+                "mcu_schedule buffer is smaller than blocks_per_mcu * 4 bytes",
+            ));
         }
         Ok(())
     }
@@ -1027,5 +1151,153 @@ mod tests {
             4,
             "labels must be unique for error formatting"
         );
+    }
+
+    // --- HuffmanPhase + HuffmanParams validation tests ---------------
+
+    #[test]
+    fn huffman_phase_is_jpeg_framed_only_for_jpeg_variants() {
+        assert!(!HuffmanPhase::Phase1IntraSync.is_jpeg_framed());
+        assert!(!HuffmanPhase::Phase2InterSync.is_jpeg_framed());
+        assert!(!HuffmanPhase::Phase4Redecode.is_jpeg_framed());
+        assert!(HuffmanPhase::JpegPhase1IntraSync.is_jpeg_framed());
+        assert!(HuffmanPhase::JpegPhase2InterSync.is_jpeg_framed());
+        assert!(HuffmanPhase::JpegPhase4Redecode.is_jpeg_framed());
+    }
+
+    /// Minimal `HuffmanParams` suitable for synthetic-stream phases.
+    /// Caller fills phase + per-phase Options.  Buffers are sized to
+    /// the documented invariants for `length_bits = 256`,
+    /// `subsequence_bits = 128`, `num_components = 1`.
+    fn ok_huffman_synthetic<'a>(
+        bitstream: &'a usize,
+        codebook: &'a usize,
+        s_info: &'a usize,
+    ) -> HuffmanParams<'a, FakeBackend> {
+        HuffmanParams {
+            bitstream,
+            codebook,
+            s_info,
+            sync_flags: None,
+            offsets: None,
+            symbols_out: None,
+            decode_status: None,
+            dc_codebook: None,
+            mcu_schedule: None,
+            length_bits: 256,
+            subsequence_bits: 128,
+            num_components: 1,
+            total_symbols: 0,
+            blocks_per_mcu: 0,
+            phase: HuffmanPhase::Phase1IntraSync,
+        }
+    }
+
+    #[test]
+    fn huffman_validate_accepts_synthetic_phase1_with_no_jpeg_fields() {
+        // 256 bits = 8 words, +1 trailing = 9 * 4 = 36 bytes.
+        let bitstream = 36;
+        // codebook: 1 component × 65536 × 4 = 262144 bytes.
+        let codebook = 1 << 18;
+        // s_info: ceil(256/128) = 2 subsequences × 16 bytes = 32.
+        let s_info = 32;
+        let params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params
+            .validate(&FakeBackend)
+            .expect("synthetic phase1 with sized buffers must validate");
+    }
+
+    #[test]
+    fn huffman_validate_rejects_jpeg_phase_without_dc_codebook() {
+        let bitstream = 36;
+        let codebook = 1 << 18;
+        let s_info = 32;
+        let mut params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params.phase = HuffmanPhase::JpegPhase1IntraSync;
+        params.blocks_per_mcu = 1;
+        let mcu_schedule = 4;
+        params.mcu_schedule = Some(&mcu_schedule);
+        // dc_codebook intentionally None.
+        let err = params
+            .validate(&FakeBackend)
+            .expect_err("JPEG-framed phase without dc_codebook must be rejected");
+        match err {
+            super::super::BackendError::InvariantViolation { detail, .. } => {
+                assert!(
+                    detail.contains("dc_codebook"),
+                    "expected dc_codebook-related detail, got: {detail}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn huffman_validate_rejects_jpeg_phase_without_mcu_schedule() {
+        let bitstream = 36;
+        let codebook = 1 << 18;
+        let s_info = 32;
+        let dc_codebook = 1 << 18;
+        let mut params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params.phase = HuffmanPhase::JpegPhase1IntraSync;
+        params.blocks_per_mcu = 1;
+        params.dc_codebook = Some(&dc_codebook);
+        // mcu_schedule intentionally None.
+        let err = params
+            .validate(&FakeBackend)
+            .expect_err("JPEG-framed phase without mcu_schedule must be rejected");
+        match err {
+            super::super::BackendError::InvariantViolation { detail, .. } => {
+                assert!(
+                    detail.contains("mcu_schedule"),
+                    "expected mcu_schedule-related detail, got: {detail}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn huffman_validate_rejects_jpeg_phase_with_zero_blocks_per_mcu() {
+        let bitstream = 36;
+        let codebook = 1 << 18;
+        let s_info = 32;
+        let dc_codebook = 1 << 18;
+        let mcu_schedule = 4;
+        let mut params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params.phase = HuffmanPhase::JpegPhase1IntraSync;
+        params.dc_codebook = Some(&dc_codebook);
+        params.mcu_schedule = Some(&mcu_schedule);
+        // blocks_per_mcu intentionally 0.
+        let err = params
+            .validate(&FakeBackend)
+            .expect_err("blocks_per_mcu = 0 must be rejected on JPEG-framed phases");
+        match err {
+            super::super::BackendError::InvariantViolation { detail, .. } => {
+                assert!(
+                    detail.contains("blocks_per_mcu"),
+                    "expected blocks_per_mcu-related detail, got: {detail}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn huffman_validate_accepts_jpeg_phase1_with_all_jpeg_fields() {
+        let bitstream = 36;
+        let codebook = 1 << 18;
+        let s_info = 32;
+        let dc_codebook = 1 << 18;
+        // blocks_per_mcu = 1 × 4 = 4 bytes.
+        let mcu_schedule = 4;
+        let mut params = ok_huffman_synthetic(&bitstream, &codebook, &s_info);
+        params.phase = HuffmanPhase::JpegPhase1IntraSync;
+        params.dc_codebook = Some(&dc_codebook);
+        params.mcu_schedule = Some(&mcu_schedule);
+        params.blocks_per_mcu = 1;
+        params
+            .validate(&FakeBackend)
+            .expect("JPEG-framed phase1 with all required fields must validate");
     }
 }

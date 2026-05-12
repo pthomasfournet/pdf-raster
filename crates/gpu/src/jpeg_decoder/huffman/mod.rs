@@ -119,10 +119,13 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
         offsets: None,
         symbols_out: None,
         decode_status: None,
+        dc_codebook: None,
+        mcu_schedule: None,
         length_bits,
         subsequence_bits,
         num_components,
         total_symbols: 0,
+        blocks_per_mcu: 0,
         phase: HuffmanPhase::Phase1IntraSync,
     })?;
     let fence = backend.submit_page()?;
@@ -215,10 +218,13 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
         offsets: None,
         symbols_out: None,
         decode_status: None,
+        dc_codebook: None,
+        mcu_schedule: None,
         length_bits,
         subsequence_bits,
         num_components,
         total_symbols: 0,
+        blocks_per_mcu: 0,
         phase: HuffmanPhase::Phase1IntraSync,
     })?;
     let fence = backend.submit_page()?;
@@ -238,10 +244,13 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
             offsets: None,
             symbols_out: None,
             decode_status: None,
+            dc_codebook: None,
+            mcu_schedule: None,
             length_bits,
             subsequence_bits,
             num_components,
             total_symbols: 0,
+            blocks_per_mcu: 0,
             phase: HuffmanPhase::Phase2InterSync,
         })?;
         let fence = backend.submit_page()?;
@@ -359,10 +368,13 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         offsets: None,
         symbols_out: None,
         decode_status: None,
+        dc_codebook: None,
+        mcu_schedule: None,
         length_bits,
         subsequence_bits,
         num_components,
         total_symbols: 0,
+        blocks_per_mcu: 0,
         phase: HuffmanPhase::Phase1IntraSync,
     })?;
     let fence = backend.submit_page()?;
@@ -382,10 +394,13 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
             offsets: None,
             symbols_out: None,
             decode_status: None,
+            dc_codebook: None,
+            mcu_schedule: None,
             length_bits,
             subsequence_bits,
             num_components,
             total_symbols: 0,
+            blocks_per_mcu: 0,
             phase: HuffmanPhase::Phase2InterSync,
         })?;
         let fence = backend.submit_page()?;
@@ -454,10 +469,13 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         offsets: Some(offsets_buf.as_ref()),
         symbols_out: Some(symbols_buf.as_ref()),
         decode_status: Some(decode_status_buf.as_ref()),
+        dc_codebook: None,
+        mcu_schedule: None,
         length_bits,
         subsequence_bits,
         num_components,
         total_symbols,
+        blocks_per_mcu: 0,
         phase: HuffmanPhase::Phase4Redecode,
     })?;
     let fence = backend.submit_page()?;

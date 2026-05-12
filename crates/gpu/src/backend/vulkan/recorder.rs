@@ -552,6 +552,17 @@ impl PageRecorder {
                     groups,
                 )
             }
+            // JPEG-framed phases land in the type system here; the
+            // kernels will follow in the next B2c commits.  Surface a
+            // typed BackendError rather than panicking so callers
+            // exercising the new dispatch path during incremental
+            // bring-up get a recoverable failure instead of an abort.
+            HuffmanPhase::JpegPhase1IntraSync
+            | HuffmanPhase::JpegPhase2InterSync
+            | HuffmanPhase::JpegPhase4Redecode => Err(crate::backend::BackendError::msg(format!(
+                "Vulkan backend: JPEG-framed phase {:?} is not yet implemented",
+                p.phase,
+            ))),
         }
     }
 
