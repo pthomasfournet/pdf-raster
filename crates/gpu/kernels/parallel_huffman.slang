@@ -582,10 +582,15 @@ void jpeg_phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
     uint nxt_start_p = (seq_idx + 1u) * subsequence_bits;
 
     // JPEG framing: block_in_mcu is in .z; z_in_block is in .w.
-    bool in_range = me.x >= nxt_start_p;
-    bool aligned  = me.z == nxt.z && me.w == nxt.w;
+    bool in_range    = me.x >= nxt_start_p;
+    bool aligned     = me.z == nxt.z && me.w == nxt.w;
+    // nxt must have decoded at least one symbol (nxt.x > its own start_p).
+    // Without this, a nxt thread that failed to decode stays at (x=nxt_start_p,
+    // z=0, w=0); if me also lands at (z=0, w=0) after a full MCU, aligned fires
+    // as a false-positive even though nxt never established a real boundary.
+    bool nxt_decoded = nxt.x > nxt_start_p;
 
-    if (in_range && aligned) {
+    if (in_range && aligned && nxt_decoded) {
         sync_flags[seq_idx] = 1u;
         return;
     }
