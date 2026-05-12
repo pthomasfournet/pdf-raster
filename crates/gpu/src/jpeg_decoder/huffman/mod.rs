@@ -1488,6 +1488,64 @@ mod tests {
         assert_eq!(syms16, syms32, "subseq 16 vs 32 symbol mismatch");
         assert_eq!(syms32, syms64, "subseq 32 vs 64 symbol mismatch");
     }
+
+    /// JPEG Phases 1–4 on CUDA decode a 4:4:4 YCbCr image and the resulting
+    /// symbol stream matches the CPU oracle.  This exercises blocks_per_mcu=3
+    /// (one block per component per MCU), the MCU schedule rotation for
+    /// z_in_block=0 → block_in_mcu advance, and multi-component AC framing.
+    #[test]
+    fn jpeg_phase4_cuda_matches_oracle_on_ycbcr_444() {
+        use crate::jpeg_decoder::decode_scan_symbols;
+        static COLOUR_32X32_444: &[u8] =
+            include_bytes!("../../../../../../tests/fixtures/jpeg/colour_32x32_444.jpg");
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let prep = prepare_jpeg(COLOUR_32X32_444).expect("colour 4:4:4 JPEG must prepare");
+        assert_eq!(
+            prep.components.len(),
+            3,
+            "fixture must be 3-component YCbCr"
+        );
+        let gpu_syms =
+            dispatch_jpeg_phase1_through_phase4(&b, &prep, 32).expect("CUDA phase4 dispatch");
+        let cpu_syms = decode_scan_symbols(&prep).expect("CPU oracle");
+        assert_eq!(
+            gpu_syms.len(),
+            cpu_syms.len(),
+            "CUDA vs CPU symbol count mismatch on YCbCr fixture"
+        );
+        for (i, (&g, &c)) in gpu_syms.iter().zip(cpu_syms.iter()).enumerate() {
+            assert_eq!(
+                g, c,
+                "CUDA vs CPU symbol[{i}] mismatch on YCbCr: GPU={g:#04x} CPU={c:#04x}"
+            );
+        }
+    }
+
+    /// JPEG Phases 1–4 returns a stable symbol stream for the 4:4:4 YCbCr
+    /// fixture across subsequence sizes 16, 32, and 64 bits.  Validates that
+    /// the MCU schedule rotation (block_in_mcu advance on z_in_block=64) is
+    /// consistent regardless of where subsequence boundaries fall.
+    #[test]
+    fn jpeg_phase4_cuda_ycbcr_stable_across_subseq_sizes() {
+        static COLOUR_32X32_444: &[u8] =
+            include_bytes!("../../../../../../tests/fixtures/jpeg/colour_32x32_444.jpg");
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let prep = prepare_jpeg(COLOUR_32X32_444).expect("colour 4:4:4 JPEG must prepare");
+        let syms16 =
+            dispatch_jpeg_phase1_through_phase4(&b, &prep, 16).expect("subseq=16 dispatch");
+        let syms32 =
+            dispatch_jpeg_phase1_through_phase4(&b, &prep, 32).expect("subseq=32 dispatch");
+        let syms64 =
+            dispatch_jpeg_phase1_through_phase4(&b, &prep, 64).expect("subseq=64 dispatch");
+        assert_eq!(syms16, syms32, "YCbCr subseq 16 vs 32 symbol mismatch");
+        assert_eq!(syms32, syms64, "YCbCr subseq 32 vs 64 symbol mismatch");
+    }
 }
 
 #[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
