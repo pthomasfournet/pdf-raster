@@ -132,7 +132,6 @@ impl GpuCtx {
         offsets: &CudaSlice<u8>,
         symbols_out: &CudaSlice<u8>,
         length_bits: u32,
-        subsequence_bits: u32,
         total_symbols: u32,
         num_subsequences: u32,
         num_components: u32,
@@ -152,12 +151,15 @@ impl GpuCtx {
             .arg(offsets)
             .arg(symbols_out)
             .arg(&length_bits)
-            .arg(&subsequence_bits)
             .arg(&total_symbols)
             .arg(&num_subsequences)
             .arg(&num_components);
         // SAFETY: arg count + types match the PTX phase4_redecode
         // signature; buffer capacities validated by HuffmanParams.
+        // Note: subsequence_bits is not in the CUDA Phase 4 arg list
+        // because Phase 4 reads end_p from the snapshot's `me.x`; the
+        // Slang side keeps it via the shared push cbuffer (other
+        // phases use it).
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }

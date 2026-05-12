@@ -240,10 +240,9 @@ fn vector_04_skewed_distribution() {
     // input distribution — but the per-subseq `n` counts vary much
     // more than the uniform case, exercising Phase 3's scan + Phase
     // 4's offset arithmetic. 1024 symbols → clean 16-subseq layout.
-    let mut symbols = Vec::with_capacity(1024);
-    for i in 0..1024 {
-        symbols.push(if i % 10 == 0 { 0x10 } else { 0x00 });
-    }
+    let symbols: Vec<u8> = (0..1024u32)
+        .map(|i| if i % 10 == 0 { 0x10 } else { 0x00 })
+        .collect();
     assert_roundtrip(&book_uniform_len2(), &symbols, 128, false);
 }
 

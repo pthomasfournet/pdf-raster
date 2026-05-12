@@ -134,7 +134,13 @@ extern "C" __global__ void phase1_intra_sync(
     unsigned int snap_z = z;
     unsigned int snapshotted = 0u;
 
-    unsigned int max_iters = (hard_limit - start_bit) + 1u;
+    // Defensive form: if a future dispatcher ever produces a
+    // seq_idx where start_bit > hard_limit (e.g., off-by-one in
+    // num_subsequences), the subtraction in the naive form would
+    // underflow u32 and produce a huge iteration count. The loop
+    // body's `p >= hard_limit` check would still terminate it
+    // immediately, but the bound expression itself should not lie.
+    unsigned int max_iters = ((hard_limit > start_bit) ? (hard_limit - start_bit) : 0u) + 1u;
     unsigned int symbol_sink;  // Phase 1 doesn't emit; the helper writes here and we ignore it.
     for (unsigned int iter = 0u; iter < max_iters; iter++) {
         if (p >= hard_limit) break;
@@ -200,7 +206,6 @@ extern "C" __global__ void phase4_redecode(
     const unsigned int* __restrict__ offsets,
     unsigned int* __restrict__ symbols_out,
     unsigned int length_bits,
-    unsigned int subsequence_bits,
     unsigned int total_symbols,
     unsigned int num_subsequences,
     unsigned int num_components
@@ -212,10 +217,6 @@ extern "C" __global__ void phase4_redecode(
 
     uint4 me = s_info[seq_idx];
     unsigned int end_p = me.x;
-    // Unused now that we read end_p directly from the snapshot,
-    // but kept in the launch signature for callers (Vulkan recorder
-    // also passes it through the shared push struct).
-    (void)subsequence_bits;
 
     // (p, n, c, z) packed into uint4 (x, y, z, w).
     unsigned int p, n, c, z;

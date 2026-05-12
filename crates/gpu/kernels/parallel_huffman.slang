@@ -137,8 +137,11 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     // Loop bound: at most one symbol every (code_bits + value_bits)
     // bits, and code_bits >= 1 — so at most `hard_limit - start_bit`
     // symbols. The +1 caps a buggy codebook (entry => 0 advance);
-    // working codebooks terminate well below this.
-    uint max_iters = (hard_limit - start_bit) + 1u;
+    // working codebooks terminate well below this. Defensive form
+    // matches Phase 4: if start_bit > hard_limit ever happens
+    // (off-by-one in num_subsequences), the naive subtraction
+    // underflows u32.
+    uint max_iters = (hard_limit > start_bit ? hard_limit - start_bit : 0u) + 1u;
     uint symbol_sink;  // Phase 1 doesn't emit.
     for (uint iter = 0u; iter < max_iters; iter++) {
         if (state.x >= hard_limit) {

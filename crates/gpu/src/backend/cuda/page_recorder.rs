@@ -321,7 +321,6 @@ impl PageRecorder {
                         offsets,
                         symbols_out,
                         p.length_bits,
-                        p.subsequence_bits,
                         p.total_symbols,
                         num_subsequences,
                         p.num_components,
