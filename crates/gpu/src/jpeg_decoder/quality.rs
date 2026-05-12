@@ -14,10 +14,12 @@ use crate::jpeg_decoder::JpegPreparedInput;
 /// Low sum → high quality → large subsequence.
 #[must_use]
 pub fn pick_subsequence_size(prep: &JpegPreparedInput) -> u32 {
-    let luma_sum: u32 = prep
-        .quant_tables
-        .iter()
-        .find_map(|qt| qt.as_ref())
+    // Prefer luma table (slot 0); fall back to the first populated slot.
+    // JFIF always places luma in slot 0, so the fallback only fires for
+    // non-standard files — still better than no estimate.
+    let luma_sum: u32 = prep.quant_tables[0]
+        .as_ref()
+        .or_else(|| prep.quant_tables.iter().find_map(|qt| qt.as_ref()))
         .map_or(0, |qt| qt.values.iter().map(|&v| u32::from(v)).sum());
 
     match luma_sum {

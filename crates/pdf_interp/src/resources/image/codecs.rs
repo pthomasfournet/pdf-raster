@@ -527,33 +527,58 @@ pub(super) fn decode_dct(
     #[cfg(feature = "gpu-jpeg-huffman")]
     if let Some(dec) = jpeg_gpu {
         let area = pdf_w.saturating_mul(pdf_h);
+        #[expect(
+            clippy::absurd_extreme_comparisons,
+            reason = "GPU_JPEG_HUFFMAN_THRESHOLD_PX is u32::MAX until a benchmark confirms a crossover"
+        )]
         if area >= super::GPU_JPEG_HUFFMAN_THRESHOLD_PX {
             match dec.decode(data) {
                 Ok(img) => {
                     let w = img.width;
                     let h = img.height;
-                    let n = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-                    let mut rgba = vec![0u8; n];
-                    let downloaded = dec
-                        .backend()
-                        .download_async(&img.buffer, &mut rgba)
-                        .and_then(|fence| dec.backend().wait_download(fence));
-                    match downloaded {
-                        Ok(()) => {
-                            let rgb: Vec<u8> = rgba
-                                .chunks_exact(4)
-                                .flat_map(|px| [px[0], px[1], px[2]])
-                                .collect();
-                            return Some(ImageDescriptor {
-                                width: w,
-                                height: h,
-                                color_space: super::ImageColorSpace::Rgb,
-                                data: super::ImageData::Cpu(rgb),
-                                smask: None,
-                                filter: ImageFilter::Dct,
-                            });
+                    if w == 0 || h == 0 {
+                        log::warn!(
+                            "GPU JPEG decoder returned zero-dimension image ({w}×{h}), skipping"
+                        );
+                    } else {
+                        let n = (w as usize) * (h as usize) * 4;
+                        let mut rgba = vec![0u8; n];
+                        let downloaded = dec
+                            .backend()
+                            .download_async(&img.buffer, &mut rgba)
+                            .and_then(|fence| dec.backend().wait_download(fence));
+                        match downloaded {
+                            Ok(()) => {
+                                // The IDCT kernel always writes RGBA8. For
+                                // grayscale (1-component) JPEGs it replicates
+                                // luma into R, G, and B. Strip alpha to get the
+                                // 3-byte-per-pixel RGB representation expected by
+                                // the blit path, and preserve the correct
+                                // color_space tag so downstream code branches
+                                // correctly.
+                                let (color_space, pixel_data) =
+                                    if jpeg_sof_components(data) == Some(1) {
+                                        let gray: Vec<u8> =
+                                            rgba.chunks_exact(4).map(|px| px[0]).collect();
+                                        (super::ImageColorSpace::Gray, gray)
+                                    } else {
+                                        let rgb: Vec<u8> = rgba
+                                            .chunks_exact(4)
+                                            .flat_map(|px| [px[0], px[1], px[2]])
+                                            .collect();
+                                        (super::ImageColorSpace::Rgb, rgb)
+                                    };
+                                return Some(ImageDescriptor {
+                                    width: w,
+                                    height: h,
+                                    color_space,
+                                    data: super::ImageData::Cpu(pixel_data),
+                                    smask: None,
+                                    filter: ImageFilter::Dct,
+                                });
+                            }
+                            Err(e) => log::warn!("GPU JPEG download failed: {e}"),
                         }
-                        Err(e) => log::debug!("GPU JPEG download failed: {e}"),
                     }
                 }
                 Err(e) => log::debug!("GPU JPEG decode failed, falling back to CPU: {e}"),

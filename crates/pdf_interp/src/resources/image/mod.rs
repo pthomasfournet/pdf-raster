@@ -117,8 +117,11 @@ pub const GPU_JPEG_THRESHOLD_PX: u32 = u32::MAX;
 ///
 /// Only 4:4:4 baseline JPEGs with 1 or 3 components are eligible.
 /// Images below this threshold always use the CPU path.
+///
+/// Set to `u32::MAX` until a corpus benchmark confirms a crossover point —
+/// mirrors the precedent set by `GPU_JPEG_THRESHOLD_PX` for nvJPEG.
 #[cfg(feature = "gpu-jpeg-huffman")]
-pub const GPU_JPEG_HUFFMAN_THRESHOLD_PX: u32 = 65_536;
+pub const GPU_JPEG_HUFFMAN_THRESHOLD_PX: u32 = u32::MAX;
 
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
 ///

@@ -34,7 +34,6 @@ CUDA_LIB="${CUDA_LIB:-/usr/local/cuda/lib64}"
 MODES=(A D H)
 declare -A MODE_BIN=([A]=cpu [D]=full-gpu [H]=huffman)
 declare -A MODE_BACKEND=([A]=cpu [D]=cuda [H]=cuda)
-declare -A MODE_EXTRA=([A]="" [D]="" [H]="")
 declare -A MODE_LABEL=(
   [A]="CPU-only"
   [D]="Full GPU (nvjpeg, no cache)"
@@ -65,11 +64,11 @@ preflight() {
   if [[ ! -e /dev/nvidia0 ]]; then
     warn "/dev/nvidia0 missing; modes D/H will be skipped"
     SKIP_CUDA=1
-  elif [[ ! -e "$CUDA_LIB/libcudart.so" ]]; then
-    warn "CUDA libs missing under $CUDA_LIB; modes D/H will be skipped"
+  elif [[ ! -e "$CUDA_LIB/libcudart.so" || ! -e "$CUDA_LIB/libnvjpeg.so" ]]; then
+    warn "CUDA libs missing under $CUDA_LIB (need libcudart.so + libnvjpeg.so); modes D/H will be skipped"
     SKIP_CUDA=1
   else
-    log "  nvidia: /dev/nvidia0 + cudart present"
+    log "  nvidia: /dev/nvidia0 + cudart + nvjpeg present"
   fi
 
   mkdir -p "$OUT_DIR"

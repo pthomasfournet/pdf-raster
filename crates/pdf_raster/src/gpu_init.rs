@@ -162,21 +162,37 @@ pub fn release_nvjpeg2k_this_thread() {
 
 // ── GPU parallel-Huffman JPEG decoder ─────────────────────────────────────────
 
+/// Three-state slot for the GPU parallel-Huffman decoder — mirrors `DecoderInit<T>`
+/// so a failed construction is remembered and not retried on every subsequent page.
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub enum JpegGpuInit {
+    Uninitialised,
+    Ready(Option<gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>),
+    Failed,
+}
+
 #[cfg(feature = "gpu-jpeg-huffman")]
 thread_local! {
-    pub static JPEG_GPU_DEC: RefCell<Option<gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>> =
-        const { RefCell::new(None) };
+    pub static JPEG_GPU_DEC: RefCell<JpegGpuInit> =
+        const { RefCell::new(JpegGpuInit::Uninitialised) };
 }
 
 /// Initialise this thread's GPU parallel-Huffman JPEG decoder if not already done.
 ///
-/// Errors are non-fatal when `policy` is `Auto`; the decoder slot stays `None`
-/// and the CPU path is used instead.
+/// Errors are non-fatal when `policy` is `Auto`; the decoder slot moves to
+/// `Failed` and the CPU path is used instead. A previous failure is remembered
+/// and not retried on subsequent pages.
 #[cfg(feature = "gpu-jpeg-huffman")]
 pub fn ensure_jpeg_gpu_huffman(policy: BackendPolicy) -> Result<(), String> {
     JPEG_GPU_DEC.with(|cell| {
-        if cell.borrow().is_some() {
-            return Ok(());
+        match *cell.borrow() {
+            JpegGpuInit::Uninitialised => {}
+            JpegGpuInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
+                return Err(
+                    "GPU JPEG decoder failed to initialise on a previous attempt".to_owned(),
+                );
+            }
+            _ => return Ok(()),
         }
         let guard = DECODER_INIT_LOCK
             .lock()
@@ -185,10 +201,12 @@ pub fn ensure_jpeg_gpu_huffman(policy: BackendPolicy) -> Result<(), String> {
         drop(guard);
         match result {
             Ok(backend) => {
-                *cell.borrow_mut() = Some(gpu::jpeg_decoder::JpegGpuDecoder::new(backend));
+                *cell.borrow_mut() =
+                    JpegGpuInit::Ready(Some(gpu::jpeg_decoder::JpegGpuDecoder::new(backend)));
                 Ok(())
             }
             Err(e) => {
+                *cell.borrow_mut() = JpegGpuInit::Failed;
                 let msg = format!("pdf_raster: GPU JPEG decoder unavailable ({e})");
                 if matches!(policy, BackendPolicy::ForceCuda) {
                     Err(msg)

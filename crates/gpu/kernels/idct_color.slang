@@ -56,8 +56,8 @@ int rshift(int x, int s) {
 }
 
 // Apply one 1-D 8-point IDCT to `v[0..8]` in place (LLM algorithm).
-// Input is scaled by 2^4 (the row pass accumulates the 2^4 scaling from
-// the dequant step). Output is unscaled integers.
+// Output is unscaled integers; the caller cancels the 64× scale from
+// both passes with >> 6 after the column pass.
 void idct_1d(inout int v[8]) {
     // Stage 0: straight-butterfly on DC-row / Nyquist pairs.
     int t0  = v[0];
@@ -151,6 +151,11 @@ void idct_dequant_colour(
 
     // Only components 0..num_components-1 are active.
     if (comp >= num_components) {
+        return;
+    }
+    // num_qtables == 0 would underflow in `min(qt_sel, num_qtables - 1u)`.
+    // The host validates this before dispatch; guard here as defence-in-depth.
+    if (num_qtables == 0u) {
         return;
     }
 

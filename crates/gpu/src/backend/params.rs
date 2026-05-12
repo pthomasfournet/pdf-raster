@@ -608,10 +608,19 @@ impl Phase4FailureKind {
         // produced a value the host doesn't recognise" is most safely
         // treated as a degenerate failure rather than silently
         // mapping to Ok or panicking.
+        // The explicit arm for 3 pins DECODE_INCOMPLETE = 3 as a named
+        // wire value even though it produces the same variant as the
+        // wildcard.  This prevents a future insertion between 3 and 4
+        // from silently absorbing value 3 into the new variant.
+        #[expect(
+            clippy::match_same_arms,
+            reason = "explicit wire-value pin; see comment above"
+        )]
         match v {
             0 => Self::Ok,
             1 => Self::PrefixMiss,
             2 => Self::LengthBits,
+            3 => Self::Incomplete,
             4 => Self::BadDcCategory,
             5 => Self::BadAcSize,
             6 => Self::AcOverflow,

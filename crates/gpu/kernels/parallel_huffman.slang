@@ -447,6 +447,9 @@ void phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
 /// stream `(component, zig-zag)` agreement.
 [shader("compute")][numthreads(256, 1, 1)]
 void jpeg_phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
+    if (blocks_per_mcu == 0u) {
+        return;
+    }
     uint seq_idx = tid.x;
     if (seq_idx >= num_subsequences) {
         return;
@@ -502,6 +505,9 @@ void jpeg_phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
 /// `symbols_out[offsets[seq_idx] + local_n]`.
 [shader("compute")][numthreads(256, 1, 1)]
 void jpeg_phase4_redecode(uint3 tid : SV_DispatchThreadID) {
+    if (blocks_per_mcu == 0u) {
+        return;
+    }
     uint seq_idx = tid.x;
     if (seq_idx >= num_subsequences) {
         return;
@@ -558,6 +564,9 @@ void jpeg_phase4_redecode(uint3 tid : SV_DispatchThreadID) {
 /// predicate.
 [shader("compute")][numthreads(256, 1, 1)]
 void jpeg_phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
+    if (blocks_per_mcu == 0u) {
+        return;
+    }
     uint seq_idx = tid.x;
     if (seq_idx >= num_subsequences) {
         return;

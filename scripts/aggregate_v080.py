@@ -64,6 +64,8 @@ def parse_mode_file(path: Path) -> dict[str, dict]:
             "mean": int(m["mean"]),
             "flags": (m["flags"] or "").strip(),
         }
+    if not out:
+        print(f"warning: {path} exists but yielded no parseable rows", file=sys.stderr)
     return out
 
 
@@ -152,12 +154,12 @@ def main(in_dir: str) -> int:
     regress_pass = regress_fail == 0
     overall = gate_pass and regress_pass
     print(f"- Mode H ≤ 0.7× mode A on corpora 06-09: "
-          f"{'PASS' if gate_pass else 'FAIL'} ({gate_wins}/1 required wins)")
+          f"{'PASS' if gate_pass else 'FAIL'} ({gate_wins}/4 corpora, 1 required)")
     print(f"- No corpus regresses > 5% vs v0.7.0 mode A: "
           f"{'PASS' if regress_pass else 'FAIL'} ({regress_fail} failures)")
     print()
-    print(f"**Overall gate: {'PASS — proceed to Phase D' if overall else 'FAIL — feature stays behind flag'}**")
-    return 0
+    print(f"**Overall gate: {'PASS — feature flag may be lifted' if overall else 'FAIL — feature stays behind flag'}**")
+    return 0 if overall else 1
 
 
 if __name__ == "__main__":

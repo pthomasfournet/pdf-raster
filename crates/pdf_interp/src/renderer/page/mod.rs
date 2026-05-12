@@ -412,9 +412,6 @@ impl<'doc> PageRenderer<'doc> {
         })
     }
 
-    /// Attach a GPU JPEG decoder to this renderer.
-    ///
-    /// When set, `DCTDecode` image streams with pixel area ≥
     /// Attach a GPU parallel-Huffman JPEG decoder to this renderer.
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub fn set_jpeg_gpu(&mut self, dec: Option<JpegGpuDecoder<CudaBackend>>) {
