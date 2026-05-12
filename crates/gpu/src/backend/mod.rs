@@ -334,6 +334,23 @@ pub trait GpuBackend: Send + Sync {
     /// # Errors
     /// Returns `BackendError` if the operation cannot be recorded.
     fn record_apply_soft_mask(&self, params: params::SoftMaskParams<'_, Self>) -> Result<()>;
+
+    /// Record one phase of the Blelloch exclusive scan kernel.
+    ///
+    /// The scan is built from three dispatches (selected by
+    /// `params.phase`); callers must invoke all three in order
+    /// (`PerWorkgroup` → `BlockSums` → `ScatterBlockSums`) for the
+    /// scan to complete. All three share `params.data` /
+    /// `params.block_sums` / `params.len_elems`, so the caller builds
+    /// one `ScanParams` and updates only `phase` between dispatches.
+    ///
+    /// The shared shape (one trait method, phase enum in the params)
+    /// avoids multiplying `record_*` trait methods 1-per-kernel-phase.
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the operation cannot be recorded or
+    /// if `params.validate(self)` fails.
+    fn record_scan(&self, params: params::ScanParams<'_, Self>) -> Result<()>;
     /// Record a zero-fill of `buf` into the current page's command list.
     ///
     /// Folds what [`Self::alloc_device_zeroed`] does as a separate one-shot

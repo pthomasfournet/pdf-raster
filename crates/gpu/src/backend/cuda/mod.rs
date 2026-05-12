@@ -117,6 +117,15 @@ impl GpuBackend for CudaBackend {
         self.recorder.record_apply_soft_mask(params)
     }
 
+    fn record_scan(&self, _params: params::ScanParams<'_, Self>) -> Result<()> {
+        // Kernel + recorder wiring lands with the JPEG decoder's
+        // Blelloch-scan dispatcher. Trait method exists today so
+        // every backend's surface stays in sync.
+        Err(BackendError::msg(
+            "CudaBackend::record_scan: kernel not yet wired in",
+        ))
+    }
+
     fn record_zero_buffer(&self, buf: &Self::DeviceBuffer) -> Result<()> {
         self.recorder.record_zero_buffer(buf)
     }

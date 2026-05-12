@@ -204,21 +204,158 @@ pub struct SoftMaskParams<'a, B: GpuBackend + ?Sized> {
     pub n_pixels: u32,
 }
 
+/// Workgroup size used by every phase of the Blelloch scan kernel.
+///
+/// Public so dispatchers can size `block_sums` correctly:
+/// `block_count = ceil(len_elems / SCAN_WORKGROUP_SIZE)`. Must match
+/// the `numthreads(...)` declaration in `kernels/jpeg/blelloch_scan.slang`
+/// (each thread handles 2 elements, so the per-workgroup tile is
+/// `2 * SCAN_WORKGROUP_SIZE = 1024` elements).
+pub const SCAN_WORKGROUP_SIZE: u32 = 512;
+
+/// Maximum number of workgroups the single-tier `BlockSums` phase can handle.
+///
+/// The middle phase runs as a single workgroup whose tile covers
+/// `2 * SCAN_WORKGROUP_SIZE = 1024` elements; arrays whose block
+/// count exceeds this require a recursive scan (out of scope for
+/// the v1 JPEG decoder).
+pub const SCAN_MAX_BLOCKS: u32 = 1024;
+
+/// Phase selector for [`record_scan`](super::GpuBackend::record_scan).
+///
+/// The three phases of the multi-workgroup Blelloch exclusive scan
+/// (Blelloch 1990); see `kernels/jpeg/blelloch_scan.slang`.
+///
+/// All three phases share the same buffer set so callers don't have to
+/// rebind between dispatches. The kernel reads `phase` as a flat u32
+/// (encoded by `ScanPhase::as_kernel_arg`) and branches internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPhase {
+    /// Per-workgroup local scan: each workgroup of
+    /// `SCAN_WORKGROUP_SIZE` threads exclusively scans its 1024-element
+    /// tile of `data` in shared memory, then writes the tile sum into
+    /// `block_sums[workgroup_idx]`.
+    PerWorkgroup,
+    /// Single-workgroup scan over `block_sums`. Requires the block
+    /// count to be ≤ [`SCAN_MAX_BLOCKS`].
+    BlockSums,
+    /// Adds the (now-scanned) `block_sums[workgroup_idx]` back into
+    /// every element of workgroup `workgroup_idx`'s output slice.
+    ScatterBlockSums,
+}
+
+impl ScanPhase {
+    /// Kernel argument encoding. Stable across backends — the SPIR-V
+    /// and PTX entry points read this and dispatch with a switch.
+    #[must_use]
+    pub const fn as_kernel_arg(self) -> u32 {
+        match self {
+            Self::PerWorkgroup => 0,
+            Self::BlockSums => 1,
+            Self::ScatterBlockSums => 2,
+        }
+    }
+}
+
+/// Parameters for one phase of the Blelloch exclusive scan kernel.
+///
+/// The same buffer set is reused across the three phases; only the
+/// `phase` field changes between dispatches.
+///
+/// # Invariants enforced by `ScanParams::validate`
+/// - `len_elems > 0`.
+/// - `data` device capacity ≥ `len_elems * 4` bytes (u32 elements).
+/// - `block_sums` device capacity ≥
+///   `block_count * 4` bytes where
+///   `block_count = ceil(len_elems / (2 * SCAN_WORKGROUP_SIZE))`.
+/// - `block_count <= SCAN_MAX_BLOCKS` — the `BlockSums` middle phase
+///   uses a single workgroup, so arrays whose block count exceeds the
+///   workgroup tile size require a recursive scan (not implemented).
+///
+/// Validation is mandatory: violating these would silently produce
+/// out-of-bounds device-pointer arithmetic in the kernel.
+pub struct ScanParams<'a, B: GpuBackend + ?Sized> {
+    /// Input/output u32 buffer scanned in place. Must hold at least
+    /// `len_elems` u32s.
+    pub data: &'a B::DeviceBuffer,
+    /// Per-workgroup scratch holding tile sums between phases. Sized
+    /// for the worst-case block count (must hold at least
+    /// `ceil(len_elems / 1024)` u32s).
+    pub block_sums: &'a B::DeviceBuffer,
+    /// Number of u32 elements to scan. Backend computes the dispatch
+    /// grid from this; the kernel reads it as a push-constant /
+    /// kernel-arg.
+    pub len_elems: u32,
+    /// Which of the three Blelloch phases this dispatch executes.
+    pub phase: ScanPhase,
+}
+
+impl<B: GpuBackend + ?Sized> ScanParams<'_, B> {
+    /// Validate the invariants documented on `ScanParams`.
+    ///
+    /// Callers should run this once per scan (after constructing the
+    /// params for `PerWorkgroup`, before any of the three dispatches)
+    /// — the invariants don't change across phases since all three
+    /// share buffers and `len_elems`.
+    ///
+    /// # Errors
+    /// Returns a `BackendError` if any documented invariant fails.
+    pub fn validate(&self, backend: &B) -> super::Result<()> {
+        const KIND: &str = "ScanInvariantViolation";
+        let invariant =
+            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
+
+        if self.len_elems == 0 {
+            return Err(invariant("len_elems must be > 0"));
+        }
+
+        // Each element is u32 = 4 bytes; check both buffers have room.
+        let data_bytes_needed = (self.len_elems as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invariant("len_elems * 4 overflows usize"))?;
+        if backend.device_buffer_len(self.data) < data_bytes_needed {
+            return Err(invariant("data buffer is smaller than len_elems * 4 bytes"));
+        }
+
+        let workgroup_tile = 2 * SCAN_WORKGROUP_SIZE;
+        let block_count = self.len_elems.div_ceil(workgroup_tile);
+        if block_count > SCAN_MAX_BLOCKS {
+            return Err(invariant(
+                "block_count exceeds SCAN_MAX_BLOCKS (1024); recursive scan not implemented",
+            ));
+        }
+        let block_sums_bytes_needed = (block_count as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invariant("block_count * 4 overflows usize"))?;
+        if backend.device_buffer_len(self.block_sums) < block_sums_bytes_needed {
+            return Err(invariant(
+                "block_sums buffer is smaller than ceil(len_elems / 1024) * 4 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Phantom backend used solely for validating param-struct invariants in
     /// pure-CPU tests (no cudarc required).
-    enum FakeBackend {}
+    ///
+    /// `DeviceBuffer = usize` — the buffer "is" its capacity in bytes,
+    /// so `device_buffer_len` is a trivial identity. Most other trait
+    /// methods are `unreachable!()` because validate-only tests don't
+    /// route through them.
+    struct FakeBackend;
 
     impl GpuBackend for FakeBackend {
-        type DeviceBuffer = ();
+        type DeviceBuffer = usize;
         type HostBuffer = ();
         type PageFence = ();
 
         fn alloc_device(&self, _size: usize) -> super::super::Result<Self::DeviceBuffer> {
-            unreachable!("FakeBackend is only constructed via &(); never instantiated")
+            unreachable!("FakeBackend allocation paths are not exercised by validate-only tests")
         }
         fn free_device(&self, _buf: Self::DeviceBuffer) {}
         fn alloc_host_pinned(&self, _size: usize) -> super::super::Result<Self::HostBuffer> {
@@ -246,6 +383,9 @@ mod tests {
         fn record_apply_soft_mask(&self, _p: SoftMaskParams<'_, Self>) -> super::super::Result<()> {
             unreachable!()
         }
+        fn record_scan(&self, _p: ScanParams<'_, Self>) -> super::super::Result<()> {
+            unreachable!()
+        }
         fn record_zero_buffer(&self, _buf: &Self::DeviceBuffer) -> super::super::Result<()> {
             unreachable!()
         }
@@ -265,8 +405,8 @@ mod tests {
         fn alloc_device_zeroed(&self, _size: usize) -> super::super::Result<Self::DeviceBuffer> {
             unreachable!()
         }
-        fn device_buffer_len(&self, _buf: &Self::DeviceBuffer) -> usize {
-            unreachable!()
+        fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize {
+            *buf
         }
         fn download_async<'a>(
             &self,
@@ -292,11 +432,15 @@ mod tests {
         }
     }
 
+    /// Static stand-in for a device buffer of "large enough" capacity.
+    /// The numeric value is only consulted by `device_buffer_len`, which
+    /// `BlitParams::validate` doesn't call — but `ScanParams::validate` does.
+    static FAKE_BUF: usize = usize::MAX;
+
     fn ok_blit() -> BlitParams<'static, FakeBackend> {
-        static UNIT: () = ();
         BlitParams {
-            src: &UNIT,
-            dst: &UNIT,
+            src: &FAKE_BUF,
+            dst: &FAKE_BUF,
             src_w: 100,
             src_h: 100,
             src_layout: 0,
@@ -406,5 +550,93 @@ mod tests {
         p.src_layout = 999;
         let err = p.validate().unwrap_err().to_string();
         assert!(err.contains("src_layout"), "{err}");
+    }
+
+    // --- ScanParams ---
+
+    /// Build a `ScanParams` with both buffers sized to `data_bytes` /
+    /// `block_sums_bytes` respectively (the test consults
+    /// `device_buffer_len`, which for `FakeBackend` is identity over
+    /// the `usize` buffer).
+    fn scan_params<'a>(
+        data_bytes: &'a usize,
+        block_sums_bytes: &'a usize,
+        len_elems: u32,
+        phase: ScanPhase,
+    ) -> ScanParams<'a, FakeBackend> {
+        ScanParams {
+            data: data_bytes,
+            block_sums: block_sums_bytes,
+            len_elems,
+            phase,
+        }
+    }
+
+    #[test]
+    fn scan_phase_kernel_arg_is_stable() {
+        // The kernel reads this; the encoding must not drift.
+        assert_eq!(ScanPhase::PerWorkgroup.as_kernel_arg(), 0);
+        assert_eq!(ScanPhase::BlockSums.as_kernel_arg(), 1);
+        assert_eq!(ScanPhase::ScatterBlockSums.as_kernel_arg(), 2);
+    }
+
+    #[test]
+    fn scan_validate_accepts_minimal_valid() {
+        let data = 4096usize;
+        let block_sums = 16usize;
+        let p = scan_params(&data, &block_sums, 1024, ScanPhase::PerWorkgroup);
+        p.validate(&FakeBackend)
+            .expect("4 KiB data + 1024 elems is valid");
+    }
+
+    #[test]
+    fn scan_validate_rejects_zero_len() {
+        let data = 4096usize;
+        let block_sums = 16usize;
+        let p = scan_params(&data, &block_sums, 0, ScanPhase::PerWorkgroup);
+        let err = p.validate(&FakeBackend).unwrap_err().to_string();
+        assert!(err.contains("len_elems"), "{err}");
+    }
+
+    #[test]
+    fn scan_validate_rejects_undersized_data_buffer() {
+        // 1024 elems * 4 bytes = 4096 bytes needed; provide 4095.
+        let data = 4095usize;
+        let block_sums = 16usize;
+        let p = scan_params(&data, &block_sums, 1024, ScanPhase::PerWorkgroup);
+        let err = p.validate(&FakeBackend).unwrap_err().to_string();
+        assert!(err.contains("data buffer"), "{err}");
+    }
+
+    #[test]
+    fn scan_validate_rejects_undersized_block_sums() {
+        // 2049 elems → block_count = ceil(2049/1024) = 3 → 12 bytes needed.
+        let data = 2049 * 4usize;
+        let block_sums = 4usize; // only room for 1 block
+        let p = scan_params(&data, &block_sums, 2049, ScanPhase::PerWorkgroup);
+        let err = p.validate(&FakeBackend).unwrap_err().to_string();
+        assert!(err.contains("block_sums buffer"), "{err}");
+    }
+
+    #[test]
+    fn scan_validate_rejects_too_many_blocks() {
+        // len_elems = 1024 * 1024 + 1 → block_count = 1025 > SCAN_MAX_BLOCKS.
+        let data = (1024 * 1024 + 1) * 4usize;
+        let block_sums = 1025 * 4usize;
+        let p = scan_params(&data, &block_sums, 1024 * 1024 + 1, ScanPhase::PerWorkgroup);
+        let err = p.validate(&FakeBackend).unwrap_err().to_string();
+        assert!(err.contains("block_count"), "{err}");
+        assert!(err.contains("recursive scan"), "{err}");
+    }
+
+    #[test]
+    fn scan_validate_accepts_at_max_blocks() {
+        // Exactly SCAN_MAX_BLOCKS blocks (the upper limit).
+        let max_elems = SCAN_MAX_BLOCKS * 2 * SCAN_WORKGROUP_SIZE;
+        let data = (max_elems as usize) * 4;
+        let block_sums = (SCAN_MAX_BLOCKS as usize) * 4;
+        let p = scan_params(&data, &block_sums, max_elems, ScanPhase::PerWorkgroup);
+        p.validate(&FakeBackend)
+            .expect("exactly SCAN_MAX_BLOCKS is valid");
     }
 }
