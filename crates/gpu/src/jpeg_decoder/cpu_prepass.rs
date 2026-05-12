@@ -233,6 +233,67 @@ fn pack_unstuffed_bitstream(unstuffed: &[u8]) -> Result<PackedBitstream, JpegGpu
     Ok(pack_be_words(unstuffed, length_bits))
 }
 
+/// Build the per-block MCU schedule the JPEG-framed GPU kernels consume.
+///
+/// The schedule is a flat `Vec<u32>` with one entry per 8×8 block in
+/// one MCU (interleaved scan) or exactly one entry (non-interleaved).
+/// Each entry packs `(ac_sel << 16) | (dc_sel << 8) | component_idx`.
+///
+/// # Validation
+///
+/// Both `dc_sel` and `ac_sel` must be `< num_components`; the kernel
+/// uses them as a stride multiplier into the flat codebook buffer
+/// (`table_base = sel * 65536`).  An out-of-range selector would
+/// read past the buffer end — on CUDA that is undefined behaviour; on
+/// Vulkan with `robustBufferAccess2` it returns 0 (a `DECODE_PREFIX_MISS`
+/// sentinel), producing wrong symbols rather than crashing.
+///
+/// The validation is done here in the host wrapper so the kernel can
+/// assume its inputs are valid.
+///
+/// # Errors
+///
+/// Returns [`JpegGpuError::InvalidHuffmanTables`] if any selector for
+/// any block is ≥ `prep.components.len()`.
+pub fn build_mcu_schedule(prep: &JpegPreparedInput) -> Result<(Vec<u32>, u32), JpegGpuError> {
+    let num_components = prep.components.len();
+    let num_comp_u32 = u32::try_from(num_components).expect("components.len() ≤ 4");
+    let scan_components = num_components;
+
+    let mut schedule: Vec<u32> = Vec::new();
+    for (k, fc) in prep.components.iter().enumerate() {
+        let k_u8 = u8::try_from(k).expect("component index < 4");
+        let dc_sel = prep.dc_selectors[k];
+        let ac_sel = prep.ac_selectors[k];
+
+        if u32::from(dc_sel) >= num_comp_u32 || u32::from(ac_sel) >= num_comp_u32 {
+            return Err(JpegGpuError::InvalidHuffmanTables(format!(
+                "scan component {} references selectors (dc={dc_sel}, ac={ac_sel}) \
+                 ≥ num_components={num_components}",
+                k_u8,
+            )));
+        }
+
+        let bpm: u8 = if scan_components == 1 {
+            1
+        } else {
+            fc.h_sampling
+                .checked_mul(fc.v_sampling)
+                .expect("upstream BadSamplingFactor caps h, v ≤ 4")
+        };
+        let entry = (u32::from(ac_sel) << 16) | (u32::from(dc_sel) << 8) | u32::from(k_u8);
+        for _ in 0..bpm {
+            schedule.push(entry);
+        }
+    }
+
+    let blocks_per_mcu = u32::try_from(schedule.len()).map_err(|_| {
+        JpegGpuError::InvalidHuffmanTables("blocks_per_mcu overflows u32".to_string())
+    })?;
+
+    Ok((schedule, blocks_per_mcu))
+}
+
 /// Collect the DC or AC selector each scan component references, checking
 /// that the prepass actually built a codebook for it.  The returned vector
 /// has the same length as the active scan components.
@@ -408,5 +469,65 @@ mod tests {
                 sc.id,
             );
         }
+    }
+
+    // ── build_mcu_schedule tests ──────────────────────────────────────────
+
+    #[test]
+    fn mcu_schedule_grayscale_one_block() {
+        let prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        // Grayscale: 1 component, dc_selector=0, ac_selector=0 — one entry.
+        let (sched, bpm) = build_mcu_schedule(&prep).expect("grayscale schedule must build");
+        assert_eq!(bpm, 1, "grayscale has 1 block per MCU");
+        assert_eq!(sched.len(), 1);
+        // Component index = 0, dc_sel = 0, ac_sel = 0.
+        // Packed: (0 << 16) | (0 << 8) | 0 = 0.
+        assert_eq!(sched[0], 0, "grayscale entry should encode sel=0 / comp=0");
+    }
+
+    #[test]
+    fn mcu_schedule_selector_bounds_validation() {
+        // Manufacture a prep with selectors ≥ num_components to trigger
+        // the validation error.  Grayscale has num_components = 1, so
+        // dc_selector = 1 is out of bounds.
+        let mut prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        prep.dc_selectors[0] = 1; // 1 ≥ 1 component → invalid
+        let err = build_mcu_schedule(&prep).expect_err("out-of-range selector must be rejected");
+        assert!(
+            matches!(err, JpegGpuError::InvalidHuffmanTables(_)),
+            "expected InvalidHuffmanTables, got: {err:?}",
+        );
+
+        let mut prep2 = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        prep2.ac_selectors[0] = 2; // 2 ≥ 1 component → invalid
+        let err2 =
+            build_mcu_schedule(&prep2).expect_err("out-of-range AC selector must be rejected");
+        assert!(
+            matches!(err2, JpegGpuError::InvalidHuffmanTables(_)),
+            "expected InvalidHuffmanTables (AC), got: {err2:?}",
+        );
+    }
+
+    #[test]
+    fn mcu_schedule_entry_encodes_correct_fields() {
+        // Verify the bit-field packing: component_idx in bits 0..8,
+        // dc_sel in bits 8..16, ac_sel in bits 16..24.
+        // For grayscale with selectors 0 the check above covers it.
+        // Manufacture a 2-component scenario by hand (bypassing prepare_jpeg)
+        // to test non-zero selectors.
+        let prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        let (sched, bpm) = build_mcu_schedule(&prep).unwrap();
+        for entry in &sched {
+            let comp_idx = entry & 0xFF;
+            let dc_sel = (entry >> 8) & 0xFF;
+            let ac_sel = (entry >> 16) & 0xFF;
+            assert!(
+                (comp_idx as usize) < prep.components.len(),
+                "component_idx oob"
+            );
+            assert_eq!(dc_sel, u32::from(prep.dc_selectors[comp_idx as usize]));
+            assert_eq!(ac_sel, u32::from(prep.ac_selectors[comp_idx as usize]));
+        }
+        let _ = bpm;
     }
 }

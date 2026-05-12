@@ -40,6 +40,130 @@ fn build_gpu_codebook(codebooks: &[CanonicalCodebook]) -> Vec<u32> {
     out
 }
 
+/// Flatten a slice of codebook *references* — the shape returned by
+/// [`JpegPreparedInput::ac_codebooks_for_dispatch`] / `dc_codebooks_for_dispatch`.
+///
+/// Same layout as `build_gpu_codebook`; differs only in the input type so
+/// callers can avoid a `.cloned().collect::<Vec<_>>()` copy of 128 KB tables.
+#[must_use]
+fn build_gpu_codebook_refs(codebooks: &[&CanonicalCodebook]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(codebooks.len() * HUFFMAN_CODEBOOK_ENTRIES);
+    for book in codebooks {
+        for entry in book.table() {
+            let packed = (u32::from(entry.num_bits) << 8) | u32::from(entry.symbol);
+            out.push(packed);
+        }
+    }
+    out
+}
+
+/// One-shot JPEG Phase 1 dispatch using real JPEG framing.
+///
+/// Builds the MCU schedule + flat codebook buffers from `prep`, uploads
+/// them alongside the entropy bitstream, runs `JpegPhase1IntraSync`,
+/// downloads the per-subsequence state, and frees all device buffers.
+///
+/// Closes the audit finding in `audit/dispatcher-codebook-signature-mismatch.md`:
+/// `JpegPreparedInput::*_for_dispatch()` returns `Vec<&CanonicalCodebook>`;
+/// this function consumes those refs via `build_gpu_codebook_refs` so no
+/// clone of the 128 KB tables is needed.
+///
+/// # Errors
+/// Returns `BackendError` for any alloc / upload / dispatch / download
+/// failure, or if `build_mcu_schedule` rejects an out-of-range selector.
+fn dispatch_jpeg_phase1_intra_sync<B: GpuBackend>(
+    backend: &B,
+    prep: &crate::jpeg_decoder::JpegPreparedInput,
+    subsequence_bits: u32,
+) -> Result<Vec<SubsequenceState>> {
+    use crate::jpeg_decoder::build_mcu_schedule;
+
+    if prep.bitstream.length_bits == 0 {
+        return Ok(Vec::new());
+    }
+    if subsequence_bits == 0 {
+        return Err(BackendError::msg(
+            "dispatch_jpeg_phase1_intra_sync: subsequence_bits must be > 0",
+        ));
+    }
+
+    // Build host-side schedule + validate selector bounds (closes
+    // audit/mcu-schedule-selector-validation.md).
+    let (mcu_sched_host, blocks_per_mcu) =
+        build_mcu_schedule(prep).map_err(|e| BackendError::msg(format!("{e}")))?;
+
+    // Flatten AC and DC codebooks from the dispatch helpers — no clone
+    // of the 128 KB tables (closes dispatcher-codebook-signature-mismatch.md).
+    let ac_refs = prep.ac_codebooks_for_dispatch();
+    let dc_refs = prep.dc_codebooks_for_dispatch();
+    let ac_flat = build_gpu_codebook_refs(&ac_refs);
+    let dc_flat = build_gpu_codebook_refs(&dc_refs);
+
+    let num_components = u32::try_from(prep.components.len())
+        .map_err(|_| BackendError::msg("components.len() does not fit in u32"))?;
+    let length_bits = prep.bitstream.length_bits;
+    let num_subsequences = length_bits.div_ceil(subsequence_bits);
+
+    let bitstream_words = (length_bits.div_ceil(32) as usize) + 1;
+    let bitstream_bytes = bitstream_words * 4;
+    let ac_codebook_bytes = ac_flat.len() * 4;
+    let dc_codebook_bytes = dc_flat.len() * 4;
+    let mcu_sched_bytes = mcu_sched_host.len() * 4;
+    let s_info_bytes = (num_subsequences as usize) * std::mem::size_of::<SubsequenceState>();
+
+    let bitstream_buf = DeviceBufferGuard::alloc_zeroed(backend, bitstream_bytes)?;
+    let codebook_buf = DeviceBufferGuard::alloc(backend, ac_codebook_bytes)?;
+    let dc_codebook_buf = DeviceBufferGuard::alloc(backend, dc_codebook_bytes)?;
+    let mcu_sched_buf = DeviceBufferGuard::alloc(backend, mcu_sched_bytes)?;
+    let s_info_buf = DeviceBufferGuard::alloc(backend, s_info_bytes)?;
+
+    let _up1 = backend.upload_async(
+        bitstream_buf.as_ref(),
+        bytemuck::cast_slice(&prep.bitstream.words),
+    )?;
+    let _up2 = backend.upload_async(codebook_buf.as_ref(), bytemuck::cast_slice(&ac_flat))?;
+    let _up3 = backend.upload_async(dc_codebook_buf.as_ref(), bytemuck::cast_slice(&dc_flat))?;
+    let _up4 = backend.upload_async(
+        mcu_sched_buf.as_ref(),
+        bytemuck::cast_slice(&mcu_sched_host),
+    )?;
+
+    backend.begin_page()?;
+    backend.record_huffman(HuffmanParams {
+        bitstream: bitstream_buf.as_ref(),
+        codebook: codebook_buf.as_ref(),
+        s_info: s_info_buf.as_ref(),
+        sync_flags: None,
+        offsets: None,
+        symbols_out: None,
+        decode_status: None,
+        dc_codebook: Some(dc_codebook_buf.as_ref()),
+        mcu_schedule: Some(mcu_sched_buf.as_ref()),
+        length_bits,
+        subsequence_bits,
+        num_components,
+        total_symbols: 0,
+        blocks_per_mcu,
+        phase: HuffmanPhase::JpegPhase1IntraSync,
+    })?;
+    let fence = backend.submit_page()?;
+    backend.wait_page(fence)?;
+
+    let mut out =
+        vec![<SubsequenceState as bytemuck::Zeroable>::zeroed(); num_subsequences as usize];
+    let dst = bytemuck::cast_slice_mut::<SubsequenceState, u8>(&mut out);
+    let handle = backend.download_async(s_info_buf.as_ref(), dst)?;
+    backend.wait_download(handle)?;
+
+    backend.free_device(bitstream_buf.take());
+    backend.free_device(codebook_buf.take());
+    backend.free_device(dc_codebook_buf.take());
+    backend.free_device(mcu_sched_buf.take());
+    backend.free_device(s_info_buf.take());
+
+    Ok(out)
+}
+
 /// One-shot dispatch of the Phase 1 intra-sync kernel.
 ///
 /// Allocates device buffers, uploads inputs, runs the kernel,
@@ -544,7 +668,9 @@ mod tests {
     use super::*;
     use crate::backend::cuda::CudaBackend;
     use crate::jpeg::headers::{DhtClass, JpegHuffmanTable};
-    use crate::jpeg_decoder::phase1_oracle::phase1_walk_snapshot;
+    use crate::jpeg_decoder::build_mcu_schedule;
+    use crate::jpeg_decoder::phase1_oracle::{phase1_jpeg_walk_snapshot, phase1_walk_snapshot};
+    use crate::jpeg_decoder::prepare_jpeg;
     use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     fn try_cuda() -> Option<CudaBackend> {
@@ -844,6 +970,80 @@ mod tests {
             }
         }
     }
+
+    // ── B2d: JPEG Phase 1 parity tests ────────────────────────────────────
+
+    /// Run `dispatch_jpeg_phase1_intra_sync` on CUDA and verify the
+    /// per-subsequence state matches the CPU oracle for every subseq.
+    #[test]
+    fn jpeg_phase1_cuda_matches_cpu_oracle_grayscale() {
+        use crate::jpeg::test_fixtures::GRAY_16X16_JPEG;
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let prep = prepare_jpeg(GRAY_16X16_JPEG).expect("baseline grayscale must prepare");
+        let (mcu_sched, blocks_per_mcu) = build_mcu_schedule(&prep).expect("schedule");
+
+        // Use a small subsequence so we get multiple subseqs on the 16×16 fixture.
+        let subsequence_bits = 32u32;
+        let gpu_states = dispatch_jpeg_phase1_intra_sync(&b, &prep, subsequence_bits)
+            .expect("JPEG Phase 1 dispatch");
+
+        let dc_refs = prep.dc_codebooks_for_dispatch();
+        let ac_refs = prep.ac_codebooks_for_dispatch();
+        let num_subseq = prep.bitstream.length_bits.div_ceil(subsequence_bits);
+        assert_eq!(
+            gpu_states.len() as u32,
+            num_subseq,
+            "GPU state count must equal num_subsequences"
+        );
+
+        for seq_idx in 0..num_subseq {
+            let start_bit = seq_idx * subsequence_bits;
+            let hard_limit = prep
+                .bitstream
+                .length_bits
+                .min(start_bit + 2 * subsequence_bits);
+            let count_to = prep.bitstream.length_bits.min(start_bit + subsequence_bits);
+
+            let (cpu, _stop) = phase1_jpeg_walk_snapshot(
+                &prep.bitstream,
+                &dc_refs,
+                &ac_refs,
+                &mcu_sched,
+                blocks_per_mcu,
+                start_bit,
+                hard_limit,
+                count_to,
+            );
+            assert_eq!(
+                gpu_states[seq_idx as usize], cpu,
+                "subsequence {seq_idx}: GPU vs CPU JPEG Phase 1 state mismatch"
+            );
+        }
+    }
+
+    /// Validate that `build_mcu_schedule` integration with the dispatcher
+    /// rejects an out-of-range selector before touching any device memory.
+    #[test]
+    fn jpeg_phase1_rejects_oob_selector_before_dispatch() {
+        use crate::jpeg::test_fixtures::GRAY_16X16_JPEG;
+        let Some(b) = try_cuda() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let mut prep = prepare_jpeg(GRAY_16X16_JPEG).unwrap();
+        // Force the DC selector out of range for validation.
+        prep.dc_selectors[0] = 99;
+        let err = dispatch_jpeg_phase1_intra_sync(&b, &prep, 128)
+            .expect_err("out-of-range selector must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("selector") || msg.contains("num_components"),
+            "error should mention selector/num_components: {msg}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "vulkan", feature = "gpu-validation"))]
@@ -852,6 +1052,7 @@ mod vulkan_tests {
     use crate::backend::cuda::CudaBackend;
     use crate::backend::vulkan::VulkanBackend;
     use crate::jpeg_decoder::phase1_oracle::phase1_walk_snapshot;
+    use crate::jpeg_decoder::prepare_jpeg;
     use crate::jpeg_decoder::tests::fixtures::{book4_codebook, book4_stream};
 
     fn try_vulkan() -> Option<VulkanBackend> {
@@ -1046,5 +1247,82 @@ mod vulkan_tests {
             .map(|&v| u8::try_from(v & 0xFF).expect("symbol fits u8"))
             .collect();
         assert_eq!(got, symbols, "decoded stream diverges from input");
+    }
+
+    // ── B2d: JPEG Phase 1 cross-backend parity tests ──────────────────────
+
+    use crate::jpeg_decoder::build_mcu_schedule;
+    use crate::jpeg_decoder::phase1_oracle::phase1_jpeg_walk_snapshot;
+
+    /// JPEG Phase 1 CUDA vs Vulkan: both backends must produce byte-
+    /// identical per-subseq state on the grayscale fixture.
+    #[test]
+    fn jpeg_phase1_cuda_vs_vulkan_grayscale() {
+        use crate::jpeg::test_fixtures::GRAY_16X16_JPEG;
+        let (Some(cuda), Some(vk)) = (try_cuda(), try_vulkan()) else {
+            eprintln!("skipping: need both CUDA and Vulkan");
+            return;
+        };
+        let prep = prepare_jpeg(GRAY_16X16_JPEG).expect("baseline grayscale must prepare");
+        let subsequence_bits = 32u32;
+        let cuda_states = dispatch_jpeg_phase1_intra_sync(&cuda, &prep, subsequence_bits)
+            .expect("CUDA JPEG Phase 1");
+        let vk_states = dispatch_jpeg_phase1_intra_sync(&vk, &prep, subsequence_bits)
+            .expect("Vulkan JPEG Phase 1");
+
+        assert_eq!(
+            cuda_states.len(),
+            vk_states.len(),
+            "state count mismatch between CUDA and Vulkan"
+        );
+        for (i, (cs, vs)) in cuda_states.iter().zip(vk_states.iter()).enumerate() {
+            assert_eq!(
+                cs, vs,
+                "subsequence {i}: CUDA vs Vulkan JPEG Phase 1 mismatch"
+            );
+        }
+    }
+
+    /// JPEG Phase 1 Vulkan vs CPU oracle: each subseq's GPU state must
+    /// match the host-side `phase1_jpeg_walk_snapshot` result.
+    #[test]
+    fn jpeg_phase1_vulkan_matches_cpu_oracle_grayscale() {
+        use crate::jpeg::test_fixtures::GRAY_16X16_JPEG;
+        let Some(vk) = try_vulkan() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        let prep = prepare_jpeg(GRAY_16X16_JPEG).expect("baseline grayscale must prepare");
+        let (mcu_sched, blocks_per_mcu) = build_mcu_schedule(&prep).expect("schedule");
+        let subsequence_bits = 32u32;
+        let gpu_states = dispatch_jpeg_phase1_intra_sync(&vk, &prep, subsequence_bits)
+            .expect("Vulkan JPEG Phase 1");
+
+        let dc_refs = prep.dc_codebooks_for_dispatch();
+        let ac_refs = prep.ac_codebooks_for_dispatch();
+        let num_subseq = prep.bitstream.length_bits.div_ceil(subsequence_bits);
+
+        for seq_idx in 0..num_subseq {
+            let start_bit = seq_idx * subsequence_bits;
+            let hard_limit = prep
+                .bitstream
+                .length_bits
+                .min(start_bit + 2 * subsequence_bits);
+            let count_to = prep.bitstream.length_bits.min(start_bit + subsequence_bits);
+            let (cpu, _) = phase1_jpeg_walk_snapshot(
+                &prep.bitstream,
+                &dc_refs,
+                &ac_refs,
+                &mcu_sched,
+                blocks_per_mcu,
+                start_bit,
+                hard_limit,
+                count_to,
+            );
+            assert_eq!(
+                gpu_states[seq_idx as usize], cpu,
+                "subsequence {seq_idx}: Vulkan vs CPU JPEG Phase 1 mismatch"
+            );
+        }
     }
 }

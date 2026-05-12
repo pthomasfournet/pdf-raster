@@ -233,6 +233,248 @@ pub(super) fn phase1_walk_snapshot(
     }
 }
 
+/// CPU oracle for the JPEG-framed Phase 1 intra-sync walk.
+///
+/// Simulates the `jpeg_phase1_intra_sync` kernel for one subsequence,
+/// producing the boundary-snapshot `(p, n, c, z)` state the GPU writes
+/// to `s_info[seq_idx]`.
+///
+/// The JPEG-framed state machine differs from the synthetic one:
+/// - `c` = component index, derived from the MCU schedule (`entry &
+///   0xFF`).
+/// - `z` = current block index within the MCU (`block_in_mcu`),
+///   cycling `0..blocks_per_mcu`.
+/// - Per block: one DC symbol (Huffman code + `category` raw bits
+///   consumed) followed by AC symbols until EOB (0x00) or slot 63.
+///   `n` increments for each symbol emitted if its first bit is
+///   `< count_to`.
+///
+/// On any decode error (prefix-miss, length-bits, bad DC category,
+/// bad AC size, AC overflow) the walk stops early and returns the
+/// pre-failure state, matching the kernel's `break` behaviour.
+///
+/// The caller must supply codebooks in the same flat layout as
+/// `build_gpu_codebook_refs` — i.e., `ac_codebooks[component]` is the
+/// AC table for the component at that schedule slot, and similarly for
+/// DC.
+pub(super) fn phase1_jpeg_walk_snapshot(
+    bitstream: &PackedBitstream,
+    dc_codebooks: &[&crate::jpeg::CanonicalCodebook],
+    ac_codebooks: &[&crate::jpeg::CanonicalCodebook],
+    mcu_schedule: &[u32],
+    blocks_per_mcu: u32,
+    start_bit: u32,
+    hard_limit: u32,
+    count_to: u32,
+) -> (SubsequenceState, Phase1Stop) {
+    assert!(!mcu_schedule.is_empty(), "mcu_schedule must be non-empty");
+    assert_eq!(mcu_schedule.len(), blocks_per_mcu as usize);
+
+    let length_bits = bitstream.length_bits;
+    let mut p = start_bit;
+    let mut n = 0u32;
+    // Initial block_in_mcu / component from schedule slot 0.
+    let first_entry = mcu_schedule[0];
+    let mut block_in_mcu = 0u32;
+    let mut c = (first_entry & 0xFF) as u32;
+
+    let mut snap_p = p;
+    let mut snap_n = n;
+    let mut snap_block = block_in_mcu;
+    let mut snap_c = c;
+    let mut snapshotted = false;
+
+    let max_iters = hard_limit.saturating_sub(start_bit) + 1;
+    for _ in 0..max_iters {
+        if p >= hard_limit {
+            break;
+        }
+        let p_before = p;
+
+        // ── DC slot ──────────────────────────────────────────────────
+        let entry = mcu_schedule[block_in_mcu as usize];
+        let dc_sel = ((entry >> 8) & 0xFF) as usize;
+        let ac_sel = ((entry >> 16) & 0xFF) as usize;
+        c = (entry & 0xFF) as u32;
+
+        // Decode DC Huffman codeword.
+        if p >= hard_limit {
+            break;
+        }
+        let peek = peek16(bitstream, u64::from(p));
+        let dc_entry = dc_codebooks[dc_sel].lookup(peek);
+        if dc_entry.num_bits == 0 {
+            return (
+                SubsequenceState {
+                    p,
+                    n,
+                    c,
+                    z: block_in_mcu,
+                },
+                Phase1Stop::PrefixMiss,
+            );
+        }
+        let category = dc_entry.symbol;
+        if category > 11 {
+            return (
+                SubsequenceState {
+                    p,
+                    n,
+                    c,
+                    z: block_in_mcu,
+                },
+                Phase1Stop::LengthBits,
+            );
+        }
+        let dc_advance = u32::from(dc_entry.num_bits) + u32::from(category);
+        if p + dc_advance > length_bits {
+            return (
+                SubsequenceState {
+                    p,
+                    n,
+                    c,
+                    z: block_in_mcu,
+                },
+                Phase1Stop::LengthBits,
+            );
+        }
+        let count_this = p < count_to;
+        p += dc_advance;
+        if count_this {
+            n = n.saturating_add(1);
+        }
+        // Snapshot: first symbol whose advance crosses count_to.
+        if !snapshotted && p_before < count_to && p >= count_to {
+            snap_p = p;
+            snap_n = n;
+            snap_block = block_in_mcu;
+            snap_c = c;
+            snapshotted = true;
+        }
+        if p >= hard_limit {
+            break;
+        }
+
+        // ── AC slots ─────────────────────────────────────────────────
+        let mut ac_pos = 1u8;
+        while ac_pos < 64 {
+            if p >= hard_limit {
+                break;
+            }
+            let p_before_ac = p;
+            let peek = peek16(bitstream, u64::from(p));
+            let ac_entry = ac_codebooks[ac_sel].lookup(peek);
+            if ac_entry.num_bits == 0 {
+                return (
+                    SubsequenceState {
+                        p,
+                        n,
+                        c,
+                        z: block_in_mcu,
+                    },
+                    Phase1Stop::PrefixMiss,
+                );
+            }
+            let symbol = ac_entry.symbol;
+            let size = symbol & 0x0F;
+            if size > 10 {
+                return (
+                    SubsequenceState {
+                        p,
+                        n,
+                        c,
+                        z: block_in_mcu,
+                    },
+                    Phase1Stop::LengthBits,
+                );
+            }
+            let ac_advance = u32::from(ac_entry.num_bits) + u32::from(size);
+            if p + ac_advance > length_bits {
+                return (
+                    SubsequenceState {
+                        p,
+                        n,
+                        c,
+                        z: block_in_mcu,
+                    },
+                    Phase1Stop::LengthBits,
+                );
+            }
+            let count_this_ac = p < count_to;
+            p += ac_advance;
+            if count_this_ac {
+                n = n.saturating_add(1);
+            }
+            if !snapshotted && p_before_ac < count_to && p >= count_to {
+                snap_p = p;
+                snap_n = n;
+                snap_block = block_in_mcu;
+                snap_c = c;
+                snapshotted = true;
+            }
+            if symbol == 0x00 {
+                // EOB: rest of block is zero.
+                break;
+            }
+            if symbol == 0xF0 {
+                // ZRL: 16 zeros.
+                ac_pos = ac_pos.saturating_add(16);
+                if ac_pos > 64 {
+                    return (
+                        SubsequenceState {
+                            p,
+                            n,
+                            c,
+                            z: block_in_mcu,
+                        },
+                        Phase1Stop::HardLimit,
+                    );
+                }
+                continue;
+            }
+            let run = symbol >> 4;
+            ac_pos = ac_pos.saturating_add(run).saturating_add(1);
+            if ac_pos > 64 {
+                return (
+                    SubsequenceState {
+                        p,
+                        n,
+                        c,
+                        z: block_in_mcu,
+                    },
+                    Phase1Stop::HardLimit,
+                );
+            }
+        }
+
+        // Advance to next block in MCU, rolling over at blocks_per_mcu.
+        block_in_mcu = (block_in_mcu + 1) % blocks_per_mcu;
+        // Update c from next block's schedule entry.
+        c = (mcu_schedule[block_in_mcu as usize] & 0xFF) as u32;
+
+        if !snapshotted && p >= hard_limit {
+            break;
+        }
+    }
+
+    let snap = if snapshotted {
+        SubsequenceState {
+            p: snap_p,
+            n: snap_n,
+            c: snap_c,
+            z: snap_block,
+        }
+    } else {
+        SubsequenceState {
+            p,
+            n,
+            c,
+            z: block_in_mcu,
+        }
+    };
+    (snap, Phase1Stop::HardLimit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

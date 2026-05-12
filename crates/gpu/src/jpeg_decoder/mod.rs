@@ -35,7 +35,7 @@ pub use bitstream::{PackedBitstream, pack_be_words};
 pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
-pub use cpu_prepass::{JpegPreparedInput, prepare_jpeg};
+pub use cpu_prepass::{JpegPreparedInput, build_mcu_schedule, prepare_jpeg};
 pub use error::JpegGpuError;
 pub use jpeg_framing::{JpegFramingError, decode_scan_symbols};
 pub use scan::dispatch_blelloch_scan;
