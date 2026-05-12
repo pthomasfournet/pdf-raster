@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 /// Maximum allowed mean absolute error per channel (0-255 scale).
 ///
 /// Rendering differences arise from sub-pixel rounding and minor divergences
-/// in FreeType / anti-aliasing behaviour vs. the C++ reference.  A value of
+/// in `FreeType` / anti-aliasing behaviour vs. the C++ reference.  A value of
 /// 4.0 is tight enough to catch real regressions while tolerating unavoidable
 /// implementation deltas.
 const MAE_LIMIT: f64 = 4.0;
@@ -220,6 +220,67 @@ fn zero_pad(n: u32, width: usize) -> String {
 
 // ── core test logic ───────────────────────────────────────────────────────────
 
+/// Compare one rendered page against its reference; return `Some(msg)` on
+/// failure or `None` on pass.  Tolerates ±1 px dimension drift from
+/// independent rounding paths.
+fn compare_page(page: u32, case: &Case, ref_file: &Path, out_file: &Path) -> Option<String> {
+    assert!(
+        ref_file.exists(),
+        "reference file missing: {}\n  Run: bash tests/golden/generate.sh",
+        ref_file.display()
+    );
+    assert!(
+        out_file.exists(),
+        "pdf-raster did not produce page {page} for {} (expected {})",
+        case.pdf,
+        out_file.display()
+    );
+
+    let (ref_w, ref_h, ref_px) = parse_ppm(ref_file);
+    let (out_w, out_h, out_px) = parse_ppm(out_file);
+
+    if ref_w.abs_diff(out_w) > 1 || ref_h.abs_diff(out_h) > 1 {
+        return Some(format!(
+            "  page {page}: dimension mismatch — ref {ref_w}×{ref_h}, got {out_w}×{out_h}"
+        ));
+    }
+
+    let cmp_w = ref_w.min(out_w) as usize;
+    let cmp_h = ref_h.min(out_h) as usize;
+    // parse_ppm asserts n_pixels > 0, and the dimension check above gates
+    // cmp_{w,h} ≥ ref_{w,h} − 1, so the comparison region is non-empty.
+    debug_assert!(cmp_w > 0 && cmp_h > 0, "comparison region is empty");
+
+    let ref_stride = ref_w as usize * 3;
+    let out_stride = out_w as usize * 3;
+
+    let mut sum_diff: u64 = 0;
+    let mut n_samples: u64 = 0;
+    for row in 0..cmp_h {
+        let r = &ref_px[row * ref_stride..row * ref_stride + cmp_w * 3];
+        let o = &out_px[row * out_stride..row * out_stride + cmp_w * 3];
+        for (&a, &b) in r.iter().zip(o.iter()) {
+            sum_diff += u64::from(a.abs_diff(b));
+            n_samples += 1;
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sum_diff ≤ 255 × pixel-count and n_samples = pixel-count; \
+                  both are bounded by image area ≪ 2^52, so the f64 cast \
+                  is lossless for any plausible test fixture"
+    )]
+    let page_mae = sum_diff as f64 / n_samples as f64;
+
+    (page_mae > MAE_LIMIT).then(|| {
+        format!(
+            "  page {page}: MAE {page_mae:.4} > limit {MAE_LIMIT:.1}  \
+             (ref {ref_w}×{ref_h}, got {out_w}×{out_h})"
+        )
+    })
+}
+
 fn run_case(case: &Case) {
     let binary = env!("CARGO_BIN_EXE_pdf-raster");
     let pdf_path = fixtures_dir().join(case.pdf);
@@ -275,77 +336,24 @@ fn run_case(case: &Case) {
 
     for page in case.first..=case.last {
         let page_str = zero_pad(page, pad_width);
-
         let out_file = tmp.path().join(format!("page-{page_str}.ppm"));
         let ref_file = ref_dir.join(format!("{}-{page_str}.ppm", case.ref_prefix));
-
-        assert!(
-            ref_file.exists(),
-            "reference file missing: {}\n  Run: bash tests/golden/generate.sh",
-            ref_file.display()
-        );
-        assert!(
-            out_file.exists(),
-            "pdf-raster did not produce page {page} for {} (expected {})",
-            case.pdf,
-            out_file.display()
-        );
-
-        let (ref_w, ref_h, ref_px) = parse_ppm(&ref_file);
-        let (out_w, out_h, out_px) = parse_ppm(&out_file);
-
-        // Allow ±1px dimension difference from independent rounding.
-        if ref_w.abs_diff(out_w) > 1 || ref_h.abs_diff(out_h) > 1 {
-            page_failures.push(format!(
-                "  page {page}: dimension mismatch — ref {ref_w}×{ref_h}, got {out_w}×{out_h}"
-            ));
-            continue;
-        }
-
-        // Compare over the overlapping region to handle the ±1px cases.
-        let cmp_w = ref_w.min(out_w) as usize;
-        let cmp_h = ref_h.min(out_h) as usize;
-
-        // n_samples cannot be 0 here: parse_ppm already asserts n_pixels > 0
-        // and the dimension check above gates cmp_w/cmp_h to be ≥ ref-1.
-        debug_assert!(cmp_w > 0 && cmp_h > 0, "comparison region is empty");
-
-        let ref_stride = ref_w as usize * 3;
-        let out_stride = out_w as usize * 3;
-
-        let mut sum_diff: u64 = 0;
-        let mut n_samples: u64 = 0;
-        for row in 0..cmp_h {
-            let r = &ref_px[row * ref_stride..row * ref_stride + cmp_w * 3];
-            let o = &out_px[row * out_stride..row * out_stride + cmp_w * 3];
-            for (&a, &b) in r.iter().zip(o.iter()) {
-                sum_diff += u64::from(a.abs_diff(b));
-                n_samples += 1;
-            }
-        }
-
-        let page_mae = sum_diff as f64 / n_samples as f64;
-
-        if page_mae > MAE_LIMIT {
-            page_failures.push(format!(
-                "  page {page}: MAE {page_mae:.4} > limit {MAE_LIMIT:.1}  \
-                 (ref {ref_w}×{ref_h}, got {out_w}×{out_h})"
-            ));
+        if let Some(failure) = compare_page(page, case, &ref_file, &out_file) {
+            page_failures.push(failure);
         }
     }
 
-    if !page_failures.is_empty() {
-        panic!(
-            "golden test FAILED for {} @{DPI}dpi:\n{}\n\n\
-             To inspect diffs: bash tests/compare/compare.sh -r {DPI} \
-             -f {} -l {} tests/fixtures/{}",
-            case.pdf,
-            page_failures.join("\n"),
-            case.first,
-            case.last,
-            case.pdf,
-        );
-    }
+    assert!(
+        page_failures.is_empty(),
+        "golden test FAILED for {} @{DPI}dpi:\n{}\n\n\
+         To inspect diffs: bash tests/compare/compare.sh -r {DPI} \
+         -f {} -l {} tests/fixtures/{}",
+        case.pdf,
+        page_failures.join("\n"),
+        case.first,
+        case.last,
+        case.pdf,
+    );
 }
 
 // ── test entry points ─────────────────────────────────────────────────────────

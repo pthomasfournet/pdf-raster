@@ -134,9 +134,9 @@ startxref\n180\n%%EOF"
 
     /// Object 1 in a linearized PDF is the linearization dict, not the
     /// catalog.  Construct a synthetic PDF where object 1 has /Linearized
-    /// + the minimum required keys, and verify try_load returns Some.
-    /// We don't need the rest of the document to be a "valid" linearized
-    /// PDF — try_load only inspects object 1.
+    /// plus the minimum required keys, and verify try_load returns Some.
+    /// The rest of the document need not be a "valid" linearized PDF;
+    /// `try_load` only inspects object 1.
     #[test]
     fn linearized_dict_in_object_1_is_detected() {
         // Per-segment byte counts:
