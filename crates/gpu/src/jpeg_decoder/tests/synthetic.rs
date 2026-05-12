@@ -5,7 +5,15 @@
 //! packed bitstream that the GPU decoder must round-trip.
 //!
 //! Used as the correctness oracle for cross-backend bit-identity
-//! tests in Phase A of the parallel-Huffman plan.
+//! tests.
+//!
+//! **Caller contract:** the encoder assumes `table` is a *valid*
+//! canonical prefix code (every codeword length yields at most
+//! `1 << length` codes; the total matches `values.len()`). It does
+//! not re-validate. Call `build_gpu_codetable` first if your test
+//! constructs a table dynamically; the canonical-walk dedup in
+//! `/audit/2026-05-11-canonical-loop-dedup.md` will fold the
+//! validation in once the shared visitor lands.
 
 #![cfg(test)]
 
@@ -94,7 +102,9 @@ pub fn encode_symbols(table: &JpegHuffmanTable, symbols: &[u8]) -> SyntheticEnco
             let shift = acc_bits - 32;
             let word = ((acc >> shift) & 0xFFFF_FFFF) as u32;
             out_words.push(word);
-            acc &= (1u64 << shift).wrapping_sub(1);
+            // shift ≤ 15 (acc_bits never exceeds 47 here), so the mask
+            // `(1 << shift) - 1` is well-defined and never overflows.
+            acc &= (1u64 << shift) - 1;
             acc_bits = shift;
         }
     }
