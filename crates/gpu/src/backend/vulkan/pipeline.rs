@@ -616,3 +616,90 @@ impl PipelineCache {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recorder feeds `binding_slots` to descriptor-set
+    /// `vkUpdateDescriptorSets` while passing one buffer per slot
+    /// from a list sized to `n_storage_buffers`.  If those two
+    /// disagree, the kernel either reads stale data (some slot
+    /// goes unbound) or the recorder over-runs its handle slice.
+    /// Lock the invariant in a pure-CPU test so a future kernel
+    /// addition can't silently drift.
+    #[test]
+    fn binding_slots_len_matches_n_storage_buffers_for_every_kernel() {
+        let kernels = [
+            KernelId::Composite,
+            KernelId::ApplySoftMask,
+            KernelId::AaFill,
+            KernelId::TileFill,
+            KernelId::IccClut,
+            KernelId::BlitImage,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::ScanPerWorkgroup,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::ScanBlockSums,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::ScanScatter,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::Phase1IntraSync,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::Phase2InterSync,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::Phase4Redecode,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::JpegPhase1IntraSync,
+        ];
+        for id in kernels {
+            let slots = id.binding_slots();
+            let n = id.n_storage_buffers();
+            assert_eq!(
+                slots.len(),
+                n as usize,
+                "{} binding_slots ({:?}) disagrees with n_storage_buffers ({n})",
+                id.label(),
+                slots,
+            );
+        }
+    }
+
+    /// `slot_index()` is the array index into `PipelineCache::slots`;
+    /// two kernels sharing the same index would silently overwrite
+    /// each other's `OnceLock`.  The `const _` block already enforces
+    /// `< NUM_KERNELS` at build time; this test confirms uniqueness.
+    #[test]
+    fn slot_indices_are_unique_across_kernels() {
+        let kernels = [
+            KernelId::Composite,
+            KernelId::ApplySoftMask,
+            KernelId::AaFill,
+            KernelId::TileFill,
+            KernelId::IccClut,
+            KernelId::BlitImage,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::ScanPerWorkgroup,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::ScanBlockSums,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::ScanScatter,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::Phase1IntraSync,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::Phase2InterSync,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::Phase4Redecode,
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            KernelId::JpegPhase1IntraSync,
+        ];
+        let mut indices: Vec<usize> = kernels.iter().map(|k| k.slot_index()).collect();
+        indices.sort_unstable();
+        let unique_count = indices.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+        assert_eq!(
+            unique_count,
+            kernels.len(),
+            "slot_index() must be unique across kernels; got {indices:?}",
+        );
+    }
+}

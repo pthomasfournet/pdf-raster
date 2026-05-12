@@ -154,6 +154,29 @@ uint try_decode_one_jpeg_symbol_kernel(inout uint4 state, uint count_to, out uin
         return DECODE_PREFIX_MISS;
     }
     uint symbol = entry & 0xFFu;
+    // Spec-bound caps on the magnitude size — mirror the CPU oracle
+    // (`jpeg_framing::emit_dc_symbol` / `emit_ac_symbols`) so a
+    // corrupt codebook can't direct us to consume more raw bits
+    // than 8-bit baseline JPEG allows.
+    //
+    //   DC: symbol is the category (0..=11) — 4-bit field but
+    //       11 is the inclusive max per ITU-T T.81 § F.1.2.1.1.
+    //   AC: symbol = (run << 4) | size; size is bounded to
+    //       0..=10 per ITU-T T.81 § F.1.2.2.1.
+    //
+    // EOB (0x00) and ZRL (0xF0) carry size = 0 so they pass the AC
+    // cap trivially; the size > 10 check fires only on adversarial
+    // / corrupt run+size symbols.
+    if (is_dc) {
+        if (symbol > 11u) {
+            return DECODE_INCOMPLETE;
+        }
+    } else {
+        uint size_field = symbol & 0xFu;
+        if (size_field > 10u) {
+            return DECODE_INCOMPLETE;
+        }
+    }
     uint value_bits = symbol & 0x0Fu;
     uint advance = num_bits + value_bits;
     if (state.x + advance > length_bits) {
