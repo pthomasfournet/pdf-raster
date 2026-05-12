@@ -102,6 +102,59 @@ impl std::fmt::Display for CanonicalCodebookError {
 
 impl std::error::Error for CanonicalCodebookError {}
 
+/// Visit every canonical `(length, code, symbol)` triple in `table`,
+/// in JPEG canonical order (length-ascending, code-ascending within
+/// each length).
+///
+/// Callers pass a closure that emits whatever per-codeword artifact
+/// they need (a LUT fill, a symbol→code map, a 2-tier quick/full
+/// codetable, ...). The shared walker handles the canonical
+/// assignment, the per-length left-shift, and the prefix-code
+/// overflow check.
+///
+/// **Doesn't** do the upfront empty / length-mismatch checks —
+/// `CanonicalCodebook::build` and `build_gpu_codetable` do them
+/// before the walk because each wraps the error differently;
+/// `SymbolEncoder::from_table` trusts its synthetic input by
+/// construction.
+///
+/// # Errors
+/// Returns [`CanonicalCodebookError::OverflowAtLength`] if the
+/// running code would exceed `1 << length` bits — i.e. the
+/// declared codeword counts don't form a valid prefix code.
+///
+/// # Panics
+/// Panics if `value_idx` would exceed `table.values.len()` during
+/// the walk. The upstream `LengthMismatch` check (in
+/// `CanonicalCodebook::build` / `build_gpu_codetable`) prevents
+/// this; the panic exists to catch a future refactor that drops
+/// that check.
+pub fn visit_canonical_codes<F>(
+    table: &JpegHuffmanTable,
+    mut emit: F,
+) -> Result<(), CanonicalCodebookError>
+where
+    F: FnMut(u8, u32, u8),
+{
+    let mut value_idx: usize = 0;
+    let mut code: u32 = 0;
+    for length_minus_1 in 0..16u8 {
+        let count = usize::from(table.num_codes[usize::from(length_minus_1)]);
+        let length = length_minus_1 + 1;
+        for _ in 0..count {
+            if code >= (1u32 << length) {
+                return Err(CanonicalCodebookError::OverflowAtLength { length });
+            }
+            let symbol = table.values[value_idx];
+            value_idx += 1;
+            emit(length, code, symbol);
+            code += 1;
+        }
+        code <<= 1;
+    }
+    Ok(())
+}
+
 impl CanonicalCodebook {
     /// Build a canonical lookup table from a parsed [`JpegHuffmanTable`].
     ///
@@ -134,36 +187,16 @@ impl CanonicalCodebook {
             .into_boxed_slice()
             .try_into()
             .expect("vec built with exactly 65_536 elements");
-        let mut value_idx: usize = 0;
-        let mut code: u32 = 0;
         let mut max_len: u8 = 0;
 
-        // Canonical code assignment per JPEG Annex C: starting at code = 0,
-        // assign each codeword in turn; on length increase, left-shift the
-        // running code by the length difference.
-        for length_minus_1 in 0..16usize {
-            let count = table.num_codes[length_minus_1] as usize;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "length_minus_1 ≤ 15, fits in u8"
-            )]
-            let length = (length_minus_1 + 1) as u8;
-            for _ in 0..count {
-                // Verify the code hasn't overflowed `length` bits.
-                if code >= (1u32 << length) {
-                    return Err(CanonicalCodebookError::OverflowAtLength { length });
-                }
-                let symbol = table.values[value_idx];
-                value_idx += 1;
-                fill_table(&mut entries, code, length, symbol);
-                if length > max_len {
-                    max_len = length;
-                }
-                code += 1;
+        // Canonical code assignment per JPEG Annex C — shared walker
+        // dispatches the per-codeword emit into the LUT fill.
+        visit_canonical_codes(table, |length, code, symbol| {
+            fill_table(&mut entries, code, length, symbol);
+            if length > max_len {
+                max_len = length;
             }
-            // Shift left for the next length tier.
-            code <<= 1;
-        }
+        })?;
 
         Ok(Self {
             table: entries,

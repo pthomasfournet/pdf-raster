@@ -18,7 +18,7 @@ pub mod unstuff;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
-pub use canonical::{CanonicalCodebook, CanonicalCodebookError};
+pub use canonical::{CanonicalCodebook, CanonicalCodebookError, visit_canonical_codes};
 pub use dc_chain::{DcChainError, DcValues};
 pub use headers::{
     DhtClass, JpegHeaderError, JpegHeaders, JpegHuffmanTable, JpegQuantTable, JpegScanComponent,

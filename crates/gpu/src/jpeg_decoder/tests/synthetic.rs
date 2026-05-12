@@ -17,7 +17,7 @@
 
 #![cfg(test)]
 
-use crate::jpeg::JpegHuffmanTable;
+use crate::jpeg::{JpegHuffmanTable, visit_canonical_codes};
 
 /// `(symbol → (code, code_bits))` lookup, derived once from a DHT.
 ///
@@ -31,29 +31,28 @@ pub struct SymbolEncoder {
 
 impl SymbolEncoder {
     /// Materialise the canonical assignment for `table` into a
-    /// symbol-keyed lookup. Mirrors the canonical loop in
-    /// `CanonicalCodebook::build` and `codetable::build_gpu_codetable`.
+    /// symbol-keyed lookup. Delegates the canonical walk to
+    /// `visit_canonical_codes`; per-codeword emit writes the
+    /// `(code, length)` pair under the symbol's slot.
+    ///
+    /// # Panics
+    /// Panics if `table` is not a valid canonical prefix code
+    /// (code-space overflow). Synthetic-stream callers build the
+    /// table from a `&[(symbol, bit_length)]` slice and guarantee
+    /// validity by construction; an overflow here is a test-fixture
+    /// bug, not a runtime condition.
     #[must_use]
     pub fn from_table(table: &JpegHuffmanTable) -> Self {
         let mut out = Self { table: [None; 256] };
-        let mut value_idx = 0usize;
-        let mut code: u32 = 0;
-        for length_minus_1 in 0..16u8 {
-            let count = usize::from(table.num_codes[length_minus_1 as usize]);
-            let length = length_minus_1 + 1;
-            for _ in 0..count {
-                let symbol = table.values[value_idx];
-                value_idx += 1;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "code < 1 << length, length ≤ 16, so code fits in u16"
-                )]
-                let code_u16 = code as u16;
-                out.table[usize::from(symbol)] = Some((code_u16, length));
-                code += 1;
-            }
-            code <<= 1;
-        }
+        visit_canonical_codes(table, |length, code, symbol| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "code < 1 << length, length ≤ 16, so code fits in u16"
+            )]
+            let code_u16 = code as u16;
+            out.table[usize::from(symbol)] = Some((code_u16, length));
+        })
+        .expect("synthetic-stream caller guarantees a valid canonical prefix code");
         out
     }
 

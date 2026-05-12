@@ -9,7 +9,7 @@
 //! AC quantiser distributions keep ≥ 95 % of codewords ≤ 10 bits, so
 //! the slow path is rare.
 
-use crate::jpeg::{CanonicalCodebookError, JpegHuffmanTable};
+use crate::jpeg::{CanonicalCodebookError, JpegHuffmanTable, visit_canonical_codes};
 use crate::jpeg_decoder::JpegGpuError;
 
 /// Prefix bits indexed by the quick table. Must match the kernel.
@@ -132,56 +132,32 @@ pub fn build_gpu_codetable(table: &JpegHuffmanTable) -> Result<GpuCodetable, Jpe
     let mut quick = vec![QuickEntry::MISS; QUICK_TABLE_SIZE];
     let mut full = Vec::new();
 
-    let mut value_idx: usize = 0;
-    let mut code: u32 = 0;
-    for length_minus_1 in 0..16u8 {
-        let count = usize::from(table.num_codes[length_minus_1 as usize]);
-        let length = length_minus_1 + 1;
-        for _ in 0..count {
-            if code >= (1u32 << length) {
-                return Err(JpegGpuError::InvalidHuffmanTables(
-                    CanonicalCodebookError::OverflowAtLength { length }.to_string(),
-                ));
-            }
-            let symbol = table.values[value_idx];
-            value_idx += 1;
-            let value_bits = symbol & 0x0F;
-            let runlength_plus1 = ((symbol >> 4) & 0x0F) + 1;
+    // Shared canonical walker; per-codeword emit splits into the
+    // QUICK_CHECK_BITS-cut quick LUT vs. the long-code FullEntry list.
+    visit_canonical_codes(table, |length, code, symbol| {
+        let value_bits = symbol & 0x0F;
+        let runlength_plus1 = ((symbol >> 4) & 0x0F) + 1;
 
-            if u32::from(length) <= QUICK_CHECK_BITS {
-                let shift = QUICK_CHECK_BITS - u32::from(length);
-                let base = (code << shift) as usize;
-                let span = 1usize << shift;
-                let packed = QuickEntry::pack(value_bits, length, runlength_plus1);
-                quick[base..base + span].fill(packed);
-            } else {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "code < 1 << length, length ≤ 16, so code fits in u16"
-                )]
-                let code_u16 = code as u16;
-                full.push(FullEntry {
-                    code_bits: length,
-                    code: code_u16,
-                    symbol,
-                });
-            }
-
-            code += 1;
+        if u32::from(length) <= QUICK_CHECK_BITS {
+            let shift = QUICK_CHECK_BITS - u32::from(length);
+            let base = (code << shift) as usize;
+            let span = 1usize << shift;
+            let packed = QuickEntry::pack(value_bits, length, runlength_plus1);
+            quick[base..base + span].fill(packed);
+        } else {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "code < 1 << length, length ≤ 16, so code fits in u16"
+            )]
+            let code_u16 = code as u16;
+            full.push(FullEntry {
+                code_bits: length,
+                code: code_u16,
+                symbol,
+            });
         }
-        code <<= 1;
-    }
-
-    // Invariant: the upfront length check guarantees value_idx ==
-    // total_codes here. Assert in debug so any future refactor that
-    // breaks the canonical walk fails loud.
-    debug_assert_eq!(
-        value_idx,
-        table.values.len(),
-        "canonical walk consumed {value_idx} symbols but DHT had {} — \
-         loop did not cover all (num_codes, values) entries",
-        table.values.len(),
-    );
+    })
+    .map_err(|e| JpegGpuError::InvalidHuffmanTables(e.to_string()))?;
 
     Ok(GpuCodetable { quick, full })
 }
