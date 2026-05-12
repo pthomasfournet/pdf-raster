@@ -2,12 +2,18 @@
 //!
 //! Used as the correctness oracle for the GPU backends; no JPEG
 //! framing, just raw symbol-stream decoding against a single canonical
-//! codebook. The Phase-A cross-backend bit-identity tests will compare
+//! codebook. The cross-backend bit-identity tests compare
 //! `CudaBackend` + `VulkanBackend` output against this.
 //!
 //! Built on top of [`CanonicalCodebook`]'s 16-bit-prefix LUT, which is
 //! the existing in-tree CPU-fast-path table. Same source of truth as
 //! the synthetic encoder in `tests::synthetic`.
+//!
+//! **Memory:** the output `Vec<u8>` is bounded by `length_bits` (one
+//! symbol per bit in the degenerate length-1-codeword case), so a
+//! `length_bits = u32::MAX` stream could allocate ~4 GB. This is
+//! `pub(crate)` precisely because production callers should not pipe
+//! untrusted bit-counts through here without their own validation.
 
 use crate::jpeg::CanonicalCodebook;
 use crate::jpeg_decoder::PackedBitstream;
@@ -20,7 +26,7 @@ use crate::jpeg_decoder::PackedBitstream;
 /// that point). Mirrors the GPU kernel's contract: don't panic on
 /// corrupt input, just stop where you can no longer decode.
 #[must_use]
-pub fn decode_scalar(book: &CanonicalCodebook, stream: &PackedBitstream) -> Vec<u8> {
+fn decode_scalar(book: &CanonicalCodebook, stream: &PackedBitstream) -> Vec<u8> {
     let mut symbols = Vec::new();
     let total_bits = u64::from(stream.length_bits);
     let mut bit_pos: u64 = 0;
@@ -145,5 +151,83 @@ mod tests {
         };
         let got = decode_scalar(&book, &stream);
         assert_eq!(got, vec![42, 42]);
+    }
+
+    #[test]
+    fn stream_truncated_mid_codeword_stops_without_emitting_partial() {
+        // Book has only the 2-bit codeword "01" → symbol 5. Feed a
+        // stream of length_bits = 1 containing just bit "0" — the
+        // 16-bit peek would land on `01_0000_..._0`, find a match
+        // claiming 2 bits, but bit_pos+2 > length_bits=1, so we
+        // must stop without emitting.
+        let t = JpegHuffmanTable {
+            class: DhtClass::Dc,
+            table_id: 0,
+            // 1 codeword of length 2.
+            num_codes: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            values: vec![5],
+        };
+        let book = CanonicalCodebook::build(&t).unwrap();
+        // Bit "0" at bit position 0; the 16-bit peek pads to
+        // 0b0100_0000_0000_0000 = 0x4000 which matches "01" → symbol 5
+        // claiming 2 bits. But length_bits = 1 < 2 bits, so we stop.
+        // Wait — actually the canonical assignment for one length-2
+        // code starts at code = 0b00, not 0b01. Use a high bit instead
+        // so the peek includes the length-2 codeword's leading bit.
+        let stream = PackedBitstream {
+            words: vec![0x0000_0000],
+            length_bits: 1,
+        };
+        let got = decode_scalar(&book, &stream);
+        // The peek reads "00_0000_...0" → matches the length-2 code
+        // "00" → symbol 5 (the only code in the table). bit_pos (0) +
+        // cb (2) > length_bits (1), so we stop without emitting.
+        assert_eq!(got, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn peek16_at_word_start_returns_high_16_bits_of_word_0() {
+        let stream = PackedBitstream {
+            words: vec![0xABCD_1234, 0xDEAD_BEEF],
+            length_bits: 64,
+        };
+        assert_eq!(peek16(&stream, 0), 0xABCD);
+    }
+
+    #[test]
+    fn peek16_at_word_end_crosses_into_word_1() {
+        let stream = PackedBitstream {
+            words: vec![0x0000_00FF, 0xFE00_0000],
+            length_bits: 64,
+        };
+        // bit_pos = 24: hi bits 24..=8 of word 0 + lo bits 7..=0
+        // wait — bit_pos = 24 reads bits 24..=39 in stream coords.
+        // word 0 bits 24..=31 (its low byte) = 0xFF; word 1 bits 0..=7
+        // (its high byte) = 0xFE. Concatenated MSB-first: 0xFFFE.
+        assert_eq!(peek16(&stream, 24), 0xFFFE);
+    }
+
+    #[test]
+    fn peek16_past_end_pads_with_zeros() {
+        let stream = PackedBitstream {
+            words: vec![0xABCD_1234],
+            length_bits: 32,
+        };
+        // bit_pos = 32: we're reading past word 0 into a nonexistent
+        // word 1; peek16 should return zeros (the bits don't matter
+        // because the caller respects length_bits).
+        assert_eq!(peek16(&stream, 32), 0x0000);
+    }
+
+    #[test]
+    fn peek16_at_word_end_minus_one_pulls_one_bit_from_next_word() {
+        let stream = PackedBitstream {
+            words: vec![0x0000_0001, 0xC000_0000],
+            length_bits: 64,
+        };
+        // bit_pos = 31: window = bit 31 of word 0 (= 1) followed by
+        // bits 0..=14 of word 1 (high bits 1, 1, 0, 0, …). MSB-first:
+        // 1_1100_0000_0000_000 = 0b1_1100_0000_0000_000 = 0xE000.
+        assert_eq!(peek16(&stream, 31), 0xE000);
     }
 }
