@@ -17,6 +17,7 @@
 
 use crate::jpeg::CanonicalCodebook;
 use crate::jpeg_decoder::PackedBitstream;
+use crate::jpeg_decoder::bitstream::peek16;
 
 /// Scalar Huffman-decode `stream` through `book` and emit the symbol
 /// sequence.
@@ -51,27 +52,6 @@ fn decode_scalar(book: &CanonicalCodebook, stream: &PackedBitstream) -> Vec<u8> 
     }
 
     symbols
-}
-
-/// Peek 16 bits starting at absolute `bit_pos`, MSB-first, padding
-/// with zeros past the end of the buffer.
-///
-/// Matches the kernel's bit-peek shape: bit 31 of `words[word_idx]`
-/// is the next bit at the start of word `word_idx`. The result is
-/// right-aligned in a u16 so [`CanonicalCodebook::lookup`] can index
-/// directly.
-fn peek16(stream: &PackedBitstream, bit_pos: u64) -> u16 {
-    let word_idx = (bit_pos / 32) as usize;
-    let bit_in_word = (bit_pos % 32) as u32;
-
-    let hi = u64::from(stream.words.get(word_idx).copied().unwrap_or(0));
-    let lo = u64::from(stream.words.get(word_idx + 1).copied().unwrap_or(0));
-    let combined = (hi << 32) | lo;
-    // We want the 16 bits starting at `bit_in_word` within `hi`,
-    // i.e. starting at bit position (63 - bit_in_word) in `combined`.
-    // Right-shift so those 16 bits land at the bottom.
-    let shift = 48 - bit_in_word;
-    ((combined >> shift) & 0xFFFF) as u16
 }
 
 #[cfg(test)]

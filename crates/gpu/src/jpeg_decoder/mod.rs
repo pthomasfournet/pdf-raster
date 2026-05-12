@@ -14,6 +14,8 @@ mod codetable;
 #[cfg(test)]
 mod cpu_reference;
 mod error;
+#[cfg(test)]
+mod phase1_oracle;
 mod scan;
 
 pub use bitstream::{PackedBitstream, pack_be_words};

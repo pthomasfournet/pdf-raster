@@ -62,6 +62,39 @@ pub fn pack_be_words(bits: &[u8], length_bits: u32) -> PackedBitstream {
     PackedBitstream { words, length_bits }
 }
 
+/// Peek 16 bits starting at absolute `bit_pos`, MSB-first, padding
+/// with zeros past the end of the buffer.
+///
+/// Matches the GPU kernel's bit-peek shape: bit 31 of `words[word_idx]`
+/// is the next bit at the start of word `word_idx`. The result is
+/// right-aligned in a u16 so [`crate::jpeg::CanonicalCodebook::lookup`]
+/// can index it directly.
+///
+/// Reads at most two adjacent words, returning zeros for any word
+/// past the end of `stream.words`. The caller is responsible for
+/// respecting `stream.length_bits` — bits past that are valid u16
+/// outputs (zero-padded) but the GPU kernel will never decode them.
+///
+/// Currently `#[cfg(test)]` because the only callers are the CPU
+/// reference decoder and the Phase 1 oracle (both test-only). The
+/// gate comes off when a production caller (the Phase 1 host-side
+/// dispatcher's CPU fallback) lands.
+#[cfg(test)]
+#[must_use]
+pub(super) fn peek16(stream: &PackedBitstream, bit_pos: u64) -> u16 {
+    let word_idx = (bit_pos / 32) as usize;
+    let bit_in_word = (bit_pos % 32) as u32;
+
+    let hi = u64::from(stream.words.get(word_idx).copied().unwrap_or(0));
+    let lo = u64::from(stream.words.get(word_idx + 1).copied().unwrap_or(0));
+    let combined = (hi << 32) | lo;
+    // We want the 16 bits starting at `bit_in_word` within `hi`,
+    // i.e. starting at bit position (63 - bit_in_word) in `combined`.
+    // Right-shift so those 16 bits land at the bottom.
+    let shift = 48 - bit_in_word;
+    ((combined >> shift) & 0xFFFF) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
