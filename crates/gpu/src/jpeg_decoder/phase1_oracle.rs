@@ -32,24 +32,8 @@
 #![cfg(test)]
 
 use crate::jpeg::CanonicalCodebook;
-use crate::jpeg_decoder::PackedBitstream;
 use crate::jpeg_decoder::bitstream::peek16;
-
-/// Per-subsequence decoder state.
-///
-/// Mirrors the GPU kernel's `SInfo` struct one-for-one so test
-/// assertions can compare host and device output without translation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SubsequenceState {
-    /// Absolute bit position in `PackedBitstream`. The kernel's `SInfo.p`.
-    pub p: u32,
-    /// Symbols decoded since `start_bit`. The kernel's `SInfo.n`.
-    pub n: u32,
-    /// Current component index (0..`num_components`). Kernel's `SInfo.c`.
-    pub c: u32,
-    /// Current zig-zag index within the 64-coefficient block. Kernel's `SInfo.z`.
-    pub z: u32,
-}
+use crate::jpeg_decoder::{PackedBitstream, SubsequenceState};
 
 /// Reason the Phase 1 walk loop exited.
 ///

@@ -351,6 +351,19 @@ pub trait GpuBackend: Send + Sync {
     /// Returns `BackendError` if the operation cannot be recorded or
     /// if `params.validate(self)` fails.
     fn record_scan(&self, params: params::ScanParams<'_, Self>) -> Result<()>;
+
+    /// Record one phase of the parallel-Huffman JPEG decoder.
+    ///
+    /// Today the only phase is `Phase1IntraSync` — one thread per
+    /// subsequence walks the entropy-coded stream and writes a
+    /// `(p, n, c, z)` tuple into `s_info[seq_idx]`. Phase 2 and 4
+    /// land in follow-up commits; Phase 3 is the Blelloch scan (see
+    /// [`Self::record_scan`]).
+    ///
+    /// # Errors
+    /// Returns `BackendError` if the operation cannot be recorded or
+    /// if `params.validate(self)` fails.
+    fn record_huffman(&self, params: params::HuffmanParams<'_, Self>) -> Result<()>;
     /// Record a zero-fill of `buf` into the current page's command list.
     ///
     /// Folds what [`Self::alloc_device_zeroed`] does as a separate one-shot

@@ -14,6 +14,7 @@ mod codetable;
 #[cfg(test)]
 mod cpu_reference;
 mod error;
+mod huffman;
 #[cfg(test)]
 mod phase1_oracle;
 mod scan;
@@ -23,6 +24,7 @@ pub use codetable::{
     FullEntry, GpuCodetable, QUICK_CHECK_BITS, QUICK_TABLE_SIZE, QuickEntry, build_gpu_codetable,
 };
 pub use error::JpegGpuError;
+pub use huffman::{SubsequenceState, build_gpu_codebook, dispatch_phase1_intra_sync};
 pub use scan::dispatch_blelloch_scan;
 
 #[cfg(test)]

@@ -267,6 +267,30 @@ impl PageRecorder {
             .map_err(be)
     }
 
+    /// Record one phase of the parallel-Huffman JPEG decoder.
+    /// Callers run `params.validate(&backend)` before this in the
+    /// trait impl.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(super) fn record_huffman(
+        &self,
+        p: params::HuffmanParams<'_, super::CudaBackend>,
+    ) -> Result<()> {
+        match p.phase {
+            params::HuffmanPhase::Phase1IntraSync => self
+                .ctx
+                .launch_phase1_intra_sync_async(
+                    p.bitstream,
+                    p.codebook,
+                    p.s_info,
+                    p.length_bits,
+                    p.subsequence_bits,
+                    p.num_subsequences,
+                    p.num_components,
+                )
+                .map_err(be),
+        }
+    }
+
     /// Record an async zero-fill on the backend's stream via
     /// `cuMemsetD8Async`.  Same single-stream serialisation as the
     /// `launch_*_async` helpers: any later record_* call ordered after

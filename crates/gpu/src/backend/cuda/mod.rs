@@ -133,6 +133,19 @@ impl GpuBackend for CudaBackend {
         ))
     }
 
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn record_huffman(&self, params: params::HuffmanParams<'_, Self>) -> Result<()> {
+        params.validate(self)?;
+        self.recorder.record_huffman(params)
+    }
+
+    #[cfg(not(feature = "gpu-jpeg-huffman"))]
+    fn record_huffman(&self, _params: params::HuffmanParams<'_, Self>) -> Result<()> {
+        Err(BackendError::msg(
+            "CudaBackend::record_huffman: gpu-jpeg-huffman feature is not enabled",
+        ))
+    }
+
     fn record_zero_buffer(&self, buf: &Self::DeviceBuffer) -> Result<()> {
         self.recorder.record_zero_buffer(buf)
     }

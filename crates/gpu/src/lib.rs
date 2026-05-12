@@ -92,6 +92,8 @@ const PTX_ICC_CLUT: &str = include_str!(concat!(env!("OUT_DIR"), "/icc_clut.ptx"
 const PTX_BLIT_IMAGE: &str = include_str!(concat!(env!("OUT_DIR"), "/blit_image.ptx"));
 #[cfg(all(not(ptx_placeholder), feature = "gpu-jpeg-huffman"))]
 const PTX_BLELLOCH_SCAN: &str = include_str!(concat!(env!("OUT_DIR"), "/blelloch_scan.ptx"));
+#[cfg(all(not(ptx_placeholder), feature = "gpu-jpeg-huffman"))]
+const PTX_PARALLEL_HUFFMAN: &str = include_str!(concat!(env!("OUT_DIR"), "/parallel_huffman.ptx"));
 
 /// Threshold in pixels below which CPU is faster than GPU dispatch overhead.
 pub const GPU_COMPOSITE_THRESHOLD: usize = 500_000;
@@ -154,6 +156,9 @@ pub(crate) struct GpuKernels {
     /// Scatter scanned block sums back into tiles (phase 3).
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub(crate) scan_scatter: CudaFunction,
+    /// JPEG Huffman Phase 1 (intra-sequence sync).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) phase1_intra_sync: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -248,6 +253,8 @@ impl GpuCtx {
                 scan_block_sums: load(PTX_BLELLOCH_SCAN, "scan_block_sums")?,
                 #[cfg(feature = "gpu-jpeg-huffman")]
                 scan_scatter: load(PTX_BLELLOCH_SCAN, "scan_scatter")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                phase1_intra_sync: load(PTX_PARALLEL_HUFFMAN, "phase1_intra_sync")?,
             },
         })
     }

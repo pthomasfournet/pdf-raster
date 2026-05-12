@@ -6,6 +6,8 @@
 
 pub mod aa;
 pub mod composite;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub mod huffman;
 pub mod icc;
 #[cfg(feature = "gpu-jpeg-huffman")]
 pub mod scan;

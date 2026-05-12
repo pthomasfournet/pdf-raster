@@ -366,6 +366,125 @@ impl<B: GpuBackend + ?Sized> ScanParams<'_, B> {
     }
 }
 
+/// Number of canonical-codebook entries the parallel-Huffman kernel reads per component.
+///
+/// The CPU-side `CanonicalCodebook` is a 65 536-entry 16-bit-prefix
+/// LUT; the GPU codebook buffer is a flat
+/// `u32[num_components * HUFFMAN_CODEBOOK_ENTRIES]`. Public so
+/// dispatchers can size + populate the buffer correctly.
+pub const HUFFMAN_CODEBOOK_ENTRIES: usize = 65_536;
+
+/// Phase selector for [`record_huffman`](super::GpuBackend::record_huffman).
+///
+/// Only `Phase1IntraSync` ships today; Phase 2 (inter-sequence sync)
+/// and Phase 4 (re-decode + write) land in follow-up commits.
+/// Phase 3 in the Weißenberger algorithm is the Blelloch scan and
+/// lives in [`ScanPhase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HuffmanPhase {
+    /// One thread per subsequence; walks the stream from
+    /// `seq_idx * subsequence_bits` to `min(length_bits,
+    /// (seq_idx + 2) * subsequence_bits)`, writing the final
+    /// `(p, n, c, z)` state into `s_info[seq_idx]`.
+    Phase1IntraSync,
+}
+
+/// Parameters for one phase of the parallel-Huffman JPEG decoder.
+///
+/// # Invariants enforced by `HuffmanParams::validate`
+/// - `length_bits > 0` and `subsequence_bits > 0`.
+/// - `num_subsequences == ceil(length_bits / subsequence_bits)`.
+/// - `num_components ≥ 1`.
+/// - `bitstream` device capacity ≥ `ceil(length_bits / 32) * 4` bytes,
+///   plus one trailing word (the kernel's `peek16` reads two adjacent
+///   words even at the stream end).
+/// - `codebook` device capacity ≥
+///   `num_components * HUFFMAN_CODEBOOK_ENTRIES * 4` bytes.
+/// - `s_info` device capacity ≥ `num_subsequences * 16` bytes
+///   (one `uint4 = (p, n, c, z)` per subsequence).
+pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
+    /// Packed bitstream as big-endian u32 words.
+    pub bitstream: &'a B::DeviceBuffer,
+    /// Flat codebook: `u32[num_components * HUFFMAN_CODEBOOK_ENTRIES]`.
+    /// Entry layout: bits 8..16 = `num_bits`, bits 0..8 = `symbol`.
+    /// `num_bits == 0` = no codeword matches that prefix.
+    pub codebook: &'a B::DeviceBuffer,
+    /// Per-subsequence output state: `uint4 = (p, n, c, z)` each.
+    pub s_info: &'a B::DeviceBuffer,
+    /// Exact bit count of `bitstream`.
+    pub length_bits: u32,
+    /// Subsequence size (Wei §III); 128 / 512 / 1024 in practice.
+    pub subsequence_bits: u32,
+    /// Number of subsequences; must equal
+    /// `ceil(length_bits / subsequence_bits)`.
+    pub num_subsequences: u32,
+    /// Number of Huffman tables (one per component for the MVP).
+    pub num_components: u32,
+    /// Which phase of the parallel-Huffman algorithm this dispatch
+    /// executes.
+    pub phase: HuffmanPhase,
+}
+
+impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
+    /// Validate the invariants documented on `HuffmanParams`.
+    ///
+    /// # Errors
+    /// Returns a `BackendError::InvariantViolation` if any check fails.
+    pub fn validate(&self, backend: &B) -> super::Result<()> {
+        const KIND: &str = "HuffmanInvariantViolation";
+        let invariant =
+            |detail: &'static str| super::BackendError::InvariantViolation { kind: KIND, detail };
+
+        if self.length_bits == 0 {
+            return Err(invariant("length_bits must be > 0"));
+        }
+        if self.subsequence_bits == 0 {
+            return Err(invariant("subsequence_bits must be > 0"));
+        }
+        if self.num_components == 0 {
+            return Err(invariant("num_components must be ≥ 1"));
+        }
+        if self.num_subsequences != self.length_bits.div_ceil(self.subsequence_bits) {
+            return Err(invariant(
+                "num_subsequences must equal ceil(length_bits / subsequence_bits)",
+            ));
+        }
+
+        // bitstream capacity: words = ceil(length_bits/32), plus one
+        // trailing word for peek16's two-word read.
+        let stream_words = self.length_bits.div_ceil(32) as usize + 1;
+        let stream_bytes = stream_words
+            .checked_mul(4)
+            .ok_or_else(|| invariant("bitstream byte count overflows usize"))?;
+        if backend.device_buffer_len(self.bitstream) < stream_bytes {
+            return Err(invariant(
+                "bitstream buffer is smaller than ceil(length_bits/32)+1 words",
+            ));
+        }
+
+        let codebook_bytes = (self.num_components as usize)
+            .checked_mul(HUFFMAN_CODEBOOK_ENTRIES)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| invariant("codebook byte count overflows usize"))?;
+        if backend.device_buffer_len(self.codebook) < codebook_bytes {
+            return Err(invariant(
+                "codebook buffer is smaller than num_components * 65536 * 4 bytes",
+            ));
+        }
+
+        // s_info: 4 u32 = 16 bytes per subsequence.
+        let s_info_bytes = (self.num_subsequences as usize)
+            .checked_mul(16)
+            .ok_or_else(|| invariant("s_info byte count overflows usize"))?;
+        if backend.device_buffer_len(self.s_info) < s_info_bytes {
+            return Err(invariant(
+                "s_info buffer is smaller than num_subsequences * 16 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +533,9 @@ mod tests {
             unreachable!()
         }
         fn record_scan(&self, _p: ScanParams<'_, Self>) -> super::super::Result<()> {
+            unreachable!()
+        }
+        fn record_huffman(&self, _p: HuffmanParams<'_, Self>) -> super::super::Result<()> {
             unreachable!()
         }
         fn record_zero_buffer(&self, _buf: &Self::DeviceBuffer) -> super::super::Result<()> {
