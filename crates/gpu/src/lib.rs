@@ -175,6 +175,12 @@ pub(crate) struct GpuKernels {
     /// machine and the JPEG sync predicate (`block_in_mcu` + `z_in_block`).
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub(crate) jpeg_phase2_inter_sync: CudaFunction,
+    /// JPEG-framed Phase 4 (re-decode + write final symbols).  Same
+    /// kernel shape as [`Self::phase4_redecode`] but uses the JPEG
+    /// state machine and inherits `(block_in_mcu, z_in_block)` from
+    /// the predecessor's Phase-1 snapshot instead of `(c, z)`.
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    pub(crate) jpeg_phase4_redecode: CudaFunction,
 }
 
 /// An initialised CUDA context and compiled kernel set.
@@ -279,6 +285,8 @@ impl GpuCtx {
                 jpeg_phase1_intra_sync: load(PTX_PARALLEL_HUFFMAN, "jpeg_phase1_intra_sync")?,
                 #[cfg(feature = "gpu-jpeg-huffman")]
                 jpeg_phase2_inter_sync: load(PTX_PARALLEL_HUFFMAN, "jpeg_phase2_inter_sync")?,
+                #[cfg(feature = "gpu-jpeg-huffman")]
+                jpeg_phase4_redecode: load(PTX_PARALLEL_HUFFMAN, "jpeg_phase4_redecode")?,
             },
         })
     }

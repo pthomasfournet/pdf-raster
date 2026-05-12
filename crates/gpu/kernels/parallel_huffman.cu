@@ -537,6 +537,77 @@ extern "C" __global__ void jpeg_phase2_inter_sync(
     flags[seq_idx] = 0u;
 }
 
+// JPEG-framed Phase 4 (re-decode + write final symbols).  Same shape
+// as `phase4_redecode` but uses the JPEG state machine.
+//
+// State semantics (JPEG framing):
+//   state.x = p              (bit position)
+//   state.y = n              (per-thread symbol count; reset to 0 at start)
+//   state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+//   state.w = z_in_block     (0 .. 64)
+//
+// Each thread inherits (p, block_in_mcu, z_in_block) from its
+// predecessor's Phase-1 snapshot (`s_info[seq_idx - 1]`) and re-walks
+// the JPEG stream until `s_info[seq_idx].x` (= this thread's `end_p`),
+// emitting decoded symbols to `symbols_out[offsets[seq_idx] + local_n]`.
+//
+// Thread 0 starts fresh at (p=0, block_in_mcu=0, z_in_block=0).
+extern "C" __global__ void jpeg_phase4_redecode(
+    const unsigned int* __restrict__ bitstream,
+    const unsigned int* __restrict__ codebook,
+    const unsigned int* __restrict__ dc_codebook,
+    const unsigned int* __restrict__ mcu_schedule,
+    const uint4* __restrict__ s_info,
+    const unsigned int* __restrict__ offsets,
+    unsigned int* __restrict__ symbols_out,
+    unsigned int* __restrict__ decode_status,
+    unsigned int length_bits,
+    unsigned int total_symbols,
+    unsigned int num_subsequences,
+    unsigned int blocks_per_mcu
+) {
+    unsigned int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+
+    uint4 me = s_info[seq_idx];
+    unsigned int end_p = me.x;
+
+    unsigned int p, n, block_in_mcu, z_in_block;
+    if (seq_idx == 0u) {
+        p = 0u; n = 0u; block_in_mcu = 0u; z_in_block = 0u;
+    } else {
+        uint4 prev = s_info[seq_idx - 1];
+        p = prev.x; n = 0u; block_in_mcu = prev.z; z_in_block = prev.w;
+    }
+
+    unsigned int base = offsets[seq_idx];
+    unsigned int status = DECODE_INCOMPLETE;
+
+    unsigned int max_iters = ((end_p > p) ? (end_p - p) : 0u) + 1u;
+    unsigned int symbol;
+    for (unsigned int iter = 0u; iter < max_iters; iter++) {
+        if (p >= end_p) {
+            status = DECODE_OK;
+            break;
+        }
+        unsigned int step = try_decode_one_jpeg_symbol_device(
+            bitstream, codebook, dc_codebook, mcu_schedule,
+            length_bits, blocks_per_mcu, end_p,
+            &p, &n, &block_in_mcu, &z_in_block, &symbol);
+        if (step != DECODE_OK) {
+            status = step;
+            break;
+        }
+        unsigned int write_idx = base + (n - 1u);
+        if (write_idx < total_symbols) {
+            symbols_out[write_idx] = symbol;
+        }
+    }
+    decode_status[seq_idx] = status;
+}
+
 // JPEG-framed Phase 1 (intra-sequence sync).  Same shape as
 // `phase1_intra_sync` but uses the JPEG state machine.
 //

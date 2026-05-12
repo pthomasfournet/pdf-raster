@@ -557,11 +557,7 @@ impl PageRecorder {
             }
             HuffmanPhase::JpegPhase1IntraSync => self.dispatch_jpeg_phase1(&p, &push, groups),
             HuffmanPhase::JpegPhase2InterSync => self.dispatch_jpeg_phase2(&p, &push, groups),
-            // JPEG-framed Phase 4 follows in the next commit.
-            HuffmanPhase::JpegPhase4Redecode => Err(crate::backend::BackendError::msg(format!(
-                "Vulkan backend: JPEG-framed phase {:?} is not yet implemented",
-                p.phase,
-            ))),
+            HuffmanPhase::JpegPhase4Redecode => self.dispatch_jpeg_phase4(&p, &push, groups),
         }
     }
 
@@ -638,6 +634,62 @@ impl PageRecorder {
                 p.codebook.size(),
                 p.s_info.size(),
                 flags.size(),
+                dc.size(),
+                sched.size(),
+            ],
+            push,
+            groups,
+        )
+    }
+
+    /// Dispatch helper for the JPEG-framed Phase 4.  Pulled out of
+    /// [`Self::record_huffman`] to keep the main fn under the clippy
+    /// `too_many_lines` threshold.
+    ///
+    /// Buffer order matches `binding_slots = [0,1,2,4,5,6,7,8]`:
+    /// bitstream, codebook, s_info, offsets, symbols_out, decode_status,
+    /// dc_codebook, mcu_schedule (slot 3 / sync_flags is skipped).
+    #[cfg(feature = "gpu-jpeg-huffman")]
+    fn dispatch_jpeg_phase4(
+        &self,
+        p: &params::HuffmanParams<'_, super::VulkanBackend>,
+        push: &[u8; 24],
+        groups: (u32, u32, u32),
+    ) -> Result<()> {
+        let dc = p
+            .dc_codebook
+            .expect("validate() proved dc_codebook is Some for JpegPhase4Redecode");
+        let sched = p
+            .mcu_schedule
+            .expect("validate() proved mcu_schedule is Some for JpegPhase4Redecode");
+        let offsets = p
+            .offsets
+            .expect("validate() proved offsets is Some for JpegPhase4Redecode");
+        let symbols_out = p
+            .symbols_out
+            .expect("validate() proved symbols_out is Some for JpegPhase4Redecode");
+        let decode_status = p
+            .decode_status
+            .expect("validate() proved decode_status is Some for JpegPhase4Redecode");
+        self.dispatch_kernel(
+            KernelId::JpegPhase4Redecode,
+            &[
+                p.bitstream.handle(),
+                p.codebook.handle(),
+                p.s_info.handle(),
+                offsets.handle(),
+                symbols_out.handle(),
+                decode_status.handle(),
+                dc.handle(),
+                sched.handle(),
+            ],
+            &[
+                p.bitstream.size(),
+                p.codebook.size(),
+                p.s_info.size(),
+                offsets.size(),
+                symbols_out.size(),
+                decode_status.size(),
                 dc.size(),
                 sched.size(),
             ],

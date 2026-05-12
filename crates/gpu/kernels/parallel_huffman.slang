@@ -487,6 +487,61 @@ void jpeg_phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     s_info_out[seq_idx] = snapshot;
 }
 
+/// JPEG-framed Phase 4 (re-decode + write final symbols).  Same shape
+/// as `phase4_redecode` but uses the JPEG state machine via
+/// `try_decode_one_jpeg_symbol_kernel`.  State semantics:
+///
+///     state.x = p              (bit position)
+///     state.y = n              (per-thread symbol count; reset to 0)
+///     state.z = block_in_mcu   (0 .. blocks_per_mcu - 1)
+///     state.w = z_in_block     (0 .. 64)
+///
+/// Each thread inherits `(p, block_in_mcu, z_in_block)` from its
+/// predecessor's Phase-1 snapshot and re-walks the JPEG stream until
+/// `s_info_out[seq_idx].x` (`end_p`), emitting decoded symbols to
+/// `symbols_out[offsets[seq_idx] + local_n]`.
+[shader("compute")][numthreads(256, 1, 1)]
+void jpeg_phase4_redecode(uint3 tid : SV_DispatchThreadID) {
+    uint seq_idx = tid.x;
+    if (seq_idx >= num_subsequences) {
+        return;
+    }
+
+    uint4 me = s_info_out[seq_idx];
+    uint end_p = me.x;
+
+    uint4 state;
+    if (seq_idx == 0u) {
+        state = uint4(0u, 0u, 0u, 0u);
+    } else {
+        uint4 prev = s_info_out[seq_idx - 1];
+        // Inherit (p, block_in_mcu, z_in_block); reset n.
+        state = uint4(prev.x, 0u, prev.z, prev.w);
+    }
+
+    uint base = offsets[seq_idx];
+    uint status = DECODE_INCOMPLETE;
+
+    uint max_iters = (end_p > state.x ? end_p - state.x : 0u) + 1u;
+    uint symbol;
+    for (uint iter = 0u; iter < max_iters; iter++) {
+        if (state.x >= end_p) {
+            status = DECODE_OK;
+            break;
+        }
+        uint step = try_decode_one_jpeg_symbol_kernel(state, end_p, symbol);
+        if (step != DECODE_OK) {
+            status = step;
+            break;
+        }
+        uint write_idx = base + (state.y - 1u);
+        if (write_idx < total_symbols) {
+            symbols_out[write_idx] = symbol;
+        }
+    }
+    decode_status[seq_idx] = status;
+}
+
 /// JPEG-framed Phase 2 (inter-sequence sync).  Same shape as
 /// `phase2_inter_sync` but uses the JPEG state machine via
 /// `try_decode_one_jpeg_symbol_kernel`.  State semantics:

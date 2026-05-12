@@ -381,12 +381,38 @@ impl PageRecorder {
                     )
                     .map_err(be)
             }
-            // JPEG-framed Phase 4 follows in the next commit.
             params::HuffmanPhase::JpegPhase4Redecode => {
-                Err(crate::backend::BackendError::msg(format!(
-                    "CUDA backend: JPEG-framed phase {:?} is not yet implemented",
-                    p.phase,
-                )))
+                let dc = p
+                    .dc_codebook
+                    .expect("validate() proved dc_codebook is Some for JpegPhase4Redecode");
+                let sched = p
+                    .mcu_schedule
+                    .expect("validate() proved mcu_schedule is Some for JpegPhase4Redecode");
+                let offsets = p
+                    .offsets
+                    .expect("validate() proved offsets is Some for JpegPhase4Redecode");
+                let symbols_out = p
+                    .symbols_out
+                    .expect("validate() proved symbols_out is Some for JpegPhase4Redecode");
+                let decode_status = p
+                    .decode_status
+                    .expect("validate() proved decode_status is Some for JpegPhase4Redecode");
+                self.ctx
+                    .launch_jpeg_phase4_redecode_async(
+                        p.bitstream,
+                        p.codebook,
+                        dc,
+                        sched,
+                        p.s_info,
+                        offsets,
+                        symbols_out,
+                        decode_status,
+                        p.length_bits,
+                        p.total_symbols,
+                        num_subsequences,
+                        p.blocks_per_mcu,
+                    )
+                    .map_err(be)
             }
         }
     }
