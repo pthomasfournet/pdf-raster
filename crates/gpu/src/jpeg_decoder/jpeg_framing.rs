@@ -29,6 +29,7 @@
 //! metadata (matching the synthetic-stream Phase 4 contract).
 
 use crate::jpeg::CanonicalCodebook;
+use crate::jpeg::bitreader::BitReader;
 use crate::jpeg::headers::{JpegFrameComponent, mcu_count};
 use crate::jpeg_decoder::{JpegGpuError, JpegPreparedInput};
 
@@ -375,90 +376,6 @@ fn emit_ac_symbols(
         }
     }
     Ok(())
-}
-
-/// MSB-first bit reader over an unstuffed JPEG entropy-coded segment.
-///
-/// Identical contract to `dc_chain::BitReader`; kept module-local so
-/// `dc_chain`'s internal struct does not need to become pub.  When
-/// either reader gains a feature the other lacks, refactor to a shared
-/// `crate::jpeg::bitreader` module rather than letting them drift.
-struct BitReader<'a> {
-    src: &'a [u8],
-    byte_pos: usize,
-    buf: u64,
-    cap: u32,
-}
-
-impl<'a> BitReader<'a> {
-    const fn new(src: &'a [u8]) -> Self {
-        Self {
-            src,
-            byte_pos: 0,
-            buf: 0,
-            cap: 0,
-        }
-    }
-
-    fn refill(&mut self) {
-        if self.cap == 0 && self.byte_pos + 8 <= self.src.len() {
-            let bytes: [u8; 8] = self.src[self.byte_pos..self.byte_pos + 8]
-                .try_into()
-                .expect("slice length checked above");
-            self.buf = u64::from_be_bytes(bytes);
-            self.byte_pos += 8;
-            self.cap = 64;
-            return;
-        }
-        while self.cap <= 56 && self.byte_pos < self.src.len() {
-            let byte = u64::from(self.src[self.byte_pos]);
-            self.byte_pos += 1;
-            self.buf |= byte << (56 - self.cap);
-            self.cap += 8;
-        }
-    }
-
-    fn peek_u16(&mut self) -> Option<u16> {
-        self.refill();
-        if self.cap == 0 {
-            return None;
-        }
-        Some((self.buf >> 48) as u16)
-    }
-
-    fn consume(&mut self, n: usize) {
-        debug_assert!(n <= self.cap as usize);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "n ≤ self.cap ≤ 64; fits in u32 trivially"
-        )]
-        let n_u32 = n as u32;
-        self.buf <<= n_u32;
-        self.cap -= n_u32;
-    }
-
-    /// Consume `n` bits and discard them.  Returns `None` when fewer
-    /// than `n` bits remain in the stream so the caller can surface a
-    /// typed `UnexpectedEnd` error.  The oracle does not need the
-    /// value (it emits the Huffman symbol byte only); production
-    /// callers consuming raw bits should reach for a richer reader.
-    fn read_bits(&mut self, n: usize) -> Option<()> {
-        if n == 0 {
-            return Some(());
-        }
-        self.refill();
-        if (self.cap as usize) < n {
-            return None;
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "n ≤ 16 in baseline JPEG codepaths; fits in u32 trivially"
-        )]
-        let n_u32 = n as u32;
-        self.buf <<= n_u32;
-        self.cap -= n_u32;
-        Some(())
-    }
 }
 
 #[cfg(test)]

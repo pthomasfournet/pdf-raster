@@ -9,6 +9,7 @@
 //! | [`dc_chain`] | Resolve per-block absolute DC values across the entropy stream. |
 //! | [`prepass`] | Top-level orchestrator: bytes → [`CpuPrepassOutput`]. |
 
+pub(crate) mod bitreader;
 pub mod canonical;
 pub mod dc_chain;
 pub mod headers;
