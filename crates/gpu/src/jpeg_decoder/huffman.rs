@@ -397,13 +397,30 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     let handle = backend.download_async(&s_info_buf, dst)?;
     backend.wait_download(handle)?;
 
-    let mut offsets_host = Vec::with_capacity(num_subsequences as usize);
-    let mut acc: u32 = 0;
-    for s in &s_info_host {
-        offsets_host.push(acc);
-        acc = acc.wrapping_add(s.n);
+    // Exclusive scan + total over s_info[*].n. checked_add surfaces
+    // u32 overflow (silent wrapping would let Phase 4 write past the
+    // allocated symbols_out). Shared with the scan parity tests.
+    let counts: Vec<u32> = s_info_host.iter().map(|s| s.n).collect();
+    let offsets_host = crate::jpeg_decoder::scan::test_helpers::cpu_exclusive_scan(&counts);
+    let total_symbols = offsets_host
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .checked_add(s_info_host.last().map(|s| s.n).unwrap_or(0))
+        .ok_or_else(|| {
+            BackendError::msg("dispatch_phase1_through_phase4: total symbol count overflows u32")
+        })?;
+
+    if total_symbols == 0 {
+        // Well-formed stream produced no decodable symbols. Skip
+        // Phase 4 entirely (kernel + alloc would both reject 0-size).
+        backend.free_device(bitstream_buf);
+        backend.free_device(codebook_buf);
+        backend.free_device(s_info_buf);
+        backend.free_device(sync_flags_buf);
+        backend.free_device(offsets_buf);
+        return Ok(Vec::new());
     }
-    let total_symbols = acc;
 
     let _up3 = backend.upload_async(&offsets_buf, bytemuck::cast_slice(&offsets_host))?;
 

@@ -47,6 +47,10 @@ cbuffer PushParams {
     uint subsequence_bits;
     uint num_subsequences;
     uint num_components;
+    // Phase 4 bounds-checks each symbols_out write against this; the
+    // other phases ignore it. Zero is a valid sentinel for Phase 1/2
+    // (they don't read it).
+    uint total_symbols;
 };
 
 /// Peek 16 bits MSB-first starting at absolute `bit_pos`.
@@ -64,20 +68,24 @@ uint peek16_kernel(uint bit_pos) {
     return uint((combined >> (48u - bit_in_word)) & 0xFFFFu);
 }
 
-/// Try to decode one Huffman symbol starting at `state.p`, returning
-/// `true` if the state was advanced. On failure (prefix-miss or
-/// length-bits truncation) `state` is left unchanged and the caller
-/// can detect the miss without checkpoint arithmetic.
+/// Try to decode one Huffman symbol starting at `state.p`, writing
+/// the decoded symbol byte to `symbol_out` on success and returning
+/// `true`. On failure (prefix-miss or length-bits truncation) the
+/// state and `symbol_out` are left unchanged so callers can detect
+/// the miss without checkpoint arithmetic.
 ///
 /// `count_to` controls per-region accounting: `state.y` (= n)
 /// increments only when the symbol *starts* (state.x before advance)
 /// below `count_to`. Symbols straddling the boundary belong to the
 /// next subseq's region. Phase 1 passes `start_bit + subsequence_bits`;
-/// Phase 2 passes the next subseq's `start_bit`.
+/// Phase 2 passes the next subseq's `start_bit`; Phase 4 passes
+/// `end_p` (every in-region symbol counts).
 ///
-/// Shared by Phase 1 (loops until hard_limit) and Phase 2 (calls
-/// once per unsynced subseq per pass).
-bool try_decode_one_symbol_kernel(inout uint4 state, uint count_to) {
+/// Shared by Phase 1 (loops until hard_limit), Phase 2 (calls once
+/// per unsynced subseq per pass), and Phase 4 (loops until end_p
+/// and emits each decoded symbol).
+bool try_decode_one_symbol_kernel(inout uint4 state, uint count_to, out uint symbol_out) {
+    symbol_out = 0u;
     uint peek = peek16_kernel(state.x);
     uint entry = codebook[state.z * 65536u + peek];
     uint num_bits = (entry >> 8u) & 0xFFu;
@@ -98,6 +106,7 @@ bool try_decode_one_symbol_kernel(inout uint4 state, uint count_to) {
     if (state.w == 0u) {
         state.z = (state.z + 1u) % num_components;
     }
+    symbol_out = symbol;
     return true;
 }
 
@@ -123,11 +132,12 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
     // symbols. The +1 caps a buggy codebook (entry => 0 advance);
     // working codebooks terminate well below this.
     uint max_iters = (hard_limit - start_bit) + 1u;
+    uint symbol_sink;  // Phase 1 doesn't emit.
     for (uint iter = 0u; iter < max_iters; iter++) {
         if (state.x >= hard_limit) {
             break;
         }
-        if (!try_decode_one_symbol_kernel(state, subseq_end_bit)) {
+        if (!try_decode_one_symbol_kernel(state, subseq_end_bit, symbol_sink)) {
             break;
         }
     }
@@ -174,30 +184,24 @@ void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
     // (code_bits + value_bits) >= 1 bits. +1 protects a degenerate
     // codebook.
     uint max_iters = (end_p > state.x ? end_p - state.x : 0u) + 1u;
+    uint symbol;
     for (uint iter = 0u; iter < max_iters; iter++) {
         if (state.x >= end_p) {
             break;
         }
-        // Inline single-symbol decode + emit. Mirrors
-        // try_decode_one_symbol_kernel but captures the symbol value.
-        uint peek = peek16_kernel(state.x);
-        uint entry = codebook[state.z * 65536u + peek];
-        uint num_bits = (entry >> 8u) & 0xFFu;
-        if (num_bits == 0u) {
+        // count_to = end_p: every in-region symbol counts (and only
+        // in-region symbols can be reached, since we exit the loop
+        // once state.x >= end_p).
+        if (!try_decode_one_symbol_kernel(state, end_p, symbol)) {
             break;
         }
-        uint symbol = entry & 0xFFu;
-        uint value_bits = symbol & 0x0Fu;
-        uint advance = num_bits + value_bits;
-        if (state.x + advance > length_bits) {
-            break;
-        }
-        symbols_out[base + state.y] = symbol;
-        state.x += advance;
-        state.y += 1u;
-        state.w = (state.w + 1u) & 63u;
-        if (state.w == 0u) {
-            state.z = (state.z + 1u) % num_components;
+        // Bounds-check each write: a buggy / adversarial upstream
+        // could inflate `state.y` past this thread's slot. `state.y`
+        // was just incremented by the helper, so the write index is
+        // base + state.y - 1.
+        uint write_idx = base + (state.y - 1u);
+        if (write_idx < total_symbols) {
+            symbols_out[write_idx] = symbol;
         }
     }
 }
@@ -232,7 +236,8 @@ void phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
     // and we'll spin this subseq until the host's retry bound.
     // count_to = nxt_start_p: symbols starting before the next
     // subseq's start belong to my region.
-    bool _ignored = try_decode_one_symbol_kernel(me, nxt_start_p);
+    uint symbol_sink;  // Phase 2 doesn't emit.
+    bool _ignored = try_decode_one_symbol_kernel(me, nxt_start_p, symbol_sink);
     s_info_out[seq_idx] = me;
     sync_flags[seq_idx] = 0u;
 }

@@ -24,12 +24,13 @@ __device__ __forceinline__ unsigned int peek16_kernel(
 }
 
 // Try to decode one Huffman symbol starting at `*p`, updating
-// `(*p, *n, *c, *z)` in place. Returns 1 on success (symbol decoded
+// `(*p, *n, *c, *z)` in place and writing the decoded symbol byte
+// to `*symbol_out` on success. Returns 1 on success (symbol decoded
 // + state advanced), 0 on either failure mode: prefix-miss (no
 // codeword matches the 16-bit peek) or length-bits truncation
-// (codeword would run past stream end). On failure, state is
-// unchanged so callers can detect the miss without checkpoint
-// arithmetic.
+// (codeword would run past stream end). On failure, state and
+// `*symbol_out` are unchanged so callers can detect the miss
+// without checkpoint arithmetic.
 //
 // `count_to` controls per-region accounting: `*n` increments only
 // when the symbol *starts* (`*p` before advance) below `count_to`.
@@ -37,11 +38,14 @@ __device__ __forceinline__ unsigned int peek16_kernel(
 // region and must not inflate this subseq's count — that's what
 // Phase 3's exclusive scan + Phase 4's per-thread write region rely
 // on. Phase 1 passes `start_bit + subsequence_bits`; Phase 2 passes
-// the next subseq's `start_bit`.
+// the next subseq's `start_bit`; Phase 4 passes `end_p` (every
+// in-region symbol counts).
 //
 // Mirrors phase1_oracle::try_decode_one_symbol on the host side;
-// shared by both phase1_intra_sync (loops until hard_limit) and
-// phase2_inter_sync (calls once per unsynced subseq per pass).
+// shared by phase1_intra_sync (loops until hard_limit),
+// phase2_inter_sync (calls once per unsynced subseq per pass),
+// and phase4_redecode (loops until end_p, emits each decoded
+// symbol via `*symbol_out`).
 __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     const unsigned int* __restrict__ bitstream,
     const unsigned int* __restrict__ codebook,
@@ -51,7 +55,8 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     unsigned int* p,
     unsigned int* n,
     unsigned int* c,
-    unsigned int* z
+    unsigned int* z,
+    unsigned int* symbol_out
 ) {
     unsigned int peek = peek16_kernel(bitstream, *p);
     unsigned int entry = codebook[(*c) * CODEBOOK_ENTRIES + peek];
@@ -70,6 +75,7 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     if (*z == 0u) {
         *c = (*c + 1u) % num_components;
     }
+    *symbol_out = symbol;
     return 1u;
 }
 
@@ -103,11 +109,12 @@ extern "C" __global__ void phase1_intra_sync(
     unsigned int z = 0u;
 
     unsigned int max_iters = (hard_limit - start_bit) + 1u;
+    unsigned int symbol_sink;  // Phase 1 doesn't emit; the helper writes here and we ignore it.
     for (unsigned int iter = 0u; iter < max_iters; iter++) {
         if (p >= hard_limit) break;
         if (try_decode_one_symbol_device(
                 bitstream, codebook, length_bits, num_components, subseq_end_bit,
-                &p, &n, &c, &z) == 0u) {
+                &p, &n, &c, &z, &symbol_sink) == 0u) {
             break;
         }
     }
@@ -126,7 +133,9 @@ extern "C" __global__ void phase1_intra_sync(
 // comes from s_info[seq_idx-1] (or fresh start for seq_idx == 0).
 //
 // Per-region accounting was fixed in Phase 1+2 so `me.n` equals the
-// number of symbols this thread emits.
+// number of symbols this thread emits — but the kernel also bounds-
+// checks each write against `total_symbols` so adversarial / buggy
+// upstream output can't corrupt host memory past symbols_out's end.
 extern "C" __global__ void phase4_redecode(
     const unsigned int* __restrict__ bitstream,
     const unsigned int* __restrict__ codebook,
@@ -134,6 +143,7 @@ extern "C" __global__ void phase4_redecode(
     const unsigned int* __restrict__ offsets,
     unsigned int* __restrict__ symbols_out,
     unsigned int length_bits,
+    unsigned int total_symbols,
     unsigned int num_subsequences,
     unsigned int num_components
 ) {
@@ -157,22 +167,24 @@ extern "C" __global__ void phase4_redecode(
     unsigned int base = offsets[seq_idx];
 
     unsigned int max_iters = ((end_p > p) ? (end_p - p) : 0u) + 1u;
+    unsigned int symbol;
     for (unsigned int iter = 0u; iter < max_iters; iter++) {
         if (p >= end_p) break;
-        unsigned int peek = peek16_kernel(bitstream, p);
-        unsigned int entry = codebook[c * CODEBOOK_ENTRIES + peek];
-        unsigned int num_bits = (entry >> 8u) & 0xFFu;
-        if (num_bits == 0u) break;
-        unsigned int symbol = entry & 0xFFu;
-        unsigned int value_bits = symbol & 0x0Fu;
-        unsigned int advance = num_bits + value_bits;
-        if (p + advance > length_bits) break;
-        symbols_out[base + n] = symbol;
-        p += advance;
-        n += 1u;
-        z = (z + 1u) & 63u;
-        if (z == 0u) {
-            c = (c + 1u) % num_components;
+        // count_to = end_p: every in-region symbol counts (and only
+        // in-region symbols can be reached, since we exit the loop
+        // once p >= end_p).
+        if (try_decode_one_symbol_device(
+                bitstream, codebook, length_bits, num_components, end_p,
+                &p, &n, &c, &z, &symbol) == 0u) {
+            break;
+        }
+        // Bounds-check the write: an adversarial / buggy upstream
+        // could inflate this thread's emit count past its slot.
+        // `n` was just incremented by the helper, so we write at
+        // `base + n - 1` and require it to fit in symbols_out.
+        unsigned int write_idx = base + (n - 1u);
+        if (write_idx < total_symbols) {
+            symbols_out[write_idx] = symbol;
         }
     }
 }
@@ -234,9 +246,10 @@ extern "C" __global__ void phase2_inter_sync(
     // count_to = nxt_start_p: symbols starting before the next
     // subseq's start belong to my region; symbols starting past
     // that don't (they belong to the next subseq).
+    unsigned int symbol_sink;  // Phase 2 doesn't emit.
     (void)try_decode_one_symbol_device(
         bitstream, codebook, length_bits, num_components, nxt_start_p,
-        &p, &n, &c, &z);
+        &p, &n, &c, &z, &symbol_sink);
 
     uint4 updated;
     updated.x = p;

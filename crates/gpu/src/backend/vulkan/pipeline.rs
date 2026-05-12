@@ -225,16 +225,14 @@ impl KernelId {
             // travel as push constants (16 bytes total).
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase1IntraSync => 3,
-            // (bitstream, codebook, s_info, sync_flags) — same 16-byte
-            // push constants as Phase 1.
+            // (bitstream, codebook, s_info, sync_flags) — shares the
+            // 20-byte push struct with all huffman phases.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase2InterSync => 4,
             // (bitstream, codebook, s_info, offsets, symbols_out) —
-            // length_bits + num_subsequences + num_components travel
-            // as push constants (12 bytes — subsequence_bits unused).
-            // The descriptor layout reuses the Phase 1/2 push constant
-            // size (16 bytes) for simplicity; the kernel just ignores
-            // the trailing 4 bytes.
+            // shares the 20-byte push struct; Phase 4 reads the
+            // total_symbols field for bounds-checking writes, the
+            // others ignore it.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase4Redecode => 5,
         }
