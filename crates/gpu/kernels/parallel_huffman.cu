@@ -23,14 +23,27 @@ __device__ __forceinline__ unsigned int peek16_kernel(
     return (unsigned int)((combined >> (48u - bit_in_word)) & 0xFFFFu);
 }
 
+// Status codes returned by `try_decode_one_symbol_device` /
+// `try_decode_one_symbol_kernel`. Match the Rust-side
+// `Phase4FailureKind` enum's discriminants exactly so the host can
+// `transmute`-style interpret the per-subseq decode_status buffer
+// without a translation layer.
+//
+// 0 reserved for Ok so a `decode_status` buffer freshly allocated
+// with `alloc_device_zeroed` reads as Ok-everywhere by default.
+#define DECODE_OK            0u
+#define DECODE_PREFIX_MISS   1u
+#define DECODE_LENGTH_BITS   2u
+#define DECODE_INCOMPLETE    3u
+
 // Try to decode one Huffman symbol starting at `*p`, updating
 // `(*p, *n, *c, *z)` in place and writing the decoded symbol byte
-// to `*symbol_out` on success. Returns 1 on success (symbol decoded
-// + state advanced), 0 on either failure mode: prefix-miss (no
-// codeword matches the 16-bit peek) or length-bits truncation
-// (codeword would run past stream end). On failure, state and
-// `*symbol_out` are unchanged so callers can detect the miss
-// without checkpoint arithmetic.
+// to `*symbol_out` on success. Returns `DECODE_OK` on success,
+// `DECODE_PREFIX_MISS` if no codeword matches the 16-bit peek
+// (`num_bits == 0`), `DECODE_LENGTH_BITS` if the decoded codeword
+// would run past stream end. On failure, state and `*symbol_out`
+// are unchanged so callers can detect the miss without checkpoint
+// arithmetic.
 //
 // `count_to` controls per-region accounting: `*n` increments only
 // when the symbol *starts* (`*p` before advance) below `count_to`.
@@ -61,11 +74,11 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
     unsigned int peek = peek16_kernel(bitstream, *p);
     unsigned int entry = codebook[(*c) * CODEBOOK_ENTRIES + peek];
     unsigned int num_bits = (entry >> 8u) & 0xFFu;
-    if (num_bits == 0u) return 0u;  // PrefixMiss
+    if (num_bits == 0u) return DECODE_PREFIX_MISS;
     unsigned int symbol = entry & 0xFFu;
     unsigned int value_bits = symbol & 0x0Fu;
     unsigned int advance = num_bits + value_bits;
-    if (*p + advance > length_bits) return 0u;  // LengthBits
+    if (*p + advance > length_bits) return DECODE_LENGTH_BITS;
 
     unsigned int count_this_one = (*p < count_to) ? 1u : 0u;
     *p += advance;
@@ -76,7 +89,7 @@ __device__ __forceinline__ unsigned int try_decode_one_symbol_device(
         *c = (*c + 1u) % num_components;
     }
     *symbol_out = symbol;
-    return 1u;
+    return DECODE_OK;
 }
 
 // Phase 1: one thread per subsequence; writes a "boundary snapshot"
@@ -147,7 +160,7 @@ extern "C" __global__ void phase1_intra_sync(
         unsigned int p_before = p;
         if (try_decode_one_symbol_device(
                 bitstream, codebook, length_bits, num_components, subseq_end_bit,
-                &p, &n, &c, &z, &symbol_sink) == 0u) {
+                &p, &n, &c, &z, &symbol_sink) != DECODE_OK) {
             break;
         }
         // First decode that crosses into the next subseq's region
@@ -199,12 +212,21 @@ extern "C" __global__ void phase1_intra_sync(
 // The kernel also bounds-checks each write against `total_symbols`
 // so adversarial / buggy upstream output can't corrupt host memory
 // past symbols_out's end.
+//
+// Per-subseq `decode_status[seq_idx]` records the exit condition:
+// DECODE_OK if the walk reached end_p cleanly, DECODE_PREFIX_MISS
+// or DECODE_LENGTH_BITS if the decode helper failed mid-region,
+// DECODE_INCOMPLETE if `max_iters` ran out without reaching end_p
+// (degenerate codebook with zero-advance entries). Host reads this
+// after dispatch to surface adversarial-input failures as typed
+// errors rather than silently truncating the symbol stream.
 extern "C" __global__ void phase4_redecode(
     const unsigned int* __restrict__ bitstream,
     const unsigned int* __restrict__ codebook,
     const uint4* __restrict__ s_info,
     const unsigned int* __restrict__ offsets,
     unsigned int* __restrict__ symbols_out,
+    unsigned int* __restrict__ decode_status,
     unsigned int length_bits,
     unsigned int total_symbols,
     unsigned int num_subsequences,
@@ -228,17 +250,23 @@ extern "C" __global__ void phase4_redecode(
     }
 
     unsigned int base = offsets[seq_idx];
+    unsigned int status = DECODE_INCOMPLETE;  // overwritten on clean exit or typed failure
 
     unsigned int max_iters = ((end_p > p) ? (end_p - p) : 0u) + 1u;
     unsigned int symbol;
     for (unsigned int iter = 0u; iter < max_iters; iter++) {
-        if (p >= end_p) break;
+        if (p >= end_p) {
+            status = DECODE_OK;
+            break;
+        }
         // count_to = end_p: every in-region symbol counts (and only
         // in-region symbols can be reached, since we exit the loop
         // once p >= end_p).
-        if (try_decode_one_symbol_device(
-                bitstream, codebook, length_bits, num_components, end_p,
-                &p, &n, &c, &z, &symbol) == 0u) {
+        unsigned int step = try_decode_one_symbol_device(
+            bitstream, codebook, length_bits, num_components, end_p,
+            &p, &n, &c, &z, &symbol);
+        if (step != DECODE_OK) {
+            status = step;  // PrefixMiss or LengthBits
             break;
         }
         // Bounds-check the write: an adversarial / buggy upstream
@@ -250,6 +278,7 @@ extern "C" __global__ void phase4_redecode(
             symbols_out[write_idx] = symbol;
         }
     }
+    decode_status[seq_idx] = status;
 }
 
 // Phase 2: one thread per subsequence. Checks whether `s_info[i]`

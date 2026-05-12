@@ -195,7 +195,7 @@ pub(super) fn phase1_walk(
 ///
 /// Same signature as `phase1_walk`; the only difference is the
 /// `state` reported on `HardLimit`. Stops other than `HardLimit`
-/// (PrefixMiss / LengthBits) are reported with the walker's pre-
+/// (`PrefixMiss` / `LengthBits`) are reported with the walker's pre-
 /// failure state, matching `phase1_walk`'s behaviour.
 pub(super) fn phase1_walk_snapshot(
     bitstream: &PackedBitstream,

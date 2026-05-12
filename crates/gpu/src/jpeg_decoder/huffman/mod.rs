@@ -118,6 +118,7 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
         sync_flags: None,
         offsets: None,
         symbols_out: None,
+        decode_status: None,
         length_bits,
         subsequence_bits,
         num_components,
@@ -213,6 +214,7 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
         sync_flags: None,
         offsets: None,
         symbols_out: None,
+        decode_status: None,
         length_bits,
         subsequence_bits,
         num_components,
@@ -235,6 +237,7 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
             sync_flags: Some(sync_flags_buf.as_ref()),
             offsets: None,
             symbols_out: None,
+            decode_status: None,
             length_bits,
             subsequence_bits,
             num_components,
@@ -292,6 +295,10 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
 /// Returns `BackendError` if any alloc/upload/dispatch/download
 /// fails, or if Phase 2 fails to converge within the retry bound.
 #[cfg(feature = "gpu-validation")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear 4-phase procedural script; splitting would obscure the phase-by-phase flow and force the per-phase param structs through tiny helper functions"
+)]
 fn dispatch_phase1_through_phase4<B: GpuBackend>(
     backend: &B,
     stream: &PackedBitstream,
@@ -351,6 +358,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         sync_flags: None,
         offsets: None,
         symbols_out: None,
+        decode_status: None,
         length_bits,
         subsequence_bits,
         num_components,
@@ -373,6 +381,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
             sync_flags: Some(sync_flags_buf.as_ref()),
             offsets: None,
             symbols_out: None,
+            decode_status: None,
             length_bits,
             subsequence_bits,
             num_components,
@@ -414,7 +423,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         .last()
         .copied()
         .unwrap_or(0)
-        .checked_add(s_info_host.last().map(|s| s.n).unwrap_or(0))
+        .checked_add(s_info_host.last().map_or(0, |s| s.n))
         .ok_or_else(|| {
             BackendError::msg("dispatch_phase1_through_phase4: total symbol count overflows u32")
         })?;
@@ -430,6 +439,10 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
 
     let symbols_bytes = (total_symbols as usize) * 4;
     let symbols_buf = DeviceBufferGuard::alloc_zeroed(backend, symbols_bytes)?;
+    // decode_status: one u32 per subseq. Zero-init = Phase4FailureKind::Ok
+    // so any subseq the kernel doesn't reach (degenerate dispatch grid)
+    // stays Ok and the post-Phase-4 inspection sees clean data.
+    let decode_status_buf = DeviceBufferGuard::alloc_zeroed(backend, flags_bytes)?;
 
     // Phase 4.
     backend.begin_page()?;
@@ -440,6 +453,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
         sync_flags: None,
         offsets: Some(offsets_buf.as_ref()),
         symbols_out: Some(symbols_buf.as_ref()),
+        decode_status: Some(decode_status_buf.as_ref()),
         length_bits,
         subsequence_bits,
         num_components,
@@ -448,6 +462,22 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     })?;
     let fence = backend.submit_page()?;
     backend.wait_page(fence)?;
+
+    // Inspect per-subseq decode status before downloading symbols.
+    // Any non-Ok subseq surfaces as a typed error — adversarial inputs
+    // that would have silently produced shorter symbol streams now
+    // fail loudly.
+    let mut status_host = vec![0u32; num_subsequences as usize];
+    let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut status_host);
+    let handle = backend.download_async(decode_status_buf.as_ref(), dst)?;
+    backend.wait_download(handle)?;
+    if let Some((failing_idx, &raw)) = status_host.iter().enumerate().find(|&(_, &s)| s != 0) {
+        let kind = crate::backend::params::Phase4FailureKind::from_u32(raw);
+        return Err(BackendError::msg(format!(
+            "dispatch_phase1_through_phase4: Phase 4 decode failed on subseq {failing_idx}: {} (status code {raw})",
+            kind.label(),
+        )));
+    }
 
     let mut symbols_host = vec![0u32; total_symbols as usize];
     let dst = bytemuck::cast_slice_mut::<u32, u8>(&mut symbols_host);
@@ -460,6 +490,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
     backend.free_device(sync_flags_buf.take());
     backend.free_device(offsets_buf.take());
     backend.free_device(symbols_buf.take());
+    backend.free_device(decode_status_buf.take());
 
     Ok(symbols_host)
 }
@@ -703,7 +734,7 @@ mod tests {
         assert_eq!(offsets, vec![0]);
     }
 
-    /// Phase 3 with empty input is a no-op — Vec::new() round-trip.
+    /// Phase 3 with empty input is a no-op — `Vec::new()` round-trip.
     #[test]
     fn phase3_empty_input_cuda() {
         let Some(b) = try_cuda() else {
@@ -762,11 +793,11 @@ mod tests {
     }
 
     /// End-to-end on **mixed** codeword lengths (lengths 2 + 3).
-    /// MVP Phase 2's `(c, z)` sync predicate can need O(subseq_bits)
+    /// MVP Phase 2's `(c, z)` sync predicate can need `O(subseq_bits)`
     /// advance steps on this corpus, exceeding the `2 * log2(n)`
     /// retry bound. Documented limitation; the test expects either
     /// Convergence (and validates the round-trip) or the
-    /// SyncBoundExceeded BackendError. Robust sync is a follow-up
+    /// `SyncBoundExceeded` `BackendError`. Robust sync is a follow-up
     /// in the post-MVP corpus work.
     #[test]
     fn end_to_end_mixed_codeword_lengths_cuda_documented_limitation() {

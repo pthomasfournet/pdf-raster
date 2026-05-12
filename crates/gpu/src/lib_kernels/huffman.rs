@@ -131,6 +131,7 @@ impl GpuCtx {
         s_info: &CudaSlice<u8>,
         offsets: &CudaSlice<u8>,
         symbols_out: &CudaSlice<u8>,
+        decode_status: &CudaSlice<u8>,
         length_bits: u32,
         total_symbols: u32,
         num_subsequences: u32,
@@ -150,6 +151,7 @@ impl GpuCtx {
             .arg(s_info)
             .arg(offsets)
             .arg(symbols_out)
+            .arg(decode_status)
             .arg(&length_bits)
             .arg(&total_symbols)
             .arg(&num_subsequences)

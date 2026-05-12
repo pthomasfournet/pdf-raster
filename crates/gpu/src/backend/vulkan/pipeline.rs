@@ -229,12 +229,14 @@ impl KernelId {
             // 20-byte push struct with all huffman phases.
             #[cfg(feature = "gpu-jpeg-huffman")]
             Self::Phase2InterSync => 4,
-            // (bitstream, codebook, s_info, offsets, symbols_out) —
-            // shares the 20-byte push struct; Phase 4 reads the
-            // total_symbols field for bounds-checking writes, the
-            // others ignore it.
+            // (bitstream, codebook, s_info, offsets, symbols_out,
+            // decode_status) — shares the 20-byte push struct;
+            // Phase 4 reads `total_symbols` for bounds-checking
+            // writes; the other phases ignore it. `decode_status`
+            // is the per-subseq u32 exit-condition buffer (see
+            // Phase4FailureKind for the encoding).
             #[cfg(feature = "gpu-jpeg-huffman")]
-            Self::Phase4Redecode => 5,
+            Self::Phase4Redecode => 6,
         }
     }
 }

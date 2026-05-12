@@ -425,11 +425,12 @@ pub enum HuffmanPhase {
 /// - When `phase == Phase2InterSync`: `sync_flags` must be `Some`
 ///   with device capacity ≥ `num_subsequences * 4` bytes (one u32
 ///   flag per subsequence). For Phase 1 the field is ignored.
-/// - When `phase == Phase4Redecode`: both `offsets` and `symbols_out`
-///   must be `Some`. `offsets` ≥ `num_subsequences * 4` bytes.
-///   `symbols_out` must hold at least `total_symbols * 4` bytes;
-///   callers compute `total_symbols` from the Phase 3 exclusive scan
-///   total plus the last subseq's `n`.
+/// - When `phase == Phase4Redecode`: `offsets`, `symbols_out`, and
+///   `decode_status` must all be `Some`. `offsets` ≥
+///   `num_subsequences * 4` bytes; `symbols_out` ≥ `total_symbols * 4`
+///   bytes; `decode_status` ≥ `num_subsequences * 4` bytes (one u32
+///   per subseq encoding the kernel's exit condition — see
+///   `Phase4FailureKind` for the discriminants).
 pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// Packed bitstream as big-endian u32 words.
     pub bitstream: &'a B::DeviceBuffer,
@@ -452,6 +453,15 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// for `Phase4Redecode`; ignored for other phases. Caller sizes
     /// it from Phase 3's scan total + last subseq's `n`.
     pub symbols_out: Option<&'a B::DeviceBuffer>,
+    /// Per-subseq exit-condition output (`u32[num_subsequences]`):
+    /// `decode_status[i]` encodes the Phase 4 kernel's exit
+    /// condition for subseq `i` — `Phase4FailureKind::Ok` on clean
+    /// `end_p` exit, or one of the typed failure modes
+    /// (`PrefixMiss`, `LengthBits`, `Incomplete`) when the helper
+    /// bails mid-region. Allocate zero-filled so untouched slots
+    /// default to Ok. Required for `Phase4Redecode`; ignored for
+    /// other phases.
+    pub decode_status: Option<&'a B::DeviceBuffer>,
     /// Exact bit count of `bitstream`.
     pub length_bits: u32,
     /// Subsequence size (Wei §III); 128 / 512 / 1024 in practice.
@@ -459,14 +469,71 @@ pub struct HuffmanParams<'a, B: GpuBackend + ?Sized> {
     /// Number of Huffman tables (one per component for the MVP).
     pub num_components: u32,
     /// Total symbol count = exclusive scan of `s_info[*].n` total +
-    /// `s_info[num_subseq-1].n`. Used only by `Phase4Redecode` to
-    /// validate `symbols_out` capacity; the kernel itself doesn't
-    /// read this value (it bounds each thread's write count via
-    /// `me.p` instead).
+    /// `s_info[num_subseq-1].n`. `Phase4Redecode` reads this in the
+    /// kernel to bounds-check each `symbols_out` write — an
+    /// adversarial / buggy upstream that inflates `n` past the
+    /// thread's slot would otherwise corrupt host memory past
+    /// `symbols_out`'s end. Set to 0 for other phases (kernel
+    /// ignores it).
     pub total_symbols: u32,
     /// Which phase of the parallel-Huffman algorithm this dispatch
     /// executes.
     pub phase: HuffmanPhase,
+}
+
+/// Phase 4 per-subseq exit condition.
+///
+/// Encoded as `u32` in the kernel-side `decode_status` buffer.
+/// Discriminants MUST match the kernel's `DECODE_*` constants
+/// exactly (CUDA `#define`, Slang `static const uint`).
+///
+/// The Phase 4 dispatcher inspects `decode_status` after the kernel
+/// returns and surfaces the first non-`Ok` subseq as a typed
+/// `BackendError`. Adversarial inputs (truncated streams, codetable
+/// mismatches) that would have silently produced shorter-than-
+/// expected symbol streams now fail loudly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Phase4FailureKind {
+    /// Walker reached `end_p` cleanly (default-zero state).
+    Ok = 0,
+    /// 16-bit peek matched no codeword in the active table —
+    /// codetable mismatch or corrupt bitstream.
+    PrefixMiss = 1,
+    /// Codeword would run past `length_bits` — stream truncated
+    /// mid-codeword.
+    LengthBits = 2,
+    /// `max_iters` exhausted without reaching `end_p`. Should not
+    /// happen with a valid codebook (every codeword advances `p`
+    /// by ≥ 1 bit); kept as defense-in-depth for degenerate
+    /// codebooks with zero-advance entries.
+    Incomplete = 3,
+}
+
+impl Phase4FailureKind {
+    /// Decode the kernel's u32 status code. Unknown values map to
+    /// `Incomplete` since "kernel produced a value the host doesn't
+    /// recognise" is most safely treated as a degenerate failure.
+    #[must_use]
+    pub const fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Self::Ok,
+            1 => Self::PrefixMiss,
+            2 => Self::LengthBits,
+            _ => Self::Incomplete,
+        }
+    }
+
+    /// Human-readable label for error formatting.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "Ok",
+            Self::PrefixMiss => "PrefixMiss",
+            Self::LengthBits => "LengthBits",
+            Self::Incomplete => "Incomplete",
+        }
+    }
 }
 
 impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
@@ -566,13 +633,23 @@ impl<B: GpuBackend + ?Sized> HuffmanParams<'_, B> {
             let Some(symbols_out) = self.symbols_out else {
                 return Err(invariant("Phase4Redecode requires symbols_out to be Some"));
             };
-            // offsets: 1 u32 per subsequence.
-            let offsets_bytes = (self.num_subsequences() as usize)
+            let Some(decode_status) = self.decode_status else {
+                return Err(invariant(
+                    "Phase4Redecode requires decode_status to be Some",
+                ));
+            };
+            // offsets + decode_status: 1 u32 per subsequence.
+            let per_subseq_bytes = (self.num_subsequences() as usize)
                 .checked_mul(4)
-                .ok_or_else(|| invariant("offsets byte count overflows usize"))?;
-            if backend.device_buffer_len(offsets) < offsets_bytes {
+                .ok_or_else(|| invariant("per-subseq byte count overflows usize"))?;
+            if backend.device_buffer_len(offsets) < per_subseq_bytes {
                 return Err(invariant(
                     "offsets buffer is smaller than num_subsequences * 4 bytes",
+                ));
+            }
+            if backend.device_buffer_len(decode_status) < per_subseq_bytes {
+                return Err(invariant(
+                    "decode_status buffer is smaller than num_subsequences * 4 bytes",
                 ));
             }
             // symbols_out: 1 u32 per decoded symbol.
@@ -894,5 +971,61 @@ mod tests {
         let p = scan_params(&data, &block_sums, max_elems, ScanPhase::PerWorkgroup);
         p.validate(&FakeBackend)
             .expect("exactly SCAN_MAX_BLOCKS is valid");
+    }
+
+    /// Discriminants must match the kernel-side DECODE_* constants
+    /// exactly; the host downloads a `u32[num_subseq]` buffer from
+    /// the device and round-trips each entry through `from_u32`. Any
+    /// drift here would silently misclassify failures.
+    #[test]
+    fn phase4_failure_kind_from_u32_round_trips_known_codes() {
+        assert_eq!(Phase4FailureKind::from_u32(0), Phase4FailureKind::Ok);
+        assert_eq!(
+            Phase4FailureKind::from_u32(1),
+            Phase4FailureKind::PrefixMiss
+        );
+        assert_eq!(
+            Phase4FailureKind::from_u32(2),
+            Phase4FailureKind::LengthBits
+        );
+        assert_eq!(
+            Phase4FailureKind::from_u32(3),
+            Phase4FailureKind::Incomplete
+        );
+    }
+
+    #[test]
+    fn phase4_failure_kind_from_u32_maps_unknown_to_incomplete() {
+        // Unknown values are most safely treated as a degenerate
+        // failure rather than silently mapping to Ok or panicking.
+        assert_eq!(
+            Phase4FailureKind::from_u32(4),
+            Phase4FailureKind::Incomplete
+        );
+        assert_eq!(
+            Phase4FailureKind::from_u32(42),
+            Phase4FailureKind::Incomplete
+        );
+        assert_eq!(
+            Phase4FailureKind::from_u32(u32::MAX),
+            Phase4FailureKind::Incomplete,
+        );
+    }
+
+    #[test]
+    fn phase4_failure_kind_labels_are_distinct() {
+        let mut labels = vec![
+            Phase4FailureKind::Ok.label(),
+            Phase4FailureKind::PrefixMiss.label(),
+            Phase4FailureKind::LengthBits.label(),
+            Phase4FailureKind::Incomplete.label(),
+        ];
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            4,
+            "labels must be unique for error formatting"
+        );
     }
 }

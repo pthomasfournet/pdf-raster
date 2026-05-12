@@ -11,7 +11,7 @@
 //! 5. single-symbol "alphabet" (degenerate, length-1 code)
 //! 6. maximum-length 16-bit codewords
 //! 7. Phase 2 retry trigger (adversarial, mixed-length book —
-//!    documented MVP limitation; expects SyncBoundExceeded)
+//!    documented MVP limitation; expects `SyncBoundExceeded`)
 //! 8. exactly one subsequence
 //! 9. exact 32-bit-word boundary (no tail padding)
 //! 10. maximum tail padding (31 bits short)
@@ -19,7 +19,7 @@
 //! The vectors that stay within the MVP `(c, z)` sync predicate
 //! assert byte-for-byte round-trip equivalence between input
 //! symbols and decoded symbols. The adversarial vector asserts
-//! the dispatcher surfaces the SyncBoundExceeded error rather
+//! the dispatcher surfaces the `SyncBoundExceeded` error rather
 //! than hanging or producing garbage.
 //!
 //! ## Why a separate module
@@ -91,7 +91,7 @@ fn book_maxlen_16() -> JpegHuffmanTable {
     }
 }
 
-/// Build a PackedBitstream from `(table, symbols)` via the
+/// Build a `PackedBitstream` from `(table, symbols)` via the
 /// synthetic encoder — pulled out so test bodies can vary the
 /// book without writing the encoder boilerplate inline.
 fn encode_to_stream(table: &JpegHuffmanTable, symbols: &[u8]) -> PackedBitstream {
@@ -105,7 +105,7 @@ fn encode_to_stream(table: &JpegHuffmanTable, symbols: &[u8]) -> PackedBitstream
 /// Run the full Phase 1→4 pipeline on a backend and return the
 /// decoded symbol stream as `Vec<u8>` (each u32 emit truncated to
 /// its low byte). On error returns the propagated `BackendError`
-/// so adversarial vectors can match SyncBoundExceeded.
+/// so adversarial vectors can match the `SyncBoundExceeded` path.
 ///
 /// Takes the `JpegHuffmanTable` rather than a pre-built
 /// `CanonicalCodebook` because the latter isn't `Clone` (owns a
@@ -150,7 +150,7 @@ fn assert_roundtrip(
     let cuda_result = run_pipeline(&cuda, table, &stream, subseq_bits);
 
     if expect_sync_bound_exceeded {
-        let cuda_err = cuda_result.expect_err("expected SyncBoundExceeded on adversarial input");
+        let cuda_err = cuda_result.expect_err("expected `SyncBoundExceeded` on adversarial input");
         let msg = format!("{cuda_err}");
         assert!(
             msg.contains("Phase 2 did not converge"),
@@ -170,18 +170,18 @@ fn assert_roundtrip(
     //
     // The adversarial vector (`expect_sync_bound_exceeded = true`)
     // doesn't depend on emit correctness — Vulkan returns the same
-    // SyncBoundExceeded error as CUDA — so we still parity-check it.
+    // `SyncBoundExceeded` error as CUDA — so we still parity-check it.
     #[cfg(feature = "vulkan")]
-    if expect_sync_bound_exceeded {
-        if let Some(vk) = try_vulkan() {
-            let vk_result = run_pipeline(&vk, table, &stream, subseq_bits);
-            let vk_err = vk_result.expect_err("expected SyncBoundExceeded on adversarial input");
-            let msg = format!("{vk_err}");
-            assert!(
-                msg.contains("Phase 2 did not converge"),
-                "Vulkan: unexpected error: {msg}",
-            );
-        }
+    if let Some(vk) = try_vulkan()
+        && expect_sync_bound_exceeded
+    {
+        let vk_result = run_pipeline(&vk, table, &stream, subseq_bits);
+        let vk_err = vk_result.expect_err("expected `SyncBoundExceeded` on adversarial input");
+        let msg = format!("{vk_err}");
+        assert!(
+            msg.contains("Phase 2 did not converge"),
+            "Vulkan: unexpected error: {msg}",
+        );
     }
 }
 
@@ -191,7 +191,7 @@ fn assert_roundtrip(
 /// The book uses 0x00, 0x10, 0x20, 0x30 so the symbol's low nibble
 /// (value-bits) is zero; see `book_uniform_len2`'s doc-comment for
 /// why low nibble matters to the kernel's advance arithmetic.
-fn uniform_symbol(i: u32) -> u8 {
+const fn uniform_symbol(i: u32) -> u8 {
     match i % 4 {
         0 => 0x00,
         1 => 0x10,

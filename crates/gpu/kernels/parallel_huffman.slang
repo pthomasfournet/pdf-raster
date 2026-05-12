@@ -40,6 +40,18 @@
 // symbol stream.
 [[vk::binding(4, 0)]] StructuredBuffer<uint> offsets;
 [[vk::binding(5, 0)]] RWStructuredBuffer<uint> symbols_out;
+// Phase 4 only — bound at slot 6. One u32 per subseq encoding the
+// thread's exit condition (see DECODE_* constants below). Allocated
+// zero-filled by the host so subseqs default to DECODE_OK; threads
+// overwrite with the actual code.
+[[vk::binding(6, 0)]] RWStructuredBuffer<uint> decode_status;
+
+// Status codes — must match the CUDA `DECODE_*` macros AND the
+// Rust-side `Phase4FailureKind` discriminants exactly.
+static const uint DECODE_OK = 0u;
+static const uint DECODE_PREFIX_MISS = 1u;
+static const uint DECODE_LENGTH_BITS = 2u;
+static const uint DECODE_INCOMPLETE = 3u;
 
 [[vk::push_constant]]
 cbuffer PushParams {
@@ -84,19 +96,19 @@ uint peek16_kernel(uint bit_pos) {
 /// Shared by Phase 1 (loops until hard_limit), Phase 2 (calls once
 /// per unsynced subseq per pass), and Phase 4 (loops until end_p
 /// and emits each decoded symbol).
-bool try_decode_one_symbol_kernel(inout uint4 state, uint count_to, out uint symbol_out) {
+uint try_decode_one_symbol_kernel(inout uint4 state, uint count_to, out uint symbol_out) {
     symbol_out = 0u;
     uint peek = peek16_kernel(state.x);
     uint entry = codebook[state.z * 65536u + peek];
     uint num_bits = (entry >> 8u) & 0xFFu;
     if (num_bits == 0u) {
-        return false;
+        return DECODE_PREFIX_MISS;
     }
     uint symbol = entry & 0xFFu;
     uint value_bits = symbol & 0x0Fu;
     uint advance = num_bits + value_bits;
     if (state.x + advance > length_bits) {
-        return false;
+        return DECODE_LENGTH_BITS;
     }
     uint count_this_one = (state.x < count_to) ? 1u : 0u;
     state.x += advance;
@@ -107,7 +119,7 @@ bool try_decode_one_symbol_kernel(inout uint4 state, uint count_to, out uint sym
         state.z = (state.z + 1u) % num_components;
     }
     symbol_out = symbol;
-    return true;
+    return DECODE_OK;
 }
 
 [shader("compute")][numthreads(256, 1, 1)]
@@ -148,7 +160,7 @@ void phase1_intra_sync(uint3 tid : SV_DispatchThreadID) {
             break;
         }
         uint p_before = state.x;
-        if (!try_decode_one_symbol_kernel(state, subseq_end_bit, symbol_sink)) {
+        if (try_decode_one_symbol_kernel(state, subseq_end_bit, symbol_sink) != DECODE_OK) {
             break;
         }
         if (!snapshotted && p_before < subseq_end_bit && state.x >= subseq_end_bit) {
@@ -202,6 +214,9 @@ void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
     }
 
     uint base = offsets[seq_idx];
+    // Default to INCOMPLETE; the loop overwrites with OK on clean
+    // end_p exit, or with PrefixMiss / LengthBits on typed failure.
+    uint status = DECODE_INCOMPLETE;
 
     // Loop bound matches Phase 1's: at most one symbol every
     // (code_bits + value_bits) >= 1 bits. +1 protects a degenerate
@@ -210,12 +225,15 @@ void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
     uint symbol;
     for (uint iter = 0u; iter < max_iters; iter++) {
         if (state.x >= end_p) {
+            status = DECODE_OK;
             break;
         }
         // count_to = end_p: every in-region symbol counts (and only
         // in-region symbols can be reached, since we exit the loop
         // once state.x >= end_p).
-        if (!try_decode_one_symbol_kernel(state, end_p, symbol)) {
+        uint step = try_decode_one_symbol_kernel(state, end_p, symbol);
+        if (step != DECODE_OK) {
+            status = step;
             break;
         }
         // Bounds-check each write: a buggy / adversarial upstream
@@ -227,6 +245,7 @@ void phase4_redecode(uint3 tid : SV_DispatchThreadID) {
             symbols_out[write_idx] = symbol;
         }
     }
+    decode_status[seq_idx] = status;
 }
 
 [shader("compute")][numthreads(256, 1, 1)]
@@ -260,7 +279,7 @@ void phase2_inter_sync(uint3 tid : SV_DispatchThreadID) {
     // count_to = nxt_start_p: symbols starting before the next
     // subseq's start belong to my region.
     uint symbol_sink;  // Phase 2 doesn't emit.
-    bool _ignored = try_decode_one_symbol_kernel(me, nxt_start_p, symbol_sink);
+    uint _ignored_status = try_decode_one_symbol_kernel(me, nxt_start_p, symbol_sink);
     s_info_out[seq_idx] = me;
     sync_flags[seq_idx] = 0u;
 }

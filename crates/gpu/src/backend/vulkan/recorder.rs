@@ -527,6 +527,9 @@ impl PageRecorder {
                 let symbols_out = p
                     .symbols_out
                     .expect("validate() proved symbols_out is Some for Phase4Redecode");
+                let decode_status = p
+                    .decode_status
+                    .expect("validate() proved decode_status is Some for Phase4Redecode");
                 self.dispatch_kernel(
                     KernelId::Phase4Redecode,
                     &[
@@ -535,6 +538,7 @@ impl PageRecorder {
                         p.s_info.handle(),
                         offsets.handle(),
                         symbols_out.handle(),
+                        decode_status.handle(),
                     ],
                     &[
                         p.bitstream.size(),
@@ -542,6 +546,7 @@ impl PageRecorder {
                         p.s_info.size(),
                         offsets.size(),
                         symbols_out.size(),
+                        decode_status.size(),
                     ],
                     &push,
                     groups,

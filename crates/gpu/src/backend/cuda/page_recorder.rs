@@ -313,6 +313,9 @@ impl PageRecorder {
                 let symbols_out = p
                     .symbols_out
                     .expect("validate() proved symbols_out is Some for Phase4Redecode");
+                let decode_status = p
+                    .decode_status
+                    .expect("validate() proved decode_status is Some for Phase4Redecode");
                 self.ctx
                     .launch_phase4_redecode_async(
                         p.bitstream,
@@ -320,6 +323,7 @@ impl PageRecorder {
                         p.s_info,
                         offsets,
                         symbols_out,
+                        decode_status,
                         p.length_bits,
                         p.total_symbols,
                         num_subsequences,
