@@ -584,6 +584,20 @@ pub enum Phase4FailureKind {
     AcOverflow = 6,
 }
 
+// Discriminants are wire values shared with the Slang `DECODE_*` and
+// CUDA `#define DECODE_*` macros.  A drift here breaks the host's
+// `decode_status` round-trip and is silent at runtime (the kernel
+// writes a value the host can't recognise).  Pin the values at
+// build time so any reorder of the enum surfaces as a compile
+// error.
+const _: () = assert!(Phase4FailureKind::Ok as u32 == 0);
+const _: () = assert!(Phase4FailureKind::PrefixMiss as u32 == 1);
+const _: () = assert!(Phase4FailureKind::LengthBits as u32 == 2);
+const _: () = assert!(Phase4FailureKind::Incomplete as u32 == 3);
+const _: () = assert!(Phase4FailureKind::BadDcCategory as u32 == 4);
+const _: () = assert!(Phase4FailureKind::BadAcSize as u32 == 5);
+const _: () = assert!(Phase4FailureKind::AcOverflow as u32 == 6);
+
 impl Phase4FailureKind {
     /// Decode the kernel's u32 status code. Unknown values map to
     /// `Incomplete` since "kernel produced a value the host doesn't
