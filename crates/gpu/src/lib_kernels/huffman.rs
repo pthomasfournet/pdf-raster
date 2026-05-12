@@ -6,11 +6,7 @@
 use cudarc::driver::{CudaSlice, PushKernelArg};
 
 use crate::GpuCtx;
-
-/// Workgroup size for Phase 1. Must match the .cu / .slang
-/// `numthreads(256, 1, 1)` declaration. One thread per subsequence;
-/// blocks dispatched at `ceil(num_subsequences / 256)`.
-pub(crate) const PHASE1_THREADS: u32 = 256;
+use crate::backend::params::HUFFMAN_PHASE1_THREADS;
 
 impl GpuCtx {
     /// Async launch of the Phase 1 intra-sequence-sync kernel.
@@ -39,8 +35,8 @@ impl GpuCtx {
         num_components: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (num_subsequences.div_ceil(PHASE1_THREADS), 1, 1),
-            block_dim: (PHASE1_THREADS, 1, 1),
+            grid_dim: (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1),
+            block_dim: (HUFFMAN_PHASE1_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
 

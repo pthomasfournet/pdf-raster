@@ -470,13 +470,8 @@ impl PageRecorder {
         &self,
         p: params::HuffmanParams<'_, super::VulkanBackend>,
     ) -> Result<()> {
-        // One thread per subsequence, 256 threads per workgroup (must
-        // match the .slang's numthreads declaration + CUDA's
-        // PHASE1_THREADS).
-        const PHASE1_THREADS: u32 = 256;
-
         use super::pipeline::KernelId;
-        use crate::backend::params::HuffmanPhase;
+        use crate::backend::params::{HUFFMAN_PHASE1_THREADS, HuffmanPhase};
 
         let num_subsequences = p.num_subsequences();
         let mut push = [0u8; 16];
@@ -488,7 +483,7 @@ impl PageRecorder {
         let kernel = match p.phase {
             HuffmanPhase::Phase1IntraSync => KernelId::Phase1IntraSync,
         };
-        let groups = (num_subsequences.div_ceil(PHASE1_THREADS), 1, 1);
+        let groups = (num_subsequences.div_ceil(HUFFMAN_PHASE1_THREADS), 1, 1);
 
         self.dispatch_kernel(
             kernel,

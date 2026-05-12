@@ -374,6 +374,14 @@ impl<B: GpuBackend + ?Sized> ScanParams<'_, B> {
 /// dispatchers can size + populate the buffer correctly.
 pub const HUFFMAN_CODEBOOK_ENTRIES: usize = 65_536;
 
+/// Workgroup size for the parallel-Huffman Phase 1 kernel.
+///
+/// Must match the `numthreads(...)` in `parallel_huffman.slang` /
+/// the block-dim arg the CUDA launcher (`launch_phase1_intra_sync_async`)
+/// uses. Backends size their dispatch grid as
+/// `ceil(num_subsequences / HUFFMAN_PHASE1_THREADS)`.
+pub const HUFFMAN_PHASE1_THREADS: u32 = 256;
+
 /// Phase selector for [`record_huffman`](super::GpuBackend::record_huffman).
 ///
 /// Phase 3 of the Weißenberger algorithm is the Blelloch scan; see
