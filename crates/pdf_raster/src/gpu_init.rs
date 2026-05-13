@@ -162,29 +162,39 @@ pub fn release_nvjpeg2k_this_thread() {
 
 // ── GPU parallel-Huffman JPEG decoder ─────────────────────────────────────────
 
-/// Three-state slot for the GPU parallel-Huffman decoder — mirrors `DecoderInit<T>`
-/// so a failed construction is remembered and not retried on every subsequent page.
+/// Three-state slot for a GPU parallel-Huffman JPEG decoder.
+///
+/// Mirrors [`DecoderInit<T>`] so a failed construction is remembered and not
+/// retried on every subsequent page.
 #[cfg(feature = "gpu-jpeg-huffman")]
-pub enum JpegGpuInit {
+pub enum JpegGpuInit<T> {
     Uninitialised,
-    Ready(Option<gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>),
+    Ready(Option<T>),
     Failed,
 }
 
 #[cfg(feature = "gpu-jpeg-huffman")]
 thread_local! {
-    pub static JPEG_GPU_DEC: RefCell<JpegGpuInit> =
-        const { RefCell::new(JpegGpuInit::Uninitialised) };
+    pub static JPEG_CUDA_DEC: RefCell<
+        JpegGpuInit<gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>,
+    > = const { RefCell::new(JpegGpuInit::Uninitialised) };
 }
 
-/// Initialise this thread's GPU parallel-Huffman JPEG decoder if not already done.
+#[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+thread_local! {
+    pub static JPEG_VK_DEC: RefCell<
+        JpegGpuInit<gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::vulkan::VulkanBackend>>,
+    > = const { RefCell::new(JpegGpuInit::Uninitialised) };
+}
+
+/// Initialise this thread's CUDA parallel-Huffman JPEG decoder if not already done.
 ///
 /// Errors are non-fatal when `policy` is `Auto`; the decoder slot moves to
 /// `Failed` and the CPU path is used instead. A previous failure is remembered
 /// and not retried on subsequent pages.
 #[cfg(feature = "gpu-jpeg-huffman")]
 pub fn ensure_jpeg_gpu_huffman(policy: BackendPolicy) -> Result<(), String> {
-    JPEG_GPU_DEC.with(|cell| {
+    JPEG_CUDA_DEC.with(|cell| {
         match *cell.borrow() {
             JpegGpuInit::Uninitialised => {}
             JpegGpuInit::Failed if matches!(policy, BackendPolicy::ForceCuda) => {
@@ -217,4 +227,56 @@ pub fn ensure_jpeg_gpu_huffman(policy: BackendPolicy) -> Result<(), String> {
             }
         }
     })
+}
+
+/// Initialise this thread's Vulkan parallel-Huffman JPEG decoder if not already done.
+///
+/// Each Rayon worker constructs its own `VulkanBackend` (independent Vulkan
+/// logical device on the same physical device) so per-thread command-buffer
+/// recording has no cross-thread contention. Construction is serialised via
+/// `DECODER_INIT_LOCK` to avoid concurrent Vulkan driver init races.
+#[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+pub fn ensure_jpeg_vk_huffman(policy: BackendPolicy) -> Result<(), String> {
+    JPEG_VK_DEC.with(|cell| {
+        match *cell.borrow() {
+            JpegGpuInit::Uninitialised => {}
+            JpegGpuInit::Failed if matches!(policy, BackendPolicy::ForceVulkan) => {
+                return Err(
+                    "Vulkan JPEG decoder failed to initialise on a previous attempt".to_owned(),
+                );
+            }
+            _ => return Ok(()),
+        }
+        let guard = DECODER_INIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = gpu::backend::vulkan::VulkanBackend::new();
+        drop(guard);
+        match result {
+            Ok(backend) => {
+                *cell.borrow_mut() =
+                    JpegGpuInit::Ready(Some(gpu::jpeg_decoder::JpegGpuDecoder::new(backend)));
+                Ok(())
+            }
+            Err(e) => {
+                *cell.borrow_mut() = JpegGpuInit::Failed;
+                let msg = format!("pdf_raster: Vulkan JPEG decoder unavailable ({e})");
+                if matches!(policy, BackendPolicy::ForceVulkan) {
+                    Err(msg)
+                } else {
+                    log::info!("{msg}; JPEG images will be decoded on CPU for this thread");
+                    Ok(())
+                }
+            }
+        }
+    })
+}
+
+/// Drop this thread's Vulkan JPEG decoder immediately so the TLS destructor at
+/// process exit is a no-op — avoids Vulkan device teardown races.
+#[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+pub fn release_jpeg_vk_this_thread() {
+    JPEG_VK_DEC.with(|cell| {
+        *cell.borrow_mut() = JpegGpuInit::Uninitialised;
+    });
 }

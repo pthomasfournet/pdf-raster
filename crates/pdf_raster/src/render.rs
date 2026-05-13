@@ -683,7 +683,7 @@ fn lend_decoders(
     if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
         gpu_init::ensure_jpeg_gpu_huffman(effective_policy)
             .map_err(RasterError::BackendUnavailable)?;
-        gpu_init::JPEG_GPU_DEC.with(|cell| {
+        gpu_init::JPEG_CUDA_DEC.with(|cell| {
             if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
                 renderer.set_jpeg_gpu(slot.take());
             }
@@ -734,7 +734,7 @@ fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
     #[cfg(not(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "gpu-jpeg-huffman")))]
     let _ = renderer;
     #[cfg(feature = "gpu-jpeg-huffman")]
-    gpu_init::JPEG_GPU_DEC.with(|cell| {
+    gpu_init::JPEG_CUDA_DEC.with(|cell| {
         if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_jpeg_gpu();
         }
