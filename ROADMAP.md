@@ -27,6 +27,10 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v1.0.1 (May 2026)
+
+Crates.io housekeeping: yanked internal plumbing crates, leaving only `rasterrocket` (library) and `rasterrocket-cli` (binary) public. Fixed git-cliff `filter_unconventional` warning. README updated to show the two-crate public surface clearly.
+
 ### v1.0.0 (May 2026)
 
 **First stable release.**
