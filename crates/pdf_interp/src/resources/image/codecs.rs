@@ -1292,6 +1292,7 @@ pub(super) fn decode_jbig2(
     let n_pixels = (jw as usize).checked_mul(jh as usize)?;
     let mut collector = Jbig2Collector {
         data: Vec::with_capacity(n_pixels),
+        n_pixels,
     };
 
     img.decode(&mut collector)
@@ -1331,21 +1332,25 @@ pub(super) fn decode_jbig2(
 /// JBIG2 white (0) → 0xFF.  `ImageColorSpace` selection is handled by the caller.
 struct Jbig2Collector {
     data: Vec<u8>,
+    /// Total expected pixel count — used to cap `push_pixel_chunk` so a stream
+    /// whose run lengths aren't a multiple of 8 doesn't overflow the buffer.
+    n_pixels: usize,
 }
 
 impl Jbig2Decoder for Jbig2Collector {
     fn push_pixel(&mut self, black: bool) {
-        self.data.push(if black { 0x00 } else { 0xFF });
+        if self.data.len() < self.n_pixels {
+            self.data.push(if black { 0x00 } else { 0xFF });
+        }
     }
 
     fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
         let byte = if black { 0x00 } else { 0xFF };
-        // saturating_mul prevents overflow on adversarial chunk_count; cap to
-        // pre-allocated capacity so a crafted stream can't grow the buffer past
-        // the expected pixel count.
-        let n = (chunk_count as usize)
-            .saturating_mul(8)
-            .min(self.data.capacity().saturating_sub(self.data.len()));
+        // chunk_count is in 8-pixel chunks; cap to the remaining pixels so that
+        // run lengths that aren't an exact multiple of 8 don't produce a short
+        // buffer (which would cause the caller to discard the image entirely).
+        let remaining = self.n_pixels.saturating_sub(self.data.len());
+        let n = (chunk_count as usize).saturating_mul(8).min(remaining);
         self.data.extend(std::iter::repeat_n(byte, n));
     }
 
@@ -1363,7 +1368,10 @@ mod tests {
     #[test]
     fn jbig2_collector_push_pixel_grayscale() {
         // JBIG2: black=true → Gray 0x00, black=false → Gray 0xFF.
-        let mut c = Jbig2Collector { data: Vec::new() };
+        let mut c = Jbig2Collector {
+            data: Vec::new(),
+            n_pixels: 2,
+        };
         Jbig2Decoder::push_pixel(&mut c, true);
         Jbig2Decoder::push_pixel(&mut c, false);
         assert_eq!(c.data, [0x00, 0xFF]);
@@ -1374,10 +1382,26 @@ mod tests {
         // Pre-allocate 16 pixels, matching the `n_pixels` pattern used in production.
         let mut c = Jbig2Collector {
             data: Vec::with_capacity(16),
+            n_pixels: 16,
         };
         // chunk_count=2 → 16 pixels of white (0xFF each).
         Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
         assert_eq!(c.data.len(), 16);
+        assert!(c.data.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn jbig2_collector_push_pixel_chunk_overrun() {
+        // Regression test: chunk whose byte-count overshoots n_pixels by 7
+        // (common when page dimensions aren't a multiple of 8).
+        // Before the fix, this produced a short buffer and the image was dropped.
+        let mut c = Jbig2Collector {
+            data: Vec::with_capacity(10),
+            n_pixels: 10,
+        };
+        // chunk_count=2 → 16 pixels, but n_pixels=10 — must cap at 10.
+        Jbig2Decoder::push_pixel_chunk(&mut c, false, 2);
+        assert_eq!(c.data.len(), 10);
         assert!(c.data.iter().all(|&b| b == 0xFF));
     }
 

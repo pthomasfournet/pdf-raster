@@ -1495,7 +1495,9 @@ impl<'doc> PageRenderer<'doc> {
                             let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
                             ix_fp = ix_fp.wrapping_add(ix_step_fp);
                             let img_idx = row_base + ix;
-                            if smask.is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0) {
+                            let alpha =
+                                smask.map_or(255u8, |s| s.get(img_idx).copied().unwrap_or(255));
+                            if alpha == 0 {
                                 continue;
                             }
                             let src = img_idx * 3;
@@ -1504,7 +1506,21 @@ impl<'doc> PageRenderer<'doc> {
                             // length precheck guarantees src+3 ≤ img_bytes.len().
                             let rgb = &img_bytes[src..src + 3];
                             let pixel_off = row_off + dx as usize * 3;
-                            data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
+                            if alpha == 255 {
+                                data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
+                            } else {
+                                let a = u16::from(alpha);
+                                let ia = 255 - a;
+                                data[pixel_off] = ((u16::from(rgb[0]) * a
+                                    + u16::from(data[pixel_off]) * ia)
+                                    / 255) as u8;
+                                data[pixel_off + 1] =
+                                    ((u16::from(rgb[1]) * a + u16::from(data[pixel_off + 1]) * ia)
+                                        / 255) as u8;
+                                data[pixel_off + 2] =
+                                    ((u16::from(rgb[2]) * a + u16::from(data[pixel_off + 2]) * ia)
+                                        / 255) as u8;
+                            }
                         }
                     }
                     ImageColorSpace::Gray => {
@@ -1512,15 +1528,27 @@ impl<'doc> PageRenderer<'doc> {
                             let ix = (ix_fp >> 32).clamp(0, img_max_x) as usize;
                             ix_fp = ix_fp.wrapping_add(ix_step_fp);
                             let img_idx = row_base + ix;
-                            if smask.is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0) {
+                            let alpha =
+                                smask.map_or(255u8, |s| s.get(img_idx).copied().unwrap_or(255));
+                            if alpha == 0 {
                                 continue;
                             }
                             // Same bounds rationale as RGB arm.
                             let v = img_bytes[img_idx];
                             let pixel_off = row_off + dx as usize * 3;
-                            data[pixel_off] = v;
-                            data[pixel_off + 1] = v;
-                            data[pixel_off + 2] = v;
+                            if alpha == 255 {
+                                data[pixel_off] = v;
+                                data[pixel_off + 1] = v;
+                                data[pixel_off + 2] = v;
+                            } else {
+                                let a = u16::from(alpha);
+                                let ia = 255 - a;
+                                let blended = ((u16::from(v) * a + u16::from(data[pixel_off]) * ia)
+                                    / 255) as u8;
+                                data[pixel_off] = blended;
+                                data[pixel_off + 1] = blended;
+                                data[pixel_off + 2] = blended;
+                            }
                         }
                     }
                     ImageColorSpace::Mask => {
@@ -1556,11 +1584,11 @@ impl<'doc> PageRenderer<'doc> {
                     let iy = ((1.0 - v) * img_h).min(img_h - 1.0) as usize;
                     let img_idx = iy * img_width_usize + ix;
 
-                    if img
+                    let alpha = img
                         .smask
                         .as_deref()
-                        .is_some_and(|s| s.get(img_idx).copied().unwrap_or(0xFF) == 0)
-                    {
+                        .map_or(255u8, |s| s.get(img_idx).copied().unwrap_or(255));
+                    if alpha == 0 {
                         continue;
                     }
 
@@ -1570,14 +1598,42 @@ impl<'doc> PageRenderer<'doc> {
                         ImageColorSpace::Rgb => {
                             let src = img_idx * 3;
                             if let Some(rgb) = img_bytes.get(src..src + 3) {
-                                data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
+                                if alpha == 255 {
+                                    data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
+                                } else {
+                                    let a = u16::from(alpha);
+                                    let ia = 255 - a;
+                                    data[pixel_off] =
+                                        ((u16::from(rgb[0]) * a + u16::from(data[pixel_off]) * ia)
+                                            / 255) as u8;
+                                    data[pixel_off + 1] = ((u16::from(rgb[1]) * a
+                                        + u16::from(data[pixel_off + 1]) * ia)
+                                        / 255)
+                                        as u8;
+                                    data[pixel_off + 2] = ((u16::from(rgb[2]) * a
+                                        + u16::from(data[pixel_off + 2]) * ia)
+                                        / 255)
+                                        as u8;
+                                }
                             }
                         }
                         ImageColorSpace::Gray => {
                             if let Some(&v) = img_bytes.get(img_idx) {
-                                data[pixel_off] = v;
-                                data[pixel_off + 1] = v;
-                                data[pixel_off + 2] = v;
+                                if alpha == 255 {
+                                    data[pixel_off] = v;
+                                    data[pixel_off + 1] = v;
+                                    data[pixel_off + 2] = v;
+                                } else {
+                                    let a = u16::from(alpha);
+                                    let ia = 255 - a;
+                                    let blended = ((u16::from(v) * a
+                                        + u16::from(data[pixel_off]) * ia)
+                                        / 255)
+                                        as u8;
+                                    data[pixel_off] = blended;
+                                    data[pixel_off + 1] = blended;
+                                    data[pixel_off + 2] = blended;
+                                }
                             }
                         }
                         ImageColorSpace::Mask => {
