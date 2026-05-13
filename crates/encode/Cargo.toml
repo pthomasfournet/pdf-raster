@@ -1,14 +1,19 @@
 [package]
-name             = "encode"
+name             = "rasterrocket-encode"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+homepage.workspace   = true
+readme.workspace     = true
+description          = "PPM/PGM/PBM/PNG output for the rasterrocket PDF renderer"
+keywords             = ["pdf", "ppm", "png", "encode", "image"]
+categories           = ["multimedia::images", "encoding"]
 
 [dependencies]
-color  = { path = "../color" }
-raster = { path = "../raster" }
+color  = { package = "rasterrocket-color",  path = "../color",  version = "1.0" }
+raster = { package = "rasterrocket-render", path = "../raster", version = "1.0" }
 
 # PNG output — pure Rust, no system libs required.
 png = "0.17"
