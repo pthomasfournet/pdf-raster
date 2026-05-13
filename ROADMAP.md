@@ -27,6 +27,19 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v1.0.2 (May 2026)
+
+Rendering correctness fixes. All bugs produced visually wrong output silently.
+
+- **JBIG2 all-white pages**: `push_pixel_chunk` capped the buffer to Vec capacity instead of `n_pixels`, leaving it short when the final run overshot. The pixel-count check then dropped the image entirely, leaving a white page.
+- **JPX + SMask grey sludge**: `blit_image` used a binary smask gate (non-zero alpha → fully opaque). Pages with smooth grayscale SMasks were composited without blending. Replaced with Porter-Duff source-over in all three blit paths.
+- **Gray SMask blending used wrong destination channels**: all three output channels were blended against `data[pixel_off]` (red) instead of their own destination channel.
+- **ImageMask `Decode=[1,0]` ignored**: stencil polarity was never read; inverted masks rendered with paint and transparency swapped.
+- **DCTDecode SMask unsupported**: JPEG-compressed alpha channels fell through to the unsupported-filter branch, silently dropping the entire parent image.
+- **JPX embedded alpha dropped**: La8/Rgba8/La16/Rgba16 JPEG 2000 images discarded their alpha component; now extracted into `smask` and composited correctly.
+- **Non-mask `Decode` array ignored**: the per-component remap array was never applied to FlateDecode/raw/DCT/CCITTFax images. Now applied across all bpc paths; identity `[0 1]` is a zero-allocation no-op.
+- **Hardening**: NaN/inf in malformed Decode arrays now falls back to identity with a warning; `apply_decode` avoids allocation on the 8-bpc identity path; `decode_smask_dct` uses JPEG-reported dimensions for `scale_smask`.
+
 ### v1.0.1 (May 2026)
 
 Crates.io housekeeping: yanked internal plumbing crates, leaving only `rasterrocket` (library) and `rasterrocket-cli` (binary) public. Fixed git-cliff `filter_unconventional` warning. README updated to show the two-crate public surface clearly.

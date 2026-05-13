@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-05-13
+
+### Bug Fixes
+
+- Correct JBIG2 pixel-buffer overrun and smask alpha blending
+- ImageMask Decode=[1,0] inversion, DCT SMask support, CMYK accuracy test
+- JPX embedded alpha preserved, non-mask Decode array applied
+- Fix gray SMask blend reads wrong dst channels; extract blend_u8 helper
+- Harden decode_smask_dct and correct test reference values
+- Harden parse_decode and apply_decode; avoid 8-bpc copy on identity
+
 ## [1.0.1] - 2026-05-13
 
 ### Bug Fixes
@@ -30,6 +41,7 @@ All notable changes to this project will be documented in this file.
 - Rename gpu crate to rasterrocket-gpu; fix CI package names; add GPU feature stubs
 - Update Cargo.lock after removing self-referential dev-deps
 - Mark internal crates publish = false; yank from crates.io
+- Release v1.0.1
 
 ### Documentation
 
@@ -37,6 +49,7 @@ All notable changes to this project will be documented in this file.
 - Rename pdf-raster → rasterrocket throughout all documentation
 - Rename pdf-raster → rasterrocket
 - Clarify two-crate public surface; update README crate map and descriptions
+- Prep v1.0.1 release notes
 
 ## [1.0.0] - 2026-05-13
 
