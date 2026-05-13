@@ -26,11 +26,11 @@
               indices intentionally mirror the kernel-side math byte-for-byte"
 )]
 
-use gpu::backend::GpuBackend;
-use gpu::backend::params::{
+use rasterrocket_gpu::backend::GpuBackend;
+use rasterrocket_gpu::backend::params::{
     AaFillParams, BlitParams, CompositeParams, IccClutParams, SoftMaskParams,
 };
-use gpu::backend::vulkan::VulkanBackend;
+use rasterrocket_gpu::backend::vulkan::VulkanBackend;
 
 /// Run `composite_rgba8` on a representative input via `VulkanBackend`,
 /// returning the result as a `Vec<u8>`.
@@ -61,10 +61,10 @@ fn run_composite_vulkan(src: &[u8], dst_in: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reference: CPU implementation from `gpu::composite::composite_rgba8_cpu`.
+/// Reference: CPU implementation from `rasterrocket_gpu::composite::composite_rgba8_cpu`.
 fn run_composite_cpu(src: &[u8], dst_in: &[u8]) -> Vec<u8> {
     let mut dst = dst_in.to_vec();
-    gpu::composite_rgba8_cpu(src, &mut dst);
+    rasterrocket_gpu::composite_rgba8_cpu(src, &mut dst);
     dst
 }
 
@@ -179,7 +179,7 @@ fn run_soft_mask_vulkan(pixels_in: &[u8], mask: &[u8]) -> Vec<u8> {
 
 fn run_soft_mask_cpu(pixels_in: &[u8], mask: &[u8]) -> Vec<u8> {
     let mut pixels = pixels_in.to_vec();
-    gpu::apply_soft_mask_cpu(&mut pixels, mask);
+    rasterrocket_gpu::apply_soft_mask_cpu(&mut pixels, mask);
     pixels
 }
 
@@ -287,7 +287,7 @@ fn run_icc_clut_vulkan(cmyk: &[u8], clut: &[u8]) -> Vec<u8> {
 }
 
 fn run_icc_clut_cpu(cmyk: &[u8], clut: &[u8], grid_n: u32) -> Vec<u8> {
-    gpu::icc_cmyk_to_rgb_cpu(cmyk, Some((clut, grid_n)))
+    rasterrocket_gpu::icc_cmyk_to_rgb_cpu(cmyk, Some((clut, grid_n)))
 }
 
 #[test]
@@ -371,7 +371,7 @@ fn aa_fill_axis_aligned_square() {
         12.0, 12.0, 4.0, 12.0, // bottom
         4.0, 12.0, 4.0, 4.0, // left
     ];
-    let cpu = gpu::aa_fill_cpu(&segs, 0.0, 0.0, 16, 16, false);
+    let cpu = rasterrocket_gpu::aa_fill_cpu(&segs, 0.0, 0.0, 16, 16, false);
     let vk = run_aa_fill_vulkan(&segs, 16, 16, 0);
     assert_within_1_lsb(&cpu, &vk, "aa_fill axis-aligned square");
 }
@@ -382,7 +382,7 @@ fn aa_fill_triangle() {
     let segs: Vec<f32> = vec![
         4.0, 2.0, 14.0, 8.0, 14.0, 8.0, 2.0, 12.0, 2.0, 12.0, 4.0, 2.0,
     ];
-    let cpu = gpu::aa_fill_cpu(&segs, 0.0, 0.0, 16, 16, false);
+    let cpu = rasterrocket_gpu::aa_fill_cpu(&segs, 0.0, 0.0, 16, 16, false);
     let vk = run_aa_fill_vulkan(&segs, 16, 16, 0);
     assert_within_1_lsb(&cpu, &vk, "aa_fill triangle");
 }
@@ -415,7 +415,7 @@ fn aa_fill_512x512_exceeds_old_1d_limit() {
         448.0, 448.0, 64.0, 448.0, // bottom
         64.0, 448.0, 64.0, 64.0, // left
     ];
-    let cpu = gpu::aa_fill_cpu(&segs, 0.0, 0.0, w, h, false);
+    let cpu = rasterrocket_gpu::aa_fill_cpu(&segs, 0.0, 0.0, w, h, false);
     let vk = run_aa_fill_vulkan(&segs, w, h, 0);
     assert_within_1_lsb(&cpu, &vk, "aa_fill 512×512 square");
 }

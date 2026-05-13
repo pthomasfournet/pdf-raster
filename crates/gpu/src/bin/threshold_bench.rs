@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use gpu::{GpuCtx, aa_fill_cpu, build_tile_records, icc_cmyk_to_rgb_cpu};
+use rasterrocket_gpu::{GpuCtx, aa_fill_cpu, build_tile_records, icc_cmyk_to_rgb_cpu};
 
 /// Unwrap a GPU `Result`, printing the error with context and exiting with
 /// status 1.  Used inside timing closures where `?` is not available.
@@ -189,7 +189,7 @@ fn bench_aa_fill(ctx: &GpuCtx, cfg: &Config) {
     match crossover {
         Some(px) => println!(
             "  → Recommended GPU_AA_FILL_THRESHOLD: {px} px  (current: {})",
-            gpu::GPU_AA_FILL_THRESHOLD
+            rasterrocket_gpu::GPU_AA_FILL_THRESHOLD
         ),
         None => println!("  → GPU never faster in this sweep — keep CPU or raise threshold"),
     }
@@ -254,7 +254,7 @@ fn bench_tile_fill(ctx: &GpuCtx, cfg: &Config) {
     match crossover {
         Some(px) => println!(
             "  → Recommended GPU_TILE_FILL_THRESHOLD: {px} px  (current: {})",
-            gpu::GPU_TILE_FILL_THRESHOLD
+            rasterrocket_gpu::GPU_TILE_FILL_THRESHOLD
         ),
         None => println!("  → GPU never faster in this sweep — keep CPU or raise threshold"),
     }
@@ -322,7 +322,7 @@ fn bench_icc_cmyk(ctx: &GpuCtx, cfg: &Config) {
         Some(px) => println!(
             "  → Matrix kernel crossover at {px} px — but dispatch always uses CPU for \
              clut=None; GPU_ICC_CLUT_THRESHOLD={} applies to CLUT path only",
-            gpu::GPU_ICC_CLUT_THRESHOLD,
+            rasterrocket_gpu::GPU_ICC_CLUT_THRESHOLD,
         ),
         None => println!(
             "  → GPU matrix kernel never faster — CPU AVX-512 dominates at all sizes. \

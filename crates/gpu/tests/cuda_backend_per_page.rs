@@ -7,8 +7,8 @@
 #[cfg(feature = "gpu-validation")]
 #[test]
 fn cuda_backend_per_page_composite_then_softmask() {
-    use gpu::backend::cuda::CudaBackend;
-    use gpu::backend::{GpuBackend, params};
+    use rasterrocket_gpu::backend::cuda::CudaBackend;
+    use rasterrocket_gpu::backend::{GpuBackend, params};
 
     let backend = CudaBackend::new()
         .expect("CudaBackend::new failed — is a CUDA device available and the driver loaded?");
@@ -66,8 +66,8 @@ fn cuda_backend_record_zero_buffer_round_trip() {
     // a CUDA error.  The Vulkan-side smoke test does the readback
     // verification; here we only care that the trait method dispatches
     // through `cuMemsetD8Async` cleanly.
-    use gpu::backend::GpuBackend;
-    use gpu::backend::cuda::CudaBackend;
+    use rasterrocket_gpu::backend::GpuBackend;
+    use rasterrocket_gpu::backend::cuda::CudaBackend;
 
     const SIZE: usize = 4096;
     let backend = CudaBackend::new().expect("CudaBackend::new");

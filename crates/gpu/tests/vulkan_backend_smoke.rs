@@ -32,8 +32,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use gpu::backend::vulkan::VulkanBackend;
-use gpu::backend::{BackendError, GpuBackend};
+use rasterrocket_gpu::backend::vulkan::VulkanBackend;
+use rasterrocket_gpu::backend::{BackendError, GpuBackend};
 
 /// Per-process `VulkanBackend`, lazy-initialised on first access.
 ///
@@ -176,7 +176,7 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
     // returns Err with DescriptorPoolExhausted.  Pre-existing guard
     // had zero coverage; a refactor that reordered guard / allocate /
     // increment could silently regress.
-    use gpu::backend::params::CompositeParams;
+    use rasterrocket_gpu::backend::params::CompositeParams;
 
     // Keep in sync with `MAX_DESC_SETS_PER_PAGE` in
     // crates/gpu/src/backend/vulkan/recorder.rs (private constant).
@@ -186,7 +186,7 @@ fn vulkan_backend_descriptor_pool_exhausts_at_max_sets() {
     // passing through the loop.
     const PER_PAGE_MAX: u32 = 64;
     const N_PIXELS: u32 = 4;
-    const BUF_BYTES: usize = (N_PIXELS as usize) * gpu::RGBA_BPP;
+    const BUF_BYTES: usize = (N_PIXELS as usize) * rasterrocket_gpu::RGBA_BPP;
 
     let (backend, _serial) = shared_backend();
     let src = backend.alloc_device_zeroed(BUF_BYTES).expect("alloc src");

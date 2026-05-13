@@ -7,8 +7,8 @@
 #[cfg(feature = "gpu-validation")]
 #[test]
 fn cuda_backend_initializes() {
-    use gpu::backend::GpuBackend;
-    use gpu::backend::cuda::CudaBackend;
+    use rasterrocket_gpu::backend::GpuBackend;
+    use rasterrocket_gpu::backend::cuda::CudaBackend;
 
     let backend = CudaBackend::new()
         .expect("CudaBackend::new failed — is a CUDA device available and the driver loaded?");
