@@ -2,6 +2,169 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-05-13
+
+### Bug Fixes
+
+- Apply tint to PaintType 2 tiling patterns
+- Hoist samples.len() i64 conversion in test helper
+- Make Phase 1+2 `n` per-region, not per-walk
+- Phase 4 binding-slot mismatch + cross-stage barrier
+- Hardening pass on B5/B6/B7 — qtable indexing, subsampling gate, loud errors
+- Second hardening pass — CUDA kernel stub, quant-selector gate, overflow, test accuracy
+- Multi-pass review — threshold, grayscale cs, failed-init sentinel, kernel guards, wire-value pin, luma-table selection, bench fixes
+- Snapshot block_in_mcu/z_in_block post-rotation, not pre-rotation
+- Guard and widen block_idx arithmetic against u32 overflow
+- Require nxt decoded at least one symbol before accepting sync
+- Prevent signed i32 overflow in idct_1d fixed-point multiplications
+- Vulkan implies gpu-jpeg-huffman in pdf_interp + pdf_raster
+- Avoid SIGPIPE under pipefail in Vulkan ICD detection
+- Restore missing #[test] on raster_options_with_pages_none_is_valid
+- Make deskew::detect and deskew::rotate pub(crate) to stop leaking raster::Bitmap
+- Gate BackendPolicy::ForceVaapi on #[cfg(feature="vaapi")]
+- Mark SessionConfig #[non_exhaustive] to handle feature-gated prefetch field
+- Suppress unnecessary_wraps on rotate_inplace, pub(crate) → pub on rotate_cpu in private module
+
+### Documentation
+
+- Replace stale Phase 1/2 refs in build_adjusts
+- Cross-reference §8.9.6 in blit_image Mask arms
+- Refresh module + variant docs post-ICC/Separation
+- Pin TransferSet.device_n shape rationale
+- Reframe scale-kernel deferral as Phase 10 task 4
+- Note Phase 8 Phase A shipped as OSS artifact
+- Update Vulkan docs — parallel-Huffman JPEG wired in, not CPU-fallback
+- Fix ocr_from_frame footgun in README snippet, add OCR wiki links
+- Replace ocr_from_frame footgun with wiki link in crate doc
+- Expand release_gpu_decoders doc with pool.broadcast example, no-op note, and Panics
+- Update api-reference.md for all pre-1.0 API cleanup changes
+- Move benchmarks to GitHub wiki
+- Update README for v1.0.0 — version tag, What's new, bench table
+- Update getting-started for v1.0.0 — tags, RasterOptions, suggested_dpi fix
+- Fix api-reference — move suggested_dpi to PageDiagnostics, remove stale RenderedPage method
+- Update Benchmarks wiki — v1.0.0 tool version, v0.9.1 five-mode results, extended regression history
+- Add v1.0.0 release section to ROADMAP
+- Fix suggested_dpi prose in getting-started; add parallel-Huffman post-mortem wiki page
+
+### Features
+
+- Decode Type 0 sample streams, clip to Range
+- Add ColorSpace taxonomy for gstate tracking
+- Add fill/stroke_color_space slots
+- Plumb cs/CS operators into gstate color_space slots
+- ColorSpace::convert_to_rgb tint → sRGB
+- Route uncoloured-pattern tints through ColorSpace
+- Store lookup_id on Indexed variant
+- Wire ICC CLUT through IccBased convert_to_rgb
+- Wire eval_function into Separation tint
+- Scaffold module + error taxonomy behind gpu-jpeg-huffman
+- 32-bit BE bitstream packer
+- 2-tier quick+full codetable builder
+- Scalar CPU reference decoder
+- Implement upload_async + download_async on the trait
+- ScanParams + record_scan trait method (API-only)
+- Blelloch exclusive scan kernel + CUDA dispatch
+- Record_scan + cross-backend bit-identity tests
+- Phase 1 intra-sequence-sync kernel + CUDA dispatcher
+- Record_huffman + cross-backend Phase 1 parity tests
+- Phase 2 inter-sync kernel + CUDA + Vulkan dispatchers
+- Phase 3 wires Blelloch scan over symbol counts
+- Phase 4 re-decode + write; end-to-end on CUDA + Vulkan
+- Phase 4 typed decode_status surface
+- JpegPreparedInput wraps CPU pre-pass for GPU dispatch
+- Retain DC codebooks for the on-GPU bitstream walker
+- CPU oracle for the JPEG-framed symbol stream
+- JPEG-framed HuffmanPhase variants + params surface
+- Slang jpeg_phase1_intra_sync with real JPEG framing
+- CUDA jpeg_phase1_intra_sync mirror + expanded Phase4FailureKind
+- B2d — JPEG Phase 1 dispatch + oracle parity on real JPEG
+- B2e — JpegPhase2InterSync kernel + host dispatcher + parity tests
+- B2f — JpegPhase4Redecode kernel + full 4-phase JPEG dispatcher + parity tests
+- B3 — quality-aware subsequence size from qtable magnitude
+- B4 — idct_dequant_colour Slang kernel (IDCT + dequant + YCbCr→RGB)
+- B5/B6 — JpegGpuDecoder + IdctParams + IDCT kernel wiring
+- Wire parallel-Huffman JPEG decoder into pdf_interp + pdf_raster
+- Gpu-jpeg-huffman gate harness + aggregator
+- Generic JpegGpuInit<T> + Vulkan TLS slot + ensure_jpeg_vk_huffman
+- Add jpeg_vk field + set/take_jpeg_vk to PageRenderer
+- Route lend/reclaim_decoders to Vulkan JPEG decoder when active
+- V0.9.0 four-mode bench harness — CPU / nvJPEG / CUDA-Huffman / Vulkan-Huffman
+- V0.9.1 five-mode bench harness + PDF_RASTER_HUFFMAN_THRESHOLD env override
+- Impl Default for RasterOptions (dpi=300, all pages, no deskew)
+- Add prescan_session; hide doc()/resolve_page()/prescan_page to stop leaking pdf::Document
+- Add pub mod session grouping open_session/render_page_rgb/prescan_session
+- Wire GPU Phases 1-4 parallel-Huffman into production decode path
+
+### Other
+
+- Remove unsafe get_unchecked from blit_image hot loop
+- Pin PDF §8.9.6 mask-no-smask invariant in blit_image
+- Tighten eval_sampled smell pass
+- Cap tiling-pattern recursion depth
+- Extract check_image_bytes_len for unit testability
+- Clippy --fix sweep on test modules
+- Kill remaining structural clippy lints on --tests
+- Tighten clippy expects + AA_GAMMA test derivation
+- Tighten pattern-tint test smells
+- Wire DeviceN N=1 through tint fn
+- Unify ICC-test tolerance + add blue + neutrality
+- Tighten fast-path corpus + idioms
+- Pre-existing clippy + idiom sweep
+- Rename JpegGpuError::BackendError to ::Dispatch
+- Tighten contract + 5 new edge-case tests
+- Drop unused _is_ac param + tighten loop invariant
+- Drop cargo-cult wrapping_sub + document caller contract
+- Test-only module + 4 peek16 boundary tests
+- Scan dedup + compile-time kernel-slot drift guard
+- Simplify pass on A7 — dedup, derive, fail-modes, dead-code
+- A7 hardening pass — overflow guard, fixture dedup, dead code
+- A7b hardening pass — lift PHASE1_THREADS to backend::params
+- A8 hardening pass — drop redundant guard + dead binding
+- A9 hardening — dedup Phase 2 outcome + retry bound
+- A11 hardening — dedup scan oracle + pin Phase 1+2 first
+- A12 hardening — bounds-check writes + dedup decode + dedup scan
+- RAII guard — accurate doc + #[must_use]
+- Visitor pre-check + assert; lift validate_canonical_table
+- A13 — defensive max_iters; drop unused Phase 4 arg; idiomatic vec_04
+- Typed error mapping + SOS/SOF guard + drop ScanClass
+- ZRL overflow, AC size cap, error context, dedup mcu_count
+- Hard asserts on shift invariants + overflow-safe refill
+- Dedup HuffmanParams validate helpers; clarify per-field docs
+- JPEG kernel — cap DC category and AC size; pipeline structural tests
+- Pin Phase4FailureKind discriminants at build time
+- B2d hardening pass
+- Baseline A/D/H results — Vulkan skipped (no ICD on bench machine)
+- Full five-mode results — CUDA Huffman beats nvJPEG on 7/10, Vulkan Huffman flat vs CPU JPEG
+
+### Refactor
+
+- Collapse per-arg let-_ on kernel launch builders
+- Use TransferLut::IDENTITY in test LUTs
+- Share empty_doc helper across test modules
+- Add TransferLut::INVERTED const, dedup test LUTs
+- Thread Document through convert_to_rgb
+- RAII guard for dispatcher device buffers
+- Extract visit_canonical_codes; collapse 3 call sites
+- Lift BitReader into shared `jpeg::bitreader` module
+- Genericise decode_dct over B: GpuBackend
+
+### Testing
+
+- Unblock 4 inline-image decode tests
+- Restore stitching wrong-bounds fallback test
+- Use static INV instead of Box::leak in transfer test
+- Make stitching fallback test actually pin fns[0]
+- Add make_doc_with_stream helper for ICC/stream tests
+- ICC sRGB-profile happy-path round-trip
+- Pin fast-path vs general-path within 1 LSB
+- Synthetic Huffman encoder oracle
+- Phase 1 CPU oracle — validates kernel spec
+- Phase 2 inter-sync CPU oracle
+- A13 corpus + Phase 1 boundary-snapshot semantics
+- B5 — DRI ∈ {1,8,64} correctness tests
+- B7 — IEEE 1180 pixel-diff parity tests vs zune-jpeg
+- Add YCbCr 4:4:4 parity tests for blocks_per_mcu=3
+
 ## [0.9.2] - 2026-05-11
 
 ### Bug Fixes
@@ -11,9 +174,14 @@ All notable changes to this project will be documented in this file.
 - Clean clippy --tests (40 → 0 warnings)
 - Use PDF font dict Widths for simple fonts (PDF §9.2.4)
 
+### Chores
+
+- Release v0.9.2
+
 ### Documentation
 
 - Document alloc_device_zeroed compute-queue contention
+- Prep v0.9.2 release notes
 
 ### Features
 
