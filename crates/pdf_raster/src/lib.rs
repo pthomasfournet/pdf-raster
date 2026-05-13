@@ -117,6 +117,21 @@ pub use render::{
     render_page_rgb_hinted, rgb_to_gray,
 };
 
+/// Session-level API for explicit control over PDF opening and per-page rendering.
+///
+/// Use these when [`raster_pdf`] or [`render_channel`] don't give you enough
+/// control — e.g. when you need to share one open document across multiple
+/// threads, customise the [`SessionConfig`] (GPU backend, VA-API device, cache
+/// prefetch), or call [`prescan_session`] before deciding how to render each page.
+///
+/// All items in this module are also re-exported at the crate root for backward
+/// compatibility.
+pub mod session {
+    pub use super::{
+        open_session, prescan_session, render_page_rgb, render_page_rgb_hinted, rgb_to_gray,
+    };
+}
+
 /// Eagerly release GPU decoders on every rayon worker thread.
 ///
 /// Call this via `pool.broadcast` **before** dropping `pool` or allowing
