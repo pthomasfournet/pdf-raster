@@ -233,7 +233,7 @@ impl DiskTier {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let writer_in_flight = Arc::clone(&in_flight);
         let writer = match thread::Builder::new()
-            .name("pdf-raster-disk-cache-writer".to_string())
+            .name("rasterrocket-disk-cache-writer".to_string())
             .spawn(move || writer_loop(receiver, &writer_state, &writer_in_flight))
         {
             Ok(handle) => handle,
@@ -965,7 +965,7 @@ mod tests {
         let writer_state = Arc::clone(&state);
         let writer_in_flight = Arc::clone(&in_flight);
         let writer = thread::Builder::new()
-            .name("pdf-raster-disk-cache-writer-test".to_string())
+            .name("rasterrocket-disk-cache-writer-test".to_string())
             .spawn(move || writer_loop(receiver, &writer_state, &writer_in_flight))
             .expect("spawn test writer");
         DiskTier {

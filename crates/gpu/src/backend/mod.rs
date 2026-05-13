@@ -205,7 +205,7 @@ impl VramBudget {
 ///
 /// # Stability — closed implementation set
 ///
-/// The trait is `pub` for callers (`pdf_raster`, `pdf_interp`) but the
+/// The trait is `pub` for callers (`rasterrocket`, `rasterrocket-interp`) but the
 /// implementation set is closed to in-tree backends (`CudaBackend`,
 /// `VulkanBackend`).  The associated `DownloadHandle` carries
 /// `pub(crate)` fields and an internal `DownloadInner` trait; external

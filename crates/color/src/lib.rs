@@ -1,7 +1,7 @@
 //! # color
 //!
 //! Pixel types, color mode definitions, shared arithmetic primitives, and
-//! transfer function LUTs for the pdf-raster workspace.
+//! transfer function LUTs for the rasterrocket workspace.
 //!
 //! ## Design rule
 //! Every compositing primitive (`div255`, `lerp_u8`, `cmyk_to_rgb`,

@@ -293,7 +293,7 @@ impl SlabAllocator {
             size,
             DEVICE_USAGE,
             MemoryLocation::GpuOnly,
-            "pdf-raster device buffer",
+            "rasterrocket device buffer",
         )?;
         let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         // Safety: `buffer` is a freshly created handle bound to memory.
@@ -315,7 +315,7 @@ impl SlabAllocator {
             size,
             HOST_USAGE,
             MemoryLocation::CpuToGpu,
-            "pdf-raster host staging buffer",
+            "rasterrocket host staging buffer",
         )?;
         // gpu-allocator persistently maps CpuToGpu allocations.  If the
         // pointer is missing, free what we have and report.

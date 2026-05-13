@@ -283,9 +283,9 @@ fn main() {
     let ms_v = bench_vello(&cfg, &params);
     let ms_o = bench_ours(&cfg, &params);
     println!("  vello_cpu : {ms_v:8.2} ms/frame");
-    println!("  pdf-raster: {ms_o:8.2} ms/frame");
+    println!("  rasterrocket: {ms_o:8.2} ms/frame");
     if ms_o < ms_v {
-        println!("  → pdf-raster is {:.2}× faster", ms_v / ms_o);
+        println!("  → rasterrocket is {:.2}× faster", ms_v / ms_o);
     } else {
         println!("  → vello_cpu  is {:.2}× faster", ms_o / ms_v);
     }

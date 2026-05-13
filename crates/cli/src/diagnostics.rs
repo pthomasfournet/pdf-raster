@@ -25,10 +25,10 @@ pub fn print_error_chain(e: &dyn std::error::Error) {
 /// even when no `--backend` flag was passed.
 pub fn report_open_error(e: &RasterError, args: &Args, policy: BackendPolicy) {
     if matches!(e, RasterError::BackendUnavailable(_)) {
-        eprintln!("pdf-raster: {e}");
+        eprintln!("rasterrocket: {e}");
         print_backend_hint(policy, &args.vaapi_device, args.backend.is_none());
     } else {
-        eprintln!("pdf-raster: failed to open PDF: {e}");
+        eprintln!("rasterrocket: failed to open PDF: {e}");
         print_error_chain(e);
     }
 }
@@ -105,7 +105,7 @@ pub fn report_errors(mut errors: Vec<(i32, RenderError)>) {
     }
     errors.sort_by_key(|(p, _)| *p);
     for (page, err) in &errors {
-        eprintln!("pdf-raster: page {page}: {err}");
+        eprintln!("rasterrocket: page {page}: {err}");
         print_error_chain(err);
     }
     std::process::exit(1);

@@ -4,7 +4,7 @@
 //! # Default behaviour
 //!
 //! By default this module redirects per-page writes to a fresh tmpfs dir
-//! (`/dev/shm/pdf-raster-<pid>-<nanos>/`) because writing to disk costs
+//! (`/dev/shm/rasterrocket-<pid>-<nanos>/`) because writing to disk costs
 //! 10–20× more wall time than writing to RAM and dominates render latency.
 //! The user's `OUTPUT_PREFIX` becomes the file stem inside that dir, so
 //! downstream consumers that read `out-NNN.ppm` keep working unchanged.
@@ -25,7 +25,7 @@
 //!    memory is comfortable, the disk prefix once it tightens.
 //!
 //! The chosen path is printed on stderr at startup and on stdout at the end
-//! so callers can capture it via `out=$(pdf-raster doc.pdf p)`.
+//! so callers can capture it via `out=$(rasterrocket doc.pdf p)`.
 //!
 //! # Why dynamic instead of pre-flight?
 //!
@@ -74,7 +74,7 @@ impl Drop for RamDirGuard {
             // Stderr only; the user's stdout may already be committed to a
             // pipeline and a stray log line would corrupt downstream parsing.
             eprintln!(
-                "pdf-raster: warning: could not remove ram dir {}: {e}",
+                "rasterrocket: warning: could not remove ram dir {}: {e}",
                 dir.display()
             );
         }
@@ -131,7 +131,7 @@ impl SpillPolicy {
         } else {
             if !self.spill_announced.swap(true, Ordering::Relaxed) {
                 eprintln!(
-                    "pdf-raster: free memory dropped below safety margin; \
+                    "rasterrocket: free memory dropped below safety margin; \
                      spilling subsequent pages to disk at {disk_prefix}-NNN.*"
                 );
             }
@@ -211,8 +211,8 @@ fn read_mem_available() -> Option<u64> {
 ///
 /// Path-like means the prefix contains a path separator or starts with `.`
 /// (covers `./out`, `../out`, and absolute paths). The intent: a user who
-/// types `pdf-raster doc.pdf out` gets the fast path; a user who types
-/// `pdf-raster doc.pdf ./out` or `pdf-raster doc.pdf /data/x` gets the
+/// types `rasterrocket doc.pdf out` gets the fast path; a user who types
+/// `rasterrocket doc.pdf ./out` or `rasterrocket doc.pdf /data/x` gets the
 /// path they asked for.
 fn should_use_ram(args: &Args) -> bool {
     use_ram_for(
@@ -264,7 +264,7 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
         if let Err(e) = fs::create_dir(&dir) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 eprintln!(
-                    "pdf-raster: warning: --ram-path {} already exists; \
+                    "rasterrocket: warning: --ram-path {} already exists; \
                      leftover files will be removed alongside this run's output",
                     dir.display()
                 );
@@ -292,7 +292,7 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
     let ram_prefix = ram_prefix_pb.to_string_lossy().into_owned();
 
     eprintln!(
-        "pdf-raster: writing to RAM at {} (auto-removed on exit; use --no-ram to write to disk)",
+        "rasterrocket: writing to RAM at {} (auto-removed on exit; use --no-ram to write to disk)",
         dir.display()
     );
     println!("{}", dir.display());
@@ -311,7 +311,7 @@ pub fn redirect_to_ram(args: &mut Args) -> std::io::Result<(RamDirGuard, SpillPo
     ))
 }
 
-/// Build a default `/dev/shm/pdf-raster-<pid>-<nanos>` path.
+/// Build a default `/dev/shm/rasterrocket-<pid>-<nanos>` path.
 ///
 /// `pid + nanos since epoch` is enough entropy for parallel CLI invocations
 /// to never collide in practice — the only collision risk is two invocations
@@ -321,7 +321,7 @@ fn default_ram_dir() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    PathBuf::from(format!("/dev/shm/pdf-raster-{pid}-{nanos}"))
+    PathBuf::from(format!("/dev/shm/rasterrocket-{pid}-{nanos}"))
 }
 
 #[cfg(test)]

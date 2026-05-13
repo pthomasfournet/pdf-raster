@@ -28,11 +28,11 @@ fn main() {
     let mut args = Args::parse();
 
     if args.odd_only && args.even_only {
-        eprintln!("pdf-raster: --odd and --even are mutually exclusive");
+        eprintln!("rasterrocket: --odd and --even are mutually exclusive");
         std::process::exit(1);
     }
     if let Err(e) = args.validate_format_flags() {
-        eprintln!("pdf-raster: {e}");
+        eprintln!("rasterrocket: {e}");
         std::process::exit(1);
     }
 
@@ -42,12 +42,12 @@ fn main() {
     // The SpillPolicy is consulted per-page: when free memory tightens, the
     // writer falls back to the original on-disk prefix automatically.
     let (_ram_guard, spill_policy) = ram::redirect_to_ram(&mut args).unwrap_or_else(|e| {
-        eprintln!("pdf-raster: --ram setup failed: {e}");
+        eprintln!("rasterrocket: --ram setup failed: {e}");
         std::process::exit(1);
     });
 
     let session_config = args.session_config().unwrap_or_else(|e| {
-        eprintln!("pdf-raster: {e}");
+        eprintln!("rasterrocket: {e}");
         std::process::exit(1);
     });
 
@@ -68,20 +68,20 @@ fn main() {
 
     let n = session.total_pages();
     if n == 0 {
-        eprintln!("pdf-raster: document has no pages");
+        eprintln!("rasterrocket: document has no pages");
         std::process::exit(1);
     }
     let total = i32::try_from(n).unwrap_or_else(|_| {
-        eprintln!("pdf-raster: document has too many pages ({n} > i32::MAX)");
+        eprintln!("rasterrocket: document has too many pages ({n} > i32::MAX)");
         std::process::exit(1);
     });
 
     let (pages, page_warnings) = args.build_page_list(total).unwrap_or_else(|e| {
-        eprintln!("pdf-raster: {e}");
+        eprintln!("rasterrocket: {e}");
         std::process::exit(1);
     });
     for w in &page_warnings {
-        eprintln!("pdf-raster: warning: {w}");
+        eprintln!("rasterrocket: warning: {w}");
     }
 
     let n_pages = pages.len();
@@ -136,7 +136,7 @@ fn main() {
                         "~?s remaining".to_owned()
                     };
                     eprintln!(
-                        "pdf-raster: page {page_num} done  [{completed}/{n_pages}]  \
+                        "rasterrocket: page {page_num} done  [{completed}/{n_pages}]  \
                          {elapsed:.1}s elapsed  {eta_str}"
                     );
                 }

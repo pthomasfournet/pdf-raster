@@ -148,7 +148,7 @@ impl PageDiagnostics {
     ///
     /// Many scanned PDFs store images at 62–67 PPI.  Rendering at 300 DPI upsamples
     /// 4.5× with no additional information.  Passing the suggested DPI to
-    /// the renderer (`pdf_raster::RasterOptions::dpi`) renders at the minimum resolution that avoids
+    /// the renderer (`rasterrocket::RasterOptions::dpi`) renders at the minimum resolution that avoids
     /// upsampling, bounded by the caller's quality floor (`min_dpi`) and ceiling
     /// (`max_dpi`).
     ///
@@ -271,7 +271,7 @@ pub struct PageRenderer<'doc> {
     /// trait surface (`alloc → upload → record_* → submit → wait → download`)
     /// over the CUDA `GpuCtx` path.  Mutually exclusive with `gpu_ctx` in
     /// practice — Phase 9 cache is CUDA-only, so opening a session under
-    /// `ForceVulkan` skips CUDA init entirely (`pdf_raster::render::open_session`).
+    /// `ForceVulkan` skips CUDA init entirely (`rasterrocket::render::open_session`).
     /// The image-blit path (`DevicePageBuffer`) stays CUDA-only and is gated
     /// behind `gpu_ctx`, so under Vulkan blits silently land on the CPU
     /// fallback inside the renderer.
@@ -521,7 +521,7 @@ impl<'doc> PageRenderer<'doc> {
     /// (`alloc → upload → record_* → submit → wait → download`) on the
     /// Vulkan recorder rather than the CUDA `GpuCtx`.  The CUDA path is
     /// not removed; it remains live for sessions opened with
-    /// `BackendPolicy::Auto` / `BackendPolicy::ForceCuda` (defined in `pdf_raster`).
+    /// `BackendPolicy::Auto` / `BackendPolicy::ForceCuda` (defined in `rasterrocket`).
     ///
     /// The Phase 9 device-resident image cache (`DeviceImageCache`,
     /// `DevicePageBuffer`) is CUDA-only — under Vulkan the renderer

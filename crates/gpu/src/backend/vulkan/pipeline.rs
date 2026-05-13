@@ -632,14 +632,14 @@ impl Drop for PipelineCache {
 }
 
 /// Resolve the absolute path to the on-disk pipeline cache:
-/// `$XDG_CACHE_HOME/pdf-raster/<file>` (falling back to `$HOME/.cache/...`).
+/// `$XDG_CACHE_HOME/rasterrocket/<file>` (falling back to `$HOME/.cache/...`).
 /// Returns `None` if neither env var is set — pure-batch builds with no
 /// home directory just skip the cache.
 fn cache_path() -> Option<std::path::PathBuf> {
     let cache_root = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
-    Some(cache_root.join("pdf-raster").join(CACHE_FILENAME))
+    Some(cache_root.join("rasterrocket").join(CACHE_FILENAME))
 }
 
 fn read_cache_file() -> std::io::Result<Vec<u8>> {

@@ -127,7 +127,7 @@ impl DeviceCtx {
 }
 
 fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
-    let app_name = c"pdf-raster";
+    let app_name = c"rasterrocket";
     let app_info = vk::ApplicationInfo::default()
         .application_name(app_name)
         .application_version(vk::make_api_version(0, 0, 7, 0))

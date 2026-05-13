@@ -1,4 +1,4 @@
-//! `FreeType` bridge and glyph cache for the `pdf-raster` pipeline.
+//! `FreeType` bridge and glyph cache for the `rasterrocket` pipeline.
 //!
 //! # Structure
 //!

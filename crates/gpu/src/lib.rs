@@ -226,7 +226,7 @@ impl GpuCtx {
     ///   `#[cfg(feature = "gpu-validation")]` test code; runtime contexts are
     ///   constructed explicitly by callers and shared via `Arc`.
     ///
-    /// As of 2026-05-09, `pdf-raster --help` (closest proxy for `--version`)
+    /// As of 2026-05-09, `rasterrocket --help` (closest proxy for `--version`)
     /// runs in ~1.0 ms median (hyperfine, 30 runs, prewarmed); the dlopen cost
     /// would only be paid once a real render starts. No deferral work needed.
     ///
