@@ -1,4 +1,5 @@
 [package]
+publish = false
 name             = "rasterrocket-color"
 version.workspace    = true
 edition.workspace    = true
