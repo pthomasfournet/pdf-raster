@@ -6,16 +6,16 @@ Cells show `mean±stddev` in milliseconds.  `PDF_RASTER_HUFFMAN_THRESHOLD=0` for
 
 | Corpus | A. CPU-only | C-std. CUDA+nvJPEG | C-huff. CUDA Huffman | V-std. Vulkan (CPU JPEG) | V-huff. Vulkan Huffman | C-huff/A | V-huff/A | V-huff/C-huff | Flags |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 01 native text small | 39±1ms | 236±10ms | 235±13ms | 1376±21ms | 1347±24ms | 6.03× | 34.54× | 5.73× |  |
-| 02 native vector+text | 17±1ms | 493±16ms | 224±9ms | 1351±12ms | 1328±15ms | 13.18× | 78.12× | 5.93× |  |
-| 03 native text dense | 223±2ms | 804±21ms | 422±7ms | 2111±14ms | 2087±24ms | 1.89× | 9.36× | 4.95× | A:[low-cpu 0%] C-std:[low-cpu 8%] C-huff:[low-cpu 15%] V-std:[low-cpu 6%] V-huff:[low-cpu 6%] |
-| 04 ebook mixed | 274±5ms | 676±42ms | 479±13ms | 2134±12ms | 2133±24ms | 1.75× | 7.78× | 4.45× | A:[low-cpu 0%] C-std:[low-cpu 14%] C-huff:[low-cpu 19%] V-std:[low-cpu 7%] V-huff:[low-cpu 6%] |
-| 05 academic book | 562±7ms | 792±20ms | 803±15ms | 2176±28ms | 2224±34ms | 1.43× | 3.96× | 2.77× | V-std:[low-cpu 19%] V-huff:[low-cpu 20%] |
-| 06 modern layout DCT | 1429±21ms | 1637±19ms | 1689±16ms | 3963±26ms | 3968±36ms | 1.18× | 2.78× | 2.35× | V-std:[low-cpu 29%] |
-| 07 journal DCT heavy | 725±11ms | 1084±81ms | 936±11ms | 2122±13ms | 2142±9ms | 1.29× | 2.95× | 2.29× | C-std:[low-cpu 29%] V-std:[low-cpu 14%] V-huff:[low-cpu 17%] |
-| 08 scan DCT 1927 (baseline JPEG) | 1578±7ms | 2125±105ms | 1832±24ms | 2821±42ms | 2844±47ms | 1.16× | 1.80× | 1.55× |  |
-| 09 scan DCT 1836 (progressive JPEG) | 2127±37ms | 2505±14ms | 2326±19ms | 3115±40ms | 3112±34ms | 1.09× | 1.46× | 1.34× |  |
-| 10 scan JBIG2+JPX | 17278±327ms | 17677±275ms | 17682±75ms | 18089±348ms | 17995±63ms | 1.02× | 1.04× | 1.02× |  |
+| 01 native text small | 41±1ms | 229±18ms | 243±9ms | 1353±12ms | 1452±47ms | 5.93× | 35.41× | 5.98× |  |
+| 02 native vector+text | 18±1ms | 497±21ms | 233±23ms | 1343±9ms | 1388±23ms | 12.94× | 77.11× | 5.96× |  |
+| 03 native text dense | 231±2ms | 844±13ms | 422±9ms | 2110±19ms | 2181±46ms | 1.83× | 9.44× | 5.17× | A:[low-cpu 0%] C-std:[low-cpu 14%] C-huff:[low-cpu 20%] V-std:[low-cpu 6%] V-huff:[low-cpu 7%] |
+| 04 ebook mixed | 278±3ms | 743±68ms | 478±6ms | 2207±105ms | 2217±14ms | 1.72× | 7.97× | 4.64× | A:[low-cpu 0%] C-std:[low-cpu 18%] C-huff:[low-cpu 19%] V-std:[low-cpu 7%] V-huff:[low-cpu 7%] |
+| 05 academic book | 582±12ms | 806±13ms | 798±19ms | 2295±57ms | 2305±31ms | 1.37× | 3.96× | 2.89× | V-huff:[low-cpu 22%] |
+| 06 modern layout DCT | 1450±10ms | 1684±26ms | 1659±20ms | 4031±69ms | 4005±40ms | 1.14× | 2.76× | 2.41× |  |
+| 07 journal DCT heavy | 783±5ms | 1153±75ms | 927±11ms | 2192±64ms | 2186±12ms | 1.18× | 2.79× | 2.36× | V-std:[low-cpu 16%] V-huff:[low-cpu 19%] |
+| 08 scan DCT 1927 (baseline JPEG) | 1652±89ms | 2143±60ms | 1929±24ms | 3188±93ms | 2854±34ms | 1.17× | 1.73× | 1.48× |  |
+| 09 scan DCT 1836 (progressive JPEG) | 2859±658ms | 2625±56ms | 2360±43ms | 3121±92ms | 3136±14ms | 0.83× | 1.10× | 1.33× | A:[high-σ 23%] |
+| 10 scan JBIG2+JPX | 17616±260ms | 17539±365ms | 17904±162ms | 18129±159ms | 17918±372ms | 1.02× | 1.02× | 1.00× |  |
 
 ## Vulkan: parallel-Huffman vs CPU JPEG (V-huff / V-std)
 
@@ -23,16 +23,16 @@ V-huff/V-std < 1.0 means the GPU Huffman path is faster than CPU decode on Vulka
 
 | Corpus | V-std | V-huff | V-huff/V-std |
 | --- | --- | --- | --- |
-| 01 native text small | 1376±21ms | 1347±24ms | 0.98× |
-| 02 native vector+text | 1351±12ms | 1328±15ms | 0.98× |
-| 03 native text dense | 2111±14ms | 2087±24ms | 0.99× |
-| 04 ebook mixed | 2134±12ms | 2133±24ms | 1.00× |
-| 05 academic book | 2176±28ms | 2224±34ms | 1.02× |
-| 06 modern layout DCT | 3963±26ms | 3968±36ms | 1.00× |
-| 07 journal DCT heavy | 2122±13ms | 2142±9ms | 1.01× |
-| 08 scan DCT 1927 (baseline JPEG) | 2821±42ms | 2844±47ms | 1.01× |
-| 09 scan DCT 1836 (progressive JPEG) | 3115±40ms | 3112±34ms | 1.00× |
-| 10 scan JBIG2+JPX | 18089±348ms | 17995±63ms | 0.99× |
+| 01 native text small | 1353±12ms | 1452±47ms | 1.07× |
+| 02 native vector+text | 1343±9ms | 1388±23ms | 1.03× |
+| 03 native text dense | 2110±19ms | 2181±46ms | 1.03× |
+| 04 ebook mixed | 2207±105ms | 2217±14ms | 1.00× |
+| 05 academic book | 2295±57ms | 2305±31ms | 1.00× |
+| 06 modern layout DCT | 4031±69ms | 4005±40ms | 0.99× |
+| 07 journal DCT heavy | 2192±64ms | 2186±12ms | 1.00× |
+| 08 scan DCT 1927 (baseline JPEG) | 3188±93ms | 2854±34ms | 0.90× |
+| 09 scan DCT 1836 (progressive JPEG) | 3121±92ms | 3136±14ms | 1.00× |
+| 10 scan JBIG2+JPX | 18129±159ms | 17918±372ms | 0.99× |
 
 ## CUDA: parallel-Huffman vs nvJPEG (C-huff / C-std)
 
@@ -40,35 +40,35 @@ C-huff/C-std < 1.0 means the GPU Huffman path is faster than nvJPEG on CUDA.
 
 | Corpus | C-std | C-huff | C-huff/C-std |
 | --- | --- | --- | --- |
-| 01 native text small | 236±10ms | 235±13ms | 1.00× |
-| 02 native vector+text | 493±16ms | 224±9ms | 0.45× |
-| 03 native text dense | 804±21ms | 422±7ms | 0.52× |
-| 04 ebook mixed | 676±42ms | 479±13ms | 0.71× |
-| 05 academic book | 792±20ms | 803±15ms | 1.01× |
-| 06 modern layout DCT | 1637±19ms | 1689±16ms | 1.03× |
-| 07 journal DCT heavy | 1084±81ms | 936±11ms | 0.86× |
-| 08 scan DCT 1927 (baseline JPEG) | 2125±105ms | 1832±24ms | 0.86× |
-| 09 scan DCT 1836 (progressive JPEG) | 2505±14ms | 2326±19ms | 0.93× |
-| 10 scan JBIG2+JPX | 17677±275ms | 17682±75ms | 1.00× |
+| 01 native text small | 229±18ms | 243±9ms | 1.06× |
+| 02 native vector+text | 497±21ms | 233±23ms | 0.47× |
+| 03 native text dense | 844±13ms | 422±9ms | 0.50× |
+| 04 ebook mixed | 743±68ms | 478±6ms | 0.64× |
+| 05 academic book | 806±13ms | 798±19ms | 0.99× |
+| 06 modern layout DCT | 1684±26ms | 1659±20ms | 0.99× |
+| 07 journal DCT heavy | 1153±75ms | 927±11ms | 0.80× |
+| 08 scan DCT 1927 (baseline JPEG) | 2143±60ms | 1929±24ms | 0.90× |
+| 09 scan DCT 1836 (progressive JPEG) | 2625±56ms | 2360±43ms | 0.90× |
+| 10 scan JBIG2+JPX | 17539±365ms | 17904±162ms | 1.02× |
 
 ## CPU regression vs v0.9.0 mode A
 
 | Corpus | v0.9.0 A | v0.9.1 A | Δ |
 | --- | --- | --- | --- |
-| 01 native text small | 39ms | 39ms | +0.0% |
-| 02 native vector+text | 17ms | 17ms | +0.0% |
-| 03 native text dense | 212ms | 223ms | +5.2% **REGRESS** |
-| 04 ebook mixed | 256ms | 274ms | +7.0% **REGRESS** |
-| 05 academic book | 562ms | 562ms | +0.0% |
-| 06 modern layout DCT | 1429ms | 1429ms | +0.0% |
-| 07 journal DCT heavy | 768ms | 725ms | -5.6% |
-| 08 scan DCT 1927 (baseline JPEG) | 1675ms | 1578ms | -5.8% |
-| 09 scan DCT 1836 (progressive JPEG) | 2171ms | 2127ms | -2.0% |
-| 10 scan JBIG2+JPX | 17810ms | 17278ms | -3.0% |
+| 01 native text small | 39ms | 41ms | +5.1% **REGRESS** |
+| 02 native vector+text | 17ms | 18ms | +5.9% **REGRESS** |
+| 03 native text dense | 212ms | 231ms | +9.0% **REGRESS** |
+| 04 ebook mixed | 256ms | 278ms | +8.6% **REGRESS** |
+| 05 academic book | 562ms | 582ms | +3.6% |
+| 06 modern layout DCT | 1429ms | 1450ms | +1.5% |
+| 07 journal DCT heavy | 768ms | 783ms | +2.0% |
+| 08 scan DCT 1927 (baseline JPEG) | 1675ms | 1652ms | -1.4% |
+| 09 scan DCT 1836 (progressive JPEG) | 2171ms | 2859ms | +31.7% **REGRESS** |
+| 10 scan JBIG2+JPX | 17810ms | 17616ms | -1.1% |
 
 ## Summary
 
 - Vulkan Huffman ≤ CUDA Huffman on 0/10 corpora
-- CPU no regression > 5% vs v0.9.0 mode A: FAIL (2 regressions)
+- CPU no regression > 5% vs v0.9.0 mode A: FAIL (5 regressions)
 
 Note: `PDF_RASTER_HUFFMAN_THRESHOLD=0` forces dispatch for benchmarking.  Production default is `GPU_JPEG_HUFFMAN_THRESHOLD_PX = u32::MAX` — the parallel-Huffman path is not auto-enabled until the crossover is confirmed.

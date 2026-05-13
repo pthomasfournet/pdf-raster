@@ -96,3 +96,7 @@ ROADMAP_INTEL.md
 /audit/
 mutants.out/
 mutants.out.old/
+
+# Python bytecode
+__pycache__/
+*.pyc
