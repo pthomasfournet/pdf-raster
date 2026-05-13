@@ -461,6 +461,18 @@ pub struct RasterOptions {
     pub pages: Option<PageSet>,
 }
 
+impl Default for RasterOptions {
+    fn default() -> Self {
+        Self {
+            dpi: 300.0,
+            first_page: 1,
+            last_page: u32::MAX,
+            deskew: false,
+            pages: None,
+        }
+    }
+}
+
 /// A single rendered page, returned as 8-bit grayscale pixels.
 #[derive(Debug)]
 pub struct RenderedPage {
@@ -642,7 +654,6 @@ mod page_set_tests {
         assert_eq!(a, b);
     }
 
-    #[test]
     fn raster_options_with_pages_none_is_valid() {
         let opts = RasterOptions {
             dpi: 150.0,
@@ -652,6 +663,12 @@ mod page_set_tests {
             pages: None,
         };
         assert!(opts.pages.is_none());
+        let default_opts = RasterOptions::default();
+        assert_eq!(default_opts.dpi, 300.0);
+        assert_eq!(default_opts.first_page, 1);
+        assert_eq!(default_opts.last_page, u32::MAX);
+        assert!(!default_opts.deskew);
+        assert!(default_opts.pages.is_none());
     }
 
     #[test]
