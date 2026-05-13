@@ -5,8 +5,13 @@ Pure Rust PDF → pixels pipeline. Zero Poppler, zero subprocesses, zero Leptoni
 Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tesseract OCR or any other downstream consumer. No intermediate files.
 
 ```toml
-# Cargo.toml
+# Cargo.toml — library
 rasterrocket = "1.0"
+```
+
+```bash
+# CLI — drop-in pdftoppm replacement
+cargo install rasterrocket-cli
 ```
 
 ## What's new in v1.0.0
@@ -38,24 +43,17 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 |---|---|
 | [Getting Started](docs/getting-started.md) | Installation, quickstart, Tesseract integration, DPI guidance, error handling, security |
 | [API Reference](docs/api-reference.md) | Full signatures for `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage`, `RasterError`, `PageDiagnostics`, feature flags, GPU dispatch thresholds |
-| [CLI Reference](docs/cli-reference.md) | All `rasterrocket` command-line flags, output format matrix, examples, pixel-diff comparison |
+| [CLI Reference](docs/cli-reference.md) | All `rrocket` command-line flags, output format matrix, examples, pixel-diff comparison |
 | [Benchmarks](../../wiki/Benchmarks) | Methodology, 10-document corpus results, CPU-only AVX-512 vs AVX2, GPU-accelerated, reproduction steps |
 | [OCR Integration](../../wiki/OCR-Integration) | Tesseract (`leptess`) and ocrs — instance reuse, zero-copy patterns, DPI wiring, multi-threaded examples |
 | [LLM Vision OCR Integration](../../wiki/LLM-Vision-OCR-Integration) | Google Cloud Vision and GPT-5 — encoding helper, Rust + Python examples, cost and latency guidance |
 
-## Crate map
+## Crates
 
-| Crate | Role |
+| Crate | What you get |
 |---|---|
-| `rasterrocket` | **Public API** — `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage` |
-| `rasterrocket-interp` | Native PDF interpreter — content streams, fonts, images, shading, transparency |
-| `rasterrocket-render` | Pixel-level fill/composite with AVX-512, AVX2, and NEON SIMD |
-| `gpu` | CUDA kernels — nvJPEG, nvJPEG2000, AA fill, tile fill, ICC CLUT, deskew; VA-API JPEG decode |
-| `rasterrocket-font` | FreeType glyph cache and rendering |
-| `rasterrocket-color` | Pixel types, colour math |
-| `rasterrocket-encode` | PPM / PGM / PBM / PNG output |
-| `rasterrocket-cli` | `rasterrocket` binary |
-| `pdf_bridge` | Poppler C++ wrapper — reference baseline only, not linked by CLI |
+| [`rasterrocket`](https://crates.io/crates/rasterrocket) | Library — `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage` |
+| [`rasterrocket-cli`](https://crates.io/crates/rasterrocket-cli) | `rrocket` binary — drop-in `pdftoppm` replacement |
 
 ## Hardware compatibility
 
@@ -148,8 +146,8 @@ Shared with any other Rust project on the same machine that opts in — cross-pr
 
 ```bash
 # Unit tests (always filter by module, never run unfiltered)
-cargo test -p rasterrocket-interp --lib -- resources
-cargo test -p gpu --lib -- icc
+cargo test -p rasterrocket --lib -- deskew
+cargo test -p rasterrocket-gpu --lib -- icc
 
 # Pixel-diff comparison against pdftoppm (requires release build in PATH)
 tests/compare/compare.sh -r 150 tests/fixtures/input.pdf

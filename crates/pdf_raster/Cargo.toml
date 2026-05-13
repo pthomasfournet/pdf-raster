@@ -7,7 +7,7 @@ license.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
 readme.workspace     = true
-description = "PDF to pixel buffer — pure Rust, zero Poppler, zero subprocesses. Vulkan and CUDA GPU backends."
+description = "PDF to pixel buffer — pure Rust, zero Poppler. For the CLI tool: cargo install rasterrocket-cli"
 keywords    = ["pdf", "raster", "ocr", "renderer", "vulkan"]
 categories  = ["multimedia::images", "rendering", "parser-implementations"]
 
