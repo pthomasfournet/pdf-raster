@@ -513,24 +513,26 @@ mod tests {
     }
 
     /// `cmyk_to_rgb_reflectance` agrees with the analytic formula
-    /// `R = round((255-C)*(255-K)/255)` to within ±2 LSB.
+    /// `((255−C)×(255−K)+127)/255` (integer, rounding toward zero) to within ±1 LSB.
     ///
-    /// Reference values are the exact f64 results rounded to u8.  The ±2 LSB
-    /// tolerance covers integer rounding in both the formula and the reference.
+    /// Reference values are the exact outputs of `reflectance_blend` for each case.
+    /// The ±2 LSB tolerance is kept as the assertion bound to absorb any future
+    /// rounding changes; delta 0 is expected for all cases here.
     #[test]
     fn cmyk_to_rgb_reflectance_colour_accuracy() {
         let cases: &[(u8, u8, u8, u8, u8, u8, u8)] = &[
             // (C, M, Y, K, R_ref, G_ref, B_ref)
+            // Reference values match reflectance_blend: ((255−ink)×(255−k)+127)/255
             (0, 0, 0, 0, 255, 255, 255),       // no ink → white
             (0, 0, 0, 255, 0, 0, 0),           // black ink only
             (255, 0, 0, 0, 0, 255, 255),       // full cyan
             (0, 255, 0, 0, 255, 0, 255),       // full magenta
             (0, 0, 255, 0, 255, 255, 0),       // full yellow
-            (128, 0, 0, 0, 128, 255, 255),     // 50% cyan
-            (0, 128, 0, 0, 255, 128, 255),     // 50% magenta
-            (0, 0, 128, 0, 255, 255, 128),     // 50% yellow
-            (128, 128, 128, 0, 128, 128, 128), // 50% CMY no K
-            (128, 128, 128, 128, 64, 64, 64),  // 50% CMY + 50% K
+            (128, 0, 0, 0, 127, 255, 255),     // 50% cyan:   (127×255+127)/255=127
+            (0, 128, 0, 0, 255, 127, 255),     // 50% magenta
+            (0, 0, 128, 0, 255, 255, 127),     // 50% yellow
+            (128, 128, 128, 0, 127, 127, 127), // 50% CMY no K
+            (128, 128, 128, 128, 63, 63, 63),  // 50% CMY + 50% K: (127×127+127)/255=63
             (200, 100, 50, 80, 38, 106, 141),  // mixed
         ];
 
