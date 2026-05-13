@@ -1,5 +1,5 @@
 [package]
-name        = "pdf_interp"
+name        = "rasterrocket-interp"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -7,7 +7,7 @@ license.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
 readme.workspace     = true
-description = "Native PDF content-stream interpreter — poppler-free render path"
+description = "Native PDF content-stream interpreter — poppler-free render path for rasterrocket"
 keywords    = ["pdf", "interpreter", "renderer", "fonts", "images"]
 categories  = ["parser-implementations", "rendering", "multimedia::images"]
 
@@ -50,12 +50,12 @@ gpu-jpeg-huffman = ["dep:gpu", "gpu/gpu-jpeg-huffman"]
 bundled = ["font/bundled"]
 
 [dependencies]
-raster = { path = "../raster" }
-color  = { path = "../color" }
-font   = { path = "../font" }
-encode = { path = "../encode" }
+raster = { package = "rasterrocket-render", path = "../raster", version = "1.0" }
+color  = { package = "rasterrocket-color",  path = "../color",  version = "1.0" }
+font   = { package = "rasterrocket-font",   path = "../font",   version = "1.0" }
+encode = { package = "rasterrocket-encode", path = "../encode", version = "1.0" }
 gpu    = { path = "../gpu", optional = true }
-pdf    = { path = "../pdf" }
+pdf    = { package = "rasterrocket-parser", path = "../pdf",    version = "1.0" }
 log    = { workspace = true }
 fax = "0.2.6"
 hayro-ccitt = "0.3.0"
