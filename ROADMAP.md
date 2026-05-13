@@ -27,6 +27,29 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v1.0.0 (May 2026)
+
+**First stable release.**
+
+All breaking API changes from the pre-1.0 cleanup are now permanent. The public surface is stable: `raster_pdf`, `render_channel`, `open_session`, `prescan_session`, `render_page_rgb`, `rgb_to_gray`, `RasterOptions`, `RenderedPage`, `PageDiagnostics`, `RasterSession`, `PageSet`, `SessionConfig`, `BackendPolicy`, `RasterError`, `release_gpu_decoders`.
+
+**What this release includes (since v0.6.0):**
+
+- **Vulkan compute backend** — cross-vendor GPU acceleration (AA fill, tile fill, parallel-Huffman JPEG) via `--features vulkan`. Vulkan preferred over CUDA under `auto`. `--backend vulkan` / `--backend cuda` make the choice explicit and hard-error if unavailable.
+- **Parallel-Huffman JPEG decode** (`gpu-jpeg-huffman`, implied by `vulkan`) — GPU-accelerated Huffman decode wired into production. Beats nvJPEG on 7/10 corpora when forced. Dormant by default pending threshold tuning (`GPU_JPEG_HUFFMAN_THRESHOLD_PX = u32::MAX`).
+- **Process-static GPU init** — CUDA and Vulkan contexts initialised once per process. Multi-document pipelines no longer pay ~240 ms per `open_session`.
+- **`PDF_RASTER_BACKEND` env var** — backend selection without recompiling. Precedence: `--backend` > env var > compile default.
+- **Device-resident image cache** (`cache` feature) — 3-tier VRAM / pinned host / disk with BLAKE3 content hashing and cross-document dedup. Opt-in disk tier via `PDF_RASTER_CACHE_DIR`. Default off.
+- **`PageSet`** — render a sparse subset of pages by 1-based page number.
+- **`prescan_session`** — classify a page without rendering pixels; returns `PageDiagnostics` with image/text flags and a native-PPI hint.
+- **`RasterOptions::default()`** — `dpi = 300`, all pages, no deskew.
+- **`SessionConfig::with_policy(p)`** — construct without reading `PDF_RASTER_BACKEND`.
+- **Spec-correct simple-font text** (v0.9.2) — PDF §9.2.4 `Widths`-array lookup now prevails over FreeType metrics. Academic / English-language PDFs show large RMSE improvements vs pdftoppm.
+- **Phase 11 contest** (v0.9.0) — million-page-archive workload; E1 first-pixel 35.6 ms vs mutool 93.7 ms (2.6×); E3 cross-doc 3.5 ms/archive.
+- **libdeflate FlateDecode** (v0.9.0, default-on) — 1.5–2.4× faster zlib decompression; `--no-default-features` falls through to flate2.
+- **In-tree `pdf` crate** (v0.6.0) — replaced lopdf; lazy mmap-backed, thread-safe per-object cache, logarithmic page-tree descent.
+- **RAM-backed output by default** (v0.6.0) — bare-stem prefixes write to `/dev/shm`; SpillPolicy falls through to disk below 1 GiB MemAvailable.
+
 ### v0.9.2 (May 2026)
 
 **Spec-correctness fix on the simple-font text path — the headline.**
