@@ -176,6 +176,29 @@ The criterion-1 baseline is **live-captured** rather than read from `bench/v070/
 
 ---
 
+## v0.9.0 four-mode benchmark (RTX 5070 + 9900X3D)
+
+Four-mode full-corpus run covering CPU-only (A), CUDA+nvJPEG (D), CUDA parallel-Huffman (H), and Vulkan parallel-Huffman (V).  Mode V was not available on this bench machine (no Vulkan ICD detected).  Run with `scripts/bench_v090.sh`; results in `bench/v090/results.md`.
+
+**Mode H** exercises the new `gpu-jpeg-huffman` path (`JpegGpuDecoder<CudaBackend>`).  `GPU_JPEG_HUFFMAN_THRESHOLD_PX = u32::MAX` keeps the path dormant in production — these are architecture-validation numbers, not production dispatch numbers.
+
+| Corpus | A. CPU-only | D. CUDA + nvJPEG | H. CUDA parallel-Huffman | H/A |
+|---|---|---|---|---|
+| 01 native text small | 39±2 ms | 238±16 ms | 242±10 ms | 6.21× |
+| 02 native vector+text | 17±1 ms | 495±20 ms | 221±14 ms | 13.00× |
+| 03 native text dense | 212±3 ms | 844±10 ms | 437±9 ms | 2.06× |
+| 04 ebook mixed | 256±2 ms | 719±66 ms | 476±6 ms | 1.86× |
+| 05 academic book | 562±15 ms | 811±22 ms | 786±13 ms | 1.40× |
+| 06 modern layout DCT | 1429±18 ms | 1669±21 ms | 1654±12 ms | 1.16× |
+| 07 journal DCT heavy | 768±7 ms | 1040±14 ms | 914±8 ms | 1.19× |
+| 08 scan DCT 1927 | 1675±53 ms | 2204±203 ms | 1828±16 ms | 1.09× |
+| 09 scan DCT 1836 | 2171±23 ms | 2628±132 ms | 2311±25 ms | 1.06× |
+| 10 scan JBIG2+JPX | 17810±247 ms | 18418±550 ms | 18093±262 ms | 1.02× |
+
+Mode A ran under load 1.3; modes D and H ran under load 27–30 (other work in progress), so the absolute D/H numbers are pessimistic.  See `bench/v090/results.md` for the full V column and regression table (two load-noise REGRESS flags on 07/08).
+
+---
+
 ## Version regression history (CPU-only, cold cache)
 
 All five minor versions benchmarked on the Ryzen 9 9900X3D, CPU-only backend, 150 DPI, cold cache. No pdftoppm reference — this table is purely for tracking regression and improvement across releases.

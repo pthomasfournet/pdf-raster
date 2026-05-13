@@ -59,7 +59,7 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 
 **GPU (optional):**
 - **NVIDIA via CUDA 12 or 13** — full feature set (nvJPEG, nvJPEG2000, AA fill, ICC CLUT, ICC matrix, deskew, image cache).  `cudarc` is pinned to the `cuda-12080` driver-API binding so the same source builds against both 12.x and 13.x drivers (forward-compatible per the CUDA driver-API ABI).
-- **Cross-vendor via Vulkan compute** — AA fill and tile fill kernels run on any Vulkan 1.3+ device (NVIDIA, AMD, Intel, Apple via `MoltenVK`). Verified on RTX 5070; cross-vendor smoke pending hardware.  No nvJPEG / cache support under Vulkan today.
+- **Cross-vendor via Vulkan compute** — AA fill, tile fill, and parallel-Huffman JPEG decode kernels run on any Vulkan 1.3+ device (NVIDIA, AMD, Intel, Apple via `MoltenVK`). Verified on RTX 5070; cross-vendor smoke pending hardware.  No nvJPEG / cache support under Vulkan today (JPEG decode goes through the GPU parallel-Huffman path, not nvJPEG).
 - **Linux iGPU/dGPU via VA-API** — JPEG baseline decode on AMD VCN, Intel Quick Sync, Intel Arc.
 
 All GPU features fall back to CPU automatically when unavailable.  AMD/Radeon ROCm and Apple Metal-native backends are not implemented (Vulkan covers Apple via `MoltenVK`).
@@ -107,7 +107,7 @@ Look up your card's exact Compute Capability at [developer.nvidia.com/cuda-gpus]
 | `gpu-deskew` | GPU deskew rotation via NPP | CUDA + NPP |
 | `cache` | Device-resident image cache (3-tier VRAM/host/disk) | CUDA |
 | `vaapi` | Linux iGPU/dGPU JPEG decode (AMD/Intel) | `libva.so.2` + DRM render node |
-| `vulkan` | Vulkan compute backend for AA / tile fill (cross-vendor) | Vulkan 1.3+ ICD; pulls in `gpu-aa`. Slang shaders compiled to SPIR-V via `slangc` from the `LunarG` Vulkan SDK |
+| `vulkan` | Vulkan compute backend for AA fill, tile fill, and parallel-Huffman JPEG decode (cross-vendor) | Vulkan 1.3+ ICD; pulls in `gpu-aa` and `gpu-jpeg-huffman`. Slang shaders compiled to SPIR-V via `slangc` from the `LunarG` Vulkan SDK |
 
 All GPU features fall back to CPU automatically when the runtime requirement is missing, except `--backend cuda` / `--backend vulkan` / `--backend vaapi` which fail loudly with a clear error.
 
