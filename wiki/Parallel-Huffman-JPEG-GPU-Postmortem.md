@@ -14,7 +14,7 @@ That last sentence is the bait. **51× on A100 vs single-threaded libjpeg-turbo 
 
 We knew this going in. The decision to build it anyway was explicit and recorded in ROADMAP.md:
 
-> The Weißenberger 2018 algorithm is genuinely beautiful CUDA work. Implementing it produces an open, redistributable artifact that demonstrates a non-obvious algorithm. The work has long-term value as a learning project; it's just not the path to faster pdf-raster.
+> The Weißenberger 2018 algorithm is genuinely beautiful CUDA work. Implementing it produces an open, redistributable artifact that demonstrates a non-obvious algorithm. The work has long-term value as a learning project; it's just not the path to faster rasterrocket.
 
 This is an academic post-mortem, not a performance story. The algorithm is interesting. We wanted to understand it from the inside.
 
@@ -77,9 +77,9 @@ All numbers are mean ± σ from 5 hyperfine runs with cold-cache eviction betwee
 
 The interesting comparison is **C-huff vs C-std (nvJPEG)**. On text-heavy corpora (01–04), C-huff is 36–53% faster than nvJPEG. This is not because the parallel-Huffman decoder is faster at Huffman decoding — it's because nvJPEG on consumer hardware has significant per-image dispatch overhead that the custom path doesn't. On JPEG-heavy corpora (06–10) the margin closes to ±10%.
 
-The comparison against CPU is the honest one. A 12-core/24-thread CPU with AVX-512 running `zune-jpeg` is a 24-way parallel decoder with SIMD-optimized IDCT. Our GPU decoder is also parallel, but it has PCIe latency and dispatch overhead that the CPU doesn't. For the aggregate-throughput workload that pdf-raster runs — many independent JPEG images, all pages of a document, 24 threads — the CPU wins because it keeps all 24 cores saturated without any PCIe round-trips.
+The comparison against CPU is the honest one. A 12-core/24-thread CPU with AVX-512 running `zune-jpeg` is a 24-way parallel decoder with SIMD-optimized IDCT. Our GPU decoder is also parallel, but it has PCIe latency and dispatch overhead that the CPU doesn't. For the aggregate-throughput workload that rasterrocket runs — many independent JPEG images, all pages of a document, 24 threads — the CPU wins because it keeps all 24 cores saturated without any PCIe round-trips.
 
-The A100 result in the paper (51× speedup) is a different workload: a **single** large JPEG image, measured against **single-threaded** libjpeg-turbo. That scenario does not appear in pdf-raster's actual usage.
+The A100 result in the paper (51× speedup) is a different workload: a **single** large JPEG image, measured against **single-threaded** libjpeg-turbo. That scenario does not appear in rasterrocket's actual usage.
 
 ---
 
@@ -115,8 +115,8 @@ The parallel-Huffman path is **wired into production** and **dormant by default*
 To enable it for a benchmark or experiment:
 
 ```bash
-PDF_RASTER_HUFFMAN_THRESHOLD=0 pdf-raster --backend cuda input.pdf out
-PDF_RASTER_HUFFMAN_THRESHOLD=0 pdf-raster --backend vulkan input.pdf out
+PDF_RASTER_HUFFMAN_THRESHOLD=0 rasterrocket --backend cuda input.pdf out
+PDF_RASTER_HUFFMAN_THRESHOLD=0 rasterrocket --backend vulkan input.pdf out
 ```
 
 The source is in `crates/gpu/src/jpeg/` — `huffman.rs` (algorithm), `bitreader.rs` (shared CPU oracle and GPU pre-pass), `dispatcher.rs` (dispatch routing), `corpus.rs` (adversarial test vectors).

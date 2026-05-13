@@ -1,6 +1,6 @@
 # OCR Integration
 
-pdf-raster outputs 8-bit greyscale pixel buffers (`RenderedPage`) ready for direct consumption by any OCR engine. This page documents the optimal integration pattern for two Rust-native, offline engines: **Tesseract** (via `leptess`) and **ocrs**.
+rasterrocket outputs 8-bit greyscale pixel buffers (`RenderedPage`) ready for direct consumption by any OCR engine. This page documents the optimal integration pattern for two Rust-native, offline engines: **Tesseract** (via `leptess`) and **ocrs**.
 
 For cloud vision APIs (Google Cloud Vision, GPT-5), see [LLM Vision OCR Integration](LLM-Vision-OCR-Integration).
 
@@ -68,7 +68,7 @@ Create one `TessApi` and reuse it across all pages:
 
 ```rust
 use leptess::{LepTess, Variable};
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 use std::path::Path;
 
 fn ocr_pdf(path: &Path, dpi: f32) -> anyhow::Result<Vec<String>> {
@@ -103,7 +103,7 @@ fn ocr_pdf(path: &Path, dpi: f32) -> anyhow::Result<Vec<String>> {
 
 ```rust
 use leptess::LepTess;
-use pdf_raster::{RasterOptions, render_channel};
+use rasterrocket::{RasterOptions, render_channel};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -188,7 +188,7 @@ for page in pages {
 
 ```rust
 use ocrs::{OcrEngine, OcrEngineParams, ImageSource};
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 use rten::Model;
 use std::path::Path;
 use std::sync::Arc;
@@ -236,7 +236,7 @@ fn ocr_pdf(path: &Path, dpi: f32) -> anyhow::Result<Vec<String>> {
 
 ```rust
 use ocrs::{OcrEngine, OcrEngineParams, ImageSource};
-use pdf_raster::{RasterOptions, render_channel};
+use rasterrocket::{RasterOptions, render_channel};
 use rten::Model;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

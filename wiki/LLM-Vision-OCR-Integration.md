@@ -1,6 +1,6 @@
 # LLM Vision OCR Integration
 
-pdf-raster outputs 8-bit greyscale pixel buffers (`RenderedPage`) that can be encoded and sent to cloud vision APIs. This page covers **Google Cloud Vision** and **OpenAI GPT-5** — the two most relevant cloud APIs for PDF OCR pipelines.
+rasterrocket outputs 8-bit greyscale pixel buffers (`RenderedPage`) that can be encoded and sent to cloud vision APIs. This page covers **Google Cloud Vision** and **OpenAI GPT-5** — the two most relevant cloud APIs for PDF OCR pipelines.
 
 For local, offline OCR without network calls or per-page costs, see [OCR Integration](OCR-Integration).
 
@@ -26,7 +26,7 @@ For local, offline OCR without network calls or per-page costs, see [OCR Integra
 
 ## Shared encoding helper: `RenderedPage` → base64 JPEG
 
-Both cloud APIs accept base64-encoded image bytes. JPEG is preferred over PNG — smaller payload means lower latency. pdf-raster's `encode` crate does not produce JPEG; add the `image` crate for this step.
+Both cloud APIs accept base64-encoded image bytes. JPEG is preferred over PNG — smaller payload means lower latency. rasterrocket's `encode` crate does not produce JPEG; add the `image` crate for this step.
 
 ```toml
 # Cargo.toml
@@ -40,7 +40,7 @@ base64 = "0.22"
 ```rust
 use image::{GrayImage, ImageEncoder};
 use image::codecs::jpeg::JpegEncoder;
-use pdf_raster::RenderedPage;
+use rasterrocket::RenderedPage;
 
 /// Encode a greyscale RenderedPage to a base64 JPEG string.
 /// quality: 0–100; 85 is a good default for OCR (small payload, no perceptible loss).
@@ -121,7 +121,7 @@ base64 = "0.22"
 ### Rust example — parallel batch
 
 ```rust
-use pdf_raster::{RasterOptions, render_channel};
+use rasterrocket::{RasterOptions, render_channel};
 use std::path::Path;
 
 #[tokio::main]
@@ -252,7 +252,7 @@ base64 = "0.22"
 ### Rust example
 
 ```rust
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 use std::path::Path;
 
 #[tokio::main]
@@ -388,7 +388,7 @@ base64 = "0.22"
 ### Rust example — Mistral OCR 3
 
 ```rust
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 use std::path::Path;
 
 #[tokio::main]

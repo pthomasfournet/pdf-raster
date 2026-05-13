@@ -8,7 +8,7 @@ All benchmarks render all pages of each corpus PDF at **150 DPI** (the default) 
 
 | Tool | Version |
 |---|---|
-| pdf-raster | v1.0.0, built with `-C target-cpu=native` |
+| rasterrocket | v1.0.0, built with `-C target-cpu=native` |
 | pdftoppm (Poppler) | 24.02.0 (Ryzen), 25.03.0 (Intel) |
 
 **Corpus:** 10 real-world PDFs spanning the common workload categories. Files are not distributed with the repository (see `.gitignore`); the corpus used internally matches the 10 fixture files in `tests/fixtures/corpus-*.pdf`.
@@ -39,11 +39,11 @@ Both binaries built **without GPU features** (`--backend cpu`). This isolates th
 | Ryzen bench | AMD Ryzen 9 9900X3D @ 4.4 GHz | x86-64 + AVX-512 | 12C/24T | 32 GB DDR5 | SATA SSD |
 | Intel bench | Intel Core i7-8700K @ 3.7 GHz | x86-64 + AVX2 | 6C/12T | 32 GB DDR4 | SATA SSD |
 
-**Reference:** `pdftoppm` (Poppler), CPU only, same machine as each pdf-raster run.
+**Reference:** `pdftoppm` (Poppler), CPU only, same machine as each rasterrocket run.
 
 ### Results
 
-| # | Document | Pages | pdf-raster (AVX-512) | pdftoppm | Speedup | pdf-raster (AVX2) | pdftoppm | Speedup |
+| # | Document | Pages | rasterrocket (AVX-512) | pdftoppm | Speedup | rasterrocket (AVX2) | pdftoppm | Speedup |
 |---|---|---|---|---|---|---|---|---|
 | 01 | Native text, small | 16 | 44 ms | 151 ms | **3.4×** | 320 ms | 461 ms | 0.69× |
 | 02 | Native vector + text | 16 | 121 ms | 146 ms | **1.2×** | 466 ms | 428 ms | 0.92× |
@@ -70,7 +70,7 @@ Both binaries built **without GPU features** (`--backend cpu`). This isolates th
 
 The Ryzen 9 9900X3D includes an integrated Radeon GPU (raphael/mendocino RDNA 2) accessible via VA-API on `/dev/dri/renderD129`. This is a first functional test of the VA-API JPEG decode path against the CPU-only baseline on the same machine.
 
-**Build:** `--features pdf_raster/vaapi`, `--backend vaapi --vaapi-device /dev/dri/renderD129`
+**Build:** `--features rasterrocket/vaapi`, `--backend vaapi --vaapi-device /dev/dri/renderD129`
 
 | # | Document | Pages | VA-API (iGPU) | CPU-only | vs CPU |
 |---|---|---|---|---|---|
@@ -101,7 +101,7 @@ _All corpora: fresh uncontested cold-cache runs._
 
 Built with all GPU features enabled (nvJPEG, nvJPEG2000, GPU AA fill, ICC CLUT). Compared against `pdftoppm` (CPU only) on the same machine.
 
-| # | Document | Pages | pdf-raster (GPU) | pdftoppm | Speedup |
+| # | Document | Pages | rasterrocket (GPU) | pdftoppm | Speedup |
 |---|---|---|---|---|---|
 | 01 | Native text, small | 16 | 217 ms | 252 ms | 1.2× |
 | 02 | Native vector + text | 16 | 256 ms | 268 ms | 1.05× |
@@ -122,9 +122,9 @@ GPU gains are largest on scan-heavy corpora where nvJPEG and nvJPEG2000 offload 
 
 Built with nvJPEG, GPU AA fill, and ICC CLUT features. nvJPEG2000 is not available on Turing (sm_75); JBIG2/JPEG2000 streams fall through to CPU. Compared against `pdftoppm` (CPU only) on the same machine.
 
-**Build:** `CUDA_ARCH=sm_75 LIBZ_SYS_STATIC=1 RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster --features "pdf_raster/nvjpeg,pdf_raster/gpu-aa,pdf_raster/gpu-icc"`
+**Build:** `CUDA_ARCH=sm_75 LIBZ_SYS_STATIC=1 RUSTFLAGS="-C target-cpu=native" cargo build --release -p rasterrocket-cli --features "rasterrocket/nvjpeg,rasterrocket/gpu-aa,rasterrocket/gpu-icc"`
 
-| # | Document | Pages | pdf-raster (GPU) | pdftoppm | Speedup |
+| # | Document | Pages | rasterrocket (GPU) | pdftoppm | Speedup |
 |---|---|---|---|---|---|
 | 01 | Native text, small | 16 | 658 ms | 582 ms | 0.88× |
 | 02 | Native vector + text | 16 | 806 ms | 610 ms | 0.76× |
@@ -262,7 +262,7 @@ The cause: v0.2.0 introduced VA-API JPEG dispatch. Even on a CPU-only build, eve
 Two things broke open the workloads that had been stuck:
 
 - **lopdf rip-out.** lopdf 0.40 was replaced by an in-tree `pdf` crate (lazy mmap-based parser, threadsafe per-object cache, ObjStm cached once across workers, DOS-hardened). lopdf's `load_objects_raw` had been burning ~20% of corpus-07 cycles in `nom_locate`'s `memchr` on the main thread before any render worker could start, capping effective parallelism at ~1.6 of 24 cores. Corpus-07 went from 757 ms (v0.5.1) to **689 ms cold cache**, with the prior hot-cache best (~2.2 s) now beaten cold.
-- **RAM-backed output by default.** The previous temp-file + atomic-rename pattern triggered ext4 `auto_da_alloc` on every page, parking 24 workers in `do_renameat2`. v0.6.0 writes pages directly to `/dev/shm/pdf-raster-<pid>-<nanos>/` for bare-stem prefixes; a `SpillPolicy` polls `/proc/meminfo` every 100 ms and falls subsequent pages through to disk when MemAvailable drops below 1 GiB. This is the dominant factor in the corpus-09 result and a non-trivial contributor on every JPEG-heavy corpus.
+- **RAM-backed output by default.** The previous temp-file + atomic-rename pattern triggered ext4 `auto_da_alloc` on every page, parking 24 workers in `do_renameat2`. v0.6.0 writes pages directly to `/dev/shm/rasterrocket-<pid>-<nanos>/` for bare-stem prefixes; a `SpillPolicy` polls `/proc/meminfo` every 100 ms and falls subsequent pages through to disk when MemAvailable drops below 1 GiB. This is the dominant factor in the corpus-09 result and a non-trivial contributor on every JPEG-heavy corpus.
 
 CPU utilisation (sampled with `mpstat`) on the v0.6.0 cold runs:
 
@@ -296,13 +296,13 @@ These are failure modes that have caused multi-day benchmark investigations. Che
 **First check:** run with `--timings`. If pages of similar size show wildly different wall times on different threads, something shared is serializing them.
 
 ```bash
-./target/release/pdf-raster --timings corpus.pdf /tmp/out/ 2>&1 | grep timing
+./target/release/rasterrocket --timings corpus.pdf /tmp/out/ 2>&1 | grep timing
 ```
 
 **Second check:** `perf record`, then look for allocator symbols.
 
 ```bash
-perf record -g ./target/release/pdf-raster corpus.pdf /tmp/out/
+perf record -g ./target/release/rasterrocket corpus.pdf /tmp/out/
 perf report   # look for: malloc, free, __lll_lock_wait, _int_malloc
 ```
 
@@ -326,13 +326,13 @@ A serial pre-scan pass over all pages before rendering starts blocks the first r
 
 ```bash
 # Build CPU-only release
-RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster
+RUSTFLAGS="-C target-cpu=native" cargo build --release -p rasterrocket-cli
 
 # Run the full corpus benchmark (CPU vs pdftoppm)
 tests/bench_corpus.sh
 
 # VA-API iGPU build (Linux, AMD/Intel iGPU)
-RUSTFLAGS="-C target-cpu=native" cargo build --release -p pdf-raster \
+RUSTFLAGS="-C target-cpu=native" cargo build --release -p rasterrocket-cli \
   --features "vaapi"
 tests/bench_corpus.sh --backend vaapi --vaapi-device /dev/dri/renderD129
 
@@ -344,7 +344,7 @@ To reproduce the GPU benchmarks, build with the full feature set:
 
 ```bash
 CUDA_ARCH=sm_120 RUSTFLAGS="-C target-cpu=native" \
-  cargo build --release -p pdf-raster \
+  cargo build --release -p rasterrocket-cli \
   --features "nvjpeg,nvjpeg2k,gpu-aa,gpu-icc"
 tests/bench_corpus.sh --backend cuda
 ```
