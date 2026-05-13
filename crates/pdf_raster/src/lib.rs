@@ -21,27 +21,17 @@
 //! }
 //! ```
 //!
-//! # Integration with Tesseract
+//! # OCR integration
 //!
-//! ```rust,no_run
-//! # use pdf_raster::{RasterOptions, raster_pdf};
-//! # use std::path::Path;
-//! # let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 1, deskew: true, pages: None };
-//! for (_, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
-//!     let page = result.expect("page render failed");
-//!     // tesseract crate (v0.15+):
-//!     // let text = tesseract::ocr_from_frame(
-//!     //     &page.pixels,
-//!     //     page.width as i32,
-//!     //     page.height as i32,
-//!     //     1,               // bytes_per_pixel (grayscale)
-//!     //     page.width as i32, // bytes_per_line (tightly packed)
-//!     //     "eng",
-//!     // ).unwrap();
-//!     // For uneven scan backgrounds: set thresholding_method=2 (Sauvola) on the Tesseract side.
-//!     // Do NOT pre-binarise — the LSTM engine reads your grayscale values directly.
-//! }
-//! ```
+//! `pdf_raster` is a rasteriser, not an OCR framework.  For Tesseract, ocrs,
+//! Google Cloud Vision, GPT-5, and Mistral integration patterns — including the
+//! `TessApi`-per-thread reuse pattern and zero-copy `set_image_from_mem` — see
+//! the project wiki:
+//!
+//! - [OCR Integration](https://github.com/pthomasfournet/pdf-raster/wiki/OCR-Integration)
+//!   (Tesseract via `leptess`, ocrs)
+//! - [LLM Vision OCR Integration](https://github.com/pthomasfournet/pdf-raster/wiki/LLM-Vision-OCR-Integration)
+//!   (Google Cloud Vision, GPT-5, Mistral)
 //!
 //! # Streaming: render and process pages in parallel
 //!
