@@ -172,7 +172,7 @@ if page.diagnostics.has_images && !page.diagnostics.has_vector_text {
 | Native/vector PDFs | 150–200 | Text is resolution-independent |
 | Thumbnails / preview | 72–96 | Not for OCR |
 
-Use `page.suggested_dpi(min, max)` to re-render at the document's native image resolution:
+Use `page.diagnostics.suggested_dpi(min, max)` to re-render at the document's native image resolution:
 
 ```rust
 let page = render_at_default_dpi()?;
