@@ -1510,16 +1510,9 @@ impl<'doc> PageRenderer<'doc> {
                                 data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                             } else {
                                 let a = u16::from(alpha);
-                                let ia = 255 - a;
-                                data[pixel_off] = ((u16::from(rgb[0]) * a
-                                    + u16::from(data[pixel_off]) * ia)
-                                    / 255) as u8;
-                                data[pixel_off + 1] =
-                                    ((u16::from(rgb[1]) * a + u16::from(data[pixel_off + 1]) * ia)
-                                        / 255) as u8;
-                                data[pixel_off + 2] =
-                                    ((u16::from(rgb[2]) * a + u16::from(data[pixel_off + 2]) * ia)
-                                        / 255) as u8;
+                                data[pixel_off] = blend_u8(rgb[0], data[pixel_off], a);
+                                data[pixel_off + 1] = blend_u8(rgb[1], data[pixel_off + 1], a);
+                                data[pixel_off + 2] = blend_u8(rgb[2], data[pixel_off + 2], a);
                             }
                         }
                     }
@@ -1542,12 +1535,12 @@ impl<'doc> PageRenderer<'doc> {
                                 data[pixel_off + 2] = v;
                             } else {
                                 let a = u16::from(alpha);
-                                let ia = 255 - a;
-                                let blended = ((u16::from(v) * a + u16::from(data[pixel_off]) * ia)
-                                    / 255) as u8;
-                                data[pixel_off] = blended;
-                                data[pixel_off + 1] = blended;
-                                data[pixel_off + 2] = blended;
+                                // Each output channel is blended against its own
+                                // existing value — the destination bitmap is RGB
+                                // and channels may differ.
+                                data[pixel_off] = blend_u8(v, data[pixel_off], a);
+                                data[pixel_off + 1] = blend_u8(v, data[pixel_off + 1], a);
+                                data[pixel_off + 2] = blend_u8(v, data[pixel_off + 2], a);
                             }
                         }
                     }
@@ -1602,18 +1595,9 @@ impl<'doc> PageRenderer<'doc> {
                                     data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                                 } else {
                                     let a = u16::from(alpha);
-                                    let ia = 255 - a;
-                                    data[pixel_off] =
-                                        ((u16::from(rgb[0]) * a + u16::from(data[pixel_off]) * ia)
-                                            / 255) as u8;
-                                    data[pixel_off + 1] = ((u16::from(rgb[1]) * a
-                                        + u16::from(data[pixel_off + 1]) * ia)
-                                        / 255)
-                                        as u8;
-                                    data[pixel_off + 2] = ((u16::from(rgb[2]) * a
-                                        + u16::from(data[pixel_off + 2]) * ia)
-                                        / 255)
-                                        as u8;
+                                    data[pixel_off] = blend_u8(rgb[0], data[pixel_off], a);
+                                    data[pixel_off + 1] = blend_u8(rgb[1], data[pixel_off + 1], a);
+                                    data[pixel_off + 2] = blend_u8(rgb[2], data[pixel_off + 2], a);
                                 }
                             }
                         }
@@ -1625,14 +1609,12 @@ impl<'doc> PageRenderer<'doc> {
                                     data[pixel_off + 2] = v;
                                 } else {
                                     let a = u16::from(alpha);
-                                    let ia = 255 - a;
-                                    let blended = ((u16::from(v) * a
-                                        + u16::from(data[pixel_off]) * ia)
-                                        / 255)
-                                        as u8;
-                                    data[pixel_off] = blended;
-                                    data[pixel_off + 1] = blended;
-                                    data[pixel_off + 2] = blended;
+                                    // Each output channel is blended against its own
+                                    // existing value — the destination bitmap is RGB
+                                    // and channels may differ.
+                                    data[pixel_off] = blend_u8(v, data[pixel_off], a);
+                                    data[pixel_off + 1] = blend_u8(v, data[pixel_off + 1], a);
+                                    data[pixel_off + 2] = blend_u8(v, data[pixel_off + 2], a);
                                 }
                             }
                         }
@@ -1807,6 +1789,21 @@ const fn int_to_join(v: i32) -> LineJoin {
     }
 }
 
+/// Porter-Duff source-over blend for a single 8-bit channel.
+///
+/// Formula: `(src * alpha + dst * (255 - alpha)) / 255`.
+///
+/// Maximum intermediate value: `255 * 255 = 65025 < u16::MAX`, so no overflow
+/// is possible regardless of the alpha split.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "result is (x*a + y*ia)/255 where a+ia=255; max value is 255*255/255=255, always fits u8"
+)]
+fn blend_u8(src: u8, dst: u8, alpha: u16) -> u8 {
+    let ia = 255_u16 - alpha;
+    ((u16::from(src) * alpha + u16::from(dst) * ia) / 255) as u8
+}
+
 /// Reason `blit_image`'s decoder-contract check rejected an image.
 #[derive(Debug, PartialEq, Eq)]
 enum ImageLenError {
@@ -1913,5 +1910,36 @@ mod tests {
     fn check_image_bytes_len_one_by_one_gray() {
         // 1 × 1 × Gray (bpp=1) → expected 1 byte.
         assert_eq!(check_image_bytes_len(1, 1, 1, 1), Ok(1));
+    }
+
+    // ── blend_u8 ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn blend_u8_opaque_returns_src() {
+        assert_eq!(blend_u8(200, 50, 255), 200);
+        assert_eq!(blend_u8(0, 255, 255), 0);
+        assert_eq!(blend_u8(255, 0, 255), 255);
+    }
+
+    #[test]
+    fn blend_u8_transparent_returns_dst() {
+        // alpha=0 is short-circuited by the caller (continue), but the function
+        // itself must still be well-defined (returns dst).
+        assert_eq!(blend_u8(200, 50, 0), 50);
+    }
+
+    #[test]
+    fn blend_u8_50pct_midpoints_correctly() {
+        // src=255, dst=0, alpha=128 → (255*128 + 0*127)/255 = 128.
+        assert_eq!(blend_u8(255, 0, 128), 128);
+        // src=0, dst=255, alpha=128 → (0*128 + 255*127)/255 = 127.
+        assert_eq!(blend_u8(0, 255, 128), 127);
+    }
+
+    #[test]
+    fn blend_u8_no_overflow_at_max_values() {
+        // Worst-case intermediate: 255*254 + 255*1 = 65025, fits u16.
+        assert_eq!(blend_u8(255, 255, 254), 255);
+        assert_eq!(blend_u8(255, 255, 1), 255);
     }
 }
