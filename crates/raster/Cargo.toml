@@ -1,10 +1,15 @@
 [package]
-name             = "raster"
+name             = "rasterrocket-render"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+homepage.workspace   = true
+readme.workspace     = true
+description          = "Software rasterizer — path fill, compositing, and AVX-512/AVX2/NEON SIMD for the rasterrocket PDF renderer"
+keywords             = ["pdf", "raster", "simd", "renderer", "avx512"]
+categories           = ["rendering", "multimedia::images"]
 
 [features]
 default     = ["simd-avx2"]
@@ -14,7 +19,7 @@ nightly-sve2 = []                  # SVE2 popcount tier (aarch64 only; requires 
 rayon       = ["dep:rayon"]        # tile-level rayon parallelism for fill
 
 [dependencies]
-color    = { path = "../color" }
+color    = { package = "rasterrocket-color", path = "../color", version = "1.0" }
 bytemuck = { workspace = true }
 bitflags = { workspace = true }
 rayon    = { version = "1", optional = true }
