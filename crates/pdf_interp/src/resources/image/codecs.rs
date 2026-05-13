@@ -522,11 +522,7 @@ pub(super) fn decode_dct<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::G
     #[cfg(feature = "gpu-jpeg-huffman")]
     if let Some(dec) = jpeg_gpu {
         let area = pdf_w.saturating_mul(pdf_h);
-        #[expect(
-            clippy::absurd_extreme_comparisons,
-            reason = "GPU_JPEG_HUFFMAN_THRESHOLD_PX is u32::MAX until a benchmark confirms a crossover"
-        )]
-        if area >= super::GPU_JPEG_HUFFMAN_THRESHOLD_PX {
+        if area >= super::huffman_threshold() {
             match dec.decode(data) {
                 Ok(img) => {
                     let w = img.width;

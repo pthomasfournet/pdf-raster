@@ -441,7 +441,7 @@ impl<'doc> PageRenderer<'doc> {
 
     /// Detach and return the Vulkan parallel-Huffman JPEG decoder for reuse.
     #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
-    pub fn take_jpeg_vk(&mut self) -> Option<JpegGpuDecoder<VulkanBackend>> {
+    pub const fn take_jpeg_vk(&mut self) -> Option<JpegGpuDecoder<VulkanBackend>> {
         self.jpeg_vk.take()
     }
 

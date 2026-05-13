@@ -118,8 +118,26 @@ pub const GPU_JPEG_THRESHOLD_PX: u32 = u32::MAX;
 ///
 /// Set to `u32::MAX` until a corpus benchmark confirms a crossover point —
 /// mirrors the precedent set by `GPU_JPEG_THRESHOLD_PX` for nvJPEG.
+///
+/// Override at runtime for benchmarking: set the `PDF_RASTER_HUFFMAN_THRESHOLD`
+/// environment variable to a decimal pixel-area value (e.g. `0` = always GPU,
+/// `4294967295` = never GPU).  The env var is read once, lazily, on first use.
 #[cfg(feature = "gpu-jpeg-huffman")]
 pub const GPU_JPEG_HUFFMAN_THRESHOLD_PX: u32 = u32::MAX;
+
+/// Returns the effective parallel-Huffman dispatch threshold: `GPU_JPEG_HUFFMAN_THRESHOLD_PX`
+/// unless `PDF_RASTER_HUFFMAN_THRESHOLD` is set in the environment.
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub(crate) fn huffman_threshold() -> u32 {
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<u32> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("PDF_RASTER_HUFFMAN_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GPU_JPEG_HUFFMAN_THRESHOLD_PX)
+    })
+}
 
 /// Minimum pixel area (width × height) for GPU-accelerated `JPXDecode`.
 ///
