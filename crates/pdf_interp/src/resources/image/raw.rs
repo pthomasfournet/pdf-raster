@@ -113,7 +113,7 @@ pub(super) fn decode_raw(
     // and then call decode_raw_8bpp.  The `pixels_expr` is evaluated once.
     macro_rules! decode_and_bpp {
         ($pixels_expr:expr) => {{
-            let pixels = $pixels_expr;
+            let pixels: std::borrow::Cow<[u8]> = $pixels_expr;
             let remapped = apply_decode(pixels, &decode_map);
             decode_raw_8bpp(
                 &remapped,
@@ -141,28 +141,28 @@ pub(super) fn decode_raw(
             let pixels = unpack_packed_bits(data, 1, samples_per_row, height, |v| {
                 if v == 0 { 0x00 } else { 0xFF }
             })?;
-            decode_and_bpp!(pixels)
+            decode_and_bpp!(std::borrow::Cow::Owned(pixels))
         }
-        2 => decode_and_bpp!(expand_nbpp::<2>(
+        2 => decode_and_bpp!(std::borrow::Cow::Owned(expand_nbpp::<2>(
             data,
             width,
             height,
             resolved.components()
-        )?),
-        4 => decode_and_bpp!(expand_nbpp::<4>(
+        )?)),
+        4 => decode_and_bpp!(std::borrow::Cow::Owned(expand_nbpp::<4>(
             data,
             width,
             height,
             resolved.components()
-        )?),
-        8 => decode_and_bpp!(data.to_vec()),
+        )?)),
+        8 => decode_and_bpp!(std::borrow::Cow::Borrowed(data)),
         16 => {
-            decode_and_bpp!(downsample_16bpp(
+            decode_and_bpp!(std::borrow::Cow::Owned(downsample_16bpp(
                 data,
                 width,
                 height,
                 resolved.components()
-            )?)
+            )?))
         }
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
@@ -175,44 +175,79 @@ pub(super) fn decode_raw(
 
 /// Parse the `Decode` array into per-component `(dmin, dmax)` pairs.
 ///
-/// Returns an empty `Vec` when the array is absent or has fewer than
-/// `2 * components` entries (identity is assumed by callers).  Entries that
-/// are already identity `(0.0, 1.0)` are preserved so that `apply_decode` can
-/// detect and skip the no-op path without re-reading the dict.
+/// Returns an empty `Vec` when the array is absent, has fewer than
+/// `2 * components` entries (identity assumed by callers), or contains any
+/// non-finite value (NaN/inf from a malformed PDF would silently blacken every
+/// pixel via `NaN as u8 == 0`; warn and treat as identity instead).  Entries
+/// that are already identity `(0.0, 1.0)` are preserved so that `apply_decode`
+/// can detect and skip the no-op path without re-reading the dict.
 fn parse_decode(dict: &Dictionary, components: usize) -> Vec<(f64, f64)> {
     let Some(Object::Array(arr)) = dict.get(b"Decode") else {
         return Vec::new();
     };
     let vals: Vec<f64> = arr.iter().filter_map(pdf::Object::as_f64).collect();
     if vals.len() < components * 2 {
+        if !arr.is_empty() {
+            log::debug!(
+                "image: Decode array has {} entries, need {}×2={} — ignoring (identity assumed)",
+                arr.len(),
+                components,
+                components * 2,
+            );
+        }
         return Vec::new();
     }
-    vals.chunks_exact(2)
+    // Reject non-finite values produced by a malformed PDF.  A NaN or infinite
+    // dmin/dmax would make `is_identity` return false (NaN comparisons), then
+    // `mul_add` would produce NaN, and the final `NaN as u8` cast would silently
+    // produce 0 (black) for every pixel.  Warn and fall back to identity instead.
+    let pairs: Vec<(f64, f64)> = vals
+        .chunks_exact(2)
         .take(components)
         .map(|pair| (pair[0], pair[1]))
-        .collect()
+        .collect();
+    if pairs
+        .iter()
+        .any(|&(d0, d1)| !d0.is_finite() || !d1.is_finite())
+    {
+        log::warn!(
+            "image: Decode array contains non-finite value(s) — ignoring (identity assumed)"
+        );
+        return Vec::new();
+    }
+    pairs
 }
 
 /// Apply the per-component Decode remap to an already-8bpc pixel buffer.
 ///
 /// Each sample `s ∈ [0, 255]` is mapped to
 /// `round(dmin * 255 + s * (dmax - dmin))`, clamped to `[0, 255]`.
-/// Identity pairs `(0.0, 1.0)` are short-circuited.
-/// Returns the input unchanged (no allocation) when every pair is identity.
-fn apply_decode(mut pixels: Vec<u8>, decode: &[(f64, f64)]) -> Vec<u8> {
+/// Identity pairs `(0.0, 1.0)` are short-circuited per component.
+///
+/// Takes a `Cow<[u8]>` so borrowed slices (e.g. the 8-bpc path when the Decode
+/// array is identity) avoid a heap copy: the identity fast-path calls
+/// `into_owned()` which only allocates when a borrow was passed; non-identity
+/// paths call `into_owned()` first and mutate in place.
+fn apply_decode(data: std::borrow::Cow<[u8]>, decode: &[(f64, f64)]) -> Vec<u8> {
     // Use an epsilon for float comparison: Decode values come from PDF real
     // objects (parsed f64) so exact 0.0/1.0 is normal, but an epsilon is safer.
     const EPS: f64 = 1e-9;
     let is_identity = |d0: f64, d1: f64| d0.abs() < EPS && (d1 - 1.0).abs() < EPS;
     if decode.is_empty() || decode.iter().all(|&(d0, d1)| is_identity(d0, d1)) {
-        return pixels;
+        // Identity — return the buffer as-is.  If the caller passed a borrowed
+        // slice (e.g. the 8-bpc path) this avoids a copy entirely.
+        return data.into_owned();
     }
+    let mut pixels = data.into_owned();
     let components = decode.len();
     for chunk in pixels.chunks_mut(components) {
         for (s, &(dmin, dmax)) in chunk.iter_mut().zip(decode.iter()) {
             if is_identity(dmin, dmax) {
                 continue; // identity — leave sample unchanged
             }
+            // `s` is in [0, 255]; output = dmin*255 + s*(dmax-dmin), giving
+            // values in [dmin*255, dmax*255] (or swapped when dmax < dmin).
+            // Clamp to [0.0, 255.0] before rounding and casting to u8.
             let remapped = dmin.mul_add(255.0, f64::from(*s) * (dmax - dmin));
             // clamp(0..=255) before cast: `as u8` after clamp is always in [0, 255].
             #[expect(
@@ -648,8 +683,8 @@ mod tests {
     #[test]
     fn decode_raw_gray_decode_inverted() {
         // A 2-pixel DeviceGray image with Decode=[1,0].
-        // Sample 0 maps to white (0xFF → inverted to 0x00), sample 255 to black (0x00).
-        // PDF §8.9.5.2: output = dmin*255 + s*(dmax-dmin) = 255 + s*(-1) = 255-s.
+        // PDF §8.9.5.2: output = dmin*255 + s*(dmax-dmin) = 1*255 + s*(0-1) = 255 - s.
+        // Sample 0 → output 255 (white); sample 255 → output 0 (black).
         let doc = make_doc();
         let mut dict = Dictionary::new();
         dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
@@ -703,5 +738,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.data.as_cpu().unwrap()[0], 128);
+    }
+
+    #[test]
+    fn decode_raw_gray_decode_integer_entries_accepted() {
+        // Decode=[1, 0] written as Integer objects (not Real) must also invert.
+        // Verifies that `parse_decode` / `Object::as_f64` handles Integer variants.
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
+        dict.set(
+            "Decode",
+            Object::Array(vec![Object::Integer(1), Object::Integer(0)]),
+        );
+        let data = vec![0u8, 255u8];
+        let desc = decode_raw(
+            &doc,
+            &data,
+            2,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        let pixels = desc.data.as_cpu().unwrap();
+        assert_eq!(
+            pixels[0], 255,
+            "integer Decode=[1,0]: sample 0 must map to 255"
+        );
+        assert_eq!(
+            pixels[1], 0,
+            "integer Decode=[1,0]: sample 255 must map to 0"
+        );
+    }
+
+    #[test]
+    fn decode_raw_gray_decode_nonfinite_falls_back_to_identity() {
+        // A malformed Decode array with a non-finite value must fall back to
+        // identity rather than silently blackening every pixel.
+        // The test uses NaN; the code path is the same for +/-inf.
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
+        // f32::NAN stored in Object::Real; as_f64 converts through f32 so it stays NaN.
+        dict.set(
+            "Decode",
+            Object::Array(vec![Object::Real(f32::NAN), Object::Real(1.0)]),
+        );
+        let data = vec![128u8];
+        let desc = decode_raw(
+            &doc,
+            &data,
+            1,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        // Identity fallback: output must equal input.
+        assert_eq!(
+            desc.data.as_cpu().unwrap()[0],
+            128,
+            "non-finite Decode must fall back to identity"
+        );
     }
 }
