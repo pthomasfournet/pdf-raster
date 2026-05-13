@@ -214,16 +214,6 @@ pub struct RenderedPage {
 | `effective_dpi` | `opts.dpi × UserUnit`. Pass this to `tesseract::set_source_resolution`. For the vast majority of documents `UserUnit = 1.0` and this equals `dpi`. |
 | `diagnostics` | Lightweight rendering metadata — see `PageDiagnostics`. |
 
-#### `RenderedPage::suggested_dpi`
-
-```rust
-pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32>
-```
-
-Suggests a re-render DPI based on the native resolution of embedded raster images. Returns `None` for vector/text-only pages (use your default DPI). Clamped to `[min_dpi, max_dpi]`.
-
----
-
 ### `PageDiagnostics`
 
 ```rust
@@ -238,6 +228,22 @@ Collected at zero extra cost during rendering.
 | `has_vector_text` | `bool` | At least one text-showing operator (`Tj`, `TJ`, `'`, `"`) was executed. `false` on scan-only pages. |
 | `dominant_filter` | `Option<ImageFilter>` | Most common image decode filter on this page (`None` for pure-vector pages). |
 | `source_ppi_hint` | `Option<f32>` | Estimated native pixels-per-inch of the dominant image. Computed as `(image_width_px / page_width_pts) × 72`. `None` when no images were blitted. |
+
+#### `PageDiagnostics::suggested_dpi`
+
+```rust
+pub fn suggested_dpi(&self, min_dpi: f32, max_dpi: f32) -> Option<f32>
+```
+
+Suggests a re-render DPI based on `source_ppi_hint`. Returns `None` for vector/text-only pages. Snaps to the nearest standard step (72, 96, 150, 200, 300, 400, 600) and clamps to `[min_dpi, max_dpi]`.
+
+```rust
+if let Some(native_dpi) = page.diagnostics.suggested_dpi(150.0, 600.0) {
+    if (native_dpi - opts.dpi).abs() > 10.0 {
+        // Re-render at native resolution
+    }
+}
+```
 
 Use `diagnostics` to route pages to different OCR configurations:
 
@@ -273,7 +279,7 @@ pub enum BackendPolicy {
 
 Controls which compute backend is used. `Auto` matches pre-v0.4.0 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active. `ForceVaapi` is only present when the `vaapi` Cargo feature is enabled.
 
-`ForceVulkan` runs the AA-fill, tile-fill, and parallel-Huffman JPEG decode kernels on the Vulkan compute backend (cross-vendor: NVIDIA, AMD, Intel, Apple via `MoltenVK`).  The device-resident image cache is CUDA-only, so under `ForceVulkan` the renderer runs uncached; ICC CMYK→RGB stays on the CPU AVX-512 fallback.  JPEG dispatch goes through the GPU parallel-Huffman path (currently dormant: GPU_JPEG_HUFFMAN_THRESHOLD_PX = u32::MAX).
+`ForceVulkan` runs the AA-fill, tile-fill, and parallel-Huffman JPEG decode kernels on the Vulkan compute backend (cross-vendor: NVIDIA, AMD, Intel, Apple via `MoltenVK`).  The device-resident image cache is CUDA-only, so under `ForceVulkan` the renderer runs uncached; ICC CMYK→RGB stays on the CPU AVX-512 fallback.  JPEG dispatch goes through the GPU parallel-Huffman path. The path is dormant by default (`GPU_JPEG_HUFFMAN_THRESHOLD_PX = u32::MAX`); enable it by setting `PDF_RASTER_HUFFMAN_THRESHOLD=0` at runtime.
 
 ---
 
