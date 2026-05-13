@@ -139,7 +139,11 @@ pub use render::{
 /// After this call the TLS slots hold `Uninitialised`, so their own destructors
 /// at process exit are no-ops.
 #[cfg_attr(
-    not(any(feature = "nvjpeg", feature = "nvjpeg2k")),
+    not(any(
+        feature = "nvjpeg",
+        feature = "nvjpeg2k",
+        all(feature = "gpu-jpeg-huffman", feature = "vulkan"),
+    )),
     expect(
         clippy::missing_const_for_fn,
         reason = "body collapses to empty when no GPU-decoder feature is on"
@@ -150,6 +154,8 @@ pub fn release_gpu_decoders() {
     gpu_init::release_nvjpeg_this_thread();
     #[cfg(feature = "nvjpeg2k")]
     gpu_init::release_nvjpeg2k_this_thread();
+    #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+    gpu_init::release_jpeg_vk_this_thread();
 }
 
 // ── Backend policy ────────────────────────────────────────────────────────────

@@ -681,13 +681,33 @@ fn lend_decoders(
 
     #[cfg(feature = "gpu-jpeg-huffman")]
     if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
-        gpu_init::ensure_jpeg_gpu_huffman(effective_policy)
-            .map_err(RasterError::BackendUnavailable)?;
-        gpu_init::JPEG_CUDA_DEC.with(|cell| {
-            if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
-                renderer.set_jpeg_gpu(slot.take());
+        // Vulkan wins Auto when a Vulkan backend is available.
+        #[cfg(feature = "vulkan")]
+        let vulkan_active = matches!(effective_policy, BackendPolicy::ForceVulkan)
+            || (matches!(effective_policy, BackendPolicy::Auto) && session.vk_backend.is_some());
+        #[cfg(not(feature = "vulkan"))]
+        let vulkan_active = false;
+
+        if vulkan_active {
+            #[cfg(feature = "vulkan")]
+            {
+                gpu_init::ensure_jpeg_vk_huffman(effective_policy)
+                    .map_err(RasterError::BackendUnavailable)?;
+                gpu_init::JPEG_VK_DEC.with(|cell| {
+                    if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
+                        renderer.set_jpeg_vk(slot.take());
+                    }
+                });
             }
-        });
+        } else {
+            gpu_init::ensure_jpeg_gpu_huffman(effective_policy)
+                .map_err(RasterError::BackendUnavailable)?;
+            gpu_init::JPEG_CUDA_DEC.with(|cell| {
+                if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
+                    renderer.set_jpeg_gpu(slot.take());
+                }
+            });
+        }
     }
 
     #[cfg(feature = "nvjpeg")]
@@ -737,6 +757,12 @@ fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
     gpu_init::JPEG_CUDA_DEC.with(|cell| {
         if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
             *slot = renderer.take_jpeg_gpu();
+        }
+    });
+    #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+    gpu_init::JPEG_VK_DEC.with(|cell| {
+        if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
+            *slot = renderer.take_jpeg_vk();
         }
     });
     #[cfg(feature = "nvjpeg")]
