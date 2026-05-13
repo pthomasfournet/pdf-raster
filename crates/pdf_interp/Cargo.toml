@@ -43,7 +43,6 @@ moxcms = "0.8.1"
 
 [dev-dependencies]
 env_logger       = { workspace = true }
-rasterrocket-interp = { path = ".", version = "1.0" }
 
 
 [lints.rust]

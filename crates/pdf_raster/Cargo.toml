@@ -36,9 +36,6 @@ pdf         = { package = "rasterrocket-parser",  path = "../pdf",        versio
 rayon       = "1"
 log         = { workspace = true }
 
-[dev-dependencies]
-rasterrocket = { path = ".", version = "1.0" }
-
 [lints.rust]
 unsafe_code    = "warn"   # deskew rotate may need unsafe for SIMD; explicit allow per site
 missing_docs   = "warn"
