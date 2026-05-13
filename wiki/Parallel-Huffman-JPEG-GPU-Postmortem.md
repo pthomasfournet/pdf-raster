@@ -115,8 +115,8 @@ The parallel-Huffman path is **wired into production** and **dormant by default*
 To enable it for a benchmark or experiment:
 
 ```bash
-PDF_RASTER_HUFFMAN_THRESHOLD=0 rasterrocket --backend cuda input.pdf out
-PDF_RASTER_HUFFMAN_THRESHOLD=0 rasterrocket --backend vulkan input.pdf out
+PDF_RASTER_HUFFMAN_THRESHOLD=0 rrocket --backend cuda input.pdf out
+PDF_RASTER_HUFFMAN_THRESHOLD=0 rrocket --backend vulkan input.pdf out
 ```
 
 The source is in `crates/gpu/src/jpeg/` — `huffman.rs` (algorithm), `bitreader.rs` (shared CPU oracle and GPU pre-pass), `dispatcher.rs` (dispatch routing), `corpus.rs` (adversarial test vectors).

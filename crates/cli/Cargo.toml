@@ -12,7 +12,7 @@ keywords    = ["pdf", "raster", "cli", "pdftoppm", "renderer"]
 categories  = ["command-line-utilities", "multimedia::images", "rendering"]
 
 [[bin]]
-name = "rasterrocket"
+name = "rrocket"
 path = "src/main.rs"
 
 [features]

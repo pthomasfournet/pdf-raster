@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# compare.sh — pixel-accurate comparison of pdftoppm vs pdf-raster output.
+# compare.sh — pixel-accurate comparison of pdftoppm vs rrocket output.
 #
 # Usage:
 #   compare.sh [OPTIONS] <PDF>
@@ -16,14 +16,14 @@
 # Exit code: 0 = all pages within threshold; 1 = failures or errors.
 # Dry-run always exits 0.
 #
-# Requires: pdftoppm, pdf-raster (release build),
+# Requires: pdftoppm, rrocket (release build),
 #           ImageMagick (compare, identify, convert), bc
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-RASTER_BIN="${REPO_ROOT}/target/release/pdf-raster"
+RASTER_BIN="${REPO_ROOT}/target/release/rrocket"
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 DPI=150
@@ -96,8 +96,8 @@ for cmd in pdftoppm compare identify convert bc; do
     command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found in PATH"
 done
 [[ -x "$RASTER_BIN" ]] || {
-    echo "Error: pdf-raster not built at $RASTER_BIN" >&2
-    echo "  Run: cargo build --release -p pdf-raster" >&2
+    echo "Error: rrocket not built at $RASTER_BIN" >&2
+    echo "  Run: cargo build --release -p rasterrocket-cli" >&2
     exit 1
 }
 
@@ -118,9 +118,9 @@ if ! pdftoppm "${ref_args[@]}" "$PDF" "${REF_DIR}/page" 2>"${WORK_DIR}/ref.log";
     exit 1
 fi
 
-# ── render: pdf-raster ────────────────────────────────────────────────────────
+# ── render: rrocket ────────────────────────────────────────────────────────
 if ! "$RASTER_BIN" "${new_args[@]}" "$PDF" "${NEW_DIR}/page" 2>"${WORK_DIR}/new.log"; then
-    echo "Error: pdf-raster failed — see log:" >&2
+    echo "Error: rrocket failed — see log:" >&2
     cat "${WORK_DIR}/new.log" >&2
     exit 1
 fi
@@ -153,7 +153,7 @@ for ref_file in "${ref_pages[@]}"; do
     diff_file="${DIFF_DIR}/${page_tag}-diff.png"
 
     if [[ ! -f "$new_file" ]]; then
-        printf "MISSING  %s — pdf-raster produced no output\n" "$page_tag"
+        printf "MISSING  %s — rrocket produced no output\n" "$page_tag"
         fail=$((fail + 1))
         continue
     fi

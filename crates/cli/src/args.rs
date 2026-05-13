@@ -17,7 +17,7 @@ fn parse_positive_dpi(s: &str) -> Result<f64, String> {
 
 /// Renders PDF pages to images.
 #[derive(Parser, Debug)]
-#[command(name = "rasterrocket", about, long_about = None)]
+#[command(name = "rrocket", about, long_about = None)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool maps to a distinct CLI flag"
@@ -197,7 +197,7 @@ pub struct Args {
     /// Force RAM-backed output even when `OUTPUT_PREFIX` looks like a path.
     ///
     /// By default the program already redirects bare-stem prefixes (e.g.
-    /// `rasterrocket doc.pdf out`) to a freshly-created tmpfs directory under
+    /// `rrocket doc.pdf out`) to a freshly-created tmpfs directory under
     /// `/dev/shm`, because writing to disk is 10–20× slower than RAM and
     /// dominates wall time. Path-like prefixes (anything with `/` or
     /// starting with `.`) opt out of that redirect and write to disk.
@@ -215,7 +215,7 @@ pub struct Args {
     pub no_ram: bool,
 
     /// Override the tmpfs directory used by RAM-backed output. Implies the
-    /// RAM redirect. Default is a fresh `/dev/shm/rasterrocket-<pid>-<nanos>/`.
+    /// RAM redirect. Default is a fresh `/dev/shm/rrocket-<pid>-<nanos>/`.
     #[arg(long = "ram-path", value_name = "PATH", conflicts_with = "no_ram")]
     pub ram_path: Option<String>,
 
@@ -507,7 +507,7 @@ mod page_list_tests {
     use super::*;
 
     fn base_args() -> Args {
-        Args::parse_from(["rasterrocket", "in.pdf", "out"])
+        Args::parse_from(["rrocket", "in.pdf", "out"])
     }
 
     #[test]

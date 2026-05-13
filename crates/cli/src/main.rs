@@ -28,11 +28,11 @@ fn main() {
     let mut args = Args::parse();
 
     if args.odd_only && args.even_only {
-        eprintln!("rasterrocket: --odd and --even are mutually exclusive");
+        eprintln!("rrocket: --odd and --even are mutually exclusive");
         std::process::exit(1);
     }
     if let Err(e) = args.validate_format_flags() {
-        eprintln!("rasterrocket: {e}");
+        eprintln!("rrocket: {e}");
         std::process::exit(1);
     }
 
@@ -42,12 +42,12 @@ fn main() {
     // The SpillPolicy is consulted per-page: when free memory tightens, the
     // writer falls back to the original on-disk prefix automatically.
     let (_ram_guard, spill_policy) = ram::redirect_to_ram(&mut args).unwrap_or_else(|e| {
-        eprintln!("rasterrocket: --ram setup failed: {e}");
+        eprintln!("rrocket: --ram setup failed: {e}");
         std::process::exit(1);
     });
 
     let session_config = args.session_config().unwrap_or_else(|e| {
-        eprintln!("rasterrocket: {e}");
+        eprintln!("rrocket: {e}");
         std::process::exit(1);
     });
 
@@ -68,20 +68,20 @@ fn main() {
 
     let n = session.total_pages();
     if n == 0 {
-        eprintln!("rasterrocket: document has no pages");
+        eprintln!("rrocket: document has no pages");
         std::process::exit(1);
     }
     let total = i32::try_from(n).unwrap_or_else(|_| {
-        eprintln!("rasterrocket: document has too many pages ({n} > i32::MAX)");
+        eprintln!("rrocket: document has too many pages ({n} > i32::MAX)");
         std::process::exit(1);
     });
 
     let (pages, page_warnings) = args.build_page_list(total).unwrap_or_else(|e| {
-        eprintln!("rasterrocket: {e}");
+        eprintln!("rrocket: {e}");
         std::process::exit(1);
     });
     for w in &page_warnings {
-        eprintln!("rasterrocket: warning: {w}");
+        eprintln!("rrocket: warning: {w}");
     }
 
     let n_pages = pages.len();
@@ -136,7 +136,7 @@ fn main() {
                         "~?s remaining".to_owned()
                     };
                     eprintln!(
-                        "rasterrocket: page {page_num} done  [{completed}/{n_pages}]  \
+                        "rrocket: page {page_num} done  [{completed}/{n_pages}]  \
                          {elapsed:.1}s elapsed  {eta_str}"
                     );
                 }

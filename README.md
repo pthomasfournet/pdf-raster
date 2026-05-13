@@ -127,10 +127,10 @@ Under `auto`, when both backends are compiled in, **Vulkan is preferred over CUD
 
 ```bash
 # Ship a Vulkan-default binary, override per-process when you need CUDA:
-PDF_RASTER_BACKEND=cuda rasterrocket input.pdf out
+PDF_RASTER_BACKEND=cuda rrocket input.pdf out
 
 # CLI flag always wins over the env var:
-PDF_RASTER_BACKEND=cuda rasterrocket --backend cpu input.pdf out   # uses CPU
+PDF_RASTER_BACKEND=cuda rrocket --backend cpu input.pdf out   # uses CPU
 ```
 
 ### Compile cache (`sccache`) — optional

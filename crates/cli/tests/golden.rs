@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 //!
 //! For each entry in [`CASES`] the test:
-//!   1. Runs `rasterrocket` on the fixture PDF.
+//!   1. Runs `rrocket` on the fixture PDF.
 //!   2. Parses every rendered PPM as a raw RGB byte slice.
 //!   3. Loads the matching reference PPM from `tests/golden/ref/`.
 //!   4. Asserts that the mean absolute error (MAE) per channel is ≤ [`MAE_LIMIT`].
@@ -12,12 +12,12 @@
 //! # Regenerating references
 //!
 //! Run `tests/golden/generate.sh` from the workspace root.  That script
-//! renders the same fixtures with the release `rasterrocket` binary and writes
+//! renders the same fixtures with the release `rrocket` binary and writes
 //! the results into `tests/golden/ref/`.  Commit the updated PPMs.
 //!
 //! # Environment
 //!
-//! The binary path is resolved at compile time via `CARGO_BIN_EXE_rasterrocket`.
+//! The binary path is resolved at compile time via `CARGO_BIN_EXE_rrocket`.
 //! During `cargo test` this is the *debug* build.  References are generated
 //! with the release build; minor rendering differences between build profiles
 //! are not expected, but regenerate references with debug if tests fail
@@ -52,7 +52,7 @@ struct Case {
     /// Prefix used when naming reference files in `tests/golden/ref/`.
     ///
     /// Reference files are named `<prefix>-<page>.ppm` where `<page>` is
-    /// the 1-based page number, zero-padded to match `rasterrocket`'s convention
+    /// the 1-based page number, zero-padded to match `rrocket`'s convention
     /// for the document's total page count.
     ref_prefix: &'static str,
     /// First page to test, 1-based.
@@ -62,7 +62,7 @@ struct Case {
     /// Total page count of the PDF — determines the zero-pad width.
     ///
     /// Must match the actual page count of the fixture so that the file names
-    /// produced by `rasterrocket` align with the reference files.
+    /// produced by `rrocket` align with the reference files.
     total_pages: u32,
 }
 
@@ -231,7 +231,7 @@ fn compare_page(page: u32, case: &Case, ref_file: &Path, out_file: &Path) -> Opt
     );
     assert!(
         out_file.exists(),
-        "rasterrocket did not produce page {page} for {} (expected {})",
+        "rrocket did not produce page {page} for {} (expected {})",
         case.pdf,
         out_file.display()
     );
@@ -282,7 +282,7 @@ fn compare_page(page: u32, case: &Case, ref_file: &Path, out_file: &Path) -> Opt
 }
 
 fn run_case(case: &Case) {
-    let binary = env!("CARGO_BIN_EXE_rasterrocket");
+    let binary = env!("CARGO_BIN_EXE_rrocket");
     let pdf_path = fixtures_dir().join(case.pdf);
     let ref_dir = ref_dir();
 
@@ -292,7 +292,7 @@ fn run_case(case: &Case) {
         pdf_path.display()
     );
 
-    // Pad width matches rasterrocket's digit_width(total_pages) in naming.rs.
+    // Pad width matches rrocket's digit_width(total_pages) in naming.rs.
     let pad_width = case.total_pages.to_string().len();
 
     // Render into a temp directory co-located with the fixtures so that both
@@ -322,12 +322,12 @@ fn run_case(case: &Case) {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn rasterrocket ({binary}): {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn rrocket ({binary}): {e}"));
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!(
-            "rasterrocket exited with {} for {}:\n{stderr}",
+            "rrocket exited with {} for {}:\n{stderr}",
             output.status, case.pdf
         );
     }

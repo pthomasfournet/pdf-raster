@@ -296,13 +296,13 @@ These are failure modes that have caused multi-day benchmark investigations. Che
 **First check:** run with `--timings`. If pages of similar size show wildly different wall times on different threads, something shared is serializing them.
 
 ```bash
-./target/release/rasterrocket --timings corpus.pdf /tmp/out/ 2>&1 | grep timing
+./target/release/rrocket --timings corpus.pdf /tmp/out/ 2>&1 | grep timing
 ```
 
 **Second check:** `perf record`, then look for allocator symbols.
 
 ```bash
-perf record -g ./target/release/rasterrocket corpus.pdf /tmp/out/
+perf record -g ./target/release/rrocket corpus.pdf /tmp/out/
 perf report   # look for: malloc, free, __lll_lock_wait, _int_malloc
 ```
 
