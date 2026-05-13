@@ -79,7 +79,14 @@ preflight() {
   fi
 
   if [[ $SKIP_VULKAN -eq 0 ]]; then
-    if ! command -v vulkaninfo >/dev/null 2>&1 || ! vulkaninfo 2>/dev/null | grep -q "Vulkan Instance"; then
+    local vk_detected=0
+    if command -v vulkaninfo >/dev/null 2>&1; then
+      local vk_out
+      vk_out=$(vulkaninfo 2>/dev/null) && \
+        echo "$vk_out" | grep -c "Vulkan Instance" >/dev/null 2>&1 && \
+        vk_detected=1 || true
+    fi
+    if [[ $vk_detected -eq 0 ]]; then
       warn "Vulkan ICD not found; mode V will be skipped"
       SKIP_VULKAN=1
     else
