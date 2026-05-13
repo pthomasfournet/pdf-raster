@@ -17,16 +17,13 @@ pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6
 ```rust
 use pdf_raster::{RasterOptions, raster_pdf};
 
-let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: u32::MAX, deskew: true };
+let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: u32::MAX, deskew: true, pages: None };
 
 for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
     let page = result?;
-    // page.pixels: Vec<u8>, 8-bit grayscale, width × height, top-to-bottom
-    let text = tesseract::ocr_from_frame(
-        &page.pixels, page.width as i32, page.height as i32,
-        1, page.width as i32, "eng",
-    )?;
-    tesseract_handle.set_source_resolution(page.effective_dpi as i32);
+    // page.pixels — Vec<u8>, 8-bit greyscale, width × height, top-to-bottom
+    // page.effective_dpi — pass to your OCR engine (accounts for PDF UserUnit scaling)
+    // See the OCR Integration wiki for Tesseract, ocrs, Google Cloud Vision, and GPT-5 patterns.
 }
 ```
 
@@ -38,6 +35,8 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 | [API Reference](docs/api-reference.md) | Full signatures for `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage`, `RasterError`, `PageDiagnostics`, feature flags, GPU dispatch thresholds |
 | [CLI Reference](docs/cli-reference.md) | All `pdf-raster` command-line flags, output format matrix, examples, pixel-diff comparison |
 | [Benchmarks](docs/benchmarks.md) | Methodology, 10-document corpus results, CPU-only AVX-512 vs AVX2, GPU-accelerated, reproduction steps |
+| [OCR Integration](../../wiki/OCR-Integration) | Tesseract (`leptess`) and ocrs — instance reuse, zero-copy patterns, DPI wiring, multi-threaded examples |
+| [LLM Vision OCR Integration](../../wiki/LLM-Vision-OCR-Integration) | Google Cloud Vision and GPT-5 — encoding helper, Rust + Python examples, cost and latency guidance |
 
 ## Crate map
 
