@@ -32,6 +32,8 @@ color
   │                 └── cli
   │                       pdf-raster binary (pdftoppm replacement)
   │
+  ├── pdf  (in-tree lazy mmap PDF parser; used by pdf_interp)
+  │
   ├── pdf_bridge  (unused in render path; poppler reference baseline only)
   │
   └── bench  (vello_cpu throughput comparison; not linked by cli)
@@ -47,7 +49,7 @@ color
 ```
 PDF bytes on disk
     │
-    ▼ lopdf::Document
+    ▼ pdf::Document  (in-tree lazy mmap parser)
 pdf_interp::open()
     │
     ▼ Vec<Operator>
@@ -65,7 +67,7 @@ render_operators(ops, resources)     dispatch loop:
     │   DCT      ───────────────────▶ gpu::NvJpegDecoder  (or zune-jpeg)
     │   JPX      ───────────────────▶ gpu::NvJpeg2kDecoder (or jpeg2k)
     │   CCITT/JBIG2 ────────────────▶ fax / hayro-jbig2
-    │   Flate    ───────────────────▶ miniz_oxide (via lopdf)
+    │   Flate    ───────────────────▶ libdeflate (default) / flate2 fallback
     │   CMYK     ───────────────────▶ gpu::icc_cmyk_to_rgb (or AVX-512/scalar)
     │                                 raster::draw_image
     ├── shading ops ────────────────▶ raster::shaded_fill / gouraud_triangle_fill
@@ -192,7 +194,7 @@ No pixel processing beyond colour-mode conversion at the boundary.
 
 ### 3.5 `pdf_interp`
 
-PDF parsing and operator dispatch. The only crate that touches lopdf.
+PDF parsing and operator dispatch. Uses the in-tree `pdf` crate (lazy mmap parser).
 
 **Sub-modules**
 
@@ -210,7 +212,8 @@ renderer/
   font_cache.rs    — per-session face loading + GlyphCache integration
   text.rs          — text matrix, font state
   page/            — page-level entry points, geometry normalisation
-  gpu_ops.rs       — GPU dispatch thresholds + optional gpu:: calls
+    gpu_ops.rs     — CUDA dispatch thresholds + optional gpu:: calls
+    vk_ops.rs      — Vulkan dispatch (AA fill, tile fill)
 
 resources/
   mod.rs           — PageResources; lazy resolve_*
@@ -219,11 +222,11 @@ resources/
   icc.rs           — ICC profile loading + moxcms CLUT extraction
   shading/         — axial/radial/mesh shading descriptors
   cmap.rs          — ToUnicode / CMap parsing
-  dict_ext.rs      — lopdf dict helper trait
+  dict_ext.rs      — typed accessor helpers for `pdf::Dictionary`
   tiling.rs        — Type 1 tiling pattern parsing
 ```
 
-**PageResources** — holds an immutable `&Document` reference. All resource
+**PageResources** — holds an immutable reference to the `pdf::Document`. All resource
 resolution is stateless and on-demand; no per-page pre-computation. This
 makes unit testing straightforward: inject a `Document` and page `ObjectId`.
 
@@ -328,10 +331,13 @@ on x86-64; the correct tier is selected at runtime. ARM uses `vmull_u8` + `vshrn
 Public library crate. The stable API surface.
 
 ```rust
-RasterOptions { dpi, first_page, last_page, deskew }
+RasterOptions { dpi, first_page, last_page, deskew, pages }  // pages: Option<PageSet>
 
 raster_pdf(path, opts) → impl Iterator<Item = (u32, Result<RenderedPage, RasterError>)>
 render_channel(path, opts, capacity) → Receiver<(u32, Result<RenderedPage, RasterError>)>
+open_session(path, config) → Result<RasterSession, RasterError>
+render_page_rgb(session, page_num, scale) → Result<Bitmap<Rgb8>, RasterError>
+prescan_session(session, page_num) → Result<PageDiagnostics, RasterError>
 release_gpu_decoders()   // call via pool.broadcast() before pool drops
 ```
 
@@ -509,7 +515,7 @@ face initialisation (rare). Glyph rendering uses `quick_cache::sync::Cache` (sha
 ## 7. Error model
 
 **Per-document errors** — abort the whole document:
-- `InterpError::Pdf` — lopdf parse failure
+- `InterpError::Pdf` — PDF parse failure (in-tree `pdf` crate)
 - `InterpError::JavaScript` — rejected at open time
 
 **Per-page errors** — skip the page, continue rendering:
