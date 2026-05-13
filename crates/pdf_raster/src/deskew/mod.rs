@@ -27,8 +27,8 @@
 //! deskew::apply(&mut page).expect("deskew failed");
 //! ```
 
-pub mod detect;
-pub mod rotate;
+pub(crate) mod detect;
+pub(crate) mod rotate;
 
 use color::Gray8;
 use raster::Bitmap;
