@@ -95,8 +95,8 @@ def main(in_dir: str) -> int:
 
     mode_headers = " | ".join(label for _, label in MODES)
     print(f"| Corpus | {mode_headers} | H/A | V/A | V/H | Flags |")
-    sep = "|".join("---|" for _ in MODES)
-    print(f"|---|{sep}---|---|---|---|")
+    sep = " | ".join("---" for _ in MODES)
+    print(f"| --- | {sep} | --- | --- | --- | --- |")
 
     v_wins = 0
 

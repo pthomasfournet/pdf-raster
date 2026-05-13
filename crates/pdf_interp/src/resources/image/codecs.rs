@@ -31,11 +31,6 @@ use gpu::JpegQueueHandle;
 #[cfg(feature = "nvjpeg2k")]
 use gpu::nvjpeg2k::{Jpeg2kColorSpace as GpuJ2kCs, NvJpeg2kDecoder};
 
-// ── GPU parallel-Huffman JPEG path ───────────────────────────────────────────
-
-#[cfg(feature = "gpu-jpeg-huffman")]
-use gpu::backend::GpuBackend;
-
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
 
 #[cfg(feature = "gpu-icc")]
