@@ -41,10 +41,6 @@ use gpu::GpuCtx;
                   the extra gpu-icc args push the count over the limit"
     )
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "single-pass raw image decoder; cfg-gated arms preclude clean splits"
-)]
 pub(super) fn decode_raw(
     doc: &Document,
     data: &[u8],
@@ -108,6 +104,32 @@ pub(super) fn decode_raw(
         None
     };
 
+    // Parse the Decode array once; used by all bpc arms after expansion to 8-bpc.
+    // PDF §8.9.5.2: Decode has 2 values per component: [Dmin Dmax ...].
+    // Identity is [0 1] per component — no-op so we skip the allocation.
+    let decode_map = parse_decode(dict, resolved.components());
+
+    // Macro to apply the Decode remap (if any) to an already-8bpc buffer
+    // and then call decode_raw_8bpp.  The `pixels_expr` is evaluated once.
+    macro_rules! decode_and_bpp {
+        ($pixels_expr:expr) => {{
+            let pixels = $pixels_expr;
+            let remapped = apply_decode(pixels, &decode_map);
+            decode_raw_8bpp(
+                &remapped,
+                width,
+                height,
+                resolved,
+                #[cfg(feature = "gpu-icc")]
+                gpu_ctx,
+                #[cfg(feature = "gpu-icc")]
+                icc_bytes.as_deref(),
+                #[cfg(feature = "gpu-icc")]
+                clut_cache,
+            )
+        }};
+    }
+
     match bpc {
         // bpc=1: PDF §8.9.3 packs one bit per sample, one sample per component.
         // Multi-component spaces (RGB: 3 bits/px, CMYK: 4 bits/px) must use
@@ -119,67 +141,29 @@ pub(super) fn decode_raw(
             let pixels = unpack_packed_bits(data, 1, samples_per_row, height, |v| {
                 if v == 0 { 0x00 } else { 0xFF }
             })?;
-            decode_raw_8bpp(
-                &pixels,
-                width,
-                height,
-                resolved,
-                #[cfg(feature = "gpu-icc")]
-                gpu_ctx,
-                #[cfg(feature = "gpu-icc")]
-                icc_bytes.as_deref(),
-                #[cfg(feature = "gpu-icc")]
-                clut_cache,
-            )
+            decode_and_bpp!(pixels)
         }
-        2 => decode_raw_8bpp(
-            &expand_nbpp::<2>(data, width, height, resolved.components())?,
-            width,
-            height,
-            resolved,
-            #[cfg(feature = "gpu-icc")]
-            gpu_ctx,
-            #[cfg(feature = "gpu-icc")]
-            icc_bytes.as_deref(),
-            #[cfg(feature = "gpu-icc")]
-            clut_cache,
-        ),
-        4 => decode_raw_8bpp(
-            &expand_nbpp::<4>(data, width, height, resolved.components())?,
-            width,
-            height,
-            resolved,
-            #[cfg(feature = "gpu-icc")]
-            gpu_ctx,
-            #[cfg(feature = "gpu-icc")]
-            icc_bytes.as_deref(),
-            #[cfg(feature = "gpu-icc")]
-            clut_cache,
-        ),
-        8 => decode_raw_8bpp(
+        2 => decode_and_bpp!(expand_nbpp::<2>(
             data,
             width,
             height,
-            resolved,
-            #[cfg(feature = "gpu-icc")]
-            gpu_ctx,
-            #[cfg(feature = "gpu-icc")]
-            icc_bytes.as_deref(),
-            #[cfg(feature = "gpu-icc")]
-            clut_cache,
-        ),
-        16 => decode_raw_8bpp(
-            &downsample_16bpp(data, width, height, resolved.components())?,
+            resolved.components()
+        )?),
+        4 => decode_and_bpp!(expand_nbpp::<4>(
+            data,
             width,
             height,
-            resolved,
-            #[cfg(feature = "gpu-icc")]
-            gpu_ctx,
-            #[cfg(feature = "gpu-icc")]
-            icc_bytes.as_deref(),
-            #[cfg(feature = "gpu-icc")]
-            clut_cache,
-        ),
+            resolved.components()
+        )?),
+        8 => decode_and_bpp!(data.to_vec()),
+        16 => {
+            decode_and_bpp!(downsample_16bpp(
+                data,
+                width,
+                height,
+                resolved.components()
+            )?)
+        }
         other => {
             log::debug!("image: {other} bits-per-component not yet implemented");
             None
@@ -188,6 +172,61 @@ pub(super) fn decode_raw(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Parse the `Decode` array into per-component `(dmin, dmax)` pairs.
+///
+/// Returns an empty `Vec` when the array is absent or has fewer than
+/// `2 * components` entries (identity is assumed by callers).  Entries that
+/// are already identity `(0.0, 1.0)` are preserved so that `apply_decode` can
+/// detect and skip the no-op path without re-reading the dict.
+fn parse_decode(dict: &Dictionary, components: usize) -> Vec<(f64, f64)> {
+    let Some(Object::Array(arr)) = dict.get(b"Decode") else {
+        return Vec::new();
+    };
+    let vals: Vec<f64> = arr.iter().filter_map(pdf::Object::as_f64).collect();
+    if vals.len() < components * 2 {
+        return Vec::new();
+    }
+    vals.chunks_exact(2)
+        .take(components)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
+}
+
+/// Apply the per-component Decode remap to an already-8bpc pixel buffer.
+///
+/// Each sample `s ∈ [0, 255]` is mapped to
+/// `round(dmin * 255 + s * (dmax - dmin))`, clamped to `[0, 255]`.
+/// Identity pairs `(0.0, 1.0)` are short-circuited.
+/// Returns the input unchanged (no allocation) when every pair is identity.
+fn apply_decode(mut pixels: Vec<u8>, decode: &[(f64, f64)]) -> Vec<u8> {
+    // Use an epsilon for float comparison: Decode values come from PDF real
+    // objects (parsed f64) so exact 0.0/1.0 is normal, but an epsilon is safer.
+    const EPS: f64 = 1e-9;
+    let is_identity = |d0: f64, d1: f64| d0.abs() < EPS && (d1 - 1.0).abs() < EPS;
+    if decode.is_empty() || decode.iter().all(|&(d0, d1)| is_identity(d0, d1)) {
+        return pixels;
+    }
+    let components = decode.len();
+    for chunk in pixels.chunks_mut(components) {
+        for (s, &(dmin, dmax)) in chunk.iter_mut().zip(decode.iter()) {
+            if is_identity(dmin, dmax) {
+                continue; // identity — leave sample unchanged
+            }
+            let remapped = dmin.mul_add(255.0, f64::from(*s) * (dmax - dmin));
+            // clamp(0..=255) before cast: `as u8` after clamp is always in [0, 255].
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "remapped is clamped to [0.0, 255.0] before cast; round() output is non-negative"
+            )]
+            {
+                *s = remapped.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    pixels
+}
 
 /// Return `true` when the `ImageMask`'s `Decode` array is `[1, 0]` (inverted stencil).
 fn is_mask_inverted(dict: &Dictionary) -> bool {
@@ -604,5 +643,65 @@ mod tests {
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Rgb);
         assert_eq!(desc.data.as_cpu().unwrap(), &[0xFF, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn decode_raw_gray_decode_inverted() {
+        // A 2-pixel DeviceGray image with Decode=[1,0].
+        // Sample 0 maps to white (0xFF → inverted to 0x00), sample 255 to black (0x00).
+        // PDF §8.9.5.2: output = dmin*255 + s*(dmax-dmin) = 255 + s*(-1) = 255-s.
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
+        dict.set(
+            "Decode",
+            Object::Array(vec![Object::Real(1.0), Object::Real(0.0)]),
+        );
+        let data = vec![0u8, 255u8]; // sample 0 → output 255, sample 255 → output 0
+        let desc = decode_raw(
+            &doc,
+            &data,
+            2,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        let pixels = desc.data.as_cpu().unwrap();
+        assert_eq!(pixels[0], 255, "sample 0 with Decode=[1,0] must map to 255");
+        assert_eq!(pixels[1], 0, "sample 255 with Decode=[1,0] must map to 0");
+    }
+
+    #[test]
+    fn decode_raw_gray_decode_identity_unchanged() {
+        // Explicit Decode=[0,1] is identity — output must equal input exactly.
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        dict.set("BitsPerComponent", Object::Integer(8));
+        dict.set(
+            "Decode",
+            Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+        );
+        let data = vec![128u8];
+        let desc = decode_raw(
+            &doc,
+            &data,
+            1,
+            1,
+            false,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        assert_eq!(desc.data.as_cpu().unwrap()[0], 128);
     }
 }

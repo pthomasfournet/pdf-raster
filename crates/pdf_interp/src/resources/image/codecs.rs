@@ -1039,7 +1039,12 @@ pub(super) fn cmyk_raw_to_rgb(
 /// PDF JPEG 2000 streams may be raw codestreams (`.j2k`) or full JP2 container
 /// format (`.jp2`).  Both paths auto-detect the format from the stream.
 ///
-/// 16-bit component images are downscaled to 8-bit.  Alpha channels are dropped.
+/// 16-bit component images are downscaled to 8-bit.  Embedded alpha channels are
+/// extracted into `ImageDescriptor::smask` so the compositor can blend them.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per ImageFormat variant; extracting alpha adds 2 lines per alpha-capable arm"
+)]
 pub(super) fn decode_jpx(
     data: &[u8],
     pdf_w: u32,
@@ -1097,9 +1102,11 @@ pub(super) fn decode_jpx(
             let ImagePixelData::La8(pixels) = img_data.data else {
                 unreachable!("jpeg2k: La8 format paired with non-La8 data")
             };
-            // Drop the alpha channel — keep luma bytes (every other byte starting at 0).
-            let gray = pixels.chunks_exact(2).map(|c| c[0]).collect();
-            Some(jpx_gray(jw, jh, gray))
+            let gray: Vec<u8> = pixels.chunks_exact(2).map(|c| c[0]).collect();
+            let alpha: Vec<u8> = pixels.chunks_exact(2).map(|c| c[1]).collect();
+            let mut desc = jpx_gray(jw, jh, gray);
+            desc.smask = Some(alpha);
+            Some(desc)
         }
         ImageFormat::Rgb8 => {
             let ImagePixelData::Rgb8(pixels) = img_data.data else {
@@ -1111,12 +1118,14 @@ pub(super) fn decode_jpx(
             let ImagePixelData::Rgba8(pixels) = img_data.data else {
                 unreachable!("jpeg2k: Rgba8 format paired with non-Rgba8 data")
             };
-            // Drop alpha channel.
-            let rgb = pixels
+            let rgb: Vec<u8> = pixels
                 .chunks_exact(4)
                 .flat_map(|c| [c[0], c[1], c[2]])
                 .collect();
-            Some(jpx_rgb(jw, jh, rgb))
+            let alpha: Vec<u8> = pixels.chunks_exact(4).map(|c| c[3]).collect();
+            let mut desc = jpx_rgb(jw, jh, rgb);
+            desc.smask = Some(alpha);
+            Some(desc)
         }
         ImageFormat::L16 => {
             let ImagePixelData::L16(pixels) = img_data.data else {
@@ -1130,9 +1139,11 @@ pub(super) fn decode_jpx(
             let ImagePixelData::La16(pixels) = img_data.data else {
                 unreachable!("jpeg2k: La16 format paired with non-La16 data")
             };
-            // Drop alpha; downscale luma.
-            let gray = pixels.chunks_exact(2).map(|c| (c[0] >> 8) as u8).collect();
-            Some(jpx_gray(jw, jh, gray))
+            let gray: Vec<u8> = pixels.chunks_exact(2).map(|c| (c[0] >> 8) as u8).collect();
+            let alpha: Vec<u8> = pixels.chunks_exact(2).map(|c| (c[1] >> 8) as u8).collect();
+            let mut desc = jpx_gray(jw, jh, gray);
+            desc.smask = Some(alpha);
+            Some(desc)
         }
         ImageFormat::Rgb16 => {
             let ImagePixelData::Rgb16(pixels) = img_data.data else {
@@ -1145,12 +1156,14 @@ pub(super) fn decode_jpx(
             let ImagePixelData::Rgba16(pixels) = img_data.data else {
                 unreachable!("jpeg2k: Rgba16 format paired with non-Rgba16 data")
             };
-            // Drop alpha; downscale RGB.
-            let rgb = pixels
+            let rgb: Vec<u8> = pixels
                 .chunks_exact(4)
                 .flat_map(|c| [(c[0] >> 8) as u8, (c[1] >> 8) as u8, (c[2] >> 8) as u8])
                 .collect();
-            Some(jpx_rgb(jw, jh, rgb))
+            let alpha: Vec<u8> = pixels.chunks_exact(4).map(|c| (c[3] >> 8) as u8).collect();
+            let mut desc = jpx_rgb(jw, jh, rgb);
+            desc.smask = Some(alpha);
+            Some(desc)
         }
     }
 }
@@ -1562,5 +1575,19 @@ mod tests {
             let result = decode_dct_gpu_path(&[], 2, 2, &mut dec);
             assert!(result.is_none());
         }
+    }
+
+    // ── jpx_gray / jpx_rgb helpers ────────────────────────────────────────────
+
+    #[test]
+    fn jpx_gray_smask_none_by_default() {
+        let desc = jpx_gray(2, 2, vec![0u8; 4]);
+        assert!(desc.smask.is_none(), "jpx_gray must not inject a smask");
+    }
+
+    #[test]
+    fn jpx_rgb_smask_none_by_default() {
+        let desc = jpx_rgb(2, 2, vec![0u8; 12]);
+        assert!(desc.smask.is_none(), "jpx_rgb must not inject a smask");
     }
 }
