@@ -20,17 +20,10 @@ pub mod decoder;
 pub mod device_image;
 mod dispatch_util;
 mod error;
+#[cfg(feature = "gpu-jpeg-huffman")]
+pub(crate) mod huffman;
 mod jpeg_framing;
-// huffman + phase1_oracle are test-only today (oracle-comparison
-// tests against the GPU dispatcher); promote when production
-// callers integrate the Phase 1 decode path. The huffman dispatcher
-// needs a real CUDA device, hence the gpu-validation gate; the
-// SubsequenceState type it owns is also re-imported by
-// phase1_oracle, which is why that one is plain `#[cfg(test)]`.
-#[cfg(all(test, feature = "gpu-validation"))]
-mod huffman;
-#[cfg(test)]
-mod phase1_oracle;
+pub(crate) mod phase1_oracle;
 #[cfg(test)]
 mod phase2_oracle;
 #[cfg(feature = "gpu-jpeg-huffman")]

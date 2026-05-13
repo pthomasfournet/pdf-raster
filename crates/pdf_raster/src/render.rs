@@ -706,54 +706,91 @@ fn lend_decoders(
     let _ = renderer;
 
     #[cfg(feature = "gpu-jpeg-huffman")]
-    if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
-        // Vulkan wins Auto when a Vulkan backend is available.
-        #[cfg(feature = "vulkan")]
-        let vulkan_active = matches!(effective_policy, BackendPolicy::ForceVulkan)
-            || (matches!(effective_policy, BackendPolicy::Auto) && session.vk_backend.is_some());
-        #[cfg(not(feature = "vulkan"))]
-        let vulkan_active = false;
-
-        if vulkan_active {
-            #[cfg(feature = "vulkan")]
+    {
+        let dispatch_huffman = {
+            #[cfg(feature = "vaapi")]
             {
-                gpu_init::ensure_jpeg_vk_huffman(effective_policy)
+                !matches!(effective_policy, BackendPolicy::ForceVaapi)
+            }
+            #[cfg(not(feature = "vaapi"))]
+            {
+                true
+            }
+        };
+        if dispatch_huffman {
+            // Vulkan wins Auto when a Vulkan backend is available.
+            #[cfg(feature = "vulkan")]
+            let vulkan_active = matches!(effective_policy, BackendPolicy::ForceVulkan)
+                || (matches!(effective_policy, BackendPolicy::Auto)
+                    && session.vk_backend.is_some());
+            #[cfg(not(feature = "vulkan"))]
+            let vulkan_active = false;
+
+            if vulkan_active {
+                #[cfg(feature = "vulkan")]
+                {
+                    gpu_init::ensure_jpeg_vk_huffman(effective_policy)
+                        .map_err(RasterError::BackendUnavailable)?;
+                    gpu_init::JPEG_VK_DEC.with(|cell| {
+                        if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
+                            renderer.set_jpeg_vk(slot.take());
+                        }
+                    });
+                }
+            } else {
+                gpu_init::ensure_jpeg_gpu_huffman(effective_policy)
                     .map_err(RasterError::BackendUnavailable)?;
-                gpu_init::JPEG_VK_DEC.with(|cell| {
+                gpu_init::JPEG_CUDA_DEC.with(|cell| {
                     if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
-                        renderer.set_jpeg_vk(slot.take());
+                        renderer.set_jpeg_gpu(slot.take());
                     }
                 });
             }
-        } else {
-            gpu_init::ensure_jpeg_gpu_huffman(effective_policy)
-                .map_err(RasterError::BackendUnavailable)?;
-            gpu_init::JPEG_CUDA_DEC.with(|cell| {
-                if let gpu_init::JpegGpuInit::Ready(slot) = &mut *cell.borrow_mut() {
-                    renderer.set_jpeg_gpu(slot.take());
+        }
+    }
+
+    #[cfg(feature = "nvjpeg")]
+    {
+        let dispatch_nvjpeg = {
+            #[cfg(feature = "vaapi")]
+            {
+                !matches!(effective_policy, BackendPolicy::ForceVaapi)
+            }
+            #[cfg(not(feature = "vaapi"))]
+            {
+                true
+            }
+        };
+        if dispatch_nvjpeg {
+            gpu_init::ensure_nvjpeg(effective_policy).map_err(RasterError::BackendUnavailable)?;
+            gpu_init::NVJPEG_DEC.with(|cell| {
+                if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+                    renderer.set_nvjpeg(slot.take());
                 }
             });
         }
     }
 
-    #[cfg(feature = "nvjpeg")]
-    if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
-        gpu_init::ensure_nvjpeg(effective_policy).map_err(RasterError::BackendUnavailable)?;
-        gpu_init::NVJPEG_DEC.with(|cell| {
-            if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
-                renderer.set_nvjpeg(slot.take());
-            }
-        });
-    }
-
     #[cfg(feature = "nvjpeg2k")]
-    if !matches!(effective_policy, BackendPolicy::ForceVaapi) {
-        gpu_init::ensure_nvjpeg2k(effective_policy).map_err(RasterError::BackendUnavailable)?;
-        gpu_init::NVJPEG2K_DEC.with(|cell| {
-            if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
-                renderer.set_nvjpeg2k(slot.take());
+    {
+        let dispatch_nvjpeg2k = {
+            #[cfg(feature = "vaapi")]
+            {
+                !matches!(effective_policy, BackendPolicy::ForceVaapi)
             }
-        });
+            #[cfg(not(feature = "vaapi"))]
+            {
+                true
+            }
+        };
+        if dispatch_nvjpeg2k {
+            gpu_init::ensure_nvjpeg2k(effective_policy).map_err(RasterError::BackendUnavailable)?;
+            gpu_init::NVJPEG2K_DEC.with(|cell| {
+                if let gpu_init::DecoderInit::Ready(slot) = &mut *cell.borrow_mut() {
+                    renderer.set_nvjpeg2k(slot.take());
+                }
+            });
+        }
     }
 
     #[cfg(feature = "vaapi")]

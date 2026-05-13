@@ -16,11 +16,18 @@ mod corpus;
 use crate::backend::params::{HUFFMAN_CODEBOOK_ENTRIES, HuffmanParams, HuffmanPhase};
 use crate::backend::{BackendError, GpuBackend, Result};
 use crate::jpeg::CanonicalCodebook;
+#[cfg(feature = "gpu-validation")]
 use crate::jpeg_decoder::PackedBitstream;
 use crate::jpeg_decoder::dispatch_util::DeviceBufferGuard;
 use crate::jpeg_decoder::phase1_oracle::SubsequenceState;
-#[cfg(feature = "gpu-validation")]
-use crate::jpeg_decoder::phase2_oracle::{Phase2Outcome, retry_bound as phase2_retry_bound};
+#[cfg(test)]
+use crate::jpeg_decoder::phase2_oracle::Phase2Outcome;
+
+/// `2 × ⌈log₂(n)⌉` — upper bound on Phase 2 iterations for `n` subsequences.
+const fn phase2_retry_bound(num_subsequences: usize) -> u32 {
+    let pow2_exp = num_subsequences.next_power_of_two().trailing_zeros();
+    2u32.saturating_mul(pow2_exp)
+}
 
 /// Flatten an iterator of `&CanonicalCodebook` into the GPU layout:
 /// `u32[num_components * 65536]`, each entry packing `(num_bits << 8) | symbol`.
@@ -39,6 +46,7 @@ fn flatten_codebooks<'a>(
     out
 }
 
+#[cfg(feature = "gpu-validation")]
 #[must_use]
 fn build_gpu_codebook(codebooks: &[CanonicalCodebook]) -> Vec<u32> {
     flatten_codebooks(codebooks.iter())
@@ -58,6 +66,7 @@ fn build_gpu_codebook_refs(codebooks: &[&CanonicalCodebook]) -> Vec<u32> {
 /// # Errors
 /// Returns `BackendError` for any alloc / upload / dispatch / download
 /// failure, or if `build_mcu_schedule` rejects an out-of-range selector.
+#[cfg(feature = "gpu-validation")]
 fn dispatch_jpeg_phase1_intra_sync<B: GpuBackend>(
     backend: &B,
     prep: &crate::jpeg_decoder::JpegPreparedInput,
@@ -302,12 +311,15 @@ fn dispatch_jpeg_phase1_then_phase2<B: GpuBackend>(
 /// Returns `BackendError` if any allocation, upload, kernel dispatch,
 /// or download fails, or if Phase 2 does not converge within the retry
 /// bound.
-#[cfg(feature = "gpu-validation")]
 #[expect(
     clippy::too_many_lines,
     reason = "linear 4-phase procedural script; same rationale as dispatch_phase1_through_phase4"
 )]
-fn dispatch_jpeg_phase1_through_phase4<B: GpuBackend>(
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is intentional: parent module is pub(crate); inner items need explicit visibility for documentation and grepping"
+)]
+pub(crate) fn dispatch_jpeg_phase1_through_phase4<B: GpuBackend>(
     backend: &B,
     prep: &crate::jpeg_decoder::JpegPreparedInput,
     subsequence_bits: u32,
@@ -434,18 +446,18 @@ fn dispatch_jpeg_phase1_through_phase4<B: GpuBackend>(
     let handle = backend.download_async(s_info_buf.as_ref(), dst)?;
     backend.wait_download(handle)?;
 
-    let counts: Vec<u32> = s_info_host.iter().map(|s| s.n).collect();
-    let offsets_host = crate::jpeg_decoder::scan::test_helpers::cpu_exclusive_scan(&counts);
-    let total_symbols = offsets_host
-        .last()
-        .copied()
-        .unwrap_or(0)
-        .checked_add(s_info_host.last().map_or(0, |s| s.n))
-        .ok_or_else(|| {
+    // Phase 3: CPU exclusive prefix scan over per-subsequence symbol counts.
+    let mut offsets_host = Vec::<u32>::with_capacity(s_info_host.len());
+    let mut running: u32 = 0;
+    for s in &s_info_host {
+        offsets_host.push(running);
+        running = running.checked_add(s.n).ok_or_else(|| {
             BackendError::msg(
                 "dispatch_jpeg_phase1_through_phase4: total symbol count overflows u32",
             )
         })?;
+    }
+    let total_symbols = running;
 
     if total_symbols == 0 {
         return Ok(Vec::new());
@@ -526,6 +538,7 @@ fn dispatch_jpeg_phase1_through_phase4<B: GpuBackend>(
 /// Returns `BackendError` for invalid arguments, or the underlying
 /// driver error if any allocation, upload, dispatch, or download
 /// fails.
+#[cfg(feature = "gpu-validation")]
 fn dispatch_phase1_intra_sync<B: GpuBackend>(
     backend: &B,
     stream: &PackedBitstream,

@@ -1,7 +1,14 @@
 //! `JpegGpuDecoder` — end-to-end JPEG → RGBA8 device image.
 //!
-//! CPU pre-pass (`prepare_jpeg`) + CPU AC coefficient extraction +
+//! CPU pre-pass (`prepare_jpeg`) + GPU Phases 1–4 (parallel Huffman) +
+//! CPU magnitude-bit extraction (`symbols_to_coefficients`) +
 //! GPU Phase 5 (IDCT + dequant + colour conversion).
+//!
+//! The GPU Huffman path (feature `gpu-jpeg-huffman`) replaces the
+//! sequential CPU Huffman walk with a parallel GPU pass; magnitude bits
+//! are still extracted on the CPU in a single sequential pass, but the
+//! CPU does no Huffman table lookups — only bit reads guided by the
+//! symbol stream the GPU produced.
 
 use crate::backend::params::IdctParams;
 use crate::backend::{BackendError as BackendErr, GpuBackend};
@@ -37,6 +44,10 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
     /// # Errors
     /// Returns `JpegGpuError` if the input is not a supported baseline JPEG,
     /// if coefficient extraction fails, or if any GPU operation fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "GPU Huffman dispatch + CPU fallback + IDCT launch; splitting obscures the linear flow"
+    )]
     pub fn decode(&self, jpeg_bytes: &[u8]) -> std::result::Result<DeviceImage<B>, JpegGpuError> {
         let prep = prepare_jpeg(jpeg_bytes)?;
 
@@ -83,8 +94,54 @@ impl<B: GpuBackend> JpegGpuDecoder<B> {
             }
         }
 
-        let (coef_flat, dc_flat, qt_flat, num_qtables) =
-            extract_coefficients(&prep).map_err(JpegGpuError::HeaderParse)?;
+        // Attempt the GPU Phases 1–4 parallel-Huffman path.  On any error
+        // (Phase 2 non-convergence, backend dispatch failure, or symbol-stream
+        // inconsistency) fall through to the CPU sequential path below.
+        let gpu_coefs: Option<(Vec<i32>, Vec<i32>)> = {
+            #[cfg(feature = "gpu-jpeg-huffman")]
+            {
+                let subseq_bits = crate::jpeg_decoder::pick_subsequence_size(&prep);
+                crate::jpeg_decoder::huffman::dispatch_jpeg_phase1_through_phase4(
+                    &self.backend,
+                    &prep,
+                    subseq_bits,
+                )
+                .ok()
+                .and_then(|symbols| symbols_to_coefficients(&prep, &symbols).ok())
+            }
+            #[cfg(not(feature = "gpu-jpeg-huffman"))]
+            {
+                None
+            }
+        };
+
+        let (coef_flat, dc_flat, qt_flat, num_qtables) = if let Some((coef, dc)) = gpu_coefs {
+            // GPU Huffman path succeeded; build qt_flat from prep.
+            let mut qt_flat = Vec::<i32>::with_capacity(4 * 64);
+            let mut num_qtables = 0u32;
+            for (qi, qt) in prep.quant_tables.iter().enumerate() {
+                if let Some(qt) = qt {
+                    if qt.values.len() != 64 {
+                        return Err(JpegGpuError::HeaderParse(format!(
+                            "quant table {qi} has {} entries (expected 64)",
+                            qt.values.len()
+                        )));
+                    }
+                    for &v in &qt.values {
+                        qt_flat.push(i32::from(v));
+                    }
+                    num_qtables += 1;
+                }
+            }
+            if qt_flat.is_empty() {
+                return Err(JpegGpuError::HeaderParse(
+                    "no quantisation tables in JPEG".to_owned(),
+                ));
+            }
+            (coef, dc, qt_flat, num_qtables)
+        } else {
+            extract_coefficients(&prep).map_err(JpegGpuError::HeaderParse)?
+        };
 
         let width = u32::from(prep.width);
         let height = u32::from(prep.height);
@@ -389,6 +446,152 @@ fn extract_coefficients(
 /// Interleaved: `h_sampling` × `v_sampling`.
 const fn blocks_permcu_count(comp: JpegFrameComponent) -> usize {
     (comp.h_sampling as usize) * (comp.v_sampling as usize)
+}
+
+/// Reconstruct AC coefficient arrays from a GPU-decoded symbol stream.
+///
+/// The GPU Phase 4 output contains Huffman symbol bytes only — no magnitude
+/// bits. This function does a single sequential pass over the raw bitstream,
+/// consuming only the magnitude bits interleaved between codewords; it
+/// performs no Huffman table lookups.
+///
+/// Returns `(coef_flat, dc_flat)`:
+/// - `coef_flat`: `num_components × blocks_per_comp × 64` i32 in zigzag order.
+///   DC coefficient at index 0 of each block is filled from `prep.dc_values`;
+///   AC coefficients 1..63 come from the symbol stream + magnitude bits.
+/// - `dc_flat`: `num_components × blocks_per_comp` i32 (absolute DC values
+///   from the CPU pre-pass, copied directly from `prep.dc_values`).
+///
+/// Returns `Err(String)` if the symbol stream length doesn't match the
+/// expected MCU count, or if magnitude bits overflow the bitstream.
+#[expect(
+    clippy::too_many_lines,
+    reason = "DC + AC magnitude walk + dc_flat copy; same structure as extract_coefficients"
+)]
+fn symbols_to_coefficients(
+    prep: &JpegPreparedInput,
+    symbols: &[u32],
+) -> std::result::Result<(Vec<i32>, Vec<i32>), String> {
+    let num_comp = prep.components.len();
+    let blocks_wide = usize::from(prep.width.div_ceil(8));
+    let blocks_high = usize::from(prep.height.div_ceil(8));
+    let blocks_per_comp = blocks_wide * blocks_high;
+
+    let mut coef_flat = vec![0i32; num_comp * blocks_per_comp * 64];
+
+    // Reconstruct the raw byte stream for magnitude bit extraction.
+    let raw_bytes: Vec<u8> = prep
+        .bitstream
+        .words
+        .iter()
+        .flat_map(|w| w.to_be_bytes())
+        .collect();
+    let mut bits = BitReader::new(&raw_bytes);
+
+    let totalmcus = mcu_count(prep.width, prep.height, &prep.components);
+    let mut block_counts = vec![0usize; num_comp];
+    let mut sym_idx = 0usize;
+
+    for mcu in 0..totalmcus {
+        for (ci, comp) in prep.components.iter().enumerate() {
+            let bpm = blocks_permcu_count(*comp);
+            for _b in 0..bpm {
+                let block_idx = block_counts[ci];
+                let coef_base = (ci * blocks_per_comp + block_idx) * 64;
+                block_counts[ci] += 1;
+
+                // DC: consume the DC symbol from the stream.  The magnitude bits
+                // in the bitstream must be consumed to keep the bit position
+                // aligned with the AC symbols that follow.
+                if sym_idx >= symbols.len() {
+                    return Err(format!(
+                        "symbol stream too short at DC (mcu={mcu} comp={ci})"
+                    ));
+                }
+                let dc_sym = (symbols[sym_idx] & 0xFF) as u8;
+                sym_idx += 1;
+                let category = dc_sym;
+                if category > 0 {
+                    let _ = bits.read_bits(usize::from(category)).ok_or_else(|| {
+                        format!("DC magnitude truncated (mcu={mcu} comp={ci} cat={category})")
+                    })?;
+                }
+                // DC coefficient value comes from the CPU-resolved chain; coef[0] is left 0
+                // and dc_flat is filled separately below.
+
+                // AC: read each symbol + magnitude bits until EOB or 63 slots filled.
+                let mut zz = 1usize;
+                while zz < 64 {
+                    if sym_idx >= symbols.len() {
+                        return Err(format!(
+                            "symbol stream too short at AC (mcu={mcu} comp={ci} zz={zz})"
+                        ));
+                    }
+                    let sym_byte = (symbols[sym_idx] & 0xFF) as u8;
+                    sym_idx += 1;
+
+                    if sym_byte == 0x00 {
+                        // EOB: remaining ACs are zero (already initialised).
+                        break;
+                    }
+                    if sym_byte == 0xF0 {
+                        // ZRL: 16 zeros, no magnitude bits.
+                        zz += 16;
+                        continue;
+                    }
+                    let run = (sym_byte >> 4) as usize;
+                    let size = sym_byte & 0x0F;
+                    zz += run;
+                    if zz >= 64 {
+                        break;
+                    }
+                    let ac_val = if size == 0 {
+                        0i32
+                    } else {
+                        let raw = bits.read_bits(usize::from(size)).ok_or_else(|| {
+                            format!(
+                                "AC magnitude truncated (mcu={mcu} comp={ci} zz={zz} size={size})"
+                            )
+                        })?;
+                        jpeg_extend(raw.cast_signed(), size)
+                    };
+                    if coef_base + zz >= coef_flat.len() {
+                        return Err(format!(
+                            "coefficient overflow: coef_base={coef_base} zz={zz} \
+                             coef_flat.len()={} (mcu={mcu} comp={ci})",
+                            coef_flat.len()
+                        ));
+                    }
+                    coef_flat[coef_base + zz] = ac_val;
+                    zz += 1;
+                }
+            }
+        }
+    }
+
+    // DC values: pre-resolved absolute DC chain from the pre-pass.
+    let mut dc_flat = vec![0i32; num_comp * blocks_per_comp];
+    for (ci, dc_vec) in prep
+        .dc_values
+        .per_component
+        .iter()
+        .take(num_comp)
+        .enumerate()
+    {
+        let base = ci * blocks_per_comp;
+        for (bi, &dc) in dc_vec.iter().enumerate() {
+            let idx = base + bi;
+            if idx >= dc_flat.len() {
+                return Err(format!(
+                    "dc_values overflow: comp={ci} block={bi} idx={idx} dc_flat.len()={}",
+                    dc_flat.len()
+                ));
+            }
+            dc_flat[idx] = dc;
+        }
+    }
+
+    Ok((coef_flat, dc_flat))
 }
 
 /// JPEG EXTEND: sign-extend an `nbits`-wide magnitude into a signed integer.

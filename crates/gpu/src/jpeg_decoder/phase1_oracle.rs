@@ -27,10 +27,11 @@
 //! `phase1_walk` / `phase1_walk_snapshot` are the *synthetic*-stream
 //! equivalents used by the original cross-subsequence oracle tests.
 
-#![cfg(test)]
-
+#[cfg(test)]
 use crate::jpeg::CanonicalCodebook;
+#[cfg(test)]
 use crate::jpeg_decoder::PackedBitstream;
+#[cfg(test)]
 use crate::jpeg_decoder::bitstream::peek16;
 
 /// Per-subsequence decoder state.
@@ -62,6 +63,7 @@ unsafe impl bytemuck::Pod for SubsequenceState {}
 ///
 /// Useful for diagnostics in tests; matches what the GPU kernel
 /// would observe when it falls out of its decode loop.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase1Stop {
     /// Reached `hard_limit` cleanly (the normal exit).
@@ -85,6 +87,7 @@ pub(super) enum Phase1Stop {
 /// variants match the kernel's two early-exit conditions and let the
 /// caller decide whether to stop (Phase 1's walk) or skip (Phase 2's
 /// inter-sync, which leaves `state.p` unchanged on miss).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepOutcome {
     /// One symbol decoded; `state` is the post-advance state.
@@ -107,6 +110,7 @@ pub(super) enum StepOutcome {
 /// Same per-symbol arithmetic as `phase1_walk`'s inner loop; lifted
 /// out so Phase 2's inter-sync oracle (which advances one symbol per
 /// retry pass) can share the codepath.
+#[cfg(test)]
 pub(super) fn try_decode_one_symbol(
     state: SubsequenceState,
     bitstream: &PackedBitstream,
@@ -156,6 +160,7 @@ pub(super) fn try_decode_one_symbol(
 /// # Panics
 /// Panics if `tables` is empty (caller bug — Phase 1 always has at
 /// least one component-keyed codetable).
+#[cfg(test)]
 pub(super) fn phase1_walk(
     bitstream: &PackedBitstream,
     tables: &[CanonicalCodebook],
@@ -185,6 +190,7 @@ pub(super) fn phase1_walk(
     }
 }
 
+#[cfg(test)]
 /// Run Phase 1's decode walk and return the **boundary snapshot**:
 /// the (p, n, c, z) state captured at the first decode whose
 /// post-advance `p` crosses `count_to`. This is what the GPU
@@ -238,6 +244,7 @@ pub(super) fn phase1_walk_snapshot(
     }
 }
 
+#[cfg(test)]
 /// CPU oracle for the JPEG-framed Phase 1 intra-sync walk.
 ///
 /// Mirrors `jpeg_phase1_intra_sync` (CUDA) / `phase1_jpeg_intra_sync` (Slang)
