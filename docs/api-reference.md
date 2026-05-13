@@ -60,9 +60,18 @@ If the `Receiver` is dropped before the producer finishes, the producer exits cl
 
 ---
 
-### `open_session` / `render_page_rgb`
+### `pdf_raster::session` module
 
-Lower-level API for parallel consumers (e.g. the CLI uses this with Rayon).
+Lower-level API for explicit control over PDF opening and per-page rendering. All items are also re-exported at the crate root for backward compatibility.
+
+```rust
+pub mod session {
+    pub use super::{
+        open_session, prescan_session, render_page_rgb,
+        render_page_rgb_hinted, rgb_to_gray,
+    };
+}
+```
 
 ```rust
 pub fn open_session(path: &Path, config: &SessionConfig) -> Result<RasterSession, RasterError>
@@ -88,6 +97,17 @@ pub fn rgb_to_gray(src: &Bitmap<Rgb8>) -> Bitmap<Gray8>
 
 BT.709 luminance conversion: `Y = 0.2126·R + 0.7152·G + 0.0722·B`.
 
+```rust
+pub fn prescan_session(
+    session: &RasterSession,
+    page_num: u32,
+) -> Result<PageDiagnostics, RasterError>
+```
+
+Classifies page `page_num` without rendering any pixels. Returns `PageDiagnostics` with image/text presence, dominant filter, and a PPI hint. Use this before `render_page_rgb` to choose the backend policy (e.g. skip GPU init for vector-only pages).
+
+Errors with `RasterError::PageOutOfRange` or `RasterError::InvalidPageGeometry` if the page is invalid.
+
 ---
 
 ### `RasterSession`
@@ -97,6 +117,8 @@ pub struct RasterSession { /* opaque */ }
 
 impl RasterSession {
     pub const fn total_pages(&self) -> u32
+    pub const fn policy(&self) -> BackendPolicy
+    // doc() and resolve_page() are #[doc(hidden)] — use prescan_session instead
 }
 ```
 
@@ -124,6 +146,15 @@ pub struct RasterOptions {
 | `last_page` | `≥ first_page` | 1-based inclusive. Clamped to document length silently. Ignored when `pages` is `Some`. |
 | `deskew` | — | Applies intensity-weighted projection-profile deskew (±7°, sub-0.05° accuracy). Disable for native-text PDFs. |
 | `pages` | — | When `Some`, only the pages in the `PageSet` are rendered; `first_page`/`last_page` are ignored. |
+
+**Default:** `RasterOptions` implements `Default`:
+
+```rust
+// Short form (dpi only, everything else defaults)
+let opts = RasterOptions { dpi: 150.0, ..RasterOptions::default() };
+```
+
+Defaults: `dpi = 300.0`, `first_page = 1`, `last_page = u32::MAX`, `deskew = false`, `pages = None`.
 
 ---
 
@@ -233,13 +264,14 @@ pub enum BackendPolicy {
     Auto,        // GPU when available, silent CPU fallback (default)
     CpuOnly,     // Skip all GPU init entirely
     ForceCuda,   // Require CUDA; error if unavailable
-    ForceVaapi,  // Require VA-API JPEG; error if unavailable
+    #[cfg(feature = "vaapi")]
+    ForceVaapi,  // Require VA-API JPEG; error if unavailable — only when `vaapi` feature is enabled
     ForceVulkan, // Require the Vulkan compute backend; error if unavailable
                  // (or if the binary was built without `--features vulkan`)
 }
 ```
 
-Controls which compute backend is used. `Auto` matches pre-v0.4.0 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active.
+Controls which compute backend is used. `Auto` matches pre-v0.4.0 behaviour. The `Force*` variants convert silent GPU fallbacks into hard `RasterError::BackendUnavailable` errors so you know immediately whether the expected hardware path is actually active. `ForceVaapi` is only present when the `vaapi` Cargo feature is enabled.
 
 `ForceVulkan` runs the AA-fill, tile-fill, and parallel-Huffman JPEG decode kernels on the Vulkan compute backend (cross-vendor: NVIDIA, AMD, Intel, Apple via `MoltenVK`).  The device-resident image cache is CUDA-only, so under `ForceVulkan` the renderer runs uncached; ICC CMYK→RGB stays on the CPU AVX-512 fallback.  JPEG dispatch goes through the GPU parallel-Huffman path (currently dormant: GPU_JPEG_HUFFMAN_THRESHOLD_PX = u32::MAX).
 
@@ -248,16 +280,46 @@ Controls which compute backend is used. `Auto` matches pre-v0.4.0 behaviour. The
 ### `SessionConfig`
 
 ```rust
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub policy: BackendPolicy,
     pub vaapi_device: String,  // default: "/dev/dri/renderD128"
+    // `prefetch: bool` exists only when `cache` feature is enabled
 }
 
 impl Default for SessionConfig { /* Auto policy, default DRM node */ }
 ```
 
-Passed to `open_session`. Use `SessionConfig::default()` for the automatic behaviour. Set `vaapi_device` to override the VA-API DRM render node (useful when `/dev/dri/renderD128` is not the correct device on your system).
+Passed to `open_session`. `SessionConfig` is `#[non_exhaustive]` — construct it via `SessionConfig::default()` or `SessionConfig::with_policy(policy)`, not a struct literal. This is required because the `prefetch` field only exists when the `cache` Cargo feature is enabled. Set `vaapi_device` to override the VA-API DRM render node (useful when `/dev/dri/renderD128` is not the correct device on your system).
+
+---
+
+### `deskew` module
+
+The `deskew` module exposes a limited public API:
+
+- `deskew::apply` — applies a deskew angle to a bitmap.
+- `deskew::DeskewError` — error type returned by `apply`.
+
+The `deskew::detect` and `deskew::rotate` submodules are `pub(crate)` and are not part of the public API.
+
+---
+
+### `release_gpu_decoders`
+
+```rust
+pub fn release_gpu_decoders()
+```
+
+Eagerly drops GPU decoder state (nvJPEG, nvJPEG2000, Vulkan Huffman) on the calling rayon worker thread. Call via `pool.broadcast` before dropping the pool:
+
+```rust
+let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
+drop(pool);
+```
+
+No-op when none of the GPU decoder features (`nvjpeg`, `nvjpeg2k`, `gpu-jpeg-huffman + vulkan`) are compiled in. Never panics.
 
 ---
 
