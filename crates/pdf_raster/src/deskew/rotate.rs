@@ -39,6 +39,10 @@ use super::DeskewError;
 /// Currently always returns `Ok(())` — the CPU path cannot fail beyond OOM
 /// (which panics).  The return type is `Result` to accommodate future GPU-only
 /// configurations where CPU fallback may not be available.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Result kept for future GPU-only configurations where CPU fallback may not be available"
+)]
 pub fn rotate_inplace(img: &mut Bitmap<Gray8>, angle_deg: f32) -> Result<(), DeskewError> {
     #[cfg(feature = "gpu-deskew")]
     match rotate_gpu(img, angle_deg) {
@@ -346,7 +350,7 @@ fn dispatch_rotate_row(dst_row: &mut [u8], src: &Bitmap<Gray8>, p: &RowParams) {
     clippy::similar_names,
     reason = "sx_*/sy_* are paired coordinate variables; renaming would obscure the symmetry"
 )]
-pub(crate) fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
+pub fn rotate_cpu(src: &Bitmap<Gray8>, angle_deg: f32) -> Bitmap<Gray8> {
     let w = src.width as usize;
     let h = src.height as usize;
 
