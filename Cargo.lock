@@ -502,22 +502,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpu"
-version = "1.0.0"
-dependencies = [
- "ash",
- "blake3",
- "bytemuck",
- "cudarc",
- "dashmap",
- "gpu-allocator",
- "log",
- "rasterrocket-color",
- "tempfile",
- "zune-jpeg",
-]
-
-[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1015,7 +999,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rasterrocket"
 version = "1.0.0"
 dependencies = [
- "gpu",
  "log",
  "rasterrocket",
  "rasterrocket-color",
@@ -1068,13 +1051,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterrocket-gpu"
+version = "1.0.0"
+dependencies = [
+ "ash",
+ "blake3",
+ "bytemuck",
+ "cudarc",
+ "dashmap",
+ "gpu-allocator",
+ "log",
+ "rasterrocket-color",
+ "tempfile",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "rasterrocket-interp"
 version = "1.0.0"
 dependencies = [
- "bytemuck",
  "env_logger",
  "fax",
- "gpu",
  "hayro-ccitt",
  "hayro-jbig2",
  "jpeg2k",

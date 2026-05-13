@@ -46,22 +46,22 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libfreetype6-dev
 
       - name: Build CLI (CPU-only, release)
-        run: cargo build --release -p pdf-raster
+        run: cargo build --release -p rasterrocket-cli
 
-      - name: Test pdf_interp (resource decoding, CPU paths)
-        run: cargo test -p pdf_interp --lib
+      - name: Test rasterrocket-interp (resource decoding, CPU paths)
+        run: cargo test -p rasterrocket-interp --lib
 
-      - name: Test raster (full unit suite — SIMD dispatch, fill, blend, popcnt)
-        run: cargo test -p raster --lib
+      - name: Test rasterrocket-render (full unit suite — SIMD dispatch, fill, blend, popcnt)
+        run: cargo test -p rasterrocket-render --lib
 
-      - name: Test gpu (CMYK matrix — AVX2 and scalar parity)
-        run: cargo test -p gpu --lib -- cmyk
+      - name: Test rasterrocket-gpu (CMYK matrix — AVX2 and scalar parity)
+        run: cargo test -p rasterrocket-gpu --lib -- cmyk
 
-      - name: Test pdf_raster (deskew, render helpers)
-        run: cargo test -p pdf_raster --lib
+      - name: Test rasterrocket (deskew, render helpers)
+        run: cargo test -p rasterrocket --lib
 
       - name: Clippy (no GPU features)
-        run: cargo clippy -p pdf_interp -p raster -p gpu -p pdf_raster -- -D warnings
+        run: cargo clippy -p rasterrocket-interp -p rasterrocket-render -p rasterrocket-gpu -p rasterrocket -- -D warnings
 
   # ── aarch64 cross-check ───────────────────────────────────────────────────
   #
@@ -99,24 +99,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-aarch64-
 
-      - name: Check raster (stable, NEON)
-        run: cargo check -p raster --target aarch64-unknown-linux-gnu
+      - name: Check rasterrocket-render (stable, NEON)
+        run: cargo check -p rasterrocket-render --target aarch64-unknown-linux-gnu
 
-      - name: Check raster (nightly, NEON + SVE2)
-        run: cargo +nightly check -p raster --target aarch64-unknown-linux-gnu --features nightly-sve2
+      - name: Check rasterrocket-render (nightly, NEON + SVE2)
+        run: cargo +nightly check -p rasterrocket-render --target aarch64-unknown-linux-gnu --features nightly-sve2
 
-      - name: Check gpu (stable, NEON CMYK path)
-        run: cargo check -p gpu --target aarch64-unknown-linux-gnu
+      - name: Check rasterrocket-gpu (stable, NEON CMYK path)
+        run: cargo check -p rasterrocket-gpu --target aarch64-unknown-linux-gnu
 
-      # pdf_raster pulls in FreeType + libz C deps that require a cross C
+      # rasterrocket pulls in FreeType + libz C deps that require a cross C
       # compiler (gcc-aarch64-linux-gnu). Install it and check the full crate.
       - name: Install aarch64 cross C toolchain
         run: sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
-      - name: Check pdf_raster (stable, NEON deskew path)
+      - name: Check rasterrocket (stable, NEON deskew path)
         env:
           LIBZ_SYS_STATIC: 1
-        run: cargo check -p pdf_raster --target aarch64-unknown-linux-gnu --features bundled
+        run: cargo check -p rasterrocket --target aarch64-unknown-linux-gnu --features bundled
 
   # ── Format check ──────────────────────────────────────────────────────────
   fmt:

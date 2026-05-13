@@ -1,6 +1,6 @@
 [package]
 publish = false
-name    = "gpu"
+name    = "rasterrocket-gpu"
 version = "1.0.0"
 edition = "2024"
 

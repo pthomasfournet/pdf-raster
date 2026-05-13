@@ -12,49 +12,25 @@ keywords    = ["pdf", "interpreter", "renderer", "fonts", "images"]
 categories  = ["parser-implementations", "rendering", "multimedia::images"]
 
 [features]
-# Enable GPU-accelerated JPEG decoding via nvJPEG for DCTDecode streams.
-# Requires CUDA 12 and a NVIDIA GPU.  Falls back to zune-jpeg when the GPU
-# context is unavailable or the image is below the dispatch threshold.
-nvjpeg = ["gpu/nvjpeg"]
-# Enable GPU-accelerated JPEG 2000 decoding via nvJPEG2000 for JPXDecode streams.
-# Requires libnvjpeg2k.so.  Falls back to jpeg2k/OpenJPEG when GPU is unavailable
-# or the image is below the dispatch threshold.
-nvjpeg2k = ["gpu/nvjpeg2k"]
-# Enable VA-API hardware JPEG decoding for AMD/Intel iGPU and discrete GPU.
-# Requires libva.so.2 and libva-drm.so.2.  Falls back to zune-jpeg when unavailable.
-vaapi = ["gpu/vaapi", "dep:gpu"]
-# Enable GPU supersampled AA fill (64-sample warp-ballot kernel).
-# Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU 4× scanline AA when
-# the fill area is below the dispatch threshold or no GPU is available.
-gpu-aa  = ["dep:gpu"]
-# Enable GPU-accelerated CMYK→RGB colour transform for image decode.
-# Requires CUDA 12 and a NVIDIA GPU.  Falls back to CPU subtractive complement
-# when no GPU context is set or the image is below the dispatch threshold.
-gpu-icc = ["dep:gpu"]
-# Phase 9 device-resident image cache.  Adds the `ImageData::Gpu` variant
-# (Arc<CachedDeviceImage>) and the `decode_dct` cache lookup-or-decode path.
-# Requires CUDA 12 and a NVIDIA GPU.  When off, the renderer compiles with
-# the CPU-only `ImageData::Cpu` arm and the cache module is excluded.
-cache = ["dep:gpu", "gpu/cache"]
-# Vulkan compute backend (Phase 10).  When on, the renderer can route
-# kernel call sites through VulkanBackend instead of GpuCtx; selection
-# happens at runtime via `BackendHandle`.  Implies `gpu-aa` because the
-# Vulkan AA / tile-fill path reuses the segment-flattening helpers in
-# `renderer::page::gpu_ops` (which are gated on `gpu-aa`).
-vulkan = ["dep:gpu", "dep:bytemuck", "gpu/vulkan", "gpu-aa", "gpu-jpeg-huffman"]
-# GPU parallel-Huffman JPEG decoder.  Requires CUDA 12 and a NVIDIA GPU.
-# Falls back to zune-jpeg when the GPU path rejects the input (progressive,
-# subsampled, or unusual component layout).
-gpu-jpeg-huffman = ["dep:gpu", "gpu/gpu-jpeg-huffman"]
 # Build FreeType from source (cross-compilation, static builds).
 bundled = ["font/bundled"]
+# GPU features require building from the git repository where the
+# internal `rasterrocket-gpu` crate is available.  They are not exposed on crates.io.
+# These stubs keep cfg(feature = "…") gates valid at compile time.
+nvjpeg           = []
+nvjpeg2k         = []
+vaapi            = []
+gpu-aa           = []
+gpu-icc          = []
+cache            = []
+vulkan           = []
+gpu-jpeg-huffman = []
 
 [dependencies]
 raster = { package = "rasterrocket-render", path = "../raster", version = "1.0" }
 color  = { package = "rasterrocket-color",  path = "../color",  version = "1.0" }
 font   = { package = "rasterrocket-font",   path = "../font",   version = "1.0" }
 encode = { package = "rasterrocket-encode", path = "../encode", version = "1.0" }
-gpu    = { path = "../gpu", optional = true }
 pdf    = { package = "rasterrocket-parser", path = "../pdf",    version = "1.0" }
 log    = { workspace = true }
 fax = "0.2.6"
@@ -64,7 +40,6 @@ zune-core = "0.5.1"
 jpeg2k      = { version = "0.10.1", default-features = false, features = ["image", "openjpeg-sys"] }
 hayro-jbig2 = { version = "0.3.0", default-features = false }
 moxcms = "0.8.1"
-bytemuck    = { workspace = true, optional = true }
 
 [dev-dependencies]
 env_logger       = { workspace = true }
