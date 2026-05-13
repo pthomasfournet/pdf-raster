@@ -1,11 +1,12 @@
 [package]
+publish = false
 name    = "pdf_bridge"
 version = "1.0.0"
 edition = "2024"
 build   = "build.rs"
 
 [dependencies]
-color = { path = "../color" }
+color = { package = "rasterrocket-color", path = "../color" }
 log   = { workspace = true }
 
 [build-dependencies]

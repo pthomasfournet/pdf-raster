@@ -1,4 +1,5 @@
 [package]
+publish = false
 name    = "bench"
 version = "1.0.0"
 edition = "2024"
@@ -12,12 +13,12 @@ name = "contest_v11"
 path = "src/contest_v11/main.rs"
 
 [dependencies]
-raster     = { path = "../raster" }
-color      = { path = "../color" }
-encode     = { path = "../encode" }
-pdf        = { path = "../pdf" }
-pdf_interp = { path = "../pdf_interp" }
-pdf_raster = { path = "../pdf_raster" }
+raster     = { package = "rasterrocket-render", path = "../raster" }
+color      = { package = "rasterrocket-color",  path = "../color" }
+encode     = { package = "rasterrocket-encode", path = "../encode" }
+pdf        = { package = "rasterrocket-parser", path = "../pdf" }
+pdf_interp = { package = "rasterrocket-interp", path = "../pdf_interp" }
+pdf_raster = { package = "rasterrocket",        path = "../pdf_raster" }
 vello_cpu  = "0.0.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]

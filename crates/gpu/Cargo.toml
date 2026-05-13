@@ -1,4 +1,5 @@
 [package]
+publish = false
 name    = "gpu"
 version = "1.0.0"
 edition = "2024"
@@ -52,7 +53,7 @@ gpu-jpeg-huffman = []
 
 [dependencies]
 cudarc   = { version = "0.19", features = ["cuda-12080"] }
-color    = { path = "../color" }
+color    = { package = "rasterrocket-color", path = "../color" }
 log      = "0.4"
 bytemuck = { workspace = true }
 blake3   = { workspace = true, optional = true }
