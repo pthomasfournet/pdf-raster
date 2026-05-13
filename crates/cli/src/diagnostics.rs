@@ -39,6 +39,8 @@ pub fn report_open_error(e: &RasterError, args: &Args, policy: BackendPolicy) {
 /// rather than `--backend`, so the hint can name the actual knob the
 /// user reached for.
 fn print_backend_hint(policy: BackendPolicy, vaapi_device: &str, via_env: bool) {
+    #[cfg(not(feature = "vaapi"))]
+    let _ = vaapi_device;
     let source_hint = |backend: &str| {
         if via_env {
             eprintln!("  hint: PDF_RASTER_BACKEND={backend} is set in your environment.");
@@ -49,6 +51,7 @@ fn print_backend_hint(policy: BackendPolicy, vaapi_device: &str, via_env: bool) 
             source_hint("cuda");
             print_cuda_hint();
         }
+        #[cfg(feature = "vaapi")]
         BackendPolicy::ForceVaapi => {
             source_hint("vaapi");
             print_vaapi_hint(vaapi_device);
@@ -73,6 +76,7 @@ fn print_cuda_hint() {
     );
 }
 
+#[cfg(feature = "vaapi")]
 fn print_vaapi_hint(device: &str) {
     eprintln!("        --backend vaapi could not open the DRM device ({device}).");
     eprintln!("        Verify the device exists and is readable by your user.");

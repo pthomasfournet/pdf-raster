@@ -178,6 +178,9 @@ pub enum BackendPolicy {
     /// Require VA-API JPEG decoding.
     /// Returns [`RasterError::BackendUnavailable`] if the VA-API device cannot
     /// be opened rather than falling back to CPU.
+    ///
+    /// Only available when the `vaapi` Cargo feature is enabled.
+    #[cfg(feature = "vaapi")]
     ForceVaapi,
     /// Require the Vulkan compute backend.  Returns
     /// [`RasterError::BackendUnavailable`] if Vulkan initialisation fails
@@ -252,6 +255,7 @@ impl std::str::FromStr for BackendPolicy {
             "" | "auto" => Ok(Self::Auto),
             "cpu" => Ok(Self::CpuOnly),
             "cuda" => Ok(Self::ForceCuda),
+            #[cfg(feature = "vaapi")]
             "vaapi" => Ok(Self::ForceVaapi),
             "vulkan" => Ok(Self::ForceVulkan),
             _ => Err(()),
@@ -684,6 +688,7 @@ mod page_set_tests {
             BackendPolicy::from_str("cuda"),
             Ok(BackendPolicy::ForceCuda)
         );
+        #[cfg(feature = "vaapi")]
         assert_eq!(
             BackendPolicy::from_str("vaapi"),
             Ok(BackendPolicy::ForceVaapi)

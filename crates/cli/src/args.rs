@@ -386,6 +386,7 @@ pub enum BackendArg {
     /// Require CUDA — error loudly if CUDA / nvJPEG is unavailable.
     Cuda,
     /// Require VA-API JPEG — error loudly if the DRM device cannot be opened.
+    #[cfg(feature = "vaapi")]
     Vaapi,
     /// Require the Vulkan compute backend — error loudly if Vulkan
     /// initialisation fails.  The device-resident image cache is
@@ -416,6 +417,7 @@ impl Args {
             Some(BackendArg::Auto) => BackendPolicy::Auto,
             Some(BackendArg::Cpu) => BackendPolicy::CpuOnly,
             Some(BackendArg::Cuda) => BackendPolicy::ForceCuda,
+            #[cfg(feature = "vaapi")]
             Some(BackendArg::Vaapi) => BackendPolicy::ForceVaapi,
             Some(BackendArg::Vulkan) => BackendPolicy::ForceVulkan,
             None => BackendPolicy::from_env(),
