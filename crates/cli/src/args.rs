@@ -441,12 +441,13 @@ impl Args {
             ));
         }
 
-        Ok(SessionConfig {
-            policy,
-            vaapi_device: self.vaapi_device.clone(),
-            #[cfg(feature = "cache")]
-            prefetch: self.prefetch,
-        })
+        let mut config = SessionConfig::with_policy(policy);
+        config.vaapi_device = self.vaapi_device.clone();
+        #[cfg(feature = "cache")]
+        {
+            config.prefetch = self.prefetch;
+        }
+        Ok(config)
     }
 
     /// Build the filtered, clamped list of 1-based page numbers to render.

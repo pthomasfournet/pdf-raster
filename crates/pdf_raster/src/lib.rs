@@ -273,6 +273,12 @@ pub const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 /// Passed to [`open_session`].  Use [`Default::default()`] for the standard
 /// behaviour: backend resolved from `PDF_RASTER_BACKEND` env var (or `Auto`
 /// if unset), default DRM render node, image-cache prefetch off.
+///
+/// This struct is `#[non_exhaustive]`: construct it via [`SessionConfig::default()`]
+/// or [`SessionConfig::with_policy()`] rather than a struct literal.  This allows
+/// new fields to be added without a breaking change — in particular, the `prefetch`
+/// field only exists when the `cache` Cargo feature is enabled.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Backend selection policy.
