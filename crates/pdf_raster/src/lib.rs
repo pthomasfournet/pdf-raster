@@ -119,14 +119,42 @@ pub use render::{
 
 /// Eagerly release GPU decoders on every rayon worker thread.
 ///
-/// Call this via `pool.broadcast(|_| pdf_raster::release_gpu_decoders())`
-/// after all rendering is done and before `pool` is dropped.  This drops each
-/// thread's `NvJpegDecoder` while the CUDA driver is still fully live, avoiding
-/// the process-exit teardown race where all workers call `nvjpegJpegStateDestroy`
-/// concurrently into a driver that has already started its own atexit shutdown.
+/// Call this via `pool.broadcast` **before** dropping `pool` or allowing
+/// process exit to proceed:
 ///
-/// After this call the TLS slots hold `Uninitialised`, so their own destructors
-/// at process exit are no-ops.
+/// ```rust,no_run
+/// # use pdf_raster::release_gpu_decoders;
+/// # let pool: rayon::ThreadPool = todo!();
+/// let _ = pool.broadcast(|_| release_gpu_decoders());
+/// drop(pool);
+/// ```
+///
+/// This drops each thread's `NvJpegDecoder` / `NvJpeg2kDecoder` / Vulkan
+/// Huffman decoder while the CUDA driver is still fully alive.  Without
+/// this call, all workers call their destructors concurrently at process
+/// exit into a driver that has already started its own `atexit` shutdown,
+/// causing undefined behaviour (typically a segfault or hang).
+///
+/// After this call the TLS slots hold `Uninitialised`, so their own
+/// destructors at process exit are no-ops.
+///
+/// # When to call
+///
+/// - Multi-page pipelines that use an explicit `rayon::ThreadPool` — call
+///   once on the pool after rendering completes, before dropping the pool.
+/// - Single-page or short runs using the global rayon pool — calling is
+///   optional but harmless; `raster_pdf` and `render_channel` do not call
+///   it automatically (they don't own the pool).
+///
+/// # No-op builds
+///
+/// When none of the GPU decoder features (`nvjpeg`, `nvjpeg2k`,
+/// `gpu-jpeg-huffman + vulkan`) are compiled in, this function is a
+/// no-op and can be omitted entirely.  It is always safe to call.
+///
+/// # Panics
+///
+/// Never panics.
 #[cfg_attr(
     not(any(
         feature = "nvjpeg",
