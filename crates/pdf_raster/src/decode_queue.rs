@@ -53,7 +53,7 @@ pub(crate) fn build_vaapi_queue(
                 ))
             } else {
                 log::warn!(
-                    "pdf_raster: VA-API JPEG unavailable ({e}); \
+                    "rasterrocket: VA-API JPEG unavailable ({e}); \
                      JPEG images will be decoded on CPU"
                 );
                 Ok(None)

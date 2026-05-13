@@ -1,8 +1,8 @@
 //! Render a single PDF page to a PPM file using the native render stack.
 //!
-//! Usage: `cargo run -p pdf_interp --example render_page -- <pdf> [page] [dpi] [out.ppm]`
+//! Usage: `cargo run -p rasterrocket-interp --example render_page -- <pdf> [page] [dpi] [out.ppm]`
 
-/// Maximum pixel dimension per axis.  Matches `pdf_raster::MAX_PX_DIMENSION`;
+/// Maximum pixel dimension per axis.  Matches `rasterrocket::MAX_PX_DIMENSION`;
 /// the example doesn't depend on that crate so the value is duplicated here.
 const MAX_PX: f64 = 32_768.0;
 
@@ -21,11 +21,11 @@ fn main() {
         .next()
         .unwrap_or_else(|| "/tmp/render_out.ppm".to_string());
 
-    let doc = pdf_interp::open(&pdf).unwrap_or_else(|e| {
+    let doc = rasterrocket_interp::open(&pdf).unwrap_or_else(|e| {
         eprintln!("error: failed to open {pdf}: {e}");
         std::process::exit(1);
     });
-    let total = pdf_interp::page_count(&doc);
+    let total = rasterrocket_interp::page_count(&doc);
     println!("Opened {pdf}: {total} pages");
 
     if page == 0 || page > total {
@@ -37,7 +37,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    let geom = pdf_interp::page_size_pts(&doc, page).unwrap_or_else(|e| {
+    let geom = rasterrocket_interp::page_size_pts(&doc, page).unwrap_or_else(|e| {
         eprintln!("error: could not determine size of page {page}: {e}");
         std::process::exit(1);
     });
@@ -71,18 +71,24 @@ fn main() {
     )]
     let (w, h) = (w_f as u32, h_f as u32);
 
-    let ops = pdf_interp::parse_page(&doc, page).unwrap_or_else(|e| {
+    let ops = rasterrocket_interp::parse_page(&doc, page).unwrap_or_else(|e| {
         eprintln!("error: failed to parse page {page}: {e}");
         std::process::exit(1);
     });
     println!("Page {page}: {} operators", ops.len());
 
-    let mut renderer =
-        pdf_interp::renderer::PageRenderer::new_scaled(w, h, scale, geom.rotate_cw, &doc, page_id)
-            .unwrap_or_else(|e| {
-                eprintln!("error: FreeType initialisation failed: {e}");
-                std::process::exit(1);
-            });
+    let mut renderer = rasterrocket_interp::renderer::PageRenderer::new_scaled(
+        w,
+        h,
+        scale,
+        geom.rotate_cw,
+        &doc,
+        page_id,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error: FreeType initialisation failed: {e}");
+        std::process::exit(1);
+    });
     renderer.execute(&ops);
     let (bitmap, _diag) = renderer.finish();
 

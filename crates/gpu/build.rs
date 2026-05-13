@@ -210,7 +210,7 @@ fn main() {
     // PTX policy: compile real kernels whenever NVCC is available; write
     // empty placeholders only as a last-resort fallback for CPU-only CI
     // runners that don't have the CUDA toolkit.  Keying on a feature-flag
-    // heuristic is wrong because pdf_interp's `gpu-aa` / `gpu-icc` features
+    // heuristic is wrong because rasterrocket-interp's `gpu-aa` / `gpu-icc` features
     // (which cause `GpuCtx::init` to be called at runtime) don't propagate
     // to the gpu crate's build environment, so a build with `gpu-aa` alone
     // would emit placeholders and produce a binary that crashes with

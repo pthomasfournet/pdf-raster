@@ -1,5 +1,5 @@
 //! Cache-side helpers that need access to the PDF object graph and
-//! the image decode pipeline (so they live in `pdf_interp` rather
+//! the image decode pipeline (so they live in `rasterrocket-interp` rather
 //! than `gpu`).
 //!
 //! Currently exposes the [`prefetch`] module — a background worker

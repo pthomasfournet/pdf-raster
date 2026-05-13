@@ -1,4 +1,4 @@
-//! Lazy, zero-copy PDF file parser for the pdf-raster render pipeline.
+//! Lazy, zero-copy PDF file parser for the rasterrocket render pipeline.
 //!
 //! # Design
 //!
@@ -6,12 +6,12 @@
 //! * Objects are resolved on first access and cached (`Arc`-wrapped) for reuse.
 //! * All byte scanning uses hand-rolled primitives in the private `lexer`
 //!   submodule; no nom/nom_locate.
-//! * Shared parsing primitives live in `lexer` — `pdf_interp`'s content
+//! * Shared parsing primitives live in `lexer` — `rasterrocket-interp`'s content
 //!   tokenizer will import from here in a follow-up refactor.
 //!
 //! # Compatibility
 //!
-//! Public types mirror `lopdf` naming so `pdf_interp` can migrate
+//! Public types mirror `lopdf` naming so `rasterrocket-interp` can migrate
 //! file-by-file with mostly mechanical changes.
 
 mod dictionary;

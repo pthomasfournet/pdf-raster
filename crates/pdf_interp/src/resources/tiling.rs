@@ -68,7 +68,7 @@ pub fn resolve_tiling(
 
     let Object::Reference(id) = pat_obj else {
         log::debug!(
-            "pdf_interp: Pattern /{} is not a reference — skipping",
+            "rasterrocket-interp: Pattern /{} is not a reference — skipping",
             String::from_utf8_lossy(name)
         );
         return None;
@@ -82,7 +82,7 @@ pub fn resolve_tiling(
     let pattern_type = stream.dict.get(b"PatternType")?.as_i64()?;
     if pattern_type != 1 {
         log::debug!(
-            "pdf_interp: Pattern /{} has PatternType {pattern_type} (only 1 supported for tiling)",
+            "rasterrocket-interp: Pattern /{} has PatternType {pattern_type} (only 1 supported for tiling)",
             String::from_utf8_lossy(name)
         );
         return None;
@@ -97,7 +97,7 @@ pub fn resolve_tiling(
     // Zero or NaN step would cause divide-by-zero or infinite tile counts downstream.
     if !x_step.is_finite() || !y_step.is_finite() || x_step == 0.0 || y_step == 0.0 {
         log::warn!(
-            "pdf_interp: Pattern /{} has invalid XStep ({x_step}) or YStep ({y_step}) — skipping",
+            "rasterrocket-interp: Pattern /{} has invalid XStep ({x_step}) or YStep ({y_step}) — skipping",
             String::from_utf8_lossy(name)
         );
         return None;
@@ -109,7 +109,7 @@ pub fn resolve_tiling(
         .decompressed_content()
         .map_err(|e| {
             log::warn!(
-                "pdf_interp: Pattern /{} — failed to decompress content stream: {e}",
+                "rasterrocket-interp: Pattern /{} — failed to decompress content stream: {e}",
                 String::from_utf8_lossy(name)
             );
         })

@@ -25,7 +25,7 @@ const SCALE_AT_RENDER_DPI: f64 = RENDER_DPI / 72.0;
 ///
 /// Uses a separate env-var name from `PDF_RASTER_BACKEND` so a
 /// developer's personal default doesn't accidentally drive the contest.
-/// Vocabulary matches `pdf_raster::BackendPolicy::from_env`: `auto`,
+/// Vocabulary matches `rasterrocket::BackendPolicy::from_env`: `auto`,
 /// `cpu`, `cuda`, `vaapi`, `vulkan`.
 fn session_config() -> SessionConfig {
     SessionConfig::with_policy(BackendPolicy::from_env_var("CONTEST_BACKEND"))
@@ -46,7 +46,7 @@ pub fn e1(archive: &Path, page_idx: u32) -> Result<EventResult, String> {
     let target = page_idx.clamp(1, total);
     let bmp = render_page_rgb(&session, target, SCALE_AT_RENDER_DPI)
         .map_err(|e| format!("render_page_rgb: {e}"))?;
-    let out_path = std::env::temp_dir().join("p11_pdf_raster_e1.ppm");
+    let out_path = std::env::temp_dir().join("p11_rasterrocket_e1.ppm");
     let file = std::fs::File::create(&out_path)
         .map_err(|e| format!("create {}: {e}", out_path.display()))?;
     encode::write_ppm(&bmp, std::io::BufWriter::new(file))

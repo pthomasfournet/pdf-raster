@@ -463,7 +463,7 @@ fn init_vk_backend(
                      Verify with `vulkaninfo` that a Vulkan 1.3+ device is present."
                 )))
             } else {
-                log::debug!("pdf_raster: Vulkan unavailable under Auto ({e}); trying CUDA next");
+                log::debug!("rasterrocket: Vulkan unavailable under Auto ({e}); trying CUDA next");
                 Ok(None)
             }
         }
@@ -517,7 +517,7 @@ fn init_gpu_ctx(policy: BackendPolicy) -> Result<Option<Arc<gpu::GpuCtx>>, Raste
                 )))
             } else {
                 log::warn!(
-                    "pdf_raster: GPU initialisation failed ({e}); \
+                    "rasterrocket: GPU initialisation failed ({e}); \
                      falling back to CPU. Run `nvidia-smi` to verify the driver is loaded."
                 );
                 Ok(None)

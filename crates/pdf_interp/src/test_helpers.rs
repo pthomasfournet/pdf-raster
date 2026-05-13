@@ -1,4 +1,4 @@
-//! Test-only helpers shared across `pdf_interp`'s unit tests.
+//! Test-only helpers shared across `rasterrocket-interp`'s unit tests.
 
 #![cfg(test)]
 

@@ -22,7 +22,7 @@ fn resolve_pattern_tint(doc: &Document, fill_cs: &ColorSpace, components: &[f64]
             return RasterColor::from_bytes(base.convert_to_rgb(doc, components));
         }
         log::debug!(
-            "pdf_interp: pattern tint comp count {} mismatches base CS expected {} — using heuristic",
+            "rasterrocket-interp: pattern tint comp count {} mismatches base CS expected {} — using heuristic",
             components.len(),
             base.ncomponents(),
         );
@@ -45,7 +45,7 @@ impl PageRenderer<'_> {
         // recurse to stack overflow on adversarial input.
         if self.pattern_depth >= MAX_PATTERN_DEPTH {
             log::warn!(
-                "pdf_interp: Pattern /{} nesting depth {MAX_PATTERN_DEPTH} exceeded — skipping",
+                "rasterrocket-interp: Pattern /{} nesting depth {MAX_PATTERN_DEPTH} exceeded — skipping",
                 String::from_utf8_lossy(name),
             );
             return None;
@@ -85,7 +85,7 @@ impl PageRenderer<'_> {
 
         if !sx.is_finite() || !sy.is_finite() {
             log::warn!(
-                "pdf_interp: Pattern /{} CTM scale is non-finite ({sx}, {sy}) — skipping",
+                "rasterrocket-interp: Pattern /{} CTM scale is non-finite ({sx}, {sy}) — skipping",
                 String::from_utf8_lossy(name)
             );
             return None;
@@ -93,7 +93,7 @@ impl PageRenderer<'_> {
 
         if sx < 0.5 || sy < 0.5 {
             log::debug!(
-                "pdf_interp: Pattern /{} tile scale ({sx:.2}, {sy:.2}) too small — skipping",
+                "rasterrocket-interp: Pattern /{} tile scale ({sx:.2}, {sy:.2}) too small — skipping",
                 String::from_utf8_lossy(name)
             );
             return None;
@@ -105,7 +105,7 @@ impl PageRenderer<'_> {
 
         if tile_w == 0 || tile_h == 0 {
             log::debug!(
-                "pdf_interp: Pattern /{} produced zero-size tile ({tile_w}×{tile_h}) — skipping",
+                "rasterrocket-interp: Pattern /{} produced zero-size tile ({tile_w}×{tile_h}) — skipping",
                 String::from_utf8_lossy(name)
             );
             return None;
@@ -125,7 +125,7 @@ impl PageRenderer<'_> {
 
         if !ox.is_finite() || !oy.is_finite() {
             log::warn!(
-                "pdf_interp: Pattern /{} origin is non-finite ({ox}, {oy}) — skipping",
+                "rasterrocket-interp: Pattern /{} origin is non-finite ({ox}, {oy}) — skipping",
                 String::from_utf8_lossy(name)
             );
             return None;

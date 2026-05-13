@@ -109,7 +109,7 @@ pub fn lerp_u8(a: u8, b: u8, t: u32) -> u8 {
 ///
 /// - [`cmyk_to_rgb_reflectance`]: uses the reflectance formula
 ///   `R = (255−C)×(255−K)/255` (rounded), for raw JPEG/CMYK pixel data.
-/// - `pdf_interp::renderer::color::cmyk_to_rgb_bytes`: takes normalised f64
+/// - `rasterrocket_interp::renderer::color::cmyk_to_rgb_bytes`: takes normalised f64
 ///   inputs per PDF §10.3.3 (`R = 1−min(1, C+K)`), for PDF colour operators.
 #[inline]
 #[must_use]

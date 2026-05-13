@@ -1,4 +1,4 @@
-//! Per-page rendering: call `pdf_raster` library → apply colour mode → write file.
+//! Per-page rendering: call `rasterrocket` library → apply colour mode → write file.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write as _};

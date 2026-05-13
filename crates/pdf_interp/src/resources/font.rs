@@ -162,7 +162,7 @@ pub struct FontDescriptor {
     pub code_to_gid: Vec<u32>,
     /// Per-character glyph name overrides from the PDF `Encoding/Differences`
     /// array.  Index = char code (0–255); `None` = inherit from base encoding.
-    /// Used by `FontCache` (in `pdf_interp::renderer::font_cache`) to resolve
+    /// Used by `FontCache` (in `rasterrocket_interp::renderer::font_cache`) to resolve
     /// names → Unicode → GID via `FreeType`'s active charmap at face-load time.
     pub differences: Box<[Option<Box<str>>; 256]>,
     /// CID encoding for Type 0 composite fonts.  `Some` when `Subtype` is

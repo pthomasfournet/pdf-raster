@@ -56,7 +56,9 @@ impl PageRenderer<'_> {
             // Tz=0 % is degenerate (zero-width advance = invisible text).
             // Substitute 100 % so text remains visible; warn because this
             // overrides explicit PDF authoring intent.
-            log::warn!("pdf_interp: Tz is 0 %, substituting 100 % to avoid invisible text");
+            log::warn!(
+                "rasterrocket-interp: Tz is 0 %, substituting 100 % to avoid invisible text"
+            );
             1.0
         } else {
             raw_hz / 100.0
@@ -68,7 +70,7 @@ impl PageRenderer<'_> {
         // Resolve font descriptor (immutable borrow of resources).
         let Some(descriptor) = self.resources.font_dict(&font_name) else {
             log::debug!(
-                "pdf_interp: no font dict for /{}",
+                "rasterrocket-interp: no font dict for /{}",
                 String::from_utf8_lossy(&font_name)
             );
             return;
@@ -321,7 +323,7 @@ impl PageRenderer<'_> {
     ) {
         if do_clip {
             log::warn!(
-                "pdf_interp: text-clip mode (render_mode ≥ 4) is not supported for Type 3 \
+                "rasterrocket-interp: text-clip mode (render_mode ≥ 4) is not supported for Type 3 \
                  fonts — clip ignored"
             );
         }
@@ -336,7 +338,7 @@ impl PageRenderer<'_> {
 
             if do_paint && self.form_depth >= MAX_FORM_DEPTH {
                 log::warn!(
-                    "pdf_interp: Type 3 CharProc depth {MAX_FORM_DEPTH} exceeded — \
+                    "rasterrocket-interp: Type 3 CharProc depth {MAX_FORM_DEPTH} exceeded — \
                      glyph 0x{byte:02X} not painted (text position still advances)"
                 );
             } else if do_paint {

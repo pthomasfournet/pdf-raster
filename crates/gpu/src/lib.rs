@@ -220,7 +220,7 @@ impl GpuCtx {
     /// - `ash::Entry::load` (in `backend::vulkan::device::init`) similarly
     ///   `dlopen`s `libvulkan.so` only when invoked.
     /// - `init` is not on any static-init path: it's called from
-    ///   `pdf_raster::render::init_gpu_ctx` during `open_session`, after the
+    ///   `rasterrocket::render::init_gpu_ctx` during `open_session`, after the
     ///   CLI has parsed args.
     /// - The only `OnceLock<GpuCtx>` in this crate lives behind
     ///   `#[cfg(feature = "gpu-validation")]` test code; runtime contexts are

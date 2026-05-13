@@ -135,13 +135,13 @@ impl PageRenderer<'_> {
             Operator::MoveTo(x, y) => {
                 let (dx, dy) = self.to_device(*x, *y);
                 if let Err(e) = self.path_builder().move_to(dx, dy) {
-                    log::debug!("pdf_interp: MoveTo failed: {e}");
+                    log::debug!("rasterrocket-interp: MoveTo failed: {e}");
                 }
             }
             Operator::LineTo(x, y) => {
                 let (dx, dy) = self.to_device(*x, *y);
                 if let Err(e) = self.path_builder().line_to(dx, dy) {
-                    log::debug!("pdf_interp: LineTo failed: {e}");
+                    log::debug!("rasterrocket-interp: LineTo failed: {e}");
                 }
             }
             Operator::CurveTo(x1, y1, x2, y2, x3, y3) => {
@@ -149,19 +149,21 @@ impl PageRenderer<'_> {
                 let (dx2, dy2) = self.to_device(*x2, *y2);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
                 if let Err(e) = self.path_builder().curve_to(dx1, dy1, dx2, dy2, dx3, dy3) {
-                    log::debug!("pdf_interp: CurveTo failed: {e}");
+                    log::debug!("rasterrocket-interp: CurveTo failed: {e}");
                 }
             }
             Operator::CurveToV(x2, y2, x3, y3) => {
                 // `v`: first control point = current point.
                 let Some(cp) = self.path_builder().cur_pt() else {
-                    log::debug!("pdf_interp: CurveToV with no current point — operator ignored");
+                    log::debug!(
+                        "rasterrocket-interp: CurveToV with no current point — operator ignored"
+                    );
                     return;
                 };
                 let (dx2, dy2) = self.to_device(*x2, *y2);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
                 if let Err(e) = self.path_builder().curve_to(cp.x, cp.y, dx2, dy2, dx3, dy3) {
-                    log::debug!("pdf_interp: CurveToV failed: {e}");
+                    log::debug!("rasterrocket-interp: CurveToV failed: {e}");
                 }
             }
             Operator::CurveToY(x1, y1, x3, y3) => {
@@ -169,14 +171,14 @@ impl PageRenderer<'_> {
                 let (dx1, dy1) = self.to_device(*x1, *y1);
                 let (dx3, dy3) = self.to_device(*x3, *y3);
                 if let Err(e) = self.path_builder().curve_to(dx1, dy1, dx3, dy3, dx3, dy3) {
-                    log::debug!("pdf_interp: CurveToY failed: {e}");
+                    log::debug!("rasterrocket-interp: CurveToY failed: {e}");
                 }
             }
             Operator::ClosePath => {
                 if let Some(b) = self.path.as_mut()
                     && let Err(e) = b.close(false)
                 {
-                    log::debug!("pdf_interp: ClosePath failed: {e}");
+                    log::debug!("rasterrocket-interp: ClosePath failed: {e}");
                 }
             }
             Operator::Rectangle(x, y, w, h) => {
@@ -365,7 +367,7 @@ impl PageRenderer<'_> {
                 if let Some(img) = decoded {
                     self.blit_image(&img);
                 } else {
-                    log::warn!("pdf_interp: inline image decode failed — skipping");
+                    log::warn!("rasterrocket-interp: inline image decode failed — skipping");
                 }
             }
             Operator::PaintShading(name) => {
@@ -387,7 +389,7 @@ impl PageRenderer<'_> {
 
             Operator::Unknown(kw) => {
                 log::warn!(
-                    "pdf_interp: unknown operator: {}",
+                    "rasterrocket-interp: unknown operator: {}",
                     String::from_utf8_lossy(kw)
                 );
             }

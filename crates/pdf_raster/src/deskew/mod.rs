@@ -21,7 +21,7 @@
 //! ```rust,no_run
 //! use color::Gray8;
 //! use raster::Bitmap;
-//! use pdf_raster::deskew;
+//! use rasterrocket::deskew;
 //!
 //! let mut page: Bitmap<Gray8> = todo!();
 //! deskew::apply(&mut page).expect("deskew failed");

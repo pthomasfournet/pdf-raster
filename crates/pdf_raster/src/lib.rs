@@ -7,7 +7,7 @@
 //!
 //! ```rust,no_run
 //! use std::path::Path;
-//! use pdf_raster::{RasterOptions, raster_pdf};
+//! use rasterrocket::{RasterOptions, raster_pdf};
 //!
 //! let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 5, deskew: true, pages: None };
 //! for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
@@ -23,14 +23,14 @@
 //!
 //! # OCR integration
 //!
-//! `pdf_raster` is a rasteriser, not an OCR framework.  For Tesseract, ocrs,
+//! `rasterrocket` is a rasteriser, not an OCR framework.  For Tesseract, ocrs,
 //! Google Cloud Vision, GPT-5, and Mistral integration patterns — including the
 //! `TessApi`-per-thread reuse pattern and zero-copy `set_image_from_mem` — see
 //! the project wiki:
 //!
-//! - [OCR Integration](https://github.com/pthomasfournet/pdf-raster/wiki/OCR-Integration)
+//! - [OCR Integration](https://github.com/pthomasfournet/rasterrocket/wiki/OCR-Integration)
 //!   (Tesseract via `leptess`, ocrs)
-//! - [LLM Vision OCR Integration](https://github.com/pthomasfournet/pdf-raster/wiki/LLM-Vision-OCR-Integration)
+//! - [LLM Vision OCR Integration](https://github.com/pthomasfournet/rasterrocket/wiki/LLM-Vision-OCR-Integration)
 //!   (Google Cloud Vision, GPT-5, Mistral)
 //!
 //! # Streaming: render and process pages in parallel
@@ -41,9 +41,9 @@
 //!
 //! ```rust,no_run
 //! use std::path::Path;
-//! use pdf_raster::{RasterOptions, render_channel};
+//! use rasterrocket::{RasterOptions, render_channel};
 //!
-//! // `rayon` is a transitive dependency of `pdf_raster`; add it explicitly
+//! // `rayon` is a transitive dependency of `rasterrocket`; add it explicitly
 //! // to your Cargo.toml only if you call rayon APIs directly: rayon = "1"
 //! //
 //! // The consumer `recv` loop MUST run on the calling thread (not inside a
@@ -83,7 +83,7 @@
 //!
 //! ```rust,no_run
 //! use std::path::Path;
-//! use pdf_raster::{PageSet, RasterOptions, raster_pdf};
+//! use rasterrocket::{PageSet, RasterOptions, raster_pdf};
 //!
 //! let pages = PageSet::new(vec![1, 5, 23, 100]).unwrap();
 //! let opts = RasterOptions {
@@ -138,7 +138,7 @@ pub mod session {
 /// process exit to proceed:
 ///
 /// ```rust,no_run
-/// # use pdf_raster::release_gpu_decoders;
+/// # use rasterrocket::release_gpu_decoders;
 /// # let pool: rayon::ThreadPool = todo!();
 /// let _ = pool.broadcast(|_| release_gpu_decoders());
 /// drop(pool);

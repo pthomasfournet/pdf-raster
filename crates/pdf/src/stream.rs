@@ -2,7 +2,7 @@
 //!
 //! We support the filters encountered in real renderer workloads.
 //! Image-format filters (DCT, JBIG2, JPX, CCITTFax) are intentionally
-//! excluded — those bytes are passed raw to the codec layer in `pdf_interp`.
+//! excluded — those bytes are passed raw to the codec layer in `rasterrocket-interp`.
 
 use crate::dictionary::Dictionary;
 use crate::object::Object;

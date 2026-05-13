@@ -67,7 +67,8 @@ moxcms = "0.8.1"
 bytemuck    = { workspace = true, optional = true }
 
 [dev-dependencies]
-env_logger = { workspace = true }
+env_logger       = { workspace = true }
+rasterrocket-interp = { path = ".", version = "1.0" }
 
 
 [lints.rust]

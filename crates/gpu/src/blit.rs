@@ -10,7 +10,7 @@
 //! # Sampling parity
 //!
 //! The kernel matches the renderer's existing CPU sampler in
-//! `crates/pdf_interp/src/renderer/page/mod.rs`:
+//! `crates/pdf_interp/src/renderer/page/mod.rs` (the CPU sampler):
 //!
 //! - Nearest-neighbour (no bilinear).
 //! - `floor(u * src_w)` for the x index, with `min(.., src_w - 1)` to

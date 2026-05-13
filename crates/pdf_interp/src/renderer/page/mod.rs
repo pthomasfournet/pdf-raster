@@ -712,7 +712,7 @@ impl<'doc> PageRenderer<'doc> {
             if let Some(builder) = self.path.take() {
                 self.clip_path_into_gstate(&builder.build(), even_odd);
             } else {
-                log::debug!("pdf_interp: W/W* with no current path — clip unchanged");
+                log::debug!("rasterrocket-interp: W/W* with no current path — clip unchanged");
             }
         }
     }
@@ -813,7 +813,7 @@ impl<'doc> PageRenderer<'doc> {
         // → warp-ballot 64-sample AA (medium fills) → CPU scanline AA
         // (always-available fallback).  The Vulkan branch fires before the
         // CUDA branch when both are present, but in practice
-        // `pdf_raster::render::open_session` wires only one of them based
+        // `rasterrocket::render::open_session` wires only one of them based
         // on `BackendPolicy`, so the second branch only runs under
         // `Auto` / `ForceCuda`.
         #[cfg(feature = "vulkan")]
@@ -1015,7 +1015,7 @@ impl<'doc> PageRenderer<'doc> {
                 return;
             }
             log::debug!(
-                "pdf_interp: Do /{} skipped (unsupported filter or missing resource)",
+                "rasterrocket-interp: Do /{} skipped (unsupported filter or missing resource)",
                 String::from_utf8_lossy(name)
             );
             return;
@@ -1045,7 +1045,7 @@ impl<'doc> PageRenderer<'doc> {
         }
         // Missing resource or unsupported filter.
         log::debug!(
-            "pdf_interp: Do /{} skipped (unsupported filter or missing resource)",
+            "rasterrocket-interp: Do /{} skipped (unsupported filter or missing resource)",
             String::from_utf8_lossy(name)
         );
     }
@@ -1068,7 +1068,7 @@ impl<'doc> PageRenderer<'doc> {
 
         let Some(result) = self.resources.shading(name, &ctm, page_h) else {
             log::warn!(
-                "pdf_interp: sh /{} — shading not available (unsupported type or missing resource)",
+                "rasterrocket-interp: sh /{} — shading not available (unsupported type or missing resource)",
                 String::from_utf8_lossy(name)
             );
             return;
@@ -1120,7 +1120,7 @@ impl<'doc> PageRenderer<'doc> {
     fn do_form_xobject(&mut self, form: &crate::resources::FormXObject) {
         if self.form_depth >= MAX_FORM_DEPTH {
             log::warn!(
-                "pdf_interp: Form XObject nesting depth {MAX_FORM_DEPTH} exceeded — skipping"
+                "rasterrocket-interp: Form XObject nesting depth {MAX_FORM_DEPTH} exceeded — skipping"
             );
             return;
         }
@@ -1164,7 +1164,7 @@ impl<'doc> PageRenderer<'doc> {
                 .any(|(x, y)| !x.is_finite() || !y.is_finite())
             {
                 log::warn!(
-                    "pdf_interp: transparency group BBox is non-finite — rendering without group"
+                    "rasterrocket-interp: transparency group BBox is non-finite — rendering without group"
                 );
                 return None;
             }
@@ -1320,7 +1320,7 @@ impl<'doc> PageRenderer<'doc> {
             .iter()
             .all(|v| v.is_finite())
         {
-            log::warn!("pdf_interp: blit_image: non-finite CTM corner — skipping image");
+            log::warn!("rasterrocket-interp: blit_image: non-finite CTM corner — skipping image");
             return;
         }
 
@@ -1366,7 +1366,9 @@ impl<'doc> PageRenderer<'doc> {
         // det is guaranteed non-zero: we already checked all corners are finite,
         // and a singular CTM would produce a degenerate bounding box caught above.
         let inv_det = if det.abs() < 1e-12 {
-            log::debug!("pdf_interp: blit_image: near-singular CTM (det={det:.2e}) — skipping");
+            log::debug!(
+                "rasterrocket-interp: blit_image: near-singular CTM (det={det:.2e}) — skipping"
+            );
             return;
         } else {
             1.0 / det

@@ -1,6 +1,6 @@
 //! PDF object model and single-object parser.
 //!
-//! [`Object`] mirrors `lopdf::Object` variant-for-variant so `pdf_interp` can
+//! [`Object`] mirrors `lopdf::Object` variant-for-variant so `rasterrocket-interp` can
 //! swap the import with minimal churn.  The parser is a hand-rolled recursive
 //! descent over a borrowed byte slice — no allocator-heavy parser combinators.
 
@@ -16,7 +16,7 @@ pub type ObjectId = (u32, u16);
 
 /// A PDF object value.
 ///
-/// Variants match `lopdf::Object` so `pdf_interp` source changes are
+/// Variants match `lopdf::Object` so `rasterrocket-interp` source changes are
 /// mechanical substitutions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object {
@@ -59,7 +59,7 @@ impl Stream {
     /// call site).
     ///
     /// Image filters (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
-    /// are passed through unchanged — the codec layer in `pdf_interp` decodes
+    /// are passed through unchanged — the codec layer in `rasterrocket-interp` decodes
     /// those.
     ///
     /// # Errors

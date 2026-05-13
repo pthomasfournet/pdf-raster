@@ -1017,6 +1017,7 @@ version = "1.0.0"
 dependencies = [
  "gpu",
  "log",
+ "rasterrocket",
  "rasterrocket-color",
  "rasterrocket-interp",
  "rasterrocket-parser",
@@ -1082,6 +1083,7 @@ dependencies = [
  "rasterrocket-color",
  "rasterrocket-encode",
  "rasterrocket-font",
+ "rasterrocket-interp",
  "rasterrocket-parser",
  "rasterrocket-render",
  "zune-core",

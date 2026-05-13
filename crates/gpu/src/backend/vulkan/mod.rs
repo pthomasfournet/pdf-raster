@@ -143,7 +143,7 @@ impl GpuBackend for VulkanBackend {
 
     fn device_buffer_len(&self, buf: &Self::DeviceBuffer) -> usize {
         // Vulkan stores sizes as u64 (vk::DeviceSize); the trait
-        // returns usize.  pdf-raster targets 64-bit only, so the
+        // returns usize.  rasterrocket targets 64-bit only, so the
         // conversion is total — failing loudly is correct because
         // a saturating fallback (e.g. usize::MAX) would silently
         // poison cache size accounting.

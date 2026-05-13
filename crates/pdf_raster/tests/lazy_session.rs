@@ -11,7 +11,7 @@ fn session_open_reports_correct_total_pages() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/corpus-05-academic-book.pdf");
     let session =
-        pdf_raster::open_session(&path, &pdf_raster::SessionConfig::default()).expect("open");
+        rasterrocket::open_session(&path, &rasterrocket::SessionConfig::default()).expect("open");
     assert_eq!(session.total_pages(), 601);
 }
 
@@ -20,7 +20,7 @@ fn resolve_page_returns_consistent_object_ids() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/corpus-04-ebook-mixed.pdf");
     let session =
-        pdf_raster::open_session(&path, &pdf_raster::SessionConfig::default()).expect("open");
+        rasterrocket::open_session(&path, &rasterrocket::SessionConfig::default()).expect("open");
 
     // Two calls for the same page must return the same object id.  The
     // underlying [`pdf::Document::get_page`] is a pure function of
@@ -35,7 +35,7 @@ fn resolve_page_returns_consistent_object_ids() {
         .resolve_page(session.total_pages() + 1)
         .expect_err("must error past total_pages");
     match err {
-        pdf_raster::RasterError::PageOutOfRange { page, total } => {
+        rasterrocket::RasterError::PageOutOfRange { page, total } => {
             assert_eq!(page, session.total_pages() + 1);
             assert_eq!(total, session.total_pages());
         }

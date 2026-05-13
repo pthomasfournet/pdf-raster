@@ -91,7 +91,7 @@ pub fn ensure_nvjpeg(policy: BackendPolicy) -> Result<(), String> {
                     Err(format!("nvJPEG unavailable: {e}"))
                 } else {
                     log::warn!(
-                        "pdf_raster: nvJPEG unavailable ({e}); \
+                        "rasterrocket: nvJPEG unavailable ({e}); \
                          JPEG images will be decoded on CPU for this thread"
                     );
                     Ok(())
@@ -132,7 +132,7 @@ pub fn ensure_nvjpeg2k(policy: BackendPolicy) -> Result<(), String> {
                     Err(format!("nvJPEG2000 unavailable: {e}"))
                 } else {
                     log::warn!(
-                        "pdf_raster: nvJPEG2000 unavailable ({e}); \
+                        "rasterrocket: nvJPEG2000 unavailable ({e}); \
                          JPEG 2000 images will be decoded on CPU for this thread"
                     );
                     Ok(())
@@ -217,7 +217,7 @@ pub fn ensure_jpeg_gpu_huffman(policy: BackendPolicy) -> Result<(), String> {
             }
             Err(e) => {
                 *cell.borrow_mut() = JpegGpuInit::Failed;
-                let msg = format!("pdf_raster: GPU JPEG decoder unavailable ({e})");
+                let msg = format!("rasterrocket: GPU JPEG decoder unavailable ({e})");
                 if matches!(policy, BackendPolicy::ForceCuda) {
                     Err(msg)
                 } else {
@@ -260,7 +260,7 @@ pub fn ensure_jpeg_vk_huffman(policy: BackendPolicy) -> Result<(), String> {
             }
             Err(e) => {
                 *cell.borrow_mut() = JpegGpuInit::Failed;
-                let msg = format!("pdf_raster: Vulkan JPEG decoder unavailable ({e})");
+                let msg = format!("rasterrocket: Vulkan JPEG decoder unavailable ({e})");
                 if matches!(policy, BackendPolicy::ForceVulkan) {
                     Err(msg)
                 } else {

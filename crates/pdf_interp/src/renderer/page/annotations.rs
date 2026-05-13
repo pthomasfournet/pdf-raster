@@ -23,7 +23,7 @@ pub(super) fn render_annotations(renderer: &mut PageRenderer<'_>, page_id: Objec
     let doc = renderer.resources.doc();
     let Ok(page_dict) = doc.get_dictionary(page_id) else {
         log::warn!(
-            "pdf_interp: render_annotations: page object ({}, {}) is not a dictionary — \
+            "rasterrocket-interp: render_annotations: page object ({}, {}) is not a dictionary — \
              skipping annotations",
             page_id.0,
             page_id.1
@@ -45,7 +45,7 @@ pub(super) fn render_annotations(renderer: &mut PageRenderer<'_>, page_id: Objec
                     a
                 } else {
                     log::warn!(
-                        "pdf_interp: render_annotations: /Annots reference ({}, {}) \
+                        "rasterrocket-interp: render_annotations: /Annots reference ({}, {}) \
                          did not resolve to an array — skipping annotations",
                         id.0,
                         id.1
@@ -77,7 +77,7 @@ pub(super) fn render_one_annotation(renderer: &mut PageRenderer<'_>, annot_id: O
 
     let Ok(annot_dict) = doc.get_dictionary(annot_id) else {
         log::warn!(
-            "pdf_interp: annotation ({}, {}) object missing or not a dictionary — skipping",
+            "rasterrocket-interp: annotation ({}, {}) object missing or not a dictionary — skipping",
             annot_id.0,
             annot_id.1
         );
@@ -97,7 +97,7 @@ pub(super) fn render_one_annotation(renderer: &mut PageRenderer<'_>, annot_id: O
     // Warn when AP exists but Rect is absent/malformed — visible annotation dropped.
     let Some(rect) = read_rect(&annot_dict) else {
         log::warn!(
-            "pdf_interp: annotation ({}, {}) has AP/N stream but missing or malformed Rect — skipping",
+            "rasterrocket-interp: annotation ({}, {}) has AP/N stream but missing or malformed Rect — skipping",
             annot_id.0,
             annot_id.1
         );

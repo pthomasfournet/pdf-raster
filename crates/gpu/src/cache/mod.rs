@@ -81,7 +81,7 @@ pub struct DocId(pub [u8; 32]);
 pub struct ObjId(pub u32);
 
 /// Component layout of a cached decoded image.  Matches `ImageColorSpace`
-/// in `pdf_interp` but kept here to avoid a circular dependency.
+/// in `rasterrocket-interp` but kept here to avoid a circular dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageLayout {
     /// One byte per pixel: gray.
