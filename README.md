@@ -6,18 +6,23 @@ Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tes
 
 ```toml
 # Cargo.toml
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.6.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0" }
 ```
 
-## What's new in v0.6.0
+## What's new in v1.0.0
 
-- **lopdf rip-out.** The lopdf 0.40 dependency is gone; replaced by an in-tree `pdf` crate (lazy mmap-based parser, threadsafe per-object cache, DOS-hardened limits). lopdf's `load_objects_raw` previously burned ~20% of corpus-07 cycles in `nom_locate` on the main thread before render workers could start, capping CPU utilisation at ~1.6/24 cores. With the new parser the same corpus is now cold-cache 689 ms.
-- **RAM-backed output by default.** Bare-stem prefixes (e.g. `pdf-raster doc.pdf out`) now write pages to `/dev/shm/pdf-raster-<pid>-<nanos>/` rather than disk, avoiding ext4 `auto_da_alloc` rename serialisation that was parking 24 workers in `do_renameat2`. A `SpillPolicy` polls `/proc/meminfo` every 100 ms and spills subsequent pages to disk when MemAvailable drops below 1 GiB. New flags: `--ram`, `--no-ram`, `--ram-path`. Path-like prefixes (anything with `/` or starting with `.`) opt out and write where the user asked.
+- **Spec-correct simple-font text.** The `Widths`-array lookup now prevails over FreeType metrics for all embedded and non-embedded simple fonts, per PDF §9.2.4. Academic and English-language PDFs show the largest improvement: avg RMSE vs pdftoppm dropped 17–19 points on corpus-05 and corpus-14.
+- **Vulkan compute backend.** `--features vulkan` or `--backend vulkan` runs AA fill, tile fill, and parallel-Huffman JPEG decode on any Vulkan 1.3+ device — NVIDIA, AMD, Intel, or Apple via `MoltenVK`. Verified on RTX 5070; cross-vendor smoke pending hardware. Under `auto`, Vulkan is preferred over CUDA when both are compiled in (faster process init on single-session workloads).
+- **Process-static GPU init.** The CUDA and Vulkan contexts are initialised once per process (not once per `open_session`). Short-lived multi-document pipelines no longer pay ~240 ms per document.
+- **`PDF_RASTER_BACKEND` env var.** Switch backends at runtime without recompiling. Valid values: `auto`, `cpu`, `cuda`, `vaapi`, `vulkan`. The CLI `--backend` flag takes precedence.
+- **Parallel-Huffman JPEG.** GPU-accelerated Huffman decode (`gpu-jpeg-huffman` feature, implied by `vulkan`) is wired into the production decode path. Dormant by default (threshold = `u32::MAX`); enable with `PDF_RASTER_HUFFMAN_THRESHOLD=0` for benchmarking.
+- **`RasterOptions::default()`** — `dpi = 300`, `first_page = 1`, `last_page = u32::MAX`, `deskew = false`, `pages = None`. Use `..RasterOptions::default()` to fill unset fields.
+- **`PageSet`** — render a sparse subset of pages without visiting intermediate ones.
 
 ```rust
 use pdf_raster::{RasterOptions, raster_pdf};
 
-let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: u32::MAX, deskew: true, pages: None };
+let opts = RasterOptions { dpi: 300.0, ..RasterOptions::default() };
 
 for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
     let page = result?;
@@ -154,21 +159,24 @@ tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 
 Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full methodology, hardware details, and AVX2 vs AVX-512 comparison in **[the Benchmarks wiki page](../../wiki/Benchmarks)**.
 
-**CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512, v0.6.0, RAM-backed output, cold cache, hyperfine 5 runs:**
+**CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512, v0.9.1, RAM-backed output, cold cache, hyperfine 5 runs:**
 
 | Document | Pages | pdf-raster |
 |---|---|---|
-| Native text, small | 16 | 51 ms ± 1 ms |
-| Native text, dense | 254 | 254 ms ± 3 ms |
-| Ebook, mixed | 358 | 382 ms ± 4 ms |
-| Journal, DCT-heavy | 162 | 689 ms ± 7 ms |
-| 1927 scan, DCT | 150 | 2.21 s ± 291 ms |
-| 1836 scan, DCT | 490 | 2.54 s ± 5 ms |
-| Scan, JBIG2+JPX | 576 | 18.22 s ± 55 ms |
+| Native text, small | 16 | 41 ms ± 1 ms |
+| Native vector + text | 16 | 18 ms ± 1 ms |
+| Native text, dense | 254 | 231 ms ± 2 ms |
+| Ebook, mixed | 358 | 278 ms ± 3 ms |
+| Academic book | 601 | 582 ms ± 12 ms |
+| Modern layout, DCT | 160 | 1 450 ms ± 10 ms |
+| Journal, DCT-heavy | 162 | 783 ms ± 5 ms |
+| 1927 scan, DCT | 390 | 1 652 ms ± 89 ms |
+| 1836 scan, DCT | 490 | 2 859 ms ± 658 ms |
+| Scan, JBIG2+JPX | 576 | 17 616 ms ± 260 ms |
 
-Per-version regression history and the full pdftoppm comparison are in **[the Benchmarks wiki page](../../wiki/Benchmarks)** — corpus-09 dropped from 36 s (v0.5.1) to 2.54 s (v0.6.0), a 14× win driven by the lopdf rip-out and RAM-backed output default.
+Per-version regression history and the full pdftoppm comparison are in **[the Benchmarks wiki page](../../wiki/Benchmarks)**.
 
-**GPU-accelerated (nvJPEG + nvJPEG2000), same machine + RTX 5070:**
+**GPU-accelerated (CUDA: nvJPEG + nvJPEG2000), same machine + RTX 5070 (v0.9.1):**
 
 | Document | Pages | pdf-raster | pdftoppm | Speedup |
 |---|---|---|---|---|
