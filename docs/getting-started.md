@@ -1,10 +1,10 @@
 # Getting Started
 
-pdf-raster converts PDF pages to pixel buffers in pure Rust. No subprocesses, no Leptonica, no Poppler in the render path.
+rasterrocket converts PDF pages to pixel buffers in pure Rust. No subprocesses, no Leptonica, no Poppler in the render path.
 
 ## What it does
 
-Given a PDF file, pdf-raster renders each page to an 8-bit grayscale buffer in memory. The primary use case is feeding pages directly into Tesseract OCR without writing any intermediate files.
+Given a PDF file, rasterrocket renders each page to an 8-bit grayscale buffer in memory. The primary use case is feeding pages directly into Tesseract OCR without writing any intermediate files.
 
 ## Hardware requirements
 
@@ -73,41 +73,34 @@ All GPU features fall back to CPU automatically if initialisation fails — a me
 
 ## Installation
 
-Add `pdf_raster` to your `Cargo.toml` as a git dependency:
+Add `rasterrocket` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0" }
+rasterrocket = "1.0"
 ```
 
 For GPU acceleration — NVIDIA (CUDA 12 or 13) + Vulkan (cross-vendor) + VA-API (Linux iGPU/dGPU):
 
 ```toml
 [dependencies]
-# CUDA GPU features (NVIDIA only; full feature set including the Phase 9 cache):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew", "cache"] }
+# CUDA GPU features (NVIDIA only; full feature set including the image cache):
+rasterrocket = { version = "1.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew", "cache"] }
 
 # Vulkan compute (cross-vendor — NVIDIA, AMD, Intel, Apple via MoltenVK):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0", features = ["vulkan"] }
+rasterrocket = { version = "1.0", features = ["vulkan"] }
 
 # VA-API (AMD/Intel iGPU on Linux — libva required):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0", features = ["vaapi"] }
+rasterrocket = { version = "1.0", features = ["vaapi"] }
 ```
 
-To track the latest commit on `master` instead of a pinned tag:
-
-```toml
-[dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", branch = "master" }
-```
-
-Pin to a tag for reproducible builds. Run `cargo update -p pdf_raster` to advance to a newer tag when one is released.
+Run `cargo add rasterrocket` to add the latest version. Pin to a specific version for reproducible builds.
 
 ## Quickstart
 
 ```rust
 use std::path::Path;
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 
 let opts = RasterOptions { dpi: 300.0, ..RasterOptions::default() };
 
@@ -127,7 +120,7 @@ for (page_num, result) in raster_pdf(Path::new("document.pdf"), &opts) {
 ## Tesseract integration
 
 ```rust
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 
 let opts = RasterOptions { dpi: 300.0, deskew: true, ..RasterOptions::default() };
 
@@ -188,7 +181,7 @@ if let Some(native_dpi) = page.diagnostics.suggested_dpi(150.0, 600.0) {
 For multi-document pipelines, use `render_channel` to render pages in the background while OCR processes the previous one:
 
 ```rust
-use pdf_raster::{RasterOptions, render_channel};
+use rasterrocket::{RasterOptions, render_channel};
 
 let opts = RasterOptions { dpi: 300.0, last_page: 100, deskew: true, ..RasterOptions::default() };
 
@@ -211,7 +204,7 @@ Per-page errors do not abort the remaining pages. Handle them per-iteration:
 for (page_num, result) in raster_pdf(path, &opts) {
     match result {
         Ok(page) => process(page),
-        Err(pdf_raster::RasterError::PageTooLarge { width, height }) => {
+        Err(rasterrocket::RasterError::PageTooLarge { width, height }) => {
             eprintln!("page {page_num}: {width}×{height} exceeds limit — skipping");
         }
         Err(e) => return Err(e.into()),
@@ -223,7 +216,7 @@ Document-open errors (bad path, corrupt PDF, JavaScript detected) are yielded as
 
 ## Security
 
-pdf-raster refuses to open PDFs that contain JavaScript entry points and returns `RasterError::Pdf(InterpError::JavaScript { location })` immediately. No JavaScript is parsed or evaluated. This check covers:
+rasterrocket refuses to open PDFs that contain JavaScript entry points and returns `RasterError::Pdf(InterpError::JavaScript { location })` immediately. No JavaScript is parsed or evaluated. This check covers:
 
 - `/Catalog/OpenAction` with `/S /JavaScript`
 - `/Catalog/AA` (catalog-level additional actions)
@@ -234,18 +227,20 @@ pdf-raster refuses to open PDFs that contain JavaScript entry points and returns
 
 ```bash
 # CPU-only (no CUDA dependency)
-cargo build --release -p pdf-raster
+cargo build --release -p rasterrocket-cli
 
 # With all GPU features
 # Default CUDA_ARCH is sm_80 (Ampere); override to match your card.
-CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
-  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew,pdf_raster/cache"
+CUDA_ARCH=sm_120 cargo build --release -p rasterrocket-cli \
+  --features "rasterrocket/nvjpeg,rasterrocket/nvjpeg2k,rasterrocket/gpu-aa,rasterrocket/gpu-icc,rasterrocket/gpu-deskew,rasterrocket/cache"
 ```
 
 `CUDA_ARCH` must match your GPU's Compute Capability (e.g. `sm_75` for RTX 20-series, `sm_86` for RTX 30-series, `sm_89` for RTX 40-series, `sm_120` for RTX 50-series). Look yours up at [developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus). See the [README's GPU matrix](../README.md#picking-cuda_arch-for-your-gpu) for the common-case table and the [feature-flag list](../README.md#feature-flags).
 
+To install the CLI from crates.io: `cargo install rasterrocket-cli`.
+
 ### A note on output destination (v0.6.0+)
 
-The CLI defaults to writing rendered pages into a fresh `/dev/shm/pdf-raster-<pid>-<nanos>/` tmpfs directory whenever `OUTPUT_PREFIX` looks like a bare stem (e.g. `out`, `p`). Disk writes were dominating wall time on JPEG-heavy workloads — ext4 `auto_da_alloc` rename serialisation parked all 24 render threads in `do_renameat2`. Path-like prefixes (anything containing `/` or starting with `.`) opt out and write where you asked. Pass `--no-ram` to force on-disk output even for bare stems, or `--ram-path <DIR>` to override the tmpfs location. A built-in spill policy automatically falls through to disk when MemAvailable drops below 1 GiB.
+The CLI defaults to writing rendered pages into a fresh `/dev/shm/rasterrocket-<pid>-<nanos>/` tmpfs directory whenever `OUTPUT_PREFIX` looks like a bare stem (e.g. `out`, `p`). Disk writes were dominating wall time on JPEG-heavy workloads — ext4 `auto_da_alloc` rename serialisation parked all 24 render threads in `do_renameat2`. Path-like prefixes (anything containing `/` or starting with `.`) opt out and write where you asked. Pass `--no-ram` to force on-disk output even for bare stems, or `--ram-path <DIR>` to override the tmpfs location. A built-in spill policy automatically falls through to disk when MemAvailable drops below 1 GiB.
 
 See [cli-reference.md](cli-reference.md) for CLI usage.

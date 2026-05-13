@@ -1,7 +1,7 @@
 # CLI Reference
 
 ```
-pdf-raster [OPTIONS] <INPUT> <OUTPUT_PREFIX>
+rasterrocket [OPTIONS] <INPUT> <OUTPUT_PREFIX>
 ```
 
 Renders PDF pages to image files. Drop-in replacement for `pdftoppm` in scripts.
@@ -119,9 +119,9 @@ DPI values must be positive finite numbers; non-positive values are rejected at 
 |---|---|---|
 | `--ram` | (heuristic) | Force RAM-backed output even when `OUTPUT_PREFIX` looks like a path. Mutually exclusive with `--no-ram`. |
 | `--no-ram` | (heuristic) | Force on-disk output. Disables the default tmpfs redirect for bare stems and writes pages exactly at `OUTPUT_PREFIX`. Mutually exclusive with `--ram`. |
-| `--ram-path PATH` | `/dev/shm/pdf-raster-<pid>-<nanos>/` | Override the tmpfs directory used by RAM-backed output. Implies `--ram`. |
+| `--ram-path PATH` | `/dev/shm/rasterrocket-<pid>-<nanos>/` | Override the tmpfs directory used by RAM-backed output. Implies `--ram`. |
 
-By default `pdf-raster` redirects rendered pages to a freshly-created tmpfs directory under `/dev/shm` whenever the output prefix is a bare stem, because writing to disk is 10–20× slower than RAM and dominates wall time on JPEG-heavy workloads.
+By default `rasterrocket` redirects rendered pages to a freshly-created tmpfs directory under `/dev/shm` whenever the output prefix is a bare stem, because writing to disk is 10–20× slower than RAM and dominates wall time on JPEG-heavy workloads.
 
 **Bare stem vs path heuristic:** prefixes containing `/` or starting with `.` (e.g. `./out`, `/tmp/p`, `out/dir/p`) are treated as path-like and write to disk literally. Bare stems (e.g. `out`, `p`, `cover`) are redirected to tmpfs. `--ram` overrides the heuristic to redirect anyway; `--no-ram` overrides it to write to disk anyway.
 
@@ -146,20 +146,20 @@ A built-in spill policy polls `/proc/meminfo` every 100 ms and falls subsequent 
 
 **`vaapi`** — Require VA-API JPEG decoding. Exits with an error if the DRM device cannot be opened. Use this to confirm iGPU/dGPU decoding is active.
 
-`--vaapi-device` has no effect with `--backend cpu`, `--backend cuda`, or `--backend vulkan` — pdf-raster will reject the combination with a clear error rather than silently ignoring it.
+`--vaapi-device` has no effect with `--backend cpu`, `--backend cuda`, or `--backend vulkan` — rasterrocket will reject the combination with a clear error rather than silently ignoring it.
 
 ```bash
 # Confirm CUDA is active (fails loudly if no NVIDIA GPU)
-pdf-raster --backend cuda -r 150 document.pdf out
+rasterrocket --backend cuda -r 150 document.pdf out
 
 # Confirm Vulkan is active (fails loudly if no Vulkan 1.3+ device)
-pdf-raster --backend vulkan -r 150 document.pdf out
+rasterrocket --backend vulkan -r 150 document.pdf out
 
 # Force CPU-only (useful for benchmarking without GPU)
-pdf-raster --backend cpu -r 150 document.pdf out
+rasterrocket --backend cpu -r 150 document.pdf out
 
 # Use VA-API on a non-default render node
-pdf-raster --backend vaapi --vaapi-device /dev/dri/renderD129 document.pdf out
+rasterrocket --backend vaapi --vaapi-device /dev/dri/renderD129 document.pdf out
 ```
 
 ---
@@ -177,25 +177,25 @@ pdf-raster --backend vaapi --vaapi-device /dev/dri/renderD129 document.pdf out
 
 ```bash
 # Render all pages at 150 DPI (default), output out-1.ppm, out-2.ppm, …
-pdf-raster document.pdf out
+rasterrocket document.pdf out
 
 # Render pages 3–7 at 300 DPI, grayscale PNG
-pdf-raster -f 3 -l 7 -r 300 --gray --png document.pdf out
+rasterrocket -f 3 -l 7 -r 300 --gray --png document.pdf out
 
 # Render all pages at 300 DPI, 4 threads, with progress
-pdf-raster -r 300 --threads 4 -P document.pdf out
+rasterrocket -r 300 --threads 4 -P document.pdf out
 
 # Render only odd pages
-pdf-raster --odd document.pdf out
+rasterrocket --odd document.pdf out
 
 # Render first page only (--singlefile stops after first match)
-pdf-raster --singlefile document.pdf cover
+rasterrocket --singlefile document.pdf cover
 
 # Render at 150 DPI, zero-pad page numbers to 3 digits: out-001.ppm
-pdf-raster -r 150 --forcenum 3 document.pdf out
+rasterrocket -r 150 --forcenum 3 document.pdf out
 
 # Render with underscore separator: out_1.ppm
-pdf-raster --sep _ document.pdf out
+rasterrocket --sep _ document.pdf out
 
 # Compare output against pdftoppm (pixel-diff test)
 tests/compare/compare.sh -r 150 -f 1 -l 5 document.pdf
@@ -205,9 +205,9 @@ tests/compare/compare.sh -r 150 -f 1 -l 5 document.pdf
 
 ## Pixel-diff comparison
 
-`tests/compare/compare.sh` compares pdf-raster output against pdftoppm page-by-page using ImageMagick RMSE.
+`tests/compare/compare.sh` compares rasterrocket output against pdftoppm page-by-page using ImageMagick RMSE.
 
-**Requirements:** `pdftoppm`, `pdf-raster` (release build in `$PATH` or `target/release/`), ImageMagick (`compare`), `bc`.
+**Requirements:** `pdftoppm`, `rasterrocket` (release build in `$PATH` or `target/release/`), ImageMagick (`compare`), `bc`.
 
 ```bash
 tests/compare/compare.sh [OPTIONS] <PDF>

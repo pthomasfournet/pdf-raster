@@ -1,19 +1,19 @@
-# pdf-raster Roadmap
+# rasterrocket Roadmap
 
 Goal: full PDF → pixels pipeline in pure Rust. Zero poppler. Zero C++ in the render path.
 
-The raster crate is complete at the pixel level. The `pdf_interp` crate is the native renderer and is now the only CLI path. The `pdf_bridge` / poppler crate is retained as a reference baseline but is no longer linked by the CLI binary.
+The rasterrocket-render crate is complete at the pixel level. The `rasterrocket-interp` crate is the native renderer and is now the only CLI path. The `pdf_bridge` / poppler crate is retained as a reference baseline but is no longer linked by the CLI binary.
 
-**Integration target (Apr 2026):** pdf-raster replaces steps 3 (pdftoppm subprocess) and 4 (Leptonica preprocessing) in an OCR pipeline:
+**Integration target (Apr 2026):** rasterrocket replaces steps 3 (pdftoppm subprocess) and 4 (Leptonica preprocessing) in an OCR pipeline:
 
 ```
-pdf_oxide → [quality check fails] → pdf-raster (rasterise + deskew) → Tesseract → (LLM correct)
+pdf_oxide → [quality check fails] → rasterrocket (rasterise + deskew) → Tesseract → (LLM correct)
 ```
 
 The caller's Tesseract step becomes a single in-process call — no subprocess, no files, no Leptonica:
 
 ```rust
-let page = pdf_raster::render_page(path, page_num, &opts)?;
+let page = rasterrocket::render_page(path, page_num, &opts)?;
 // page.pixels is 8-bit grayscale, tightly packed, top-to-bottom
 let text = tesseract::ocr_from_frame(
     &page.pixels, page.width as i32, page.height as i32,
@@ -55,7 +55,7 @@ All breaking API changes from the pre-1.0 cleanup are now permanent. The public 
 **Spec-correctness fix on the simple-font text path — the headline.**
 
 - **PDF §9.2.4 Widths-array lookup for simple fonts**
-  (`pdf_interp/resources/font.rs`). The renderer was using FreeType's
+  (`rasterrocket-interp/resources/font.rs`). The renderer was using FreeType's
   `horiAdvance` for every byte of simple-font text, but for any font
   not embedded in the PDF (most academic / English-language PDFs),
   FreeType returns Helvetica-substitute metrics. The spec is explicit
@@ -89,7 +89,7 @@ All breaking API changes from the pre-1.0 cleanup are now permanent. The public 
 
 **Pre-existing bugs fixed:**
 
-- **`pdf_raster::PageCursor` sparse-iteration hang** (`041465a`). When
+- **`rasterrocket::PageCursor` sparse-iteration hang** (`041465a`). When
   the consumer drained pages out of `PageSet`'s iterator order, the
   cursor could deadlock. Replaced the `PageSet` iterator with a
   cursor that tracks emitted pages directly. Behaviour-preserving on
@@ -138,7 +138,7 @@ All breaking API changes from the pre-1.0 cleanup are now permanent. The public 
 - **CPU rotation invariants** (`ea5ee31`). 4 new tests on
   `rotate_cpu` / `bilinear_sample` / `rotate_pixel_scalar` + 4
   boundary-pixel assertions on the existing `rotate_zero_is_identity`.
-  cargo-mutants on `pdf_raster/deskew/rotate.rs --features
+  cargo-mutants on `crates/rasterrocket/src/deskew/rotate.rs --features
   gpu-deskew`: **18 → 1** survivors. The one remaining is the
   aarch64-only NEON dispatcher, untestable on x86.
 - **Structural `rotate_gpu` dimension pin** (`6f20264`). Runs
@@ -149,7 +149,7 @@ All breaking API changes from the pre-1.0 cleanup are now permanent. The public 
 
 **Clippy / fmt cleanups:**
 
-- `pdf_interp --tests` — **40 → 0** warnings (`6533b17`). Auto-fix
+- `rasterrocket-interp --tests` — **40 → 0** warnings (`6533b17`). Auto-fix
   sweep + 12 `#[expect(float_cmp, reason = ...)]` annotations on
   bit-exact identity-matrix / sentinel-fallback tests.
 - `gpu --features ...,vaapi --tests` — **14 → 0** pre-existing
@@ -172,7 +172,7 @@ workspace; ~700 net lines removed.**
   cache, never wired up.  Type 3 glyph caching, if it returns, should
   extend `font::GlyphCache` (now keyed on `GlyphKey`) rather than
   reintroduce a sibling cache.  A pointer comment in
-  `pdf_interp::renderer::page::text::show_text_type3` documents the
+  `rasterrocket_interp::renderer::page::text::show_text_type3` documents the
   trigger.
 - **`raster::state::StateFlags` collapsed to a single `bool` field**
   (-191 lines across two commits).  The 8-bit packed flag struct had
@@ -181,13 +181,13 @@ workspace; ~700 net lines removed.**
   silence `clippy::struct_excessive_bools` on 8 flags; with 1 flag
   remaining it had no justification.  If a future flag returns, add it
   as a field, not a re-introduced bit packing.
-- **`pdf_interp::cache::PrefetchHandle::{wait, stats}`** and
+- **`rasterrocket_interp::cache::PrefetchHandle::{wait, stats}`** and
   `PrefetchStats::snapshot` deleted; `PrefetchStats` counters and
   `PrefetchState.stats` field also removed (the worker `fetch_add`
   calls had become write-only after the snapshot reader was deleted).
   `RasterSession` holds `PrefetchHandle` purely as a Drop side-effect;
   the handle's methods had zero callers.
-- **`pdf_raster::RenderedPage::suggested_dpi` delegate deleted.**
+- **`rasterrocket::RenderedPage::suggested_dpi` delegate deleted.**
   One-line `pub fn` wrapping `self.diagnostics.suggested_dpi(...)`
   with no external callers.  Users now reach through the public
   `diagnostics` field directly.
@@ -222,24 +222,24 @@ workspace; ~700 net lines removed.**
 
 - `Bitmap` / `AaBuf`: extracted 7 duplicated bounds-check asserts into
   two `assert_row_in_bounds` helpers.
-- `pdf_interp` example binaries: every `.unwrap()` / `.expect("X")` on
+- `rasterrocket-interp` example binaries: every `.unwrap()` / `.expect("X")` on
   `open` / `parse_page` replaced with `unwrap_or_else(|e| { eprintln!;
   exit(1); })` — failures now fail loudly with the path / page /
   underlying error rather than a terse panic.  `examples/render_page.rs`
   also gained real bounds checking on the f64 → u32 dimension cast
   (a malformed `PageGeometry` or extreme `--dpi` could previously
   saturate to `u32::MAX`).
-- `pdf_raster::PageSet::is_empty` is now `const fn -> false`; the
+- `rasterrocket::PageSet::is_empty` is now `const fn -> false`; the
   non-empty invariant from `PageSet::new` is structurally enforced.
 
 **Pre-existing bugs fixed:**
 
-- `pdf_interp/examples/render_page.rs` called `.get(&page)` on
+- `rasterrocket-interp/examples/render_page.rs` called `.get(&page)` on
   `doc.get_pages()` — broken since the lopdf → native-pdf migration
   (the return is an iterator, not a `HashMap`).  Now uses
   `pdf::Document::get_page(idx - 1)` with explicit 1-based bounds
   checking.
-- Three `pdf_interp` example binaries (`dump_ops`, `smoke`,
+- Three `rasterrocket-interp` example binaries (`dump_ops`, `smoke`,
   `scan_fills`) had no `//!` header and triggered workspace
   `-W missing-docs`; `dump_ops` also re-walked `std::env::args()`
   twice.
@@ -264,7 +264,7 @@ in this release: `PageIter` 4-billion-iter spin → fixed by the
 `glyph_advance` → fixed by the PDF §9.2.4 `Widths`-array headline
 (`ab556d7`) above; GPU rotation pixel parity → already covered by
 `gpu_vs_cpu_rotation_parity` under `gpu-validation` in
-`crates/pdf_raster/src/deskew/rotate.rs:690`, complementing the
+`crates/rasterrocket/src/deskew/rotate.rs:690`, complementing the
 structural `rotate_gpu_preserves_dimensions_or_errors` pin
 (`6f20264`) cited above; AVX-512 fast-path vs general-path
 byte-equality → pinned by
@@ -274,8 +274,8 @@ asserting `|fast - exact| ≤ 1` per byte and verifying the corpus
 actually exercises the 1-LSB divergence.)*
 
 **Verification:** all 689 workspace unit tests pass; clippy clean
-across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
-`pdf_raster`/`bench`/`pdf-raster` (CLI); rustdoc clean.
+across `rasterrocket-color`/`rasterrocket-parser`/`rasterrocket-render`/`gpu`/`rasterrocket-font`/`rasterrocket-encode`/`rasterrocket-interp`/
+`rasterrocket`/`bench`/`rasterrocket-cli`; rustdoc clean.
 
 ### v0.9.0 (May 2026)
 
@@ -300,7 +300,7 @@ across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
   `from_env_var`; consumed by `SessionConfig::default()`.
 - **Process-static GPU contexts.**  Both `gpu::GpuCtx` (CUDA) and
   `gpu::backend::vulkan::VulkanBackend` are memoised in a
-  `OnceLock<Result<Arc<_>, String>>` inside `pdf_raster::render`, so
+  `OnceLock<Result<Arc<_>, String>>` inside `rasterrocket::render`, so
   workloads that open many short-lived sessions (Phase 11 E3:
   100 archives, 1 page each) pay the ~240 ms init cost once per
   process instead of N times.  Phase 11 E3 went from 24 s → 14 s
@@ -334,12 +334,12 @@ across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
 
 - Four-event bench
   harness in `crates/bench/contest_v11`: E1 first-pixel, E2 sustained,
-  E3 cross-doc, E4 random-access.  All three engines (pdf-raster,
+  E3 cross-doc, E4 random-access.  All three engines (rasterrocket,
   mutool draw, pdftoppm) write a PPM file per render — the timed
   window includes disk write to make the comparison apples-to-apples
   on a 2.78 GB synthetic archive built from corpus-04/05/08/09.
   See `bench/v11/results.md` for the full table.
-  - **E1 (page 8000 of a 16193-page archive):** pdf-raster 35.6 ms vs
+  - **E1 (page 8000 of a 16193-page archive):** rasterrocket 35.6 ms vs
     mutool 93.7 ms (**2.6× faster**) vs pdftoppm 770.5 ms (**22×
     faster**).  pdftoppm DNF on the spec's literal "page 50000"
     invocation since the archive only has 16193 pages and pdftoppm
@@ -415,7 +415,7 @@ across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
     three times per render (`page_size_pts`, `resolve_page`,
     `parse_page` each calling `Document::get_page` independently);
     now plumbs a single resolved `page_id` through
-    `pdf_interp::page_size_pts_by_id` and `parse_page_by_id`.
+    `rasterrocket_interp::page_size_pts_by_id` and `parse_page_by_id`.
   - **Real perf fix**: new `Document::get_dict_arc` accessor returns
     `Arc<Object>` zero-clone; descender uses it.  `pages_root_id`
     memoised on `Document`.  Flat-tree fast path in `descend_to_page_index`.
@@ -429,7 +429,7 @@ across `color`/`pdf`/`raster`/`gpu`/`font`/`encode`/`pdf_interp`/
     the lint there; now `#[cfg_attr(not(test), expect(dead_code, ...))]`
     so the suppression scopes to lib builds only.
   - **Pre-existing dead code removed**: the `eval_stitching` test
-    wrapper in `pdf_interp/resources/shading/function.rs` existed only
+    wrapper in `rasterrocket-interp/resources/shading/function.rs` existed only
     to support a `#[ignore]`'d test; deleted.
 
 **Bench gate (Phase 11 — see `bench/v11/results.md`):**
@@ -448,7 +448,7 @@ Future runs can add competitor invocations to E2/E3/E4 if a meaningful
 side-by-side becomes interesting.
 
 **What this means:** Phase 11 is functionally complete on the contest
-hardware (Ryzen 9 9900X3D + RTX 5070 + Linux 6.17).  pdf-raster wins
+hardware (Ryzen 9 9900X3D + RTX 5070 + Linux 6.17).  rasterrocket wins
 the spec'd cross-engine event by 2.6×–22× under the strictest
 fair-play comparison (apples-to-apples disk write, fair-play mutool
 flags, pdftoppm DNF on the literal page-50000 invocation).  Hardening
@@ -462,8 +462,8 @@ removed pre-existing dead code.
 
 - **Vulkan compute backend (Phase 10).**  All six GPU kernels (`composite_rgba8`, `apply_soft_mask`, `aa_fill`, `tile_fill`, `icc_clut`, `blit_image`) now also exist as Slang shaders compiled to SPIR-V at build time, run by a new `VulkanBackend` (`crates/gpu/src/backend/vulkan/`) implementing a backend-agnostic `GpuBackend` trait.  CLI flag: `--backend vulkan`.  Cross-vendor support is the goal (NVIDIA, AMD, Intel, Apple via `MoltenVK`); only RTX 5070 has been on-machine tested so far.  Phase 9 device-resident image cache stays CUDA-only — under `--backend vulkan` the renderer runs uncached, matching pre-Phase-9 behaviour.
 - **GpuBackend trait + CudaBackend skeleton.**  `crates/gpu/src/backend/{mod,params,cuda}.rs` factor the per-page state machine (`begin_page` → `record_*` → `submit_page` → `wait_page`) out of `GpuCtx`.  The CUDA renderer path still goes through `GpuCtx` directly (no measurable benefit from a shape-only port; the `DevicePageBuffer` migration is what would force the trait through, and that's deferred until the cache itself becomes generic over `B`).
-- **Renderer integration.**  `PageRenderer` gained an `Option<Arc<VulkanBackend>>` field beside `gpu_ctx`; the fill dispatch prefers Vulkan when set.  `pdf_interp::renderer::page::vk_ops` wraps the trait surface for AA fill and tile fill.  ICC CMYK→RGB on Vulkan is intentionally deferred — under `ForceVulkan` the renderer falls through to the CPU `cmyk_to_rgb_reflectance` matrix (same shape as Phase 9-pre).
-- **Build-script bug fix (pre-existing).**  `crates/gpu/build.rs` previously keyed PTX compilation on a feature-flag heuristic that didn't include `pdf_interp::gpu-aa` / `gpu-icc` (those features don't propagate to the gpu crate's build env).  A build with `--features "vulkan,gpu-aa"` or `gpu-aa` alone produced 0-byte placeholder PTX, then crashed at runtime with `CUDA_ERROR_INVALID_IMAGE`.  Now keys on a real `nvcc --version` probe and emits `cargo:rustc-cfg=ptx_placeholder` only when nvcc is genuinely missing.  `GpuCtx::init` short-circuits under that cfg with a clear message pointing at the build host's missing nvcc rather than letting the driver throw.
+- **Renderer integration.**  `PageRenderer` gained an `Option<Arc<VulkanBackend>>` field beside `gpu_ctx`; the fill dispatch prefers Vulkan when set.  `rasterrocket_interp::renderer::page::vk_ops` wraps the trait surface for AA fill and tile fill.  ICC CMYK→RGB on Vulkan is intentionally deferred — under `ForceVulkan` the renderer falls through to the CPU `cmyk_to_rgb_reflectance` matrix (same shape as Phase 9-pre).
+- **Build-script bug fix (pre-existing).**  `crates/gpu/build.rs` previously keyed PTX compilation on a feature-flag heuristic that didn't include `rasterrocket-interp/gpu-aa` / `gpu-icc` (those features don't propagate to the gpu crate's build env).  A build with `--features "vulkan,gpu-aa"` or `gpu-aa` alone produced 0-byte placeholder PTX, then crashed at runtime with `CUDA_ERROR_INVALID_IMAGE`.  Now keys on a real `nvcc --version` probe and emits `cargo:rustc-cfg=ptx_placeholder` only when nvcc is genuinely missing.  `GpuCtx::init` short-circuits under that cfg with a clear message pointing at the build host's missing nvcc rather than letting the driver throw.
 - **Hardening pass on Vulkan dispatch.**  `n_segs` overflow check (was a saturating cast that would silently corrupt coverage on adversarial input), `checked_pixel_count` overflow guard, in-place segment shift (saved one `Vec<f32>` allocation per AA fill), `alloc_or_warn` / `upload_or_warn` / `warn_err` helpers consolidate ten near-identical error-handling blocks, NVCC stderr captured on probe and per-kernel compile failures so build diagnostics are actionable instead of bare exit-status panics.
 - **Documentation.**  `docs/api-reference.md`, `docs/cli-reference.md`, `docs/getting-started.md`, `docs/benchmarks.md`, `ARCHITECTURE.md`, and `README.md` updated for `--backend vulkan` and the Vulkan compute backend.  `bench/v10/` ships the Phase-10 bench-gate matrix.
 
@@ -486,9 +486,9 @@ The criterion-1 baseline is **live-captured** (the v0.7.0 binary rebuilt and re-
 
 **New since v0.6.0:**
 
-- **Device-resident image cache (3-tier).** New `cache` feature on the `gpu` and `pdf_interp` crates wires a `DeviceImageCache` with three tiers: VRAM (primary, refcount-pinned LRU), pinned host RAM (demote-on-evict / promote-on-hit), and disk (`<root>/<doc-sha256>/<content-hash>.bin` sidecar files for cross-session persistence). Keys: BLAKE3 content hash (cross-document dedup) + `(DocId, ObjId)` alias (same-document fast path). Disk writes are atomic via temp+rename, gated on env vars `PDF_RASTER_CACHE_DIR` / `PDF_RASTER_CACHE_BYTES`, invalidated automatically when the source PDF changes (DocId is BLAKE3 of the bytes).
+- **Device-resident image cache (3-tier).** New `cache` feature on the `gpu` and `rasterrocket-interp` crates wires a `DeviceImageCache` with three tiers: VRAM (primary, refcount-pinned LRU), pinned host RAM (demote-on-evict / promote-on-hit), and disk (`<root>/<doc-sha256>/<content-hash>.bin` sidecar files for cross-session persistence). Keys: BLAKE3 content hash (cross-document dedup) + `(DocId, ObjId)` alias (same-document fast path). Disk writes are atomic via temp+rename, gated on env vars `PDF_RASTER_CACHE_DIR` / `PDF_RASTER_CACHE_BYTES`, invalidated automatically when the source PDF changes (DocId is BLAKE3 of the bytes).
 - **Device-resident page buffer + GPU image blit.** New `crates/gpu/kernels/blit_image.cu` 16×16-block kernel with f32 inverse-CTM nearest-neighbour sampling that matches the CPU path byte-for-byte (verified by an in-tree CPU-reference parity test). `DevicePageBuffer` is lazy-allocated on first GPU image; source-over composite onto the host bitmap happens in one `cudaMemcpyAsync` at `PageRenderer::finish`. `ImageData::Gpu(Arc<CachedDeviceImage>)` is the cached-decode product `decode_dct` returns when the cache is on.
-- **Image-cache prefetcher.** `pdf_interp::cache::spawn_prefetch` walks every page's `/XObject` resource dict at session open, dedupes by `ObjId`, and decodes `/DCTDecode` images on a small `std::thread` worker pool (default 2, capped at `MAX_PREFETCH_WORKERS = 16`). Decoder panics caught per-image so one bad XObject doesn't kill the run. Opt-in via `SessionConfig::prefetch`; default off because eager resource-dict walks are wasted work for short single-page renders. `RasterSession.doc` upgraded to `Arc<Document>` so the prefetcher can hold its own clone without changing how the renderer borrows.
+- **Image-cache prefetcher.** `rasterrocket_interp::cache::spawn_prefetch` walks every page's `/XObject` resource dict at session open, dedupes by `ObjId`, and decodes `/DCTDecode` images on a small `std::thread` worker pool (default 2, capped at `MAX_PREFETCH_WORKERS = 16`). Decoder panics caught per-image so one bad XObject doesn't kill the run. Opt-in via `SessionConfig::prefetch`; default off because eager resource-dict walks are wasted work for short single-page renders. `RasterSession.doc` upgraded to `Arc<Document>` so the prefetcher can hold its own clone without changing how the renderer borrows.
 - **JPEG scaffolding correctness fixes (`crates/gpu/src/jpeg/`).** RST predictor reset is now driven by MCU index (`mcu_idx % restart_interval == 0`) instead of the bit reader's byte position — the byte-position chase worked by incidental ordering but a truncated MCU could leave the cursor short of the marker and silently skip the predictor reset. The `aa_fill.cu` `JITTER_Y` table had 8 wrong Halton(3) values at indices 17–23 and 44–47, found while bringing up gpu-validation tests; CPU `HALTON3` in `fill.rs` is now the source of truth.
 - **JPEG scaffolding cleanup.** Collapsed the double SOF scan in `JpegHeaders::parse` (non-baseline detection inline in the marker loop, no separate `jpeg_sof_type` pre-pass). `BitReader::refill` grew an 8-byte `u64::from_be_bytes` fast path on the common cap-zero case (~2× Huffman codeword throughput per textbooks). `canonical::fill_table` switched to `slice::fill`. VA-API adapter no longer caches `num_mcus` — derives from a shared `mcu_count_from_max_sampling` helper.
 - **Documentation.** README gains a "Picking CUDA_ARCH for your GPU" subsection mapping consumer GPU generations (Pascal → Blackwell, A100, H100) to the right `sm_NN` flag, plus a feature-flag table covering `nvjpeg`, `nvjpeg2k`, `gpu-aa`, `gpu-icc`, `gpu-deskew`, `cache`, `vaapi`. Build script default of `sm_80` is documented inline.
@@ -526,8 +526,8 @@ Criterion 2 (≤ 30% second-render time) is just outside the threshold but the r
 
 **New since v0.5.1:**
 
-- **lopdf rip-out — in-tree `pdf` crate.** Replaced lopdf 0.40 with `crates/pdf/`: a lazy mmap-based parser that reads only the xref table and trailer at `Document::open` and resolves objects on demand via byte-offset seek. Per-object `Arc` cache + mutex; ObjStm decompression cached once across worker threads. API surface (`Object`, `Dictionary` newtype, `Stream`, `ObjectId`, `PdfError`) mirrors the lopdf names previously used so the migration was mechanical. DOS-hardened: caps on xref entries (10M), `/N` (1M), PNG predictor output (256 MiB); `checked_add` throughout. `pdf_interp` (17 files) and `pdf_raster` swapped over file-by-file; lopdf is gone from the entire workspace. Motivation: lopdf's `load_objects_raw` had been burning ~20% of corpus-07 cycles in `nom_locate`'s `memchr` on the main thread before render workers could start, capping CPU utilisation at ~1.6 of 24 cores. Cold-cache corpus-07 went from 757 ms → 689 ms.
-- **RAM-backed output by default.** Disk I/O was hiding actual CPU work — the previous temp-file + atomic-rename pattern triggered ext4 `auto_da_alloc` on every page, parking 24 workers in `do_renameat2`. Two changes: dropped the temp-rename dance (write directly to the final path, delete on encode failure); defaulted per-page output to `/dev/shm/pdf-raster-<pid>-<nanos>/` for bare-stem prefixes. New CLI flags: `--ram`, `--no-ram`, `--ram-path <PATH>`. Heuristic: bare stem (`out`, `p`) → RAM; path-like (`./out`, `/tmp/p`) → disk literally. `SpillPolicy` queries `/proc/meminfo` MemAvailable every 100 ms; subsequent pages spill to disk automatically when free RAM drops below 1 GiB, with a one-shot stderr warning.
+- **lopdf rip-out — in-tree `rasterrocket-parser` crate.** Replaced lopdf 0.40 with `crates/rasterrocket-parser/`: a lazy mmap-based parser that reads only the xref table and trailer at `Document::open` and resolves objects on demand via byte-offset seek. Per-object `Arc` cache + mutex; ObjStm decompression cached once across worker threads. API surface (`Object`, `Dictionary` newtype, `Stream`, `ObjectId`, `PdfError`) mirrors the lopdf names previously used so the migration was mechanical. DOS-hardened: caps on xref entries (10M), `/N` (1M), PNG predictor output (256 MiB); `checked_add` throughout. `rasterrocket-interp` (17 files) and `rasterrocket` swapped over file-by-file; lopdf is gone from the entire workspace. Motivation: lopdf's `load_objects_raw` had been burning ~20% of corpus-07 cycles in `nom_locate`'s `memchr` on the main thread before render workers could start, capping CPU utilisation at ~1.6 of 24 cores. Cold-cache corpus-07 went from 757 ms → 689 ms.
+- **RAM-backed output by default.** Disk I/O was hiding actual CPU work — the previous temp-file + atomic-rename pattern triggered ext4 `auto_da_alloc` on every page, parking 24 workers in `do_renameat2`. Two changes: dropped the temp-rename dance (write directly to the final path, delete on encode failure); defaulted per-page output to `/dev/shm/rasterrocket-<pid>-<nanos>/` for bare-stem prefixes. New CLI flags: `--ram`, `--no-ram`, `--ram-path <PATH>`. Heuristic: bare stem (`out`, `p`) → RAM; path-like (`./out`, `/tmp/p`) → disk literally. `SpillPolicy` queries `/proc/meminfo` MemAvailable every 100 ms; subsequent pages spill to disk automatically when free RAM drops below 1 GiB, with a one-shot stderr warning.
 - **`PageIter` handles indirect `/Kids`.** The PDF spec allows `/Kids` to be either an inline array or an indirect Reference to one. `PageIter` only handled the inline case, silently reporting `page_count=0` for files using the reference form. Now resolves the reference one level. Regression test added in `pdf/src/document.rs`. Discovered while benchmarking corpus-04.
 
 ### v0.5.1 (May 2026)
@@ -561,7 +561,7 @@ Phases 5 and 6 are complete and integrated.  All core roadmap milestones done.
 
 **New since v0.2.0:**
 
-- **`pdf_raster` public library crate** — `raster_pdf`, `render_channel`, `open_session`, `RasterOptions`, `RenderedPage`, `PageDiagnostics`, `RasterError`.  Three review passes; full validation, GPU teardown, `render_channel` backpressure, atomic temp-file rename in CLI.
+- **`rasterrocket` public library crate** — `raster_pdf`, `render_channel`, `open_session`, `RasterOptions`, `RenderedPage`, `PageDiagnostics`, `RasterError`.  Three review passes; full validation, GPU teardown, `render_channel` backpressure, atomic temp-file rename in CLI.
 - **`UserUnit` support** — `page_size_pts` reads, validates, and propagates `UserUnit`; `RenderedPage.effective_dpi` is the correct value to pass to Tesseract.
 - **`PageDiagnostics`** — `has_images`, `has_vector_text`, `dominant_filter`, `source_ppi_hint`, `suggested_dpi()` — zero-cost collection during render.
 - **Pipelined render+OCR** — `render_channel(path, opts, capacity)` for bounded producer/consumer.
@@ -602,11 +602,11 @@ Initial release.  Native PDF interpreter (Phases 1–4), GPU acceleration (nvJPE
 | DPI handling? | Call `set_source_resolution(dpi)` explicitly after `set_frame`. Default fallback is 70 DPI which severely degrades accuracy. Pass the actual render DPI. |
 | libopenjp2 on this machine? | Yes — Leptonica 1.82.0 links libopenjp2 2.5.0. JPEG 2000 works natively. |
 
-### What exists in pdf-raster
+### What exists in rasterrocket
 
-- `render_page_native()` in `crates/cli/src/render.rs` — closest to a pipeline entry point, but CLI-entangled: takes `&Args`, writes to disk, returns `()`
-- `rgb_to_gray()` in `crates/cli/src/render.rs` — BT.709 grayscale, unexported
-- `pdf_interp::open()`, `page_count()`, `page_size_pts()`, `parse_page()` — clean public surface
+- `render_page_native()` in `crates/rasterrocket-cli/src/render.rs` — closest to a pipeline entry point, but CLI-entangled: takes `&Args`, writes to disk, returns `()`
+- `rgb_to_gray()` in `crates/rasterrocket-cli/src/render.rs` — BT.709 grayscale, unexported
+- `rasterrocket_interp::open()`, `page_count()`, `page_size_pts()`, `parse_page()` — clean public surface
 - `raster::Bitmap<T>` — pixel buffer type, usable as a return type
 - GPU decoder lifecycle (`DecoderInit<T>` thread-locals) — CLI-specific, needs encapsulation
 
@@ -641,7 +641,7 @@ Initial release.  Native PDF interpreter (Phases 1–4), GPU acceleration (nvJPE
 - [x] Image colour spaces: DeviceRGB, DeviceGray, mask (stencil)
 - [x] Soft mask (SMask) compositing on images
 - [x] JavaScript rejection — hard fail on any JS entry point in the document
-- [x] CLI `--native` flag wired to `pdf_interp` render path
+- [x] CLI `--native` flag wired to `rasterrocket-interp` render path
 
 ### Blocking parity — must land before deleting pdf_bridge
 
@@ -752,7 +752,7 @@ For scan-heavy corpora (JPEG/JBIG2/CCITT image layers + thin OCR text overlay), 
 
 - [x] `gpu::nvjpeg` module: minimal raw FFI surface (no bindgen); `NvJpeg` (pub(crate)) + `NvJpegDecoder` (pub) safe wrapper; `decode_sync` blocks on `cuStreamSynchronize` after GPU DMA completes
 - [x] DCTDecode dispatch: image area ≥ `GPU_JPEG_THRESHOLD_PX` (512×512) → nvJPEG; else CPU zune-jpeg; CMYK JPEG falls through to CPU
-- [x] Feature flags: `gpu/nvjpeg` + `pdf_interp/nvjpeg`; zero-cost when disabled; pdf_interp maintains `unsafe_code = "deny"`
+- [x] Feature flags: `gpu/nvjpeg` + `rasterrocket-interp/nvjpeg`; zero-cost when disabled; `rasterrocket-interp` maintains `unsafe_code = "deny"`
 - [x] `NVJPEG_BACKEND_HARDWARE` (on-die engine, RTX 5070/Turing+) with automatic fallback to `NVJPEG_BACKEND_DEFAULT` on `NVJPEG_STATUS_JPEG_NOT_SUPPORTED` (progressive JPEGs); fallback is one-shot per decoder instance
 - [x] Output buffer is `PinnedBuf` via `cuMemAllocHost_v2` — declare the `_v2` symbol explicitly via `#[link_name]`; calling the old `cuMemAllocHost` symbol returns `CUDA_ERROR_INVALID_CONTEXT=201`; plain `Vec<u8>` segfaults on DMA
 - [x] Pure raw CUDA driver API in `NvJpegDecoder` (no cudarc at runtime): `cuInit → cuDeviceGet → cuDevicePrimaryCtxRetain → cuCtxSetCurrent → cuStreamCreate → nvjpegCreateEx`; mixing cudarc's primary context with nvJPEG's internal context causes `CUDA_ERROR_INVALID_CONTEXT=201` on every `cuStreamSynchronize`
@@ -792,7 +792,7 @@ output[py * width + px] = (uint8_t)((coverage * 255) / 32);
 
 - [x] CUDA kernel: jittered 64-sample winding test per pixel (`kernels/aa_fill.cu`; Halton(2,3) sample table; winding-number + EO rule; scales 0..64 → 0..255 via `(total*255+32)>>6`)
 - [x] Warp-ballot reduction: `__ballot_sync` + `__popc` per warp (2 warps/pixel = 64 samples); warp counts aggregated via shared memory; thread 0 writes final byte
-- [x] Wire into fill dispatch: `PageRenderer::try_gpu_aa_fill` (gated on `pdf_interp/gpu-aa` feature); CPU fallback below `GPU_AA_FILL_THRESHOLD`; pattern fills always CPU
+- [x] Wire into fill dispatch: `PageRenderer::try_gpu_aa_fill` (gated on `rasterrocket-interp/gpu-aa` feature); CPU fallback below `GPU_AA_FILL_THRESHOLD`; pattern fills always CPU
 - [x] Validate quality vs CPU AA on pixel-diff benchmark — pixel-identical (RMSE=0) across 41 pages / 98 GPU-dispatched fills at 600 DPI; CLI `gpu-aa` feature wires `GpuCtx` into renderer
 - [x] **Dispatch threshold calibration** (`src/bin/threshold_bench.rs`): geometric sweep 256–4M px on RTX 5070 + `PCIe` 5.0; `GPU_AA_FILL_THRESHOLD` 16 384 → **256 px** (GPU wins immediately; 2.5× at 256 px, 100× at 16 384 px)
 
@@ -817,7 +817,7 @@ DeviceCMYK → DeviceRGB via two paths depending on whether a full ICC CLUT is a
 - [x] **CPU matrix path** (`icc_cmyk_to_rgb_cpu`, clut=None): subtractive formula `(255−ch)*(255−K)/255` vectorised with `avx512bw` + `avx2` — 16 pixels/call via `_mm256_mullo_epi16`. VNNI was evaluated and rejected: `_mm512_dpbusds_epi32` requires compile-time constant weights; both operands are runtime pixel data here. Exact `⌊(x+127)/255⌋` divide matches scalar to the bit. Scalar fallback for non-AVX-512 targets and tail pixels.
 - [x] **GPU CLUT kernel** (`kernels/icc_clut.cu`): 4D quadrilinear interpolation over a baked `grid_n⁴ × 3` byte table; one thread per pixel; threshold `GPU_ICC_CLUT_THRESHOLD = 500 000 px` (conservative placeholder; CLUT path not yet in the hot path)
 - [x] **ICC matrix dispatch fix**: `icc_cmyk_to_rgb` short-circuits to `icc_cmyk_to_rgb_cpu` before the threshold check when `clut=None` — `threshold_bench` showed GPU matrix kernel never beats AVX-512 across all measured sizes (256–4M px); `PCIe` round-trip cost exceeds the cheap per-pixel computation
-- [x] `bake_cmyk_clut` (`pdf_interp/src/resources/icc.rs`): bakes a Little CMS ICC profile into a compact `u8` CLUT for upload; `BakeError` with `InvalidGridSize` and `Cms` variants; `DEFAULT_GRID_N = 17`
+- [x] `bake_cmyk_clut` (`rasterrocket-interp/src/resources/icc.rs`): bakes a Little CMS ICC profile into a compact `u8` CLUT for upload; `BakeError` with `InvalidGridSize` and `Cms` variants; `DEFAULT_GRID_N = 17`
 - [x] Rounding bias fix in CUDA kernel: `((255u - c) * inv_k + 127u) / 255u` (was missing the `+127` bias)
 - [x] Parity tests: `icc_cmyk_matrix_avx_vs_scalar` asserts AVX-512 and scalar agree byte-for-byte across 16 representative pixels including axis extremes and mid-range sweep
 - [x] nvJPEG2000 for JPXDecode — implemented (see Phase 4 item 1 above)
@@ -847,7 +847,7 @@ FreeType text rendering is **not** a GPU target — hinting is sequential per gl
 
 ### Results vs pdftoppm (poppler 24.x)
 
-| Fixture | Size | Character | pdf-raster | pdftoppm | Speedup |
+| Fixture | Size | Character | rasterrocket | pdftoppm | Speedup |
 |---|---|---|---|---|---|
 | light-vector.pdf | 116 KB | Light vector + text, 41 pp | 213 ms | 262 ms | **1.2×** |
 | mixed-vector.pdf | 281 KB | Mixed vector + images, 7 pp | 109 ms | 291 ms | **2.7×** |
@@ -863,7 +863,7 @@ The scan-heavy corpus (JPEG/JPEG2K) shows the largest gap because nvJPEG + nvJPE
 
 ### ~~Known gap: page rotation (`/Rotate`)~~ — RESOLVED (commit `82efbe5`)
 
-`/Rotate` and `CropBox` are fully handled: `pdf_interp::page_size_pts` reads
+`/Rotate` and `CropBox` are fully handled: `rasterrocket_interp::page_size_pts` reads
 `CropBox` (falling back to `MediaBox`), normalises `/Rotate` to 0/90/180/270,
 and swaps dimensions for 90°/270° rotations.  `PageRenderer::new_scaled`
 applies the matching CTM so all four rotation values produce correctly-oriented
@@ -898,7 +898,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release \
   --manifest-path crates/cli/Cargo.toml \
   --features nvjpeg,nvjpeg2k,gpu-aa,gpu-icc
 
-BIN=target/release/pdf-raster
+BIN=target/release/rasterrocket
 LD_LIB=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/libnvjpeg2k/13:/usr/local/cuda/lib64
 
 # Throughput vs pdftoppm
@@ -937,7 +937,7 @@ cargo run -p gpu --release --bin threshold_bench
 
 Extract the render pipeline into a reusable library crate. The caller gets 8-bit grayscale pixels in memory and passes them directly to Tesseract — no subprocess, no files, no Leptonica.
 
-### Crate: `crates/pdf_raster`
+### Crate: `crates/rasterrocket`
 
 ```rust
 pub struct RasterOptions {
@@ -966,7 +966,7 @@ pub fn raster_pdf(
 **Caller's OCR step after integration:**
 
 ```rust
-for (page_num, result) in pdf_raster::raster_pdf(path, &opts) {
+for (page_num, result) in rasterrocket::raster_pdf(path, &opts) {
     let page = result?;
     let text = tesseract::ocr_from_frame(
         &page.pixels, page.width as i32, page.height as i32,
@@ -980,8 +980,8 @@ for (page_num, result) in pdf_raster::raster_pdf(path, &opts) {
 
 | Step | Owner | Notes |
 |---|---|---|
-| Rasterise to grayscale | **pdf-raster** | BT.709 RGB→Gray; already in CLI, just needs exporting |
-| Deskew | **pdf-raster** | See deskew design below |
+| Rasterise to grayscale | **rasterrocket** | BT.709 RGB→Gray; already in CLI, just needs exporting |
+| Deskew | **rasterrocket** | See deskew design below |
 | Background normalisation | **Tesseract** | Sauvola `thresholding_method=2` on the caller side |
 | Binarisation | **Tesseract** | LSTM reads grayscale directly; do NOT pre-binarise |
 | DPI metadata | **caller** | Pass `page.dpi` to `set_source_resolution`; default is 70 DPI (useless) |
@@ -1034,14 +1034,14 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 
 ### Work items
 
-- [x] New `crates/pdf_raster` library crate; add to `Cargo.toml` workspace members
+- [x] New `crates/rasterrocket` library crate; add to `Cargo.toml` workspace members
 - [x] Move `render_page_native` core (minus `&Args`, minus file I/O) into library
 - [x] Export `rgb_to_gray` (BT.709) from library (currently private in CLI)
 - [x] Encapsulate GPU decoder lifecycle (`DecoderInit<T>`) inside library — not caller-visible
-- [x] `crates/pdf_raster/src/deskew/detect.rs` — intensity-weighted projection profile, AVX-512 row sums, Rayon sweep parallelism
-- [x] `crates/pdf_raster/src/deskew/rotate.rs` — CPU bilinear fallback; GPU path via `nppiRotate_8u_C1R_Ctx`
+- [x] `crates/rasterrocket/src/deskew/detect.rs` — intensity-weighted projection profile, AVX-512 row sums, Rayon sweep parallelism
+- [x] `crates/rasterrocket/src/deskew/rotate.rs` — CPU bilinear fallback; GPU path via `nppiRotate_8u_C1R_Ctx`
 - [x] Review pass: sentinel hack → `Option<Result>`, pages map O(n²) → O(n), `InvalidOptions` validation, `debug_assert` → `assert`, `NVJPEG2K_STATUS_IMPLEMENTATION_NOT_SUPPORTED` constant, `remove(0)` → `swap_remove(0)`, bilinear inlined into rotate loop, `downsample` factor=0 guard
-- [x] Make CLI a thin wrapper over `crates/pdf_raster` (RasterSession, render_page_rgb, open_session)
+- [x] Make CLI a thin wrapper over `crates/rasterrocket` (RasterSession, render_page_rgb, open_session)
 - [x] Second review pass (Apr 2026): scale validation guard in `render_page_rgb`; GPU init failure `eprintln!`; `PageIter::next` Err arm cleaned; dead variable removed from `bitmap_to_vec`; `# Panics` doc corrected in lib.rs; `MONO_THRESHOLD` const extracted in CLI; atomic temp-file rename in CLI `render_page` (no partial files on encode failure)
 - [x] Third review pass (Apr 2026): `open_session` double get_pages eliminated; bad `scale` returns `InvalidOptions` (not `PageDegenerate`); `PageIter::next` Err arm rewritten with explicit match; compile-time `Sync` assertion on `RasterSession`; `#[expect]` replaces `#[allow]` on Args; erroneous `cast_sign_loss` suppression removed from f64→f32 and f32→i32 casts; SWEEP_STEPS≥2 compile-time assert; `n_rows-skip` saturation guard; intermediate Vec allocations in coarse sweep eliminated (par reduce); `assert!→debug_assert!` in private `downsample`; rotation docs corrected (CW-positive throughout); GPU deskew stub noted in lib.rs; scatter loop AVX-512 auto-vec claim removed from doc; rename failure now also removes temp file; `--odd`+`--even` mutual exclusion check; open_session error walks source chain; DPI args validated ≥1 at CLI; jpeg_quality validated 0–100; `OutputFormat` implements Display; 13 redundant `default_value_t=false` removed
 - [x] GPU rotation: `rotate_gpu` via `nppiRotate_8u_C1R_Ctx` — NPP CW-positive (Y-down); GPU/CPU parity ≤2 grey levels at 2°; thread-local `NppRotator`, CPU fallback retained; hardening pass (input validation, three-state slot, Drop logging, null asserts)
@@ -1053,7 +1053,7 @@ Net deskew cost per page at steady state: **~0.4ms** (rotation-bound; detection 
 
 ### Goal
 
-Make pdf-raster the drop-in replacement for the pdftoppm + Leptonica preprocessing
+Make rasterrocket the drop-in replacement for the pdftoppm + Leptonica preprocessing
 stack in the mss OCR pipeline.  The rasterise + deskew path is feature-complete;
 Phase 6 closes the remaining gaps before the first production integration.
 
@@ -1076,9 +1076,9 @@ Phase 6 closes the remaining gaps before the first production integration.
   dominant image).  Collected at zero extra cost during rendering: `blit_image`
   increments per-filter counts; `show_text` sets `has_vector_text`; `finish()`
   resolves `dominant_filter` from counts.  `ImageFilter` and `PageDiagnostics`
-  are re-exported from `pdf_raster` (commit 199d13a).
+  are re-exported from `rasterrocket` (commit 199d13a).
 
-- [x] **Pipelined render + OCR** — `pdf_raster::render_channel(path, opts, capacity)`
+- [x] **Pipelined render + OCR** — `rasterrocket::render_channel(path, opts, capacity)`
   returns a `std::sync::mpsc::Receiver<(u32, Result<RenderedPage>)>`.  A
   Rayon-spawned producer renders pages in ascending order and sends them as they
   complete; the consumer (Tesseract) processes each page immediately.  The channel
@@ -1153,7 +1153,7 @@ Currently every progressive JPEG incurs a full VA-API header parse + `BadJpeg` e
 - [x] Extract SOF marker detection into `gpu::jpeg_sof_type()` — `crates/gpu/src/jpeg_sof.rs`; `JpegVariant { Baseline, Progressive, Other }`; zero-allocation marker scan; `#[must_use]`; 8 unit tests; shared by VA-API and dispatch
 - [x] Update `decode_dct` dispatch: `jpeg_variant = gpu::jpeg_sof_type(data)` before threshold check; nvJPEG accepts `Baseline | Progressive`; VA-API accepts `Baseline` only — progressive skipped entirely; `VapiJpegDecoder::decode_sync` also guards with early return; `decode_dct_gpu` + `decode_dct_vaapi` collapsed into generic `decode_dct_gpu_path<D: GpuJpegDecoder>`
 - [x] Work-stealing page queue: bounded `mpsc::sync_channel` + `rayon::scope`; `RoutingHint` extension point; back-pressure at 2× thread count; `crates/cli/src/page_queue.rs`; deadlock fix + single-thread guard; `routing_hint_from_diag` + `ProgressCtx::report` live in `page_queue.rs`
-- [x] `PageDiagnostics` pre-scan pass: `pdf_interp::prescan_page` walks XObject dict + content stream operators without decoding pixels; sets `GpuJpegCandidate`/`CpuOnly` hints before enqueueing; `crates/pdf_interp/src/prescan.rs`; `count_filter` + `update_max_ppi` helpers extracted
+- [x] `PageDiagnostics` pre-scan pass: `rasterrocket_interp::prescan_page` walks XObject dict + content stream operators without decoding pixels; sets `GpuJpegCandidate`/`CpuOnly` hints before enqueueing; `crates/rasterrocket-interp/src/prescan.rs`; `count_filter` + `update_max_ppi` helpers extracted
 - [x] Serial prescan loop removed from CLI render path — all pages default to `RoutingHint::Unclassified`; `routing_hint_from_diag` retained as extension point for future affinity dispatch; recovered 15-20% throughput regression
 - [x] Affinity dispatch: prescan all pages sequentially before pool start; `CpuOnly` hint → `BackendPolicy::CpuOnly` override in `render_page_rgb_hinted` → `lend_decoders` skips `ensure_nvjpeg` and `DECODER_INIT_LOCK` acquisition; `GpuJpegCandidate` uses session policy unchanged; single rayon pool (soft affinity)
 - [x] Benchmark: full v0.6.0 matrix on 9900X3D + RTX 5070 (`bench/v060/results.md`) and i7-8700K + RTX 2080 SUPER testbench (`bench/v060/results-testbench-i7-8700K-rtx2080super.md`).  Target corpus 08/09 GPU speedup ≥ 5× **was not met** — nvJPEG-via-`GPU_HYBRID` is 5–13× *slower* than 24-thread zune-jpeg on every DCT-heavy corpus on both machines.  Root cause and fix scoped under Phase 8.
@@ -1173,7 +1173,7 @@ The fixed-function NVJPG hardware engine is **closed to consumer GeForce SKUs** 
 
 Reverse-engineering desktop NVJPG would take a multi-month research project (cf. Asahi Linux's GPU work for analogous scope), wouldn't transfer across architecture generations, and would land in a legally murky zone (Falcon firmware signatures). No academic or community project is publicly working on this; the ROI doesn't exist for the open-source ecosystem either.
 
-**What this means for pdf-raster:** the only open path to GPU acceleration of JPEG-related work is the SM array via custom CUDA or Vulkan compute shaders. The fixed-function engine is unreachable from any open code path. This is the load-bearing constraint behind Phase 9's design (CPU decode + device-resident pipeline) and Phase 8's deferral.
+**What this means for rasterrocket:** the only open path to GPU acceleration of JPEG-related work is the SM array via custom CUDA or Vulkan compute shaders. The fixed-function engine is unreachable from any open code path. This is the load-bearing constraint behind Phase 9's design (CPU decode + device-resident pipeline) and Phase 8's deferral.
 
 ---
 
@@ -1197,7 +1197,7 @@ The Phase 0 work (`crates/gpu/src/jpeg/`) shipped clean across three commits and
 
 **Why Phase 8 stays in the roadmap at all:**
 
-The Weißenberger 2018 self-synchronizing parallel Huffman algorithm is genuinely beautiful CUDA work. Implementing it produces an open, redistributable artifact that demonstrates a non-obvious algorithm. If pdf-raster ever wants to run on a workload where 24 CPU threads aren't available (embedded, single-core, etc.) the GPU decoder becomes relevant. The work has long-term value as a learning project; it's just not the path to faster pdf-raster.
+The Weißenberger 2018 self-synchronizing parallel Huffman algorithm is genuinely beautiful CUDA work. Implementing it produces an open, redistributable artifact that demonstrates a non-obvious algorithm. If rasterrocket ever wants to run on a workload where 24 CPU threads aren't available (embedded, single-core, etc.) the GPU decoder becomes relevant. The work has long-term value as a learning project; it's just not the path to faster rasterrocket.
 
 The full original spec is preserved as a developer-side research artifact; it isn't active design.
 
@@ -1238,9 +1238,9 @@ Phase 9 addresses all three at the same time: the cache makes (3) free after the
 - [x] **Task 1 — `ImageData` enum, `ImageData::Cpu` variant only** (commit `f0519ca`, hardened in `8a19c3a`/`48aeecb`). `Vec<u8>` → `ImageData::Cpu(Vec<u8>)` plumbing across the renderer; `#[non_exhaustive]` enum so `Gpu` variant is a non-breaking add. The Gpu variant itself is deferred to Task 4 wiring.
 - [x] **Task 2 — VRAM tier in-process** (commit `e3709ee`, hardened in `e3acb21`/`69a1cd2`). `crates/gpu/src/cache/` module behind a new `cache` feature: `DeviceImageCache` with dual-key (BLAKE3 content hash + (DocId, ObjId) alias), DashMap-backed concurrent access, LRU + refcount-pinned eviction, `InsertRequest` builder, structured `CacheError`. 8 cache tests under `cache,gpu-validation`; concurrent-insert dedup test proves no double-counted `used_bytes`.
 - [x] **Task 3 — Host RAM tier** (commit `0e197c3`, hardened in `52acfdf`/`e2f750d`). `crates/gpu/src/cache/host_tier.rs` with `PinnedHostSlice<u8>` slabs, independent budget + LRU, demote-on-evict from VRAM, promote-on-hit back to VRAM. Critical fix in the hardening pass: `clone_htod` must take `&PinnedHostSlice` directly (not `as_slice().ok()?`) so cudarc records the H→D event back to the slice's internal event — otherwise `PinnedHostSlice::Drop` could free pinned memory mid-DMA. 13 cache tests; end-to-end demote+promote round-trip verifies bit-identical pixels.
-- [x] **Task 4 — Device page buffer + GPU blit kernel** (commits `6ee47de`/`738ba14`/`ef67045` GPU side, `8f01c3d` AA-fill fix, `a7859e4` renderer integration). GPU side: `kernels/blit_image.cu` (16×16-block CUDA kernel with f32 inverse-CTM nearest-neighbour sampling matching the CPU path byte-for-byte), `gpu::blit` module (`InverseCtm`, `BlitBbox`, `GpuCtx::blit_image_to_buffer`, structured `BlitError`), `cache::DevicePageBuffer` (zero-init RGBA8). Renderer integration: `ImageData::Gpu(Arc<CachedDeviceImage>)` feature-gated variant, `decode_dct → ImageData::Gpu` wiring with BLAKE3 content-hash dedup + `(DocId, ObjId)` alias, per-page `DevicePageBuffer` lazy-allocated on first GPU image, source-over composite of buffer onto host bitmap at `finish()`. New `cache` feature in `pdf_interp`, `pdf_raster`, and the CLI. AA fill / ICC / tile fill / composite still use the CPU bitmap; rewiring those to read/write the device buffer is deferred (the `coverage_scratch` field in the spec). Pre-existing AA-fill `JITTER_Y` corruption (8 wrong Halton(3) values) found and fixed in `8f01c3d`. **Bench gate pending**: needs an end-to-end run on corpus 06–08 to confirm mode D ≤ 0.7× mode A.
+- [x] **Task 4 — Device page buffer + GPU blit kernel** (commits `6ee47de`/`738ba14`/`ef67045` GPU side, `8f01c3d` AA-fill fix, `a7859e4` renderer integration). GPU side: `kernels/blit_image.cu` (16×16-block CUDA kernel with f32 inverse-CTM nearest-neighbour sampling matching the CPU path byte-for-byte), `gpu::blit` module (`InverseCtm`, `BlitBbox`, `GpuCtx::blit_image_to_buffer`, structured `BlitError`), `cache::DevicePageBuffer` (zero-init RGBA8). Renderer integration: `ImageData::Gpu(Arc<CachedDeviceImage>)` feature-gated variant, `decode_dct → ImageData::Gpu` wiring with BLAKE3 content-hash dedup + `(DocId, ObjId)` alias, per-page `DevicePageBuffer` lazy-allocated on first GPU image, source-over composite of buffer onto host bitmap at `finish()`. New `cache` feature in `rasterrocket-interp`, `rasterrocket`, and the CLI. AA fill / ICC / tile fill / composite still use the CPU bitmap; rewiring those to read/write the device buffer is deferred (the `coverage_scratch` field in the spec). Pre-existing AA-fill `JITTER_Y` corruption (8 wrong Halton(3) values) found and fixed in `8f01c3d`. **Bench gate pending**: needs an end-to-end run on corpus 06–08 to confirm mode D ≤ 0.7× mode A.
 - [x] **Task 5 — Disk tier**. `crates/gpu/src/cache/disk_tier.rs` — `<root>/<doc-hex>/<hash-hex>.bin` sidecar files with PDRF magic + version + dimensions header.  Atomic write via temp+rename; `posix_fadvise(WILLNEED)` on Linux for read-ahead; document-mtime eviction.  Env-var overrides: `PDF_RASTER_CACHE_DIR`, `PDF_RASTER_CACHE_BYTES`.  `open_session` switched to BLAKE3-of-PDF-bytes for the `DocId` so editing a PDF naturally invalidates the disk cache.  7 unit tests under `cache` feature (no GPU needed).
-- [x] **Task 6 — Pre-fetcher** (commits `013219b` + `a2e81d9` hardening pass). `crates/pdf_interp/src/cache/prefetch.rs` — `spawn_prefetch(doc, cache, doc_id, config)` walks every page's `/XObject` resource dict, dedupes by `ObjId`, decodes `/DCTDecode` images on a small `std::thread` worker pool (default 2, capped at `MAX_PREFETCH_WORKERS = 16`).  Discovery is single-threaded; `seen` is a plain local `HashSet<ObjId>`.  Decoder panics caught per-image so one bad XObject doesn't kill the run.  Opt-in via `SessionConfig::prefetch`; `RasterSession.doc` upgraded to `Arc<Document>` so the prefetcher can hold its own clone.  Form-XObject contents are not recursed into; renderer decodes them on first touch.  4 unit tests under the `cache` feature (no GPU needed).
+- [x] **Task 6 — Pre-fetcher** (commits `013219b` + `a2e81d9` hardening pass). `crates/rasterrocket-interp/src/cache/prefetch.rs` — `spawn_prefetch(doc, cache, doc_id, config)` walks every page's `/XObject` resource dict, dedupes by `ObjId`, decodes `/DCTDecode` images on a small `std::thread` worker pool (default 2, capped at `MAX_PREFETCH_WORKERS = 16`).  Discovery is single-threaded; `seen` is a plain local `HashSet<ObjId>`.  Decoder panics caught per-image so one bad XObject doesn't kill the run.  Opt-in via `SessionConfig::prefetch`; `RasterSession.doc` upgraded to `Arc<Document>` so the prefetcher can hold its own clone.  Form-XObject contents are not recursed into; renderer decodes them on first touch.  4 unit tests under the `cache` feature (no GPU needed).
 
 **Bench gate (PARTIAL after disk-tier rework, see release-history block above for full numbers):** initial bench on both 9900X3D + RTX 5070 (sm_120) and i7-8700K + RTX 2080 SUPER (sm_75) showed criterion 5 failing 0/5 with mode DCP **3–14× slower** than mode A on DCT-heavy corpora.  Three fixes landed in commit `0bd61ca`: async disk writer (renderer no longer blocks on `sync_all`), opt-in disk tier (no surprise persistence cost), and cold-start three-tier lookup (the disk tier was actually unreachable on a fresh process before).
 
@@ -1273,11 +1273,11 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
 
 - [~] **Task 1 — Backend trait + CUDA refactor** (merged via `4c22ce0`).
     - **Shipped:** `GpuBackend` trait + `*Params` structs with state-machine and invariant docs (`crates/gpu/src/backend/{mod,params}.rs`); `CudaBackend` init + alloc + budget + `record_*` + `submit_page` / `wait_page` (`crates/gpu/src/backend/cuda/`); the five existing kernels extracted into `lib_kernels::{aa, composite, icc, soft_mask, tile}`; `BackendError::msg`; `cuda_backend_smoke` + `cuda_backend_per_page` tests; `crates/gpu/src/cache/mod.rs` split into `budget` / `eviction` / `promotion` submodules.
-    - **Deliberately deferred:** renderer migration to the trait (the spec's `pdf_interp::renderer::page::gpu_ops` rewrite). The Phase 9 blit path is *already* per-page-batched (no `synchronize` between blits; only `buf.download()` at end-of-page), so migrating shape-only without an upload/download surface on the trait would just shuffle code. `DevicePageBuffer` and `DeviceImageCache` therefore stay un-generified for now; they generify alongside Task 3 once the trait grows the H↔D surface that the Vulkan side will need anyway. See the docstring on `DevicePageBuffer` (`crates/gpu/src/cache/page_buffer.rs`) for the in-tree rationale.
+    - **Deliberately deferred:** renderer migration to the trait (the spec's `rasterrocket_interp::renderer::page::gpu_ops` rewrite). The Phase 9 blit path is *already* per-page-batched (no `synchronize` between blits; only `buf.download()` at end-of-page), so migrating shape-only without an upload/download surface on the trait would just shuffle code. `DevicePageBuffer` and `DeviceImageCache` therefore stay un-generified for now; they generify alongside Task 3 once the trait grows the H↔D surface that the Vulkan side will need anyway. See the docstring on `DevicePageBuffer` (`crates/gpu/src/cache/page_buffer.rs`) for the in-tree rationale.
     - **Not yet measured:** the spec's `±5%-of-pre-refactor` per-kernel bench gate. Deferred until Task 3 lands so the bench matrix runs CUDA + Vulkan together.
 - [x] **Task 2 — Slang port of all kernels** (merged via `42dc479`). All six kernels translated; `slangc -target spirv` invocation in `build.rs`; `vulkan` Cargo feature gates the SPIR-V compile; aa_fill's `WaveActiveSum` confirmed lowering to `OpGroupNonUniformIAdd Reduce` (no fallback emulation).
     - **Sub-task 2a — CPU twin per kernel.** For each kernel, ship a plain-Rust function that produces bit-identical output (or pixel-diff ≤ 1 LSB for floating-point ones) used as a correctness oracle in tests. Lets us validate Slang→SPIR-V codegen *without* a GPU, isolates "is the kernel logic right" from "is the Vulkan dispatch right" when chasing cross-backend divergence. Already partially present (`crates/gpu/src/blit.rs` has a CPU reference for `blit_image`); generalise to all five.
-- [~] **Task 3 — Vulkan backend implementation**. `VulkanBackend` ships at `crates/gpu/src/backend/vulkan/` via `ash` 0.38 + `gpu-allocator` 0.28 (pure Rust, no FFI).  Module split: `device` (instance/device/queue init, Vulkan 1.3 features incl. shaderInt8 + bufferDeviceAddress + 8-bit storage; ranks discrete > integrated > virtual > CPU when picking physical devices), `memory` (slab sub-allocator wrapping gpu-allocator with persistent-mapped host buffers and BDA-queried device buffers), `pipeline` (lazy SPIR-V→VkPipeline cache, per-kernel descriptor set layouts, on-disk `VkPipelineCache` blob at `$XDG_CACHE_HOME/pdf-raster/vulkan_pipeline_cache.bin`), `recorder` (per-page command buffer, timeline-semaphore page fence, single-page-in-flight invariant, compute→compute memory barriers between dispatches, 2D dispatch for aa_fill so images >256×256 fit the workgroup-count limit), `transfer` (synchronous upload/download via a reusable host-coherent staging buffer grown to high-water-mark).
+- [~] **Task 3 — Vulkan backend implementation**. `VulkanBackend` ships at `crates/gpu/src/backend/vulkan/` via `ash` 0.38 + `gpu-allocator` 0.28 (pure Rust, no FFI).  Module split: `device` (instance/device/queue init, Vulkan 1.3 features incl. shaderInt8 + bufferDeviceAddress + 8-bit storage; ranks discrete > integrated > virtual > CPU when picking physical devices), `memory` (slab sub-allocator wrapping gpu-allocator with persistent-mapped host buffers and BDA-queried device buffers), `pipeline` (lazy SPIR-V→VkPipeline cache, per-kernel descriptor set layouts, on-disk `VkPipelineCache` blob at `$XDG_CACHE_HOME/rasterrocket/vulkan_pipeline_cache.bin`), `recorder` (per-page command buffer, timeline-semaphore page fence, single-page-in-flight invariant, compute→compute memory barriers between dispatches, 2D dispatch for aa_fill so images >256×256 fit the workgroup-count limit), `transfer` (synchronous upload/download via a reusable host-coherent staging buffer grown to high-water-mark).
     - **Parity tests passing (15/15):** four `composite_rgba8`, three `apply_soft_mask`, four `aa_fill` (square / triangle / degenerate / 512×512-exceeds-1D-limit), two `icc_cmyk_clut`, two `blit_image` (RGB / Gray) — all match the CPU reference within ≤ 1 LSB per channel on the dev box's nouveau ICD.
     - **Task 3 follow-ups (perf only — neither correctness nor parity blocks them):**
         - **Dedicated transfer queue (TRANSFER family without GRAPHICS or COMPUTE).** Probe at device init; allocate a separate `VkCommandPool` from that family; emit queue-family ownership-transfer barriers (`srcQueueFamilyIndex`/`dstQueueFamilyIndex`) when the dst is read by the compute queue's recorder.  Enables overlap of DMA uploads with rendering, which the prefetcher critical path needs.  Gated on prefetcher-Vulkan integration; today's compute-queue path is correct and the staging-ring already kills the per-upload alloc cost.
@@ -1287,10 +1287,10 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
         - **`record_tile_fill` parity test.** No CPU reference exists for `tile_fill` — only the GPU paths use it.  Blocked on sub-task 2a's CPU twin.  The Vulkan kernel itself runs and `dispatch_kernel`'s parity check would catch divergence vs. CUDA, but we don't have an oracle.
         - **`OnceLock::get_or_try_init` usage.** Stable-API gap (rust-lang/rust#109737).  Today's manual race-loser cleanup in `pipeline.rs::get` is correct; switch when stable.
         - **Cross-vendor smoke (AMD-RADV, Intel-ANV, lavapipe).** Needs CI-runner or loaner hardware.  Lavapipe is installed on the dev box but currently flagged as unmaintained on Ubuntu 24.04; revisit with the next Mesa update.
-- [x] **Task 4 — Renderer integration + bench gate** (~1500 LoC across `pdf_interp`, `pdf_raster`, `cli`).  Today the Vulkan backend exists and parity-tests against CPU references, but the renderer dispatches CUDA via `GpuCtx` directly — no end-to-end Vulkan path.  Closing the phase needs:
-    - [x] **Step 1 — `BackendPolicy::ForceVulkan` plumbing + loud-error placeholder** (commits `8126100`, `aec2053`, `55b54a0`).  CLI `--backend vulkan` → `BackendArg::Vulkan` → `BackendPolicy::ForceVulkan` → `pdf_raster::render::open_session` returns `BackendUnavailable` with a directive message.  `init_gpu_ctx` short-circuits CUDA init under `ForceVulkan`.  `--vaapi-device` conflict detection extended.  Smoke-tested: `pdf-raster --backend vulkan <pdf> <prefix>` exits with the explanatory error rather than silently CPU-rendering.
-    - [x] **Step 2 — Migrate kernel call sites in `pdf_interp` to the trait surface** (commit `15dd420`, hardened in `1783d66`).  Parallel-Vulkan-branch architecture: `PageRenderer` gains an `Option<Arc<VulkanBackend>>` field beside `gpu_ctx`; the fill dispatch prefers Vulkan when set.  `pdf_interp::renderer::page::vk_ops` wraps the trait surface (`alloc → upload → record_* → submit → wait → download`) for AA fill and tile fill.  Phase 9 cache stays CUDA-only by construction (Vulkan path doesn't touch `DevicePageBuffer`/`DeviceImageCache`).  ICC CMYK→RGB on Vulkan is intentionally deferred — the renderer plumbing (`resolve_image → decode_dct → cmyk_raw_to_rgb`) currently threads only `Option<&GpuCtx>`, and under `ForceVulkan` it falls through to the CPU `cmyk_to_rgb_reflectance` matrix (matches Phase 9-pre-2026-05-07 quality).  Pre-existing `crates/gpu/build.rs` bug found and fixed in the same commit: PTX compilation now keys on a real NVCC probe instead of a feature-flag heuristic that didn't include `pdf_interp::gpu-aa` (the previous heuristic produced 0-byte placeholder PTX for `--features "vulkan,gpu-aa"` builds, then crashed at runtime with `CUDA_ERROR_INVALID_IMAGE`).
-    - [x] **Step 3 — End-to-end CLI smoke** (folded into step 2).  The loud-error stub in `pdf_raster::render::open_session` was replaced with real `init_vk_backend` + `RasterSession::vk_backend` + per-page `set_vk_backend` propagation in step 2's commit.  Verified: `pdf-raster --backend vulkan tests/fixtures/corpus-02-native-vector-text.pdf <prefix>` renders all 16 pages byte-identical to both `--backend cpu` and `--backend cuda`; same on the 358-page corpus-04 mixed-content fixture (Vulkan == CPU on every page).
+- [x] **Task 4 — Renderer integration + bench gate** (~1500 LoC across `rasterrocket-interp`, `rasterrocket`, `rasterrocket-cli`).  Today the Vulkan backend exists and parity-tests against CPU references, but the renderer dispatches CUDA via `GpuCtx` directly — no end-to-end Vulkan path.  Closing the phase needs:
+    - [x] **Step 1 — `BackendPolicy::ForceVulkan` plumbing + loud-error placeholder** (commits `8126100`, `aec2053`, `55b54a0`).  CLI `--backend vulkan` → `BackendArg::Vulkan` → `BackendPolicy::ForceVulkan` → `rasterrocket::render::open_session` returns `BackendUnavailable` with a directive message.  `init_gpu_ctx` short-circuits CUDA init under `ForceVulkan`.  `--vaapi-device` conflict detection extended.  Smoke-tested: `rasterrocket --backend vulkan <pdf> <prefix>` exits with the explanatory error rather than silently CPU-rendering.
+    - [x] **Step 2 — Migrate kernel call sites in `rasterrocket-interp` to the trait surface** (commit `15dd420`, hardened in `1783d66`).  Parallel-Vulkan-branch architecture: `PageRenderer` gains an `Option<Arc<VulkanBackend>>` field beside `gpu_ctx`; the fill dispatch prefers Vulkan when set.  `rasterrocket_interp::renderer::page::vk_ops` wraps the trait surface (`alloc → upload → record_* → submit → wait → download`) for AA fill and tile fill.  Phase 9 cache stays CUDA-only by construction (Vulkan path doesn't touch `DevicePageBuffer`/`DeviceImageCache`).  ICC CMYK→RGB on Vulkan is intentionally deferred — the renderer plumbing (`resolve_image → decode_dct → cmyk_raw_to_rgb`) currently threads only `Option<&GpuCtx>`, and under `ForceVulkan` it falls through to the CPU `cmyk_to_rgb_reflectance` matrix (matches Phase 9-pre-2026-05-07 quality).  Pre-existing `crates/gpu/build.rs` bug found and fixed in the same commit: PTX compilation now keys on a real NVCC probe instead of a feature-flag heuristic that didn't include `rasterrocket-interp/gpu-aa` (the previous heuristic produced 0-byte placeholder PTX for `--features "vulkan,gpu-aa"` builds, then crashed at runtime with `CUDA_ERROR_INVALID_IMAGE`).
+    - [x] **Step 3 — End-to-end CLI smoke** (folded into step 2).  The loud-error stub in `rasterrocket::render::open_session` was replaced with real `init_vk_backend` + `RasterSession::vk_backend` + per-page `set_vk_backend` propagation in step 2's commit.  Verified: `rasterrocket --backend vulkan tests/fixtures/corpus-02-native-vector-text.pdf <prefix>` renders all 16 pages byte-identical to both `--backend cpu` and `--backend cuda`; same on the 358-page corpus-04 mixed-content fixture (Vulkan == CPU on every page).
     - [x] **Step 4 — Bench gate measurement** (`scripts/bench_v10.sh` + `scripts/aggregate_v10.py`, results in `bench/v10/results.md`).  Vector-heavy subset (corpora 01-05) on RTX 5070; DCT-heavy corpora skipped because the Vulkan binary doesn't include nvjpeg, so 06-10 would compare CPU JPEG decode against silicon and bias the result.
         - **Criterion 1** (CUDA no-regression, threshold +5% slower than v0.7.0): **PASS** on all 5 corpora.  Live-captured baseline (v0.7.0 binary rebuilt on the same hardware) used because `bench/v070/D.txt` is stale relative to current driver state — corpus-02 was 212ms there but ~500ms today on the same v0.7.0 binary, so the old numbers would conflate driver drift with Phase 10 code drift.  Master vs v0.7.0 (live): 01 +0.4%, 02 −11.2%, 03 +2.6%, 04 −3.3%, 05 −6.7%.
         - **Criterion 2** (Vulkan pixel-diff ≤ 1 LSB vs CUDA): verified during step 2 (16/16 pages byte-identical on corpus-02, 358/358 on corpus-04).
@@ -1311,7 +1311,7 @@ What was missing before Phase 9 was *the abstraction layer to even consider a ba
 
 **Reframe.**  An earlier draft of this phase (titled "memory-frugal rendering and parse caching") was a feature-parity checklist of things MuPDF and PDFium have that we don't.  The first task on it was a sidecar cache for the parsed page tree.  A pre-implementation microbench killed it: the existing `Document::get_pages()` walk takes 76 µs–1.34 ms across the full corpus (16-page through 601-page documents).  Adding a 150-LoC sidecar plus an invalidation surface to save a millisecond was a textbook bad trade.
 
-The actual gap was at a different layer.  MuPDF and PDFium don't *cache* the page-tree walk — they don't *do* it on open.  Their `LoadDocument` parses xref + the catalog's `/Pages` root and that's it; per-page resolution is logarithmic.  Ours was linear, eagerly populating a `BTreeMap<u32, ObjectId>` of every page in `pdf_raster::open_session` before rendering even one page.  On a 100k-page archival PDF that's millions of `get_object` calls per cold open, regardless of which page the caller asked for.
+The actual gap was at a different layer.  MuPDF and PDFium don't *cache* the page-tree walk — they don't *do* it on open.  Their `LoadDocument` parses xref + the catalog's `/Pages` root and that's it; per-page resolution is logarithmic.  Ours was linear, eagerly populating a `BTreeMap<u32, ObjectId>` of every page in `rasterrocket::open_session` before rendering even one page.  On a 100k-page archival PDF that's millions of `get_object` calls per cold open, regardless of which page the caller asked for.
 
 So the real Phase 11 is not "close the feature checklist" but "win a benchmark on the workload competitors weren't optimised for."  We define a four-event contest, build the harness that scores it against `mutool` and `pdftoppm`, and ship the layer changes needed to dominate it on a 10 GB synthetic archive.
 
@@ -1327,20 +1327,20 @@ So the real Phase 11 is not "close the feature checklist" but "win a benchmark o
 **What shipped (commits on `phase-11`, in order):**
 
 - **Logarithmic page-tree descent** (`b0600ab`).  New `crates/pdf/src/page_tree.rs::descend_to_page_index(doc, idx) -> Result<ObjectId, _>` walks only root → leaf using each interior node's `/Count` to choose the correct `/Kids` branch.  Cycle protection via `HashSet<u32>`, depth bound at 64.  `Document::get_page(idx)` and `Document::page_count_fast()` (reads `/Pages /Count` directly, falls back to eager walk on malformed catalogs) added on top.  TDD: tests landed first as `todo!()` red-light at `893a90c`, then implementation passed all four.  `resolve_kids` handles both inline-array and indirect-Reference forms of `/Kids` (corpus-04 hits the second).
-- **`RasterSession` lazy refactor** (`bb64737`).  `pages: BTreeMap<u32, ObjectId>` field replaced with `page_cache: RwLock<HashMap<u32, ObjectId>>`, populated on demand via `RasterSession::resolve_page` (read-then-write pattern; idempotent under contention; poisoned-lock-tolerant).  `pdf_raster::open_session` no longer materialises a per-page map at all — it just stashes `total_pages = doc.page_count_fast()`.  `pdf_interp::page_count` and `resolve_page_id` migrated to the lazy API.  Compile-time `assert_sync<RasterSession>()` / `assert_send<RasterSession>()` invariants kept intact.  Integration test (`crates/pdf_raster/tests/lazy_session.rs`) verifies the cache is empty immediately after `open_session` and grows by exactly one entry per page rendered.  Render output of corpus-04 page 100 byte-identical to master baseline (md5 `6c5703a00b2abd45b8c7ebbc31b54ba8`).
+- **`RasterSession` lazy refactor** (`bb64737`).  `pages: BTreeMap<u32, ObjectId>` field replaced with `page_cache: RwLock<HashMap<u32, ObjectId>>`, populated on demand via `RasterSession::resolve_page` (read-then-write pattern; idempotent under contention; poisoned-lock-tolerant).  `rasterrocket::open_session` no longer materialises a per-page map at all — it just stashes `total_pages = doc.page_count_fast()`.  `rasterrocket_interp::page_count` and `resolve_page_id` migrated to the lazy API.  Compile-time `assert_sync<RasterSession>()` / `assert_send<RasterSession>()` invariants kept intact.  Integration test (`crates/rasterrocket/tests/lazy_session.rs`) verifies the cache is empty immediately after `open_session` and grows by exactly one entry per page rendered.  Render output of corpus-04 page 100 byte-identical to master baseline (md5 `6c5703a00b2abd45b8c7ebbc31b54ba8`).
 - **Linearization (Fast Web View) detection** (`892b3ff`).  New `crates/pdf/src/linearization.rs::LinearizationHints::try_load` probes object 1 for the `/Linearized` dict and parses `/N`, `/O`, `/H[0]`, `/H[1]`.  `Document::linearization_hints()` caches the result via a manual `OnceLock` lazy-init dance (because `OnceLock::get_or_try_init` is unstable, rust-lang/rust#109737).  `Document::bytes()` exposes the underlying mmap as `&[u8]` for future hint-stream parsing.  `descend_to_page_index` has the fast-path probe wired in; today it falls through because `page_offset` returns `None` (the bit-packed Page Offset Hint Table parser per PDF 1.7 § F.4.5 is deferred — better no parser than a half-correct one that silently misdirects lookups).
 - **`posix_fadvise` plumbing on the `Document` mmap** (`3b9bcbd`, lint scope fix in `a045326`).  `crates/pdf/src/madvise.rs::advise_random` is called immediately after `File::open` and tells the kernel "I'll touch arbitrary 4 KB ranges; don't readahead."  `advise_willneed(file, offset, len)` exported for content-stream prefetch later.  Routed through `rustix` so the `pdf` crate's `unsafe_code = "deny"` invariant holds.  No-op on non-Unix.
-- **Lazy GPU init audit — no refactor needed** (`c3705ee`).  Baselined `pdf-raster --help` at ~1.0 ms median (hyperfine, 30 runs, prewarmed).  Spec threshold for shipping a refactor was ≥ 2 ms improvement.  `cudarc 0.19.4` and `ash 0.38.0` already lazy-init via `libloading` at first call, not at dlopen; workspace-wide grep for `lazy_static!`, `once_cell::Lazy`, `#[ctor]` returns zero hits in production code.  Audit doc-comment added to `GpuCtx::init` in `crates/gpu/src/lib.rs:155-177` so future-us doesn't re-investigate.  The 10–30 ms claim in the original spec was speculative; the real cost is binary-load + clap, not GPU init.
+- **Lazy GPU init audit — no refactor needed** (`c3705ee`).  Baselined `rasterrocket --help` at ~1.0 ms median (hyperfine, 30 runs, prewarmed).  Spec threshold for shipping a refactor was ≥ 2 ms improvement.  `cudarc 0.19.4` and `ash 0.38.0` already lazy-init via `libloading` at first call, not at dlopen; workspace-wide grep for `lazy_static!`, `once_cell::Lazy`, `#[ctor]` returns zero hits in production code.  Audit doc-comment added to `GpuCtx::init` in `crates/gpu/src/lib.rs:155-177` so future-us doesn't re-investigate.  The 10–30 ms claim in the original spec was speculative; the real cost is binary-load + clap, not GPU init.
 - **libdeflate backend for FlateDecode** (`c64a695`, partial-tolerance fix in `6139ef9`).  `libdeflater 1.25.2` behind a default-on `libdeflate` Cargo feature.  `apply_flate` dispatches via `decompress_zlib` (libdeflate) or falls back to `flate2`/miniz_oxide on `--no-default-features`.  Microbench (`crates/pdf/examples/flate_bench.rs`) using public `decompressed_content` API: corpus-03 (text-heavy, 774 small streams) **1.47×** faster, corpus-04 (DCT-heavy, 715 large streams, 11.4 MiB raw → 774 MB decompressed) **2.40×** faster.  Render byte-parity against master baseline preserved.  The fallback retains flate2's silent partial-decompression tolerance for truncated/checksum-corrupt content streams that real-world malformed PDFs ship — libdeflate is all-or-nothing (validates Adler-32 before returning `Ok`), so any `BadData` error falls through to a flate2-based last-ditch attempt that accepts partial output.
 - **PGO + BOLT release build script** (`9e2b70f`).  `scripts/release_pgo_build.sh` runs profile-generate → train (10 pages of corpus-04) → `llvm-profdata merge` → profile-use rebuild.  BOLT applied on top when `llvm-bolt` is on `PATH`; skipped with a clear message otherwise.  Verified end-to-end on the dev box; final binary at 3.26 MB.  Workflow integration (CI hook) deferred until v0.9.0 actually ships.
 - **Bench harness skeleton + qpdf archive builder** (`34e1e3f`).  Second `[[bin]]` target `contest_v11` in `crates/bench/`.  `archive::build(out, target_bytes)` cycles through corpus-04/05/08/09 fixtures, concatenating via `qpdf <base> --pages <p> 1-z ...`.  `target_bytes` is *cumulative input fixture bytes*, not output bytes — qpdf deduplicates shared PDF objects and the output is typically 2–3× smaller, so a 10 GiB output requires passing ~25–30 GiB as `target_bytes`.  Documented in the function doc-comment so the next caller doesn't get surprised.
-- **Four-event runners + competitor wrappers** (`b6c3781`).  `events::{e1,e2,e3,e4}` use `pdf_raster::{open_session, render_page_rgb}` at 150 DPI; `_bmp` discards (we're benching, not rendering to disk; PPM encode + filesystem cost would be noise).  E4 uses a fixed-seed xorshift64 (`0xDEAD_BEEF_DEAD_BEEF`) so successive runs touch the same pages.  `competitors::{mutool_render, pdftoppm_render}` invoke the subprocesses, time them, clean up output files.  Missing competitors degrade to `None` rather than failing the run.  E3 prefetches the last 4 KB of each archive via `rustix::fs::fadvise(WillNeed)` (`io_uring_open::warm_xref_tails`) — the spec originally proposed `io_uring` but `posix_fadvise` is the same kernel hint and avoids the async-runtime tax.
+- **Four-event runners + competitor wrappers** (`b6c3781`).  `events::{e1,e2,e3,e4}` use `rasterrocket::{open_session, render_page_rgb}` at 150 DPI; `_bmp` discards (we're benching, not rendering to disk; PPM encode + filesystem cost would be noise).  E4 uses a fixed-seed xorshift64 (`0xDEAD_BEEF_DEAD_BEEF`) so successive runs touch the same pages.  `competitors::{mutool_render, pdftoppm_render}` invoke the subprocesses, time them, clean up output files.  Missing competitors degrade to `None` rather than failing the run.  E3 prefetches the last 4 KB of each archive via `rustix::fs::fadvise(WillNeed)` (`io_uring_open::warm_xref_tails`) — the spec originally proposed `io_uring` but `posix_fadvise` is the same kernel hint and avoids the async-runtime tax.
 
 **Smoke result on a 335 MB synthetic archive (E1, page 1, 9900X3D + RTX 5070):**
 
 | Engine | First-pixel time |
 |---|---|
-| pdf-raster | **4.2 ms** |
+| rasterrocket | **4.2 ms** |
 | pdftoppm | 15.9 ms |
 | mutool draw | 18.7 ms |
 
@@ -1348,7 +1348,7 @@ We're already 4× faster than `pdftoppm` and 4.5× faster than `mutool` on this 
 
 **What's left — Task 11 (the bench gate):**
 
-Build a 10 GB output archive (~30 GB qpdf-input target), build 50–100 cross-doc archives for E3, run the four-event harness 5 times, write `bench/v11/results.md`, update `ROADMAP.md`'s release-history block with the v0.9.0 numbers.  Phase 11 ships if pdf-raster wins or ties at least three of four events on the 10 GB workload.
+Build a 10 GB output archive (~30 GB qpdf-input target), build 50–100 cross-doc archives for E3, run the four-event harness 5 times, write `bench/v11/results.md`, update `ROADMAP.md`'s release-history block with the v0.9.0 numbers.  Phase 11 ships if rasterrocket wins or ties at least three of four events on the 10 GB workload.
 
 **What stays deferred:**
 
@@ -1360,7 +1360,7 @@ The original Phase-11 draft had three tasks that are still real future work but 
 
 **Out of scope (re-affirming from the original):**
 
-A 2-stage interpretation+render pipeline within a single document.  pdf-raster already parallelises across pages with Rayon, which dominates per-document pipelining on any multi-core machine — confirmed empirically by the May-2026 baseline matrix (3–10 % gain over serial vs. Rayon-per-page's much larger lead).  Network-streaming PDF (HTTP range requests).  Not our user; PDFium's browser use case, not a CLI tool's.  AVX-512 simdjson-style PDF lexer.  Real engineering effort with a real win, but the contest events don't bottleneck on dictionary parsing — deferred to a future phase.
+A 2-stage interpretation+render pipeline within a single document.  rasterrocket already parallelises across pages with Rayon, which dominates per-document pipelining on any multi-core machine — confirmed empirically by the May-2026 baseline matrix (3–10 % gain over serial vs. Rayon-per-page's much larger lead).  Network-streaming PDF (HTTP range requests).  Not our user; PDFium's browser use case, not a CLI tool's.  AVX-512 simdjson-style PDF lexer.  Real engineering effort with a real win, but the contest events don't bottleneck on dictionary parsing — deferred to a future phase.
 
 **Rejected ideas (kept here so they don't get re-proposed under new names):**
 

@@ -1,8 +1,8 @@
 # API Reference
 
-## `pdf_raster` crate — public API
+## `rasterrocket` crate — public API
 
-The `pdf_raster` crate is the integration entry point. It wraps `pdf_interp` and `raster` behind a simple, stable API.
+The `rasterrocket` crate is the integration entry point. It wraps `rasterrocket-interp` and `rasterrocket-render` behind a simple, stable API.
 
 ---
 
@@ -60,7 +60,7 @@ If the `Receiver` is dropped before the producer finishes, the producer exits cl
 
 ---
 
-### `pdf_raster::session` module
+### `rasterrocket::session` module
 
 Lower-level API for explicit control over PDF opening and per-page rendering. All items are also re-exported at the crate root for backward compatibility.
 
@@ -217,7 +217,7 @@ pub struct RenderedPage {
 ### `PageDiagnostics`
 
 ```rust
-pub use pdf_interp::renderer::PageDiagnostics;
+pub use rasterrocket_interp::renderer::PageDiagnostics;
 ```
 
 Collected at zero extra cost during rendering.
@@ -321,7 +321,7 @@ pub fn release_gpu_decoders()
 Eagerly drops GPU decoder state (nvJPEG, nvJPEG2000, Vulkan Huffman) on the calling rayon worker thread. Call via `pool.broadcast` before dropping the pool:
 
 ```rust
-let _ = pool.broadcast(|_| pdf_raster::release_gpu_decoders());
+let _ = pool.broadcast(|_| rasterrocket::release_gpu_decoders());
 drop(pool);
 ```
 
@@ -334,7 +334,7 @@ No-op when none of the GPU decoder features (`nvjpeg`, `nvjpeg2k`, `gpu-jpeg-huf
 ```rust
 pub enum RasterError {
     InvalidOptions(String),
-    Pdf(pdf_interp::InterpError),
+    Pdf(rasterrocket_interp::InterpError),
     PageOutOfRange { page: u32, total: u32 },
     PageDegenerate { width: u32, height: u32 },
     PageTooLarge { width: u32, height: u32 },
@@ -361,17 +361,17 @@ Maximum accepted pixel dimension (width or height). `PageTooLarge` is returned i
 ### Re-exports
 
 ```rust
-pub use pdf_interp::renderer::PageDiagnostics;
-pub use pdf_interp::resources::ImageFilter;
+pub use rasterrocket_interp::renderer::PageDiagnostics;
+pub use rasterrocket_interp::resources::ImageFilter;
 ```
 
 `ImageFilter` identifies which decode filter was used for an embedded image (DCTDecode, JPXDecode, FlateDecode, etc.). Available through `PageDiagnostics` for routing decisions.
 
 ---
 
-## `pdf_interp` crate — lower-level API
+## `rasterrocket-interp` crate — lower-level API
 
-Direct use of `pdf_interp` is not required for most consumers. Use it when building a custom render loop or accessing document metadata without rendering.
+Direct use of `rasterrocket-interp` is not required for most consumers. Use it when building a custom render loop or accessing document metadata without rendering.
 
 ### `open`
 
@@ -505,7 +505,7 @@ GPU initialisation failures at runtime print a warning to stderr and fall back t
 
 ## Feature flags
 
-### `pdf_raster` features
+### `rasterrocket` features
 
 | Feature | Requires | Effect |
 |---|---|---|

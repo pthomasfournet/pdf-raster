@@ -1,4 +1,4 @@
-# pdf-raster
+# rasterrocket
 
 Pure Rust PDF → pixels pipeline. Zero Poppler, zero subprocesses, zero Leptonica in the render path.
 
@@ -6,7 +6,7 @@ Renders PDF pages to 8-bit grayscale pixel buffers for direct consumption by Tes
 
 ```toml
 # Cargo.toml
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0" }
+rasterrocket = "1.0"
 ```
 
 ## What's new in v1.0.0
@@ -20,7 +20,7 @@ pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0
 - **`PageSet`** — render a sparse subset of pages without visiting intermediate ones.
 
 ```rust
-use pdf_raster::{RasterOptions, raster_pdf};
+use rasterrocket::{RasterOptions, raster_pdf};
 
 let opts = RasterOptions { dpi: 300.0, ..RasterOptions::default() };
 
@@ -38,7 +38,7 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 |---|---|
 | [Getting Started](docs/getting-started.md) | Installation, quickstart, Tesseract integration, DPI guidance, error handling, security |
 | [API Reference](docs/api-reference.md) | Full signatures for `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage`, `RasterError`, `PageDiagnostics`, feature flags, GPU dispatch thresholds |
-| [CLI Reference](docs/cli-reference.md) | All `pdf-raster` command-line flags, output format matrix, examples, pixel-diff comparison |
+| [CLI Reference](docs/cli-reference.md) | All `rasterrocket` command-line flags, output format matrix, examples, pixel-diff comparison |
 | [Benchmarks](../../wiki/Benchmarks) | Methodology, 10-document corpus results, CPU-only AVX-512 vs AVX2, GPU-accelerated, reproduction steps |
 | [OCR Integration](../../wiki/OCR-Integration) | Tesseract (`leptess`) and ocrs — instance reuse, zero-copy patterns, DPI wiring, multi-threaded examples |
 | [LLM Vision OCR Integration](../../wiki/LLM-Vision-OCR-Integration) | Google Cloud Vision and GPT-5 — encoding helper, Rust + Python examples, cost and latency guidance |
@@ -47,14 +47,14 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 
 | Crate | Role |
 |---|---|
-| `pdf_raster` | **Public API** — `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage` |
-| `pdf_interp` | Native PDF interpreter — content streams, fonts, images, shading, transparency |
-| `raster` | Pixel-level fill/composite with AVX-512, AVX2, and NEON SIMD |
+| `rasterrocket` | **Public API** — `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage` |
+| `rasterrocket-interp` | Native PDF interpreter — content streams, fonts, images, shading, transparency |
+| `rasterrocket-render` | Pixel-level fill/composite with AVX-512, AVX2, and NEON SIMD |
 | `gpu` | CUDA kernels — nvJPEG, nvJPEG2000, AA fill, tile fill, ICC CLUT, deskew; VA-API JPEG decode |
-| `font` | FreeType glyph cache and rendering |
-| `color` | Pixel types, colour math |
-| `encode` | PPM / PGM / PBM / PNG output |
-| `cli` | `pdf-raster` binary |
+| `rasterrocket-font` | FreeType glyph cache and rendering |
+| `rasterrocket-color` | Pixel types, colour math |
+| `rasterrocket-encode` | PPM / PGM / PBM / PNG output |
+| `rasterrocket-cli` | `rasterrocket` binary |
 | `pdf_bridge` | Poppler C++ wrapper — reference baseline only, not linked by CLI |
 
 ## Hardware compatibility
@@ -72,17 +72,17 @@ All GPU features fall back to CPU automatically when unavailable.  AMD/Radeon RO
 
 ```bash
 # CPU-only (no CUDA)
-cargo build --release -p cli
+cargo build --release -p rasterrocket-cli
 
 # With all GPU features (CUDA 12 or 13 toolkit, NVIDIA GPU required)
 # Default CUDA_ARCH is sm_80 (Ampere); override for older or newer GPUs.
-CUDA_ARCH=sm_120 cargo build --release -p pdf-raster \
-  --features "pdf_raster/nvjpeg,pdf_raster/nvjpeg2k,pdf_raster/gpu-aa,pdf_raster/gpu-icc,pdf_raster/gpu-deskew,pdf_raster/cache"
+CUDA_ARCH=sm_120 cargo build --release -p rasterrocket-cli \
+  --features "rasterrocket/nvjpeg,rasterrocket/nvjpeg2k,rasterrocket/gpu-aa,rasterrocket/gpu-icc,rasterrocket/gpu-deskew,rasterrocket/cache"
 
 # With Vulkan compute backend (cross-vendor; no NVIDIA dependency).
 # Requires the LunarG Vulkan SDK on the build host (slangc compiles the
 # .slang shaders to SPIR-V).  Vulkan 1.3+ ICD on the runtime host.
-cargo build --release -p pdf-raster --features "pdf_raster/vulkan"
+cargo build --release -p rasterrocket-cli --features "rasterrocket/vulkan"
 ```
 
 ### Picking `CUDA_ARCH` for your GPU
@@ -127,10 +127,10 @@ Under `auto`, when both backends are compiled in, **Vulkan is preferred over CUD
 
 ```bash
 # Ship a Vulkan-default binary, override per-process when you need CUDA:
-PDF_RASTER_BACKEND=cuda pdf-raster input.pdf out
+PDF_RASTER_BACKEND=cuda rasterrocket input.pdf out
 
 # CLI flag always wins over the env var:
-PDF_RASTER_BACKEND=cuda pdf-raster --backend cpu input.pdf out   # uses CPU
+PDF_RASTER_BACKEND=cuda rasterrocket --backend cpu input.pdf out   # uses CPU
 ```
 
 ### Compile cache (`sccache`) — optional
@@ -148,7 +148,7 @@ Shared with any other Rust project on the same machine that opts in — cross-pr
 
 ```bash
 # Unit tests (always filter by module, never run unfiltered)
-cargo test -p pdf_interp --lib -- resources
+cargo test -p rasterrocket-interp --lib -- resources
 cargo test -p gpu --lib -- icc
 
 # Pixel-diff comparison against pdftoppm (requires release build in PATH)
@@ -161,7 +161,7 @@ Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full meth
 
 **CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512, v0.9.1, RAM-backed output, cold cache, hyperfine 5 runs:**
 
-| Document | Pages | pdf-raster |
+| Document | Pages | rasterrocket |
 |---|---|---|
 | Native text, small | 16 | 41 ms ± 1 ms |
 | Native vector + text | 16 | 18 ms ± 1 ms |
@@ -178,7 +178,7 @@ Per-version regression history and the full pdftoppm comparison are in **[the Be
 
 **GPU-accelerated (CUDA: nvJPEG + nvJPEG2000), same machine + RTX 5070 (v0.9.1):**
 
-| Document | Pages | pdf-raster | pdftoppm | Speedup |
+| Document | Pages | rasterrocket | pdftoppm | Speedup |
 |---|---|---|---|---|
 | Native text, dense | 254 | 4.3 s | 9.8 s | 2.3× |
 | 1927 scan, DCT | 390 | 50 s | 279 s | **5.6×** |

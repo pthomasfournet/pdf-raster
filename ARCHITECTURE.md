@@ -1,4 +1,4 @@
-# pdf-raster — Architecture
+# rasterrocket — Architecture
 
 End-to-end description of the codebase: crate topology, data flow, key
 abstractions, and platform strategy.
@@ -8,39 +8,39 @@ abstractions, and platform strategy.
 ## 1. Crate topology
 
 ```
-color
+rasterrocket-color
   │   pixel types, colour math, convert helpers
   │
-  ├── raster
+  ├── rasterrocket-render
   │     software rasterizer — paths, fills, compositing, SIMD
   │     │
-  │     ├── font
+  │     ├── rasterrocket-font
   │     │     FreeType glyph cache + outline → Path bridge
   │     │
-  │     ├── encode
+  │     ├── rasterrocket-encode
   │     │     PPM / PGM / PBM / PNG output
   │     │
-  │     └── pdf_interp
+  │     └── rasterrocket-interp
   │           PDF content stream interpreter + operator dispatcher
   │           │
   │           ├── gpu  (optional, feature-gated)
   │           │     CUDA kernels, nvJPEG/nvJPEG2k decoders, NPP rotate
   │           │
-  │           └── pdf_raster
+  │           └── rasterrocket
   │                 public OCR library — raster_pdf(), render_channel()
   │                 │
-  │                 └── cli
-  │                       pdf-raster binary (pdftoppm replacement)
+  │                 └── rasterrocket-cli
+  │                       rasterrocket binary (pdftoppm replacement)
   │
-  ├── pdf  (in-tree lazy mmap PDF parser; used by pdf_interp)
+  ├── rasterrocket-parser  (in-tree lazy mmap PDF parser; used by rasterrocket-interp)
   │
   ├── pdf_bridge  (unused in render path; poppler reference baseline only)
   │
-  └── bench  (vello_cpu throughput comparison; not linked by cli)
+  └── bench  (vello_cpu throughput comparison; not linked by rasterrocket-cli)
 ```
 
-`color` and `raster` are the foundation. Nothing above them has knowledge of PDF.
-`pdf_interp` is the only crate that parses PDF; everything below it is PDF-agnostic.
+`rasterrocket-color` and `rasterrocket-render` are the foundation. Nothing above them has knowledge of PDF.
+`rasterrocket-interp` is the only crate that parses PDF; everything below it is PDF-agnostic.
 
 ---
 
@@ -49,14 +49,14 @@ color
 ```
 PDF bytes on disk
     │
-    ▼ pdf::Document  (in-tree lazy mmap parser)
-pdf_interp::open()
+    ▼ rasterrocket_parser::Document  (in-tree lazy mmap parser)
+rasterrocket_interp::open()
     │
     ▼ Vec<Operator>
-pdf_interp::parse_page()             content tokenizer → operator decode
+rasterrocket_interp::parse_page()    content tokenizer → operator decode
     │
     ▼ Bitmap<Rgb8>  (blank, DPI-sized)
-pdf_interp::PageRenderer::new()      allocates target bitmap
+rasterrocket_interp::PageRenderer::new()  allocates target bitmap
     │
     ▼
 render_operators(ops, resources)     dispatch loop:
@@ -75,7 +75,7 @@ render_operators(ops, resources)     dispatch loop:
     └── transparency groups ────────▶ raster begin_group / paint_group
     │
     ▼ Bitmap<Rgb8>
-pdf_raster::rgb_to_gray()            BT.709 luma
+rasterrocket::rgb_to_gray()          BT.709 luma
     │
     ▼ Vec<u8>  (width × height, 8-bit grayscale)
 RenderedPage { pixels, width, height, dpi, effective_dpi, diagnostics }
@@ -94,7 +94,7 @@ No file I/O after the initial `open()`. No subprocess at any stage.
 
 ## 3. Crates in detail
 
-### 3.1 `color`
+### 3.1 `rasterrocket-color`
 
 Single source of truth for pixel types and colour math. No SIMD, no I/O.
 
@@ -110,7 +110,7 @@ Single source of truth for pixel types and colour math. No SIMD, no I/O.
 - `byte_to_col` / `col_to_byte` — 16.16 fixed-point GfxColorComp bridge
 - `TransferLut` — `[u8; 256]` newtype for transfer functions
 
-### 3.2 `raster`
+### 3.2 `rasterrocket-render`
 
 ~9 000 lines. The software rendering engine. PDF-agnostic — takes paths,
 bitmaps, and compositing parameters; knows nothing about operators or resources.
@@ -168,7 +168,7 @@ SVE2 tier requires `nightly-sve2` Cargo feature (nightly Rust + `stdarch_aarch64
 `PARALLEL_FILL_MIN_HEIGHT`. Each band is an independent `BitmapBand` (`&mut` slice),
 no synchronisation needed.
 
-### 3.3 `font`
+### 3.3 `rasterrocket-font`
 
 FreeType wrapper with two-level caching.
 
@@ -181,7 +181,7 @@ FreeType wrapper with two-level caching.
   to the raster path format; glyphs rendered as path fills when AA is on, direct
   bitmap blit when AA is off
 
-### 3.4 `encode`
+### 3.4 `rasterrocket-encode`
 
 Thin I/O layer. Takes `Bitmap<P>`, writes file format bytes to a `Write` sink.
 
@@ -192,9 +192,9 @@ Thin I/O layer. Takes `Bitmap<P>`, writes file format bytes to a `Write` sink.
 
 No pixel processing beyond colour-mode conversion at the boundary.
 
-### 3.5 `pdf_interp`
+### 3.5 `rasterrocket-interp`
 
-PDF parsing and operator dispatch. Uses the in-tree `pdf` crate (lazy mmap parser).
+PDF parsing and operator dispatch. Uses the in-tree `rasterrocket-parser` crate (lazy mmap parser).
 
 **Sub-modules**
 
@@ -222,11 +222,11 @@ resources/
   icc.rs           — ICC profile loading + moxcms CLUT extraction
   shading/         — axial/radial/mesh shading descriptors
   cmap.rs          — ToUnicode / CMap parsing
-  dict_ext.rs      — typed accessor helpers for `pdf::Dictionary`
+  dict_ext.rs      — typed accessor helpers for `rasterrocket_parser::Dictionary`
   tiling.rs        — Type 1 tiling pattern parsing
 ```
 
-**PageResources** — holds an immutable reference to the `pdf::Document`. All resource
+**PageResources** — holds an immutable reference to the `rasterrocket_parser::Document`. All resource
 resolution is stateless and on-demand; no per-page pre-computation. This
 makes unit testing straightforward: inject a `Document` and page `ObjectId`.
 
@@ -237,7 +237,7 @@ makes unit testing straightforward: inject a `Document` and page `ObjectId`.
 - AA fill: `gpu::aa_fill()` / `gpu::tile_fill()` if span ≥ `GPU_AA_FILL_THRESHOLD`
 
 GPU decoders live in thread-local storage on rayon worker threads (one per thread).
-They are torn down eagerly via `pdf_raster::release_gpu_decoders()` broadcast before
+They are torn down eagerly via `rasterrocket::release_gpu_decoders()` broadcast before
 the rayon pool drops — this avoids the CUDA driver teardown race at process exit.
 
 **Error handling**
@@ -278,7 +278,7 @@ CUDA 12.x and 13.x drivers (forward-compatible per the CUDA driver-API ABI).
 **`VulkanBackend`** — one per process; loads the Vulkan instance, picks a
 discrete device (ranks discrete > integrated > virtual > CPU), creates a single
 compute queue, and lazy-loads SPIR-V → `VkPipeline` per kernel.  Persistent
-`VkPipelineCache` blob at `$XDG_CACHE_HOME/pdf-raster/vulkan_pipeline_cache.bin`
+`VkPipelineCache` blob at `$XDG_CACHE_HOME/rasterrocket/vulkan_pipeline_cache.bin`
 across runs.  Shared via `Arc<VulkanBackend>`.  The renderer dispatches AA fill
 and tile fill through this; ICC CMYK→RGB and the `cache` feature stay CUDA-only,
 so `--backend vulkan` runs uncached and the CMYK matrix path falls to CPU AVX-512.
@@ -326,7 +326,7 @@ AVX2 (`_mm256_mullo_epi16`, runtime detection), scalar. All three are compiled i
 on x86-64; the correct tier is selected at runtime. ARM uses `vmull_u8` + `vshrn_n_u16`
 (NEON, always-on on aarch64).
 
-### 3.7 `pdf_raster`
+### 3.7 `rasterrocket`
 
 Public library crate. The stable API surface.
 
@@ -351,9 +351,9 @@ resolution. Returns `None` for vector/text-only pages.
 `sync_channel`. Typical use: `capacity=4`, Tesseract consumes from the other end
 while the next page renders.
 
-### 3.8 `cli`
+### 3.8 `rasterrocket-cli`
 
-Binary entry point. Thin glue over `pdf_raster` + `encode`.
+Binary entry point. Thin glue over `rasterrocket` + `rasterrocket-encode`.
 
 ```
 clap args → RasterOptions → rayon ThreadPool
@@ -371,8 +371,8 @@ the CUDA driver is fully live.
 ## 4. Feature flag graph
 
 ```
-cli feature        → pdf_raster feature → pdf_interp feature → gpu feature
-───────────────────────────────────────────────────────────────────────────
+rasterrocket-cli feature → rasterrocket feature → rasterrocket-interp feature → gpu feature
+────────────────────────────────────────────────────────────────────────────────────────────
 nvjpeg             → nvjpeg             → nvjpeg             → nvjpeg
 nvjpeg2k           → nvjpeg2k           → nvjpeg2k           → nvjpeg2k
 gpu-aa             → gpu-aa             → gpu-aa             → (enables gpu module)
@@ -380,14 +380,14 @@ gpu-icc            → gpu-icc            → gpu-icc            → (enables cm
 gpu-deskew         → gpu-deskew         →                    → gpu-deskew
 gpu-validation     →                    →                    → gpu-validation
 
-raster features (orthogonal, no cross-crate effect):
+rasterrocket-render features (orthogonal, no cross-crate effect):
   simd-avx2        default on; enables blend/fill AVX2 paths
   simd-avx512      implies simd-avx2; adds VPOPCNTDQ AA counter
   nightly-sve2     aarch64 only; SVE2 popcount tier (requires nightly Rust)
   rayon            enables fill_parallel / eo_fill_parallel
 ```
 
-`dep:gpu` in `pdf_interp` is optional — the `gpu` crate is only compiled when
+`dep:gpu` in `rasterrocket-interp` is optional — the `gpu` crate is only compiled when
 at least one `gpu-*` feature is active. CPU-only builds require no CUDA toolkit.
 
 ---
