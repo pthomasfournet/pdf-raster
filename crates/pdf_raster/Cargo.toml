@@ -1,5 +1,5 @@
 [package]
-name        = "pdf_raster"
+name        = "rasterrocket"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -7,8 +7,8 @@ license.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
 readme.workspace     = true
-description = "PDF to grayscale pixel buffer — zero subprocess, zero Leptonica, Tesseract-ready"
-keywords    = ["pdf", "raster", "ocr", "tesseract", "image"]
+description = "PDF to pixel buffer — pure Rust, zero Poppler, zero subprocesses. Vulkan and CUDA GPU backends."
+keywords    = ["pdf", "raster", "ocr", "renderer", "vulkan"]
 categories  = ["multimedia::images", "rendering", "parser-implementations"]
 
 [features]
@@ -47,11 +47,11 @@ gpu-validation = ["gpu/gpu-validation"]
 bundled = ["pdf_interp/bundled"]
 
 [dependencies]
-pdf_interp  = { path = "../pdf_interp" }
-raster      = { path = "../raster" }
-color       = { path = "../color" }
+pdf_interp  = { package = "rasterrocket-interp",  path = "../pdf_interp", version = "1.0" }
+raster      = { package = "rasterrocket-render",  path = "../raster",     version = "1.0" }
+color       = { package = "rasterrocket-color",   path = "../color",      version = "1.0" }
 gpu         = { path = "../gpu", optional = true }
-pdf         = { path = "../pdf" }
+pdf         = { package = "rasterrocket-parser",  path = "../pdf",        version = "1.0" }
 rayon       = "1"
 log         = { workspace = true }
 
