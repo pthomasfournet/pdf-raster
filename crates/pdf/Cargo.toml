@@ -1,11 +1,15 @@
 [package]
-name        = "pdf"
-description = "Lazy, zero-copy PDF file parser for the pdf-raster render pipeline"
+name        = "rasterrocket-parser"
 version.workspace     = true
 edition.workspace     = true
 authors.workspace     = true
 license.workspace     = true
 repository.workspace  = true
+homepage.workspace    = true
+readme.workspace      = true
+description = "Lazy, zero-copy PDF file parser for the rasterrocket render pipeline"
+keywords    = ["pdf", "parser", "mmap", "zero-copy", "document"]
+categories  = ["parser-implementations", "encoding"]
 
 [dependencies]
 flate2      = { version = "1" }
