@@ -100,7 +100,7 @@ pub fn render_page(
     // Prescan only when a GPU decoder is compiled in — otherwise it's pure overhead
     // with no benefit (CpuOnly is already the effective policy for every page).
     #[cfg(any(feature = "nvjpeg", feature = "nvjpeg2k", feature = "vaapi"))]
-    let effective_policy = match pdf_raster::prescan_page(session.doc(), page_num).ok() {
+    let effective_policy = match pdf_raster::prescan_session(session, page_num).ok() {
         Some(ref diag) if !diag.has_images => BackendPolicy::CpuOnly,
         Some(ref diag) if matches!(diag.dominant_filter, Some(ImageFilter::Dct)) => {
             session.policy()

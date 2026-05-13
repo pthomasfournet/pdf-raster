@@ -110,11 +110,10 @@ mod render;
 
 use std::path::Path;
 
-pub use pdf_interp::prescan_page;
 pub use pdf_interp::renderer::PageDiagnostics;
 pub use pdf_interp::resources::ImageFilter;
 pub use render::{
-    MAX_PX_DIMENSION, RasterError, RasterSession, open_session, render_page_rgb,
+    MAX_PX_DIMENSION, RasterError, RasterSession, open_session, prescan_session, render_page_rgb,
     render_page_rgb_hinted, rgb_to_gray,
 };
 

@@ -198,8 +198,11 @@ impl RasterSession {
         self.total_pages
     }
 
-    /// Borrow the underlying [`pdf::Document`] for read-only operations such as
-    /// the [`crate::prescan_page`] pre-scan pass.
+    /// Borrow the underlying [`pdf::Document`] for read-only operations.
+    ///
+    /// Prefer [`prescan_session`] over calling this directly — it avoids
+    /// exposing `pdf::Document` in your call graph.
+    #[doc(hidden)]
     #[must_use]
     pub fn doc(&self) -> &pdf::Document {
         &self.doc
@@ -221,10 +224,14 @@ impl RasterSession {
     /// cold-read on every contest event (each page rendered once) and was
     /// dropped.
     ///
+    /// Prefer [`prescan_session`] and [`render_page_rgb`] over calling this
+    /// directly — they avoid exposing `pdf::ObjectId` in your call graph.
+    ///
     /// # Errors
     /// [`RasterError::PageOutOfRange`] when `page_num` is `0` or exceeds
     /// `self.total_pages`; [`RasterError::Pdf`] when the underlying page-tree
     /// descent fails (malformed `/Pages` node).
+    #[doc(hidden)]
     pub fn resolve_page(&self, page_num: u32) -> Result<pdf::ObjectId, RasterError> {
         // The upper-bound check is structurally duplicated by
         // `Document::get_page`, but doing it here keeps the user-facing
@@ -239,6 +246,25 @@ impl RasterSession {
         }
         self.doc.get_page(page_num - 1).map_err(RasterError::from)
     }
+}
+
+/// Classify page `page_num` (1-based) without rendering any pixels.
+///
+/// Wraps [`pdf_interp::prescan_page`] using the document already loaded in
+/// `session` — callers do not need to access `session.doc()` directly.
+///
+/// Returns a [`PageDiagnostics`] with `has_images`, `has_vector_text`,
+/// `dominant_filter`, and a conservative `source_ppi_hint`.
+///
+/// # Errors
+///
+/// Returns a [`RasterError`] if `page_num` is outside the document or the
+/// page geometry is invalid.
+pub fn prescan_session(
+    session: &RasterSession,
+    page_num: u32,
+) -> Result<crate::PageDiagnostics, RasterError> {
+    pdf_interp::prescan_page(&session.doc, page_num).map_err(RasterError::from)
 }
 
 // Compile-time assertions: RasterSession must be Sync (shared across rayon threads) and
