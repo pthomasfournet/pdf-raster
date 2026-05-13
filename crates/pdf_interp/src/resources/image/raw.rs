@@ -59,7 +59,10 @@ pub(super) fn decode_raw(
 
     if is_mask {
         // Stencil mask — always 1 byte per pixel, no colour space conversion.
-        return decode_mask_raw(data, width, height, bpc);
+        // PDF §8.9.6.2: Decode=[1,0] inverts the stencil polarity so that
+        // sample 1 = paint and sample 0 = transparent instead of the default.
+        let invert = is_mask_inverted(dict);
+        return decode_mask_raw(data, width, height, bpc, invert);
     }
 
     // Resolve the ColorSpace entry, following indirect references.  We need the
@@ -186,14 +189,33 @@ pub(super) fn decode_raw(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+/// Return `true` when the `ImageMask`'s `Decode` array is `[1, 0]` (inverted stencil).
+fn is_mask_inverted(dict: &Dictionary) -> bool {
+    let Some(Object::Array(arr)) = dict.get(b"Decode") else {
+        return false;
+    };
+    let vals: Vec<f64> = arr.iter().filter_map(pdf::Object::as_f64).collect();
+    matches!(vals.as_slice(), [v0, v1] if *v0 > 0.5 && *v1 < 0.5)
+}
+
 /// Decode a stencil mask (ImageMask=true) from raw data.
-fn decode_mask_raw(data: &[u8], width: u32, height: u32, bpc: i64) -> Option<ImageDescriptor> {
+///
+/// When `invert` is `true` (`Decode=[1,0]`), polarity is flipped: sample 1
+/// maps to 0x00 (paint) and sample 0 maps to 0xFF (transparent).
+fn decode_mask_raw(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    bpc: i64,
+    invert: bool,
+) -> Option<ImageDescriptor> {
     match bpc {
         1 => {
             let width_usize = usize::try_from(width).ok()?;
             // Mask images are always 1-component: 1 bit per pixel.
             let pixels = unpack_packed_bits(data, 1, width_usize, height, |v| {
-                if v == 0 { 0x00 } else { 0xFF }
+                let paint = if invert { v != 0 } else { v == 0 };
+                if paint { 0x00 } else { 0xFF }
             })?;
             Some(ImageDescriptor {
                 width,
@@ -213,11 +235,16 @@ fn decode_mask_raw(data: &[u8], width: u32, height: u32, bpc: i64) -> Option<Ima
                 );
                 return None;
             }
+            let pixels: Vec<u8> = if invert {
+                data[..expected].iter().map(|&b| 255 - b).collect()
+            } else {
+                data[..expected].to_vec()
+            };
             Some(ImageDescriptor {
                 width,
                 height,
                 color_space: ImageColorSpace::Mask,
-                data: ImageData::Cpu(data[..expected].to_vec()),
+                data: ImageData::Cpu(pixels),
                 smask: None,
                 filter: ImageFilter::Raw,
             })
@@ -438,6 +465,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desc.color_space, ImageColorSpace::Mask);
+    }
+
+    #[test]
+    fn decode_raw_mask_decode_inverted() {
+        // Decode=[1,0] flips stencil polarity: sample 0 → 0xFF (transparent),
+        // sample 255 → 0x00 (paint).  Without the fix both would stay as-is.
+        let doc = make_doc();
+        let mut dict = Dictionary::new();
+        dict.set("BitsPerComponent", Object::Integer(8));
+        dict.set(
+            "Decode",
+            Object::Array(vec![Object::Real(1.0), Object::Real(0.0)]),
+        );
+        // pixel 0 → was "paint" in default polarity; with Decode=[1,0] it should
+        // become 0xFF (transparent).  Pixel 255 should become 0x00 (paint).
+        let data = vec![0u8, 255u8];
+        let desc = decode_raw(
+            &doc,
+            &data,
+            2,
+            1,
+            true,
+            &dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .unwrap();
+        let pixels = desc.data.as_cpu().unwrap();
+        assert_eq!(
+            pixels[0], 0xFF,
+            "sample 0 with Decode=[1,0] must be transparent"
+        );
+        assert_eq!(
+            pixels[1], 0x00,
+            "sample 255 with Decode=[1,0] must be paint"
+        );
     }
 
     #[test]

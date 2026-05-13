@@ -511,4 +511,39 @@ mod tests {
         let (r, g, b) = cmyk_to_rgb(0, 0, 0, 0);
         assert_eq!((r, g, b), (255, 255, 255));
     }
+
+    /// `cmyk_to_rgb_reflectance` agrees with the analytic formula
+    /// `R = round((255-C)*(255-K)/255)` to within ±2 LSB.
+    ///
+    /// Reference values are the exact f64 results rounded to u8.  The ±2 LSB
+    /// tolerance covers integer rounding in both the formula and the reference.
+    #[test]
+    fn cmyk_to_rgb_reflectance_colour_accuracy() {
+        let cases: &[(u8, u8, u8, u8, u8, u8, u8)] = &[
+            // (C, M, Y, K, R_ref, G_ref, B_ref)
+            (0, 0, 0, 0, 255, 255, 255),       // no ink → white
+            (0, 0, 0, 255, 0, 0, 0),           // black ink only
+            (255, 0, 0, 0, 0, 255, 255),       // full cyan
+            (0, 255, 0, 0, 255, 0, 255),       // full magenta
+            (0, 0, 255, 0, 255, 255, 0),       // full yellow
+            (128, 0, 0, 0, 128, 255, 255),     // 50% cyan
+            (0, 128, 0, 0, 255, 128, 255),     // 50% magenta
+            (0, 0, 128, 0, 255, 255, 128),     // 50% yellow
+            (128, 128, 128, 0, 128, 128, 128), // 50% CMY no K
+            (128, 128, 128, 128, 64, 64, 64),  // 50% CMY + 50% K
+            (200, 100, 50, 80, 38, 106, 141),  // mixed
+        ];
+
+        for &(c, m, y, k, r_ref, g_ref, b_ref) in cases {
+            let (r, g, b) = cmyk_to_rgb_reflectance(c, m, y, k);
+            let dr = (i32::from(r) - i32::from(r_ref)).unsigned_abs();
+            let dg = (i32::from(g) - i32::from(g_ref)).unsigned_abs();
+            let db = (i32::from(b) - i32::from(b_ref)).unsigned_abs();
+            assert!(
+                dr <= 2 && dg <= 2 && db <= 2,
+                "cmyk({c},{m},{y},{k}): got ({r},{g},{b}), ref ({r_ref},{g_ref},{b_ref}), \
+                 delta=({dr},{dg},{db})"
+            );
+        }
+    }
 }
