@@ -237,10 +237,14 @@ pub struct PageRenderer<'doc> {
     /// Non-OCG `BDC`/`EMC` pairs do not touch this stack (they are `MarkedContent`
     /// no-ops).  Content is skipped whenever any entry is `false`.
     ocg_stack: Vec<bool>,
-    /// GPU parallel-Huffman JPEG decoder, present when the `gpu-jpeg-huffman`
-    /// feature is enabled.  `None` means the path is inactive.
+    /// GPU parallel-Huffman JPEG decoder via the CUDA backend.
+    /// `None` means the path is inactive.
     #[cfg(feature = "gpu-jpeg-huffman")]
     jpeg_gpu: Option<JpegGpuDecoder<CudaBackend>>,
+    /// GPU parallel-Huffman JPEG decoder via the Vulkan backend.
+    /// Mutually exclusive with `jpeg_gpu` — only one is `Some` per render call.
+    #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+    jpeg_vk: Option<JpegGpuDecoder<VulkanBackend>>,
     /// GPU-accelerated JPEG decoder, present when the `nvjpeg` feature is enabled
     /// and a CUDA device is available.  `None` means CPU-only JPEG decode.
     #[cfg(feature = "nvjpeg")]
@@ -395,6 +399,8 @@ impl<'doc> PageRenderer<'doc> {
             ocg_stack: Vec::new(),
             #[cfg(feature = "gpu-jpeg-huffman")]
             jpeg_gpu: None,
+            #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+            jpeg_vk: None,
             #[cfg(feature = "nvjpeg")]
             nvjpeg: None,
             #[cfg(feature = "vaapi")]
@@ -422,6 +428,21 @@ impl<'doc> PageRenderer<'doc> {
     #[cfg(feature = "gpu-jpeg-huffman")]
     pub const fn take_jpeg_gpu(&mut self) -> Option<JpegGpuDecoder<CudaBackend>> {
         self.jpeg_gpu.take()
+    }
+
+    /// Attach a Vulkan parallel-Huffman JPEG decoder to this renderer.
+    ///
+    /// Mutually exclusive with [`set_jpeg_gpu`] — call one or the other per
+    /// render, never both.
+    #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+    pub fn set_jpeg_vk(&mut self, dec: Option<JpegGpuDecoder<VulkanBackend>>) {
+        self.jpeg_vk = dec;
+    }
+
+    /// Detach and return the Vulkan parallel-Huffman JPEG decoder for reuse.
+    #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+    pub fn take_jpeg_vk(&mut self) -> Option<JpegGpuDecoder<VulkanBackend>> {
+        self.jpeg_vk.take()
     }
 
     /// [`crate::resources::image::GPU_JPEG_THRESHOLD_PX`] are decoded on the
@@ -967,6 +988,38 @@ impl<'doc> PageRenderer<'doc> {
             return;
         }
         // Try Image.
+        // Route to whichever GPU JPEG decoder is active (only one is Some per render).
+        // Each branch is a separately monomorphised call; no decoder is wasted.
+        #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+        if self.jpeg_vk.is_some() {
+            let img = self.resources.image(
+                name,
+                #[cfg(feature = "nvjpeg")]
+                self.nvjpeg.as_mut(),
+                #[cfg(feature = "vaapi")]
+                self.vaapi_jpeg_queue.as_ref(),
+                #[cfg(feature = "nvjpeg2k")]
+                self.nvjpeg2k.as_mut(),
+                self.jpeg_vk.as_mut(),
+                #[cfg(feature = "gpu-icc")]
+                self.gpu_ctx.as_deref(),
+                #[cfg(feature = "gpu-icc")]
+                Some(&mut self.icc_clut_cache),
+                #[cfg(feature = "cache")]
+                self.cache_state.as_ref().map(|cs| &cs.cache),
+                #[cfg(feature = "cache")]
+                self.cache_state.as_ref().map(|cs| cs.doc_id),
+            );
+            if let Some(img) = img {
+                self.blit_image(&img);
+                return;
+            }
+            log::debug!(
+                "pdf_interp: Do /{} skipped (unsupported filter or missing resource)",
+                String::from_utf8_lossy(name)
+            );
+            return;
+        }
         let img = self.resources.image(
             name,
             #[cfg(feature = "nvjpeg")]

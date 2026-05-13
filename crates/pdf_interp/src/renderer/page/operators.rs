@@ -307,7 +307,45 @@ impl PageRenderer<'_> {
                 self.do_xobject(name);
             }
             Operator::InlineImage { params, data } => {
-                if let Some(img) = crate::resources::image::decode_inline_image(
+                // Route to whichever GPU JPEG decoder is active (only one is Some per render).
+                #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
+                let decoded = if self.jpeg_vk.is_some() {
+                    crate::resources::image::decode_inline_image(
+                        self.resources.doc(),
+                        params,
+                        data,
+                        #[cfg(feature = "nvjpeg")]
+                        self.nvjpeg.as_mut(),
+                        #[cfg(feature = "vaapi")]
+                        self.vaapi_jpeg_queue.as_ref(),
+                        #[cfg(feature = "nvjpeg2k")]
+                        self.nvjpeg2k.as_mut(),
+                        self.jpeg_vk.as_mut(),
+                        #[cfg(feature = "gpu-icc")]
+                        self.gpu_ctx.as_deref(),
+                        #[cfg(feature = "gpu-icc")]
+                        Some(&mut self.icc_clut_cache),
+                    )
+                } else {
+                    crate::resources::image::decode_inline_image(
+                        self.resources.doc(),
+                        params,
+                        data,
+                        #[cfg(feature = "nvjpeg")]
+                        self.nvjpeg.as_mut(),
+                        #[cfg(feature = "vaapi")]
+                        self.vaapi_jpeg_queue.as_ref(),
+                        #[cfg(feature = "nvjpeg2k")]
+                        self.nvjpeg2k.as_mut(),
+                        self.jpeg_gpu.as_mut(),
+                        #[cfg(feature = "gpu-icc")]
+                        self.gpu_ctx.as_deref(),
+                        #[cfg(feature = "gpu-icc")]
+                        Some(&mut self.icc_clut_cache),
+                    )
+                };
+                #[cfg(not(all(feature = "gpu-jpeg-huffman", feature = "vulkan")))]
+                let decoded = crate::resources::image::decode_inline_image(
                     self.resources.doc(),
                     params,
                     data,
@@ -323,7 +361,8 @@ impl PageRenderer<'_> {
                     self.gpu_ctx.as_deref(),
                     #[cfg(feature = "gpu-icc")]
                     Some(&mut self.icc_clut_cache),
-                ) {
+                );
+                if let Some(img) = decoded {
                     self.blit_image(&img);
                 } else {
                     log::warn!("pdf_interp: inline image decode failed — skipping");
