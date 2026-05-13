@@ -22,8 +22,6 @@ use gpu::nvjpeg2k::NvJpeg2kDecoder;
 use gpu::JpegQueueHandle;
 
 #[cfg(feature = "gpu-jpeg-huffman")]
-use gpu::backend::cuda::CudaBackend;
-#[cfg(feature = "gpu-jpeg-huffman")]
 use gpu::jpeg_decoder::JpegGpuDecoder;
 
 #[cfg(feature = "gpu-icc")]
@@ -74,14 +72,14 @@ use super::ImageColorSpace;
                   populated context per call"
     )
 )]
-pub fn decode_inline_image(
+pub fn decode_inline_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBackend>(
     doc: &Document,
     params: &[u8],
     data: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
-    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<&mut JpegGpuDecoder<CudaBackend>>,
+    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<&mut JpegGpuDecoder<B>>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
 ) -> Option<ImageDescriptor> {

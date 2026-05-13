@@ -325,14 +325,14 @@ impl<'doc> PageResources<'doc> {
             reason = "thin forwarder to resolve_image; argument count is feature-gated"
         )
     )]
-    pub fn image(
+    pub fn image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBackend>(
         &self,
         name: &[u8],
         #[cfg(feature = "nvjpeg")] gpu: Option<&mut gpu::nvjpeg::NvJpegDecoder>,
         #[cfg(feature = "vaapi")] vaapi: Option<&gpu::JpegQueueHandle>,
         #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut gpu::nvjpeg2k::NvJpeg2kDecoder>,
         #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<
-            &mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>,
+            &mut gpu::jpeg_decoder::JpegGpuDecoder<B>,
         >,
         #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&gpu::GpuCtx>,
         #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut image::IccClutCache>,

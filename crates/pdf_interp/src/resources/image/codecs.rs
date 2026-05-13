@@ -437,14 +437,14 @@ fn append_ccitt_row(
                   populated context per call"
     )
 )]
-pub(super) fn decode_dct(
+pub(super) fn decode_dct<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBackend>(
     data: &[u8],
     pdf_w: u32,
     pdf_h: u32,
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<
-        &mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>,
+        &mut gpu::jpeg_decoder::JpegGpuDecoder<B>,
     >,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,

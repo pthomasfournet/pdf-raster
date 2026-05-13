@@ -62,8 +62,6 @@ use gpu::JpegQueueHandle;
 // ── GPU parallel-Huffman JPEG decoder ────────────────────────────────────────
 
 #[cfg(feature = "gpu-jpeg-huffman")]
-use gpu::backend::cuda::CudaBackend;
-#[cfg(feature = "gpu-jpeg-huffman")]
 use gpu::jpeg_decoder::JpegGpuDecoder;
 
 // ── GPU ICC CMYK→RGB acceleration ─────────────────────────────────────────────
@@ -377,14 +375,14 @@ pub struct ImageDescriptor {
                   populated context per call"
     )
 )]
-pub fn resolve_image(
+pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBackend>(
     doc: &Document,
     page_dict: &Dictionary,
     name: &[u8],
     #[cfg(feature = "nvjpeg")] gpu: Option<&mut NvJpegDecoder>,
     #[cfg(feature = "vaapi")] vaapi: Option<&JpegQueueHandle>,
     #[cfg(feature = "nvjpeg2k")] gpu_j2k: Option<&mut NvJpeg2kDecoder>,
-    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<&mut JpegGpuDecoder<CudaBackend>>,
+    #[cfg(feature = "gpu-jpeg-huffman")] jpeg_gpu: Option<&mut JpegGpuDecoder<B>>,
     #[cfg(feature = "gpu-icc")] gpu_ctx: Option<&GpuCtx>,
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
     #[cfg(feature = "cache")] image_cache: Option<&std::sync::Arc<gpu::cache::DeviceImageCache>>,
