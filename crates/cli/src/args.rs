@@ -433,7 +433,9 @@ impl Args {
                 BackendPolicy::CpuOnly => "cpu",
                 BackendPolicy::ForceCuda => "cuda",
                 BackendPolicy::ForceVulkan => "vulkan",
-                _ => unreachable!("matched CpuOnly | ForceCuda | ForceVulkan above"),
+                BackendPolicy::Auto => {
+                    unreachable!("matched CpuOnly | ForceCuda | ForceVulkan above")
+                }
             };
             return Err(format!(
                 "--vaapi-device has no effect with --backend {backend_name}.\n\
@@ -442,7 +444,7 @@ impl Args {
         }
 
         let mut config = SessionConfig::with_policy(policy);
-        config.vaapi_device = self.vaapi_device.clone();
+        config.vaapi_device.clone_from(&self.vaapi_device);
         #[cfg(feature = "cache")]
         {
             config.prefetch = self.prefetch;
