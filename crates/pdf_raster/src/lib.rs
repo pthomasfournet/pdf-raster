@@ -654,6 +654,7 @@ mod page_set_tests {
         assert_eq!(a, b);
     }
 
+    #[test]
     fn raster_options_with_pages_none_is_valid() {
         let opts = RasterOptions {
             dpi: 150.0,
