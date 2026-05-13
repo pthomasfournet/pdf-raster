@@ -77,7 +77,7 @@ Add `pdf_raster` to your `Cargo.toml` as a git dependency:
 
 ```toml
 [dependencies]
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0" }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0" }
 ```
 
 For GPU acceleration — NVIDIA (CUDA 12 or 13) + Vulkan (cross-vendor) + VA-API (Linux iGPU/dGPU):
@@ -85,13 +85,13 @@ For GPU acceleration — NVIDIA (CUDA 12 or 13) + Vulkan (cross-vendor) + VA-API
 ```toml
 [dependencies]
 # CUDA GPU features (NVIDIA only; full feature set including the Phase 9 cache):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew", "cache"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0", features = ["nvjpeg", "nvjpeg2k", "gpu-aa", "gpu-icc", "gpu-deskew", "cache"] }
 
 # Vulkan compute (cross-vendor — NVIDIA, AMD, Intel, Apple via MoltenVK):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0", features = ["vulkan"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0", features = ["vulkan"] }
 
 # VA-API (AMD/Intel iGPU on Linux — libva required):
-pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v0.8.0", features = ["vaapi"] }
+pdf_raster = { git = "https://github.com/pthomasfournet/pdf-raster", tag = "v1.0.0", features = ["vaapi"] }
 ```
 
 To track the latest commit on `master` instead of a pinned tag:
@@ -109,12 +109,7 @@ Pin to a tag for reproducible builds. Run `cargo update -p pdf_raster` to advanc
 use std::path::Path;
 use pdf_raster::{RasterOptions, raster_pdf};
 
-let opts = RasterOptions {
-    dpi: 300.0,
-    first_page: 1,
-    last_page: u32::MAX,  // render all pages
-    deskew: true,
-};
+let opts = RasterOptions { dpi: 300.0, ..RasterOptions::default() };
 
 for (page_num, result) in raster_pdf(Path::new("document.pdf"), &opts) {
     match result {
@@ -134,12 +129,7 @@ for (page_num, result) in raster_pdf(Path::new("document.pdf"), &opts) {
 ```rust
 use pdf_raster::{RasterOptions, raster_pdf};
 
-let opts = RasterOptions {
-    dpi: 300.0,
-    first_page: 1,
-    last_page: u32::MAX,
-    deskew: true,
-};
+let opts = RasterOptions { dpi: 300.0, deskew: true, ..RasterOptions::default() };
 
 for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
     let page = match result {
@@ -186,7 +176,7 @@ Use `page.suggested_dpi(min, max)` to re-render at the document's native image r
 
 ```rust
 let page = render_at_default_dpi()?;
-if let Some(native_dpi) = page.suggested_dpi(150.0, 600.0) {
+if let Some(native_dpi) = page.diagnostics.suggested_dpi(150.0, 600.0) {
     if (native_dpi - opts.dpi).abs() > 10.0 {
         // Re-render at native resolution to avoid up/downsampling artefacts
     }
@@ -200,7 +190,7 @@ For multi-document pipelines, use `render_channel` to render pages in the backgr
 ```rust
 use pdf_raster::{RasterOptions, render_channel};
 
-let opts = RasterOptions { dpi: 300.0, first_page: 1, last_page: 100, deskew: true };
+let opts = RasterOptions { dpi: 300.0, last_page: 100, deskew: true, ..RasterOptions::default() };
 
 // capacity=4: up to 4 rendered pages buffered before the producer blocks
 let rx = render_channel(Path::new("scan.pdf"), &opts, 4);
