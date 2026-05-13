@@ -1,0 +1,22 @@
+
+System: load=6.81   cores=24  perf_paranoid=1
+Binary: target/release/pdf-raster-vulkan-huffman  backend=vulkan
+Runs:   5 (warmup 1) — hyperfine mean±σ + mpstat/iostat
+
+corpus                                    mean ± σ   cpu avg  cpu peak  disk MB/s  flags
+------                                      --------   -------  --------  ---------
+01-native-text-small                   1376ms ±   21ms        5%        5%         0 MB/s  
+02-native-vector-text                  1351ms ±   12ms        5%        5%         0 MB/s  
+03-native-text-dense                   2111ms ±   14ms        6%        7%         0 MB/s  [low-cpu 6%] 
+04-ebook-mixed                         2134ms ±   12ms        7%        9%         0 MB/s  [low-cpu 7%] 
+05-academic-book                       2176ms ±   28ms       19%       25%         0 MB/s  [low-cpu 19%] 
+06-modern-layout-dct                   3963ms ±   26ms       29%       60%         0 MB/s  [low-cpu 29%] 
+07-journal-dct-heavy                   2122ms ±   13ms       14%       15%         0 MB/s  [low-cpu 14%] 
+08-scan-dct-1927                       2821ms ±   42ms       28%       62%         0 MB/s  
+09-scan-dct-1836                       3115ms ±   40ms       42%       87%         0 MB/s  
+10-scan-jbig2-jpx                     18089ms ±  348ms       87%       99%         0 MB/s  
+
+Flags:
+  [high-σ N%]    stddev > 15% of mean — background interference likely
+  [low-cpu N%]   avg CPU < 30% on multi-page corpus — contention or I/O bound
+  [cold=Nms>>mean] cold-cache single run >> hyperfine mean — scheduling outlier
