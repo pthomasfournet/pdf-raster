@@ -1,5 +1,5 @@
 [package]
-name        = "pdf-raster"
+name        = "rasterrocket-cli"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -7,12 +7,12 @@ license.workspace    = true
 repository.workspace = true
 homepage.workspace   = true
 readme.workspace     = true
-description = "CLI — renders PDF pages to PPM/PNG/JPEG/TIFF, drop-in pdftoppm replacement"
-keywords    = ["pdf", "raster", "cli", "pdftoppm", "image"]
+description = "CLI — renders PDF pages to pixel files. Drop-in pdftoppm replacement. Pure Rust, zero Poppler."
+keywords    = ["pdf", "raster", "cli", "pdftoppm", "renderer"]
 categories  = ["command-line-utilities", "multimedia::images", "rendering"]
 
 [[bin]]
-name = "pdf-raster"
+name = "rasterrocket"
 path = "src/main.rs"
 
 [features]
@@ -39,10 +39,10 @@ vulkan     = ["pdf_raster/vulkan"]
 gpu-jpeg-huffman = ["pdf_raster/gpu-jpeg-huffman"]
 
 [dependencies]
-pdf_raster  = { path = "../pdf_raster" }
-encode      = { path = "../encode" }
-color       = { path = "../color" }
-raster      = { path = "../raster" }
+pdf_raster  = { package = "rasterrocket",        path = "../pdf_raster", version = "1.0" }
+encode      = { package = "rasterrocket-encode", path = "../encode",     version = "1.0" }
+color       = { package = "rasterrocket-color",  path = "../color",      version = "1.0" }
+raster      = { package = "rasterrocket-render", path = "../raster",     version = "1.0" }
 clap        = { version = "4", features = ["derive"] }
 rayon       = "1"
 log         = { workspace = true }
