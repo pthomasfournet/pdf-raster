@@ -34,7 +34,7 @@ for (page_num, result) in raster_pdf(Path::new("scan.pdf"), &opts) {
 | [Getting Started](docs/getting-started.md) | Installation, quickstart, Tesseract integration, DPI guidance, error handling, security |
 | [API Reference](docs/api-reference.md) | Full signatures for `raster_pdf`, `render_channel`, `RasterOptions`, `RenderedPage`, `RasterError`, `PageDiagnostics`, feature flags, GPU dispatch thresholds |
 | [CLI Reference](docs/cli-reference.md) | All `pdf-raster` command-line flags, output format matrix, examples, pixel-diff comparison |
-| [Benchmarks](docs/benchmarks.md) | Methodology, 10-document corpus results, CPU-only AVX-512 vs AVX2, GPU-accelerated, reproduction steps |
+| [Benchmarks](../../wiki/Benchmarks) | Methodology, 10-document corpus results, CPU-only AVX-512 vs AVX2, GPU-accelerated, reproduction steps |
 | [OCR Integration](../../wiki/OCR-Integration) | Tesseract (`leptess`) and ocrs — instance reuse, zero-copy patterns, DPI wiring, multi-threaded examples |
 | [LLM Vision OCR Integration](../../wiki/LLM-Vision-OCR-Integration) | Google Cloud Vision and GPT-5 — encoding helper, Rust + Python examples, cost and latency guidance |
 
@@ -152,7 +152,7 @@ tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 
 ## Performance
 
-Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full methodology, hardware details, and AVX2 vs AVX-512 comparison in **[docs/benchmarks.md](docs/benchmarks.md)**.
+Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full methodology, hardware details, and AVX2 vs AVX-512 comparison in **[the Benchmarks wiki page](../../wiki/Benchmarks)**.
 
 **CPU-only (no GPU), Ryzen 9 9900X3D + AVX-512, v0.6.0, RAM-backed output, cold cache, hyperfine 5 runs:**
 
@@ -166,7 +166,7 @@ Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full meth
 | 1836 scan, DCT | 490 | 2.54 s ± 5 ms |
 | Scan, JBIG2+JPX | 576 | 18.22 s ± 55 ms |
 
-Per-version regression history and the full pdftoppm comparison are in **[docs/benchmarks.md](docs/benchmarks.md)** — corpus-09 dropped from 36 s (v0.5.1) to 2.54 s (v0.6.0), a 14× win driven by the lopdf rip-out and RAM-backed output default.
+Per-version regression history and the full pdftoppm comparison are in **[the Benchmarks wiki page](../../wiki/Benchmarks)** — corpus-09 dropped from 36 s (v0.5.1) to 2.54 s (v0.6.0), a 14× win driven by the lopdf rip-out and RAM-backed output default.
 
 **GPU-accelerated (nvJPEG + nvJPEG2000), same machine + RTX 5070:**
 
@@ -177,4 +177,4 @@ Per-version regression history and the full pdftoppm comparison are in **[docs/b
 | 1836 scan, DCT | 490 | 71 s | 356 s | **5.0×** |
 | Scan, JBIG2+JPX | 576 | 19.6 s | 148.9 s | **7.6×** |
 
-Largest gains on scan-heavy corpora where SIMD JPEG decoding (CPU) and nvJPEG/nvJPEG2000 (GPU) dominate. Short native-text PDFs are startup-bound and show modest gains. See [docs/benchmarks.md](docs/benchmarks.md) for the full table including an Intel i7-8700K (AVX2-only) comparison.
+Largest gains on scan-heavy corpora where SIMD JPEG decoding (CPU) and nvJPEG/nvJPEG2000 (GPU) dominate. Short native-text PDFs are startup-bound and show modest gains. See [the Benchmarks wiki page](../../wiki/Benchmarks) for the full table including an Intel i7-8700K (AVX2-only) comparison.
