@@ -1,10 +1,15 @@
 [package]
-name             = "color"
+name             = "rasterrocket-color"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+homepage.workspace   = true
+readme.workspace     = true
+description          = "Pixel types and colour math for the rasterrocket PDF renderer"
+keywords             = ["pdf", "color", "pixel", "raster", "image"]
+categories           = ["multimedia::images", "rendering"]
 
 [dependencies]
 bytemuck = { workspace = true }
