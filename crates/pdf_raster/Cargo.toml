@@ -50,7 +50,7 @@ bundled = ["pdf_interp/bundled"]
 pdf_interp  = { package = "rasterrocket-interp",  path = "../pdf_interp", version = "1.0" }
 raster      = { package = "rasterrocket-render",  path = "../raster",     version = "1.0" }
 color       = { package = "rasterrocket-color",   path = "../color",      version = "1.0" }
-gpu         = { path = "../gpu", optional = true }
+gpu         = { path = "../gpu", version = "1.0", optional = true }
 pdf         = { package = "rasterrocket-parser",  path = "../pdf",        version = "1.0" }
 rayon       = "1"
 log         = { workspace = true }

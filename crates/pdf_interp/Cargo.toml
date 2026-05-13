@@ -54,7 +54,7 @@ raster = { package = "rasterrocket-render", path = "../raster", version = "1.0" 
 color  = { package = "rasterrocket-color",  path = "../color",  version = "1.0" }
 font   = { package = "rasterrocket-font",   path = "../font",   version = "1.0" }
 encode = { package = "rasterrocket-encode", path = "../encode", version = "1.0" }
-gpu    = { path = "../gpu", optional = true }
+gpu    = { path = "../gpu", version = "1.0", optional = true }
 pdf    = { package = "rasterrocket-parser", path = "../pdf",    version = "1.0" }
 log    = { workspace = true }
 fax = "0.2.6"

@@ -117,12 +117,12 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "bench"
 version = "1.0.0"
 dependencies = [
- "color 1.0.0",
- "encode",
- "pdf",
- "pdf_interp",
- "pdf_raster",
- "raster",
+ "rasterrocket",
+ "rasterrocket-color",
+ "rasterrocket-encode",
+ "rasterrocket-interp",
+ "rasterrocket-parser",
+ "rasterrocket-render",
  "rustix",
  "vello_cpu",
 ]
@@ -245,13 +245,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "color"
-version = "1.0.0"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,15 +327,6 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
-
-[[package]]
-name = "encode"
-version = "1.0.0"
-dependencies = [
- "color 1.0.0",
- "png 0.17.16",
- "raster",
-]
 
 [[package]]
 name = "env_filter"
@@ -462,16 +446,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
-name = "font"
-version = "1.0.0"
-dependencies = [
- "color 1.0.0",
- "freetype-rs",
- "quick_cache",
- "raster",
-]
-
-[[package]]
 name = "font-types"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,11 +508,11 @@ dependencies = [
  "ash",
  "blake3",
  "bytemuck",
- "color 1.0.0",
  "cudarc",
  "dashmap",
  "gpu-allocator",
  "log",
+ "rasterrocket-color",
  "tempfile",
  "zune-jpeg",
 ]
@@ -905,76 +879,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pdf"
-version = "1.0.0"
-dependencies = [
- "flate2",
- "libdeflater",
- "log",
- "memmap2",
- "rustix",
- "tempfile",
- "weezl",
-]
-
-[[package]]
-name = "pdf-raster"
-version = "1.0.0"
-dependencies = [
- "clap",
- "color 1.0.0",
- "encode",
- "env_logger",
- "log",
- "mimalloc",
- "pdf_raster",
- "raster",
- "rayon",
- "tempfile",
-]
-
-[[package]]
 name = "pdf_bridge"
 version = "1.0.0"
 dependencies = [
  "cc",
- "color 1.0.0",
  "log",
-]
-
-[[package]]
-name = "pdf_interp"
-version = "1.0.0"
-dependencies = [
- "bytemuck",
- "color 1.0.0",
- "encode",
- "env_logger",
- "fax",
- "font",
- "gpu",
- "hayro-ccitt",
- "hayro-jbig2",
- "jpeg2k",
- "log",
- "moxcms",
- "pdf",
- "raster",
- "zune-core",
- "zune-jpeg",
-]
-
-[[package]]
-name = "pdf_raster"
-version = "1.0.0"
-dependencies = [
- "color 1.0.0",
- "gpu",
- "log",
- "pdf",
- "pdf_interp",
- "raster",
- "rayon",
+ "rasterrocket-color",
 ]
 
 [[package]]
@@ -984,7 +894,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a2b6aadb221872732e87d465213e9be5af2849b0e8cc5300a8ba98fffa2e00a"
 dependencies = [
  "bytemuck",
- "color 0.3.2",
+ "color",
  "kurbo",
  "linebender_resource_handle",
  "smallvec",
@@ -1102,12 +1012,102 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "raster"
+name = "rasterrocket"
+version = "1.0.0"
+dependencies = [
+ "gpu",
+ "log",
+ "rasterrocket-color",
+ "rasterrocket-interp",
+ "rasterrocket-parser",
+ "rasterrocket-render",
+ "rayon",
+]
+
+[[package]]
+name = "rasterrocket-cli"
+version = "1.0.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "log",
+ "mimalloc",
+ "rasterrocket",
+ "rasterrocket-color",
+ "rasterrocket-encode",
+ "rasterrocket-render",
+ "rayon",
+ "tempfile",
+]
+
+[[package]]
+name = "rasterrocket-color"
+version = "1.0.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "rasterrocket-encode"
+version = "1.0.0"
+dependencies = [
+ "png 0.17.16",
+ "rasterrocket-color",
+ "rasterrocket-render",
+]
+
+[[package]]
+name = "rasterrocket-font"
+version = "1.0.0"
+dependencies = [
+ "freetype-rs",
+ "quick_cache",
+ "rasterrocket-color",
+ "rasterrocket-render",
+]
+
+[[package]]
+name = "rasterrocket-interp"
+version = "1.0.0"
+dependencies = [
+ "bytemuck",
+ "env_logger",
+ "fax",
+ "gpu",
+ "hayro-ccitt",
+ "hayro-jbig2",
+ "jpeg2k",
+ "log",
+ "moxcms",
+ "rasterrocket-color",
+ "rasterrocket-encode",
+ "rasterrocket-font",
+ "rasterrocket-parser",
+ "rasterrocket-render",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "rasterrocket-parser"
+version = "1.0.0"
+dependencies = [
+ "flate2",
+ "libdeflater",
+ "log",
+ "memmap2",
+ "rustix",
+ "tempfile",
+ "weezl",
+]
+
+[[package]]
+name = "rasterrocket-render"
 version = "1.0.0"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
- "color 1.0.0",
+ "rasterrocket-color",
  "rayon",
 ]
 
