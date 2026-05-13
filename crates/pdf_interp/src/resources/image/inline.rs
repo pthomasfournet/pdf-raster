@@ -539,7 +539,7 @@ mod tests {
             #[cfg(feature = "nvjpeg2k")]
             None,
             #[cfg(feature = "gpu-jpeg-huffman")]
-            None,
+            None::<&mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>,
             #[cfg(feature = "gpu-icc")]
             None,
             #[cfg(feature = "gpu-icc")]
@@ -570,7 +570,7 @@ mod tests {
             #[cfg(feature = "nvjpeg2k")]
             None,
             #[cfg(feature = "gpu-jpeg-huffman")]
-            None,
+            None::<&mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>,
             #[cfg(feature = "gpu-icc")]
             None,
             #[cfg(feature = "gpu-icc")]
@@ -600,7 +600,7 @@ mod tests {
                 #[cfg(feature = "nvjpeg2k")]
                 None,
                 #[cfg(feature = "gpu-jpeg-huffman")]
-                None,
+                None::<&mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>,
                 #[cfg(feature = "gpu-icc")]
                 None,
                 #[cfg(feature = "gpu-icc")]
@@ -627,7 +627,7 @@ mod tests {
                 #[cfg(feature = "nvjpeg2k")]
                 None,
                 #[cfg(feature = "gpu-jpeg-huffman")]
-                None,
+                None::<&mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>,
                 #[cfg(feature = "gpu-icc")]
                 None,
                 #[cfg(feature = "gpu-icc")]

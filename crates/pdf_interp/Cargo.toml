@@ -41,7 +41,7 @@ cache = ["dep:gpu", "gpu/cache"]
 # happens at runtime via `BackendHandle`.  Implies `gpu-aa` because the
 # Vulkan AA / tile-fill path reuses the segment-flattening helpers in
 # `renderer::page::gpu_ops` (which are gated on `gpu-aa`).
-vulkan = ["dep:gpu", "dep:bytemuck", "gpu/vulkan", "gpu-aa"]
+vulkan = ["dep:gpu", "dep:bytemuck", "gpu/vulkan", "gpu-aa", "gpu-jpeg-huffman"]
 # GPU parallel-Huffman JPEG decoder.  Requires CUDA 12 and a NVIDIA GPU.
 # Falls back to zune-jpeg when the GPU path rejects the input (progressive,
 # subsampled, or unusual component layout).
