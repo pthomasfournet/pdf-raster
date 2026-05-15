@@ -76,7 +76,9 @@ use super::font_cache::FontCache;
 use super::gstate::{GStateStack, ctm_multiply, ctm_transform};
 use crate::InterpError;
 use crate::content::Operator;
-use crate::resources::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageResources};
+use crate::resources::{
+    ColorSpace, IMAGE_FILTER_COUNT, ImageColorSpace, ImageFilter, PageResources,
+};
 #[cfg(any(feature = "gpu-aa", feature = "gpu-icc", feature = "cache"))]
 use gpu::GpuCtx;
 #[cfg(feature = "vaapi")]
@@ -842,6 +844,28 @@ impl<'doc> PageRenderer<'doc> {
         let gs = self.gstate.current_mut();
         gs.stroke_color = c;
         gs.stroke_pattern = None;
+    }
+
+    /// Resolve `sc`/`scn` (or `SC`/`SCN`) component operands against an
+    /// already-selected colour space.
+    ///
+    /// For plain device spaces the raw components ARE the colour, so the
+    /// fast [`components_to_color`] path is kept (and stays bit-identical
+    /// for RGB/CMYK/Gray).  Parameterised spaces — `Separation`, `DeviceN`,
+    /// `ICCBased`, `Indexed`, `Lab` — must run the components through the
+    /// space's tint/profile transform (PDF §8.6.6): treating a Separation
+    /// tint of `1.0` as a grey of `1.0` paints white and silently drops all
+    /// content on spot-colour pages.
+    fn color_for_components(&self, cs: &ColorSpace, comps: &[f64]) -> RasterColor {
+        match cs {
+            ColorSpace::DeviceGray | ColorSpace::DeviceRgb | ColorSpace::DeviceCmyk => {
+                components_to_color(comps)
+            }
+            // Pattern operands are handled by the pattern dispatch, not here;
+            // fall back to the legacy heuristic for any stray component.
+            ColorSpace::Pattern { .. } => components_to_color(comps),
+            _ => RasterColor::from_bytes(cs.convert_to_rgb(self.resources.doc(), comps)),
+        }
     }
 
     fn path_builder(&mut self) -> &mut PathBuilder {

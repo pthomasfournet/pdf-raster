@@ -2,7 +2,7 @@
 
 use super::super::color::RasterColor;
 use super::super::gstate::ctm_multiply;
-use super::{PageRenderer, components_to_color, int_to_cap, int_to_join};
+use super::{PageRenderer, int_to_cap, int_to_join};
 use crate::content::{Operator, TextArrayElement};
 
 impl PageRenderer<'_> {
@@ -96,7 +96,11 @@ impl PageRenderer<'_> {
             Operator::SetFillGray(g) => self.set_fill(RasterColor::gray(*g)),
             Operator::SetFillRgb(r, g, b) => self.set_fill(RasterColor::rgb(*r, *g, *b)),
             Operator::SetFillCmyk(c, m, y, k) => self.set_fill(RasterColor::cmyk(*c, *m, *y, *k)),
-            Operator::SetFillColor(comps) => self.set_fill(components_to_color(comps)),
+            Operator::SetFillColor(comps) => {
+                let cs = self.gstate.current().fill_color_space.clone();
+                let c = self.color_for_components(&cs, comps);
+                self.set_fill(c);
+            }
             Operator::SetFillColorSpace(name) => {
                 // PDF §8.6.8: switching colour space clears any active pattern
                 // and resets the fill colour to its default for the new space
@@ -120,7 +124,11 @@ impl PageRenderer<'_> {
             Operator::SetStrokeCmyk(c, m, y, k) => {
                 self.set_stroke(RasterColor::cmyk(*c, *m, *y, *k));
             }
-            Operator::SetStrokeColor(comps) => self.set_stroke(components_to_color(comps)),
+            Operator::SetStrokeColor(comps) => {
+                let cs = self.gstate.current().stroke_color_space.clone();
+                let c = self.color_for_components(&cs, comps);
+                self.set_stroke(c);
+            }
             Operator::SetStrokeColorSpace(name) => {
                 // Mirror of SetFillColorSpace; see comment above.
                 let cs = self.resources.color_space(name);
