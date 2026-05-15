@@ -41,6 +41,20 @@ pub enum PdfFontKind {
     Other,
 }
 
+/// The base encoding a simple font's char codes resolve through before any
+/// `Differences` overrides (PDF §9.6.6).  Determines the code→glyph-name
+/// table the font cache uses when resolving glyphs by name.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BaseEncoding {
+    /// `/StandardEncoding` — Adobe Standard.  Also the spec default for a
+    /// non-symbolic simple font with no explicit base encoding.
+    Standard,
+    /// `/WinAnsiEncoding` — Windows Code Page 1252 superset.
+    WinAnsi,
+    /// `/MacRomanEncoding` — Mac OS Roman.
+    MacRoman,
+}
+
 /// CID encoding information for Type 0 composite fonts.
 ///
 /// Type 0 fonts encode character codes as 1–4 byte sequences.  The `Encoding`
@@ -165,6 +179,10 @@ pub struct FontDescriptor {
     /// Used by `FontCache` (in `rasterrocket_interp::renderer::font_cache`) to resolve
     /// names → Unicode → GID via `FreeType`'s active charmap at face-load time.
     pub differences: Box<[Option<Box<str>>; 256]>,
+    /// Base encoding for simple fonts: the code→glyph-name table that applies
+    /// before `Differences` overrides.  `StandardEncoding` per PDF spec when
+    /// no `/BaseEncoding` is named.  Unused for Type 0 / Type 3.
+    pub base_encoding: BaseEncoding,
     /// CID encoding for Type 0 composite fonts.  `Some` when `Subtype` is
     /// `Type0`; `None` for all simple fonts (Type1, TrueType, `MMType1`).
     pub cid_encoding: Option<CidEncoding>,
@@ -222,7 +240,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     let bytes = extract_bytes(doc, dict);
     let (first_char, widths) = extract_widths(dict);
     let missing_width = extract_missing_width(doc, dict);
-    let (code_to_gid, differences) = extract_encoding(doc, dict, kind);
+    let (code_to_gid, differences, base_encoding) = extract_encoding(doc, dict, kind);
 
     FontDescriptor {
         kind,
@@ -232,6 +250,7 @@ pub fn resolve_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         missing_width,
         code_to_gid,
         differences,
+        base_encoding,
         cid_encoding: None,
         type3: None,
     }
@@ -391,36 +410,62 @@ fn empty_differences() -> Box<[Option<Box<str>>; 256]> {
 
 /// Extract encoding information from a simple (non-Type0) font dictionary.
 ///
-/// Returns `(code_to_gid, differences)`:
+/// Returns `(code_to_gid, differences, base_encoding)`:
 /// - `code_to_gid`: non-empty only for encodings fully resolved at PDF-parse
-///   time (currently none — `FreeType` handles standard encodings).
+///   time (currently none — resolution happens at face-load time).
 /// - `differences`: 256-entry table of glyph-name overrides parsed from the
 ///   `Differences` array.  The font cache resolves these to GIDs at face-load
-///   time via `FreeType`'s charmap.
+///   time.
+/// - `base_encoding`: the code→glyph-name table to apply before `Differences`.
+///   `/BaseEncoding` if named, else `StandardEncoding` (the PDF-spec default
+///   for a simple font with no explicit base encoding).
 #[expect(
     clippy::type_complexity,
-    reason = "private helper; introducing a type alias for (Vec<u32>, Box<[Option<Box<str>>; 256]>) would obscure rather than clarify"
+    reason = "private helper; a type alias for the (code_to_gid, differences, base) triple would obscure rather than clarify"
 )]
 fn extract_encoding(
     doc: &Document,
     dict: &Dictionary,
     _kind: PdfFontKind,
-) -> (Vec<u32>, Box<[Option<Box<str>>; 256]>) {
+) -> (Vec<u32>, Box<[Option<Box<str>>; 256]>, BaseEncoding) {
     let Some(encoding) = dict.get(b"Encoding") else {
-        return (vec![], empty_differences());
+        return (vec![], empty_differences(), BaseEncoding::Standard);
     };
 
     match encoding {
-        Object::Reference(id) => {
-            let diffs = doc
-                .get_dictionary(*id)
-                .ok()
-                .map_or_else(empty_differences, |d| parse_differences(&d));
-            (vec![], diffs)
-        }
-        Object::Dictionary(d) => (vec![], parse_differences(d)),
-        // Named standard encoding or anything else: `FreeType` handles char → GID.
-        _ => (vec![], empty_differences()),
+        Object::Reference(id) => doc.get_dictionary(*id).ok().map_or_else(
+            || (vec![], empty_differences(), BaseEncoding::Standard),
+            |d| {
+                (
+                    vec![],
+                    parse_differences(&d),
+                    parse_base_encoding(d.get_name(b"BaseEncoding")),
+                )
+            },
+        ),
+        Object::Dictionary(d) => (
+            vec![],
+            parse_differences(d),
+            parse_base_encoding(d.get_name(b"BaseEncoding")),
+        ),
+        // A bare named encoding (`/WinAnsiEncoding`, `/MacRomanEncoding`, …):
+        // no Differences, base encoding selected by the name.
+        Object::Name(n) => (
+            vec![],
+            empty_differences(),
+            parse_base_encoding(Some(n.as_slice())),
+        ),
+        _ => (vec![], empty_differences(), BaseEncoding::Standard),
+    }
+}
+
+/// Map a PDF base-encoding name to [`BaseEncoding`].  Unknown or absent →
+/// `StandardEncoding` (PDF-spec default for a simple font).
+fn parse_base_encoding(name: Option<&[u8]>) -> BaseEncoding {
+    match name {
+        Some(b"WinAnsiEncoding") => BaseEncoding::WinAnsi,
+        Some(b"MacRomanEncoding") => BaseEncoding::MacRoman,
+        _ => BaseEncoding::Standard,
     }
 }
 
@@ -476,6 +521,8 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         missing_width: 0,
         code_to_gid: vec![],
         differences: empty_differences(),
+        // Unused for Type 0 (CID path bypasses name resolution entirely).
+        base_encoding: BaseEncoding::Standard,
         cid_encoding: Some(CidEncoding {
             encoding_cmap,
             cid_to_gid,
@@ -595,6 +642,9 @@ fn resolve_type3_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
         missing_width: 0,
         code_to_gid: vec![],
         differences,
+        // Type 3 glyphs are content-stream procedures, not a font program;
+        // name→GID resolution does not apply.
+        base_encoding: BaseEncoding::Standard,
         cid_encoding: None,
         type3: Some(Type3Data {
             glyphs,
@@ -960,6 +1010,7 @@ mod tests {
             missing_width,
             code_to_gid: vec![],
             differences: empty_differences(),
+            base_encoding: BaseEncoding::Standard,
             cid_encoding: None,
             type3: None,
         }

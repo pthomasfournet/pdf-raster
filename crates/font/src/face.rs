@@ -347,6 +347,20 @@ impl FontFace {
         self.face.get_char_index(unicode as usize).unwrap_or(0)
     }
 
+    /// Look up a glyph *name* in the font program's own charset / `post`
+    /// table (`FreeType` `FT_Get_Name_Index`) and return the glyph index.
+    /// Returns 0 (`.notdef`) when the font has no name table or the name is
+    /// absent.
+    ///
+    /// This is the correct primitive for simple (non-CID) Type1/Type1C/CFF
+    /// fonts: a subsetted embedded program packs glyphs in arbitrary order,
+    /// so the char code is neither the GID nor (often) a usable Unicode cmap
+    /// key — but the program's charset still names every glyph it contains.
+    #[must_use]
+    pub fn raw_get_name_index(&self, name: &str) -> u32 {
+        self.face.get_name_index(name).unwrap_or(0)
+    }
+
     /// Resolve a character code to a `FreeType` glyph index.
     ///
     /// When `code_to_gid` is populated (e.g. from a PDF `Differences` array),

@@ -24,7 +24,7 @@ use font::{
     hinting::FontKind,
 };
 
-use crate::resources::font::{FontDescriptor, PdfFontKind};
+use crate::resources::font::{BaseEncoding, FontDescriptor, PdfFontKind};
 
 // ── Fallback font discovery ───────────────────────────────────────────────────
 
@@ -157,9 +157,14 @@ impl FontCache {
             return None;
         }
 
-        // code_to_gid from the descriptor is populated for CID/Type0 fonts.
-        // For simple fonts with Differences, we resolve after loading the face.
-        let has_differences = desc.differences.iter().any(Option::is_some);
+        // code_to_gid from the descriptor is populated for CID/Type0 fonts and
+        // must be preserved.  A simple embedded Type1/Type1C/CFF font instead
+        // needs its codes resolved by glyph *name* against the font program's
+        // own charset after the face is loaded (see resolve_simple_to_gid).
+        let resolve_by_name = desc.bytes.is_some()
+            && desc.cid_encoding.is_none()
+            && desc.type3.is_none()
+            && matches!(desc.kind, PdfFontKind::Type1 | PdfFontKind::Other);
 
         let params = FaceParams {
             kind: to_font_kind(desc.kind),
@@ -185,11 +190,14 @@ impl FontCache {
                 .ok()?
         };
 
-        // If the Differences array supplied glyph names, resolve them to GIDs
-        // using FreeType's active charmap via Unicode codepoint lookup.
-        if has_differences {
-            let code_to_gid = resolve_differences_to_gid(&face, &desc.differences);
-            face.code_to_gid = code_to_gid;
+        // For a simple embedded Type1/CFF font the char code is NOT the GID
+        // (subset programs pack glyphs arbitrarily) and often has no usable
+        // Unicode cmap.  Build the full code→GID table by resolving each
+        // code's glyph *name* (Differences override, else the base encoding)
+        // against the program's charset.  CID/Type0 keep the descriptor's
+        // table; symbolic TrueType keeps select_truetype_cmap's charmap.
+        if resolve_by_name {
+            face.code_to_gid = resolve_simple_to_gid(&face, &desc.differences, desc.base_encoding);
         }
 
         Some(face)
@@ -208,25 +216,67 @@ pub(crate) fn trm_pixel_size_valid(trm: [f64; 4]) -> bool {
     size.is_finite() && size >= 1.0
 }
 
-// ── Differences → GID resolution ─────────────────────────────────────────────
+// ── Simple-font name → GID resolution ────────────────────────────────────────
 
-/// Build a 256-entry `code_to_gid` table from a `Differences` glyph-name array.
+/// Build a 256-entry `code_to_gid` table for a simple embedded
+/// Type1/Type1C/CFF font by resolving each char code's glyph *name* against
+/// the font program's own charset.
 ///
-/// For each char code that has a named override, look up the Adobe standard
-/// glyph name → Unicode codepoint, then call `FreeType`'s `get_char_index` to
-/// get the GID.  Codes without an override use `char_code` directly as the
-/// char index (`FreeType`'s Unicode charmap fallback).
-fn resolve_differences_to_gid(face: &FontFace, differences: &[Option<Box<str>>; 256]) -> Vec<u32> {
-    let mut table: Vec<u32> = (0u32..256).collect();
-    for (code, entry) in differences.iter().enumerate() {
-        if let Some(name) = entry
+/// For every code 0..256 the glyph name is `differences[code]` if the
+/// `Encoding/Differences` array overrides it, otherwise the name the
+/// `base_encoding` assigns to that code (PDF §9.6.6).  The name is resolved
+/// to a GID via `FreeType`'s `FT_Get_Name_Index` (the program's charset /
+/// `post` table — the only correct source for a subsetted program where the
+/// char code is neither the GID nor a usable Unicode-cmap key).
+///
+/// Resolution order per code:
+/// 1. name (Differences ▸ base encoding) → `raw_get_name_index`
+/// 2. name → Adobe Glyph List → Unicode → `raw_get_char_index` (handles
+///    programs that expose a usable Unicode cmap but no charset names)
+/// 3. `.notdef` (0) — a truly absent glyph.  We deliberately do NOT fall
+///    back to code-identity: identity is the original garble bug.
+fn resolve_simple_to_gid(
+    face: &FontFace,
+    differences: &[Option<Box<str>>; 256],
+    base: BaseEncoding,
+) -> Vec<u32> {
+    let mut table = vec![0u32; 256];
+    for (code, slot) in table.iter_mut().enumerate() {
+        let Some(name) = glyph_name_for_code(differences, base, code) else {
+            continue;
+        };
+
+        let mut gid = face.raw_get_name_index(name);
+        if gid == 0
             && let Some(unicode) = adobe_glyph_to_unicode(name)
         {
-            table[code] = face.raw_get_char_index(unicode);
+            gid = face.raw_get_char_index(unicode);
         }
-        // Names absent from the Adobe list keep table[code] = code (identity).
+        *slot = gid;
     }
     table
+}
+
+/// Resolve the glyph name for one char code: the `Differences` override if
+/// present, otherwise the `base` encoding's name (PDF §9.6.6 — Differences
+/// take precedence over the base encoding).  `None` = no glyph at this code.
+fn glyph_name_for_code(
+    differences: &[Option<Box<str>>; 256],
+    base: BaseEncoding,
+    code: usize,
+) -> Option<&str> {
+    differences[code]
+        .as_deref()
+        .or_else(|| base_encoding_table(base)[code].filter(|n| !n.is_empty()))
+}
+
+/// Return the code→glyph-name table for a PDF base encoding (PDF Appendix D).
+const fn base_encoding_table(base: BaseEncoding) -> &'static [Option<&'static str>; 256] {
+    match base {
+        BaseEncoding::Standard => &STANDARD_ENCODING,
+        BaseEncoding::WinAnsi => &WIN_ANSI_ENCODING,
+        BaseEncoding::MacRoman => &MAC_ROMAN_ENCODING,
+    }
 }
 
 // ── Adobe Glyph List ─────────────────────────────────────────────────────────
@@ -606,4 +656,873 @@ fn adobe_glyph_to_unicode(name: &str) -> Option<u32> {
     AGL.binary_search_by_key(&name, |&(k, _)| k)
         .ok()
         .map(|i| AGL[i].1)
+}
+
+// ── PDF base-encoding code → glyph-name tables (PDF 1.7 Appendix D.2) ─────────
+//
+// Static arrays, not `match`: a 256-arm `match` per encoding compiles to a
+// large LLVM decision tree that OOMs debug codegen on this box (the same
+// reason `AGL` above is a static).  These are pure data, zero LLVM IR.
+
+/// Adobe `StandardEncoding`: char code → glyph name (`None` = unused code).
+static STANDARD_ENCODING: [Option<&str>; 256] = [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("space"),
+    Some("exclam"),
+    Some("quotedbl"),
+    Some("numbersign"),
+    Some("dollar"),
+    Some("percent"),
+    Some("ampersand"),
+    Some("quoteright"),
+    Some("parenleft"),
+    Some("parenright"),
+    Some("asterisk"),
+    Some("plus"),
+    Some("comma"),
+    Some("hyphen"),
+    Some("period"),
+    Some("slash"),
+    Some("zero"),
+    Some("one"),
+    Some("two"),
+    Some("three"),
+    Some("four"),
+    Some("five"),
+    Some("six"),
+    Some("seven"),
+    Some("eight"),
+    Some("nine"),
+    Some("colon"),
+    Some("semicolon"),
+    Some("less"),
+    Some("equal"),
+    Some("greater"),
+    Some("question"),
+    Some("at"),
+    Some("A"),
+    Some("B"),
+    Some("C"),
+    Some("D"),
+    Some("E"),
+    Some("F"),
+    Some("G"),
+    Some("H"),
+    Some("I"),
+    Some("J"),
+    Some("K"),
+    Some("L"),
+    Some("M"),
+    Some("N"),
+    Some("O"),
+    Some("P"),
+    Some("Q"),
+    Some("R"),
+    Some("S"),
+    Some("T"),
+    Some("U"),
+    Some("V"),
+    Some("W"),
+    Some("X"),
+    Some("Y"),
+    Some("Z"),
+    Some("bracketleft"),
+    Some("backslash"),
+    Some("bracketright"),
+    Some("asciicircum"),
+    Some("underscore"),
+    Some("quoteleft"),
+    Some("a"),
+    Some("b"),
+    Some("c"),
+    Some("d"),
+    Some("e"),
+    Some("f"),
+    Some("g"),
+    Some("h"),
+    Some("i"),
+    Some("j"),
+    Some("k"),
+    Some("l"),
+    Some("m"),
+    Some("n"),
+    Some("o"),
+    Some("p"),
+    Some("q"),
+    Some("r"),
+    Some("s"),
+    Some("t"),
+    Some("u"),
+    Some("v"),
+    Some("w"),
+    Some("x"),
+    Some("y"),
+    Some("z"),
+    Some("braceleft"),
+    Some("bar"),
+    Some("braceright"),
+    Some("asciitilde"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("exclamdown"),
+    Some("cent"),
+    Some("sterling"),
+    Some("fraction"),
+    Some("yen"),
+    Some("florin"),
+    Some("section"),
+    Some("currency"),
+    Some("quotesingle"),
+    Some("quotedblleft"),
+    Some("guillemotleft"),
+    Some("guilsinglleft"),
+    Some("guilsinglright"),
+    Some("fi"),
+    Some("fl"),
+    None,
+    Some("endash"),
+    Some("dagger"),
+    Some("daggerdbl"),
+    Some("periodcentered"),
+    None,
+    Some("paragraph"),
+    Some("bullet"),
+    Some("quotesinglbase"),
+    Some("quotedblbase"),
+    Some("quotedblright"),
+    Some("guillemotright"),
+    Some("ellipsis"),
+    Some("perthousand"),
+    None,
+    Some("questiondown"),
+    None,
+    Some("grave"),
+    Some("acute"),
+    Some("circumflex"),
+    Some("tilde"),
+    Some("macron"),
+    Some("breve"),
+    Some("dotaccent"),
+    Some("dieresis"),
+    None,
+    Some("ring"),
+    Some("cedilla"),
+    None,
+    Some("hungarumlaut"),
+    Some("ogonek"),
+    Some("caron"),
+    Some("emdash"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("AE"),
+    None,
+    Some("ordfeminine"),
+    None,
+    None,
+    None,
+    None,
+    Some("Lslash"),
+    Some("Oslash"),
+    Some("OE"),
+    Some("ordmasculine"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("ae"),
+    None,
+    None,
+    None,
+    Some("dotlessi"),
+    None,
+    None,
+    Some("lslash"),
+    Some("oslash"),
+    Some("oe"),
+    Some("germandbls"),
+    None,
+    None,
+    None,
+    None,
+];
+
+/// `WinAnsiEncoding` (Windows CP-1252 superset): char code → glyph name.
+static WIN_ANSI_ENCODING: [Option<&str>; 256] = [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("space"),
+    Some("exclam"),
+    Some("quotedbl"),
+    Some("numbersign"),
+    Some("dollar"),
+    Some("percent"),
+    Some("ampersand"),
+    Some("quotesingle"),
+    Some("parenleft"),
+    Some("parenright"),
+    Some("asterisk"),
+    Some("plus"),
+    Some("comma"),
+    Some("hyphen"),
+    Some("period"),
+    Some("slash"),
+    Some("zero"),
+    Some("one"),
+    Some("two"),
+    Some("three"),
+    Some("four"),
+    Some("five"),
+    Some("six"),
+    Some("seven"),
+    Some("eight"),
+    Some("nine"),
+    Some("colon"),
+    Some("semicolon"),
+    Some("less"),
+    Some("equal"),
+    Some("greater"),
+    Some("question"),
+    Some("at"),
+    Some("A"),
+    Some("B"),
+    Some("C"),
+    Some("D"),
+    Some("E"),
+    Some("F"),
+    Some("G"),
+    Some("H"),
+    Some("I"),
+    Some("J"),
+    Some("K"),
+    Some("L"),
+    Some("M"),
+    Some("N"),
+    Some("O"),
+    Some("P"),
+    Some("Q"),
+    Some("R"),
+    Some("S"),
+    Some("T"),
+    Some("U"),
+    Some("V"),
+    Some("W"),
+    Some("X"),
+    Some("Y"),
+    Some("Z"),
+    Some("bracketleft"),
+    Some("backslash"),
+    Some("bracketright"),
+    Some("asciicircum"),
+    Some("underscore"),
+    Some("grave"),
+    Some("a"),
+    Some("b"),
+    Some("c"),
+    Some("d"),
+    Some("e"),
+    Some("f"),
+    Some("g"),
+    Some("h"),
+    Some("i"),
+    Some("j"),
+    Some("k"),
+    Some("l"),
+    Some("m"),
+    Some("n"),
+    Some("o"),
+    Some("p"),
+    Some("q"),
+    Some("r"),
+    Some("s"),
+    Some("t"),
+    Some("u"),
+    Some("v"),
+    Some("w"),
+    Some("x"),
+    Some("y"),
+    Some("z"),
+    Some("braceleft"),
+    Some("bar"),
+    Some("braceright"),
+    Some("asciitilde"),
+    None,
+    Some("Euro"),
+    None,
+    Some("quotesinglbase"),
+    Some("florin"),
+    Some("quotedblbase"),
+    Some("ellipsis"),
+    Some("dagger"),
+    Some("daggerdbl"),
+    Some("circumflex"),
+    Some("perthousand"),
+    Some("Scaron"),
+    Some("guilsinglleft"),
+    Some("OE"),
+    None,
+    Some("Zcaron"),
+    None,
+    None,
+    Some("quoteleft"),
+    Some("quoteright"),
+    Some("quotedblleft"),
+    Some("quotedblright"),
+    Some("bullet"),
+    Some("endash"),
+    Some("emdash"),
+    Some("tilde"),
+    Some("trademark"),
+    Some("scaron"),
+    Some("guilsinglright"),
+    Some("oe"),
+    None,
+    Some("zcaron"),
+    Some("Ydieresis"),
+    None,
+    Some("exclamdown"),
+    Some("cent"),
+    Some("sterling"),
+    Some("currency"),
+    Some("yen"),
+    Some("brokenbar"),
+    Some("section"),
+    Some("dieresis"),
+    Some("copyright"),
+    Some("ordfeminine"),
+    Some("guillemotleft"),
+    Some("logicalnot"),
+    None,
+    Some("registered"),
+    Some("macron"),
+    Some("degree"),
+    Some("plusminus"),
+    Some("twosuperior"),
+    Some("threesuperior"),
+    Some("acute"),
+    Some("mu"),
+    Some("paragraph"),
+    Some("periodcentered"),
+    Some("cedilla"),
+    Some("onesuperior"),
+    Some("ordmasculine"),
+    Some("guillemotright"),
+    Some("onequarter"),
+    Some("onehalf"),
+    Some("threequarters"),
+    Some("questiondown"),
+    Some("Agrave"),
+    Some("Aacute"),
+    Some("Acircumflex"),
+    Some("Atilde"),
+    Some("Adieresis"),
+    Some("Aring"),
+    Some("AE"),
+    Some("Ccedilla"),
+    Some("Egrave"),
+    Some("Eacute"),
+    Some("Ecircumflex"),
+    Some("Edieresis"),
+    Some("Igrave"),
+    Some("Iacute"),
+    Some("Icircumflex"),
+    Some("Idieresis"),
+    Some("Eth"),
+    Some("Ntilde"),
+    Some("Ograve"),
+    Some("Oacute"),
+    Some("Ocircumflex"),
+    Some("Otilde"),
+    Some("Odieresis"),
+    Some("multiply"),
+    Some("Oslash"),
+    Some("Ugrave"),
+    Some("Uacute"),
+    Some("Ucircumflex"),
+    Some("Udieresis"),
+    Some("Yacute"),
+    Some("Thorn"),
+    Some("germandbls"),
+    Some("agrave"),
+    Some("aacute"),
+    Some("acircumflex"),
+    Some("atilde"),
+    Some("adieresis"),
+    Some("aring"),
+    Some("ae"),
+    Some("ccedilla"),
+    Some("egrave"),
+    Some("eacute"),
+    Some("ecircumflex"),
+    Some("edieresis"),
+    Some("igrave"),
+    Some("iacute"),
+    Some("icircumflex"),
+    Some("idieresis"),
+    Some("eth"),
+    Some("ntilde"),
+    Some("ograve"),
+    Some("oacute"),
+    Some("ocircumflex"),
+    Some("otilde"),
+    Some("odieresis"),
+    Some("divide"),
+    Some("oslash"),
+    Some("ugrave"),
+    Some("uacute"),
+    Some("ucircumflex"),
+    Some("udieresis"),
+    Some("yacute"),
+    Some("thorn"),
+    Some("ydieresis"),
+];
+
+/// `MacRomanEncoding` (Mac OS Roman): char code → glyph name.
+static MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("space"),
+    Some("exclam"),
+    Some("quotedbl"),
+    Some("numbersign"),
+    Some("dollar"),
+    Some("percent"),
+    Some("ampersand"),
+    Some("quotesingle"),
+    Some("parenleft"),
+    Some("parenright"),
+    Some("asterisk"),
+    Some("plus"),
+    Some("comma"),
+    Some("hyphen"),
+    Some("period"),
+    Some("slash"),
+    Some("zero"),
+    Some("one"),
+    Some("two"),
+    Some("three"),
+    Some("four"),
+    Some("five"),
+    Some("six"),
+    Some("seven"),
+    Some("eight"),
+    Some("nine"),
+    Some("colon"),
+    Some("semicolon"),
+    Some("less"),
+    Some("equal"),
+    Some("greater"),
+    Some("question"),
+    Some("at"),
+    Some("A"),
+    Some("B"),
+    Some("C"),
+    Some("D"),
+    Some("E"),
+    Some("F"),
+    Some("G"),
+    Some("H"),
+    Some("I"),
+    Some("J"),
+    Some("K"),
+    Some("L"),
+    Some("M"),
+    Some("N"),
+    Some("O"),
+    Some("P"),
+    Some("Q"),
+    Some("R"),
+    Some("S"),
+    Some("T"),
+    Some("U"),
+    Some("V"),
+    Some("W"),
+    Some("X"),
+    Some("Y"),
+    Some("Z"),
+    Some("bracketleft"),
+    Some("backslash"),
+    Some("bracketright"),
+    Some("asciicircum"),
+    Some("underscore"),
+    Some("grave"),
+    Some("a"),
+    Some("b"),
+    Some("c"),
+    Some("d"),
+    Some("e"),
+    Some("f"),
+    Some("g"),
+    Some("h"),
+    Some("i"),
+    Some("j"),
+    Some("k"),
+    Some("l"),
+    Some("m"),
+    Some("n"),
+    Some("o"),
+    Some("p"),
+    Some("q"),
+    Some("r"),
+    Some("s"),
+    Some("t"),
+    Some("u"),
+    Some("v"),
+    Some("w"),
+    Some("x"),
+    Some("y"),
+    Some("z"),
+    Some("braceleft"),
+    Some("bar"),
+    Some("braceright"),
+    Some("asciitilde"),
+    None,
+    Some("Adieresis"),
+    Some("Aring"),
+    Some("Ccedilla"),
+    Some("Eacute"),
+    Some("Ntilde"),
+    Some("Odieresis"),
+    Some("Udieresis"),
+    Some("aacute"),
+    Some("agrave"),
+    Some("acircumflex"),
+    Some("adieresis"),
+    Some("atilde"),
+    Some("aring"),
+    Some("ccedilla"),
+    Some("eacute"),
+    Some("egrave"),
+    Some("ecircumflex"),
+    Some("edieresis"),
+    Some("iacute"),
+    Some("igrave"),
+    Some("icircumflex"),
+    Some("idieresis"),
+    Some("ntilde"),
+    Some("oacute"),
+    Some("ograve"),
+    Some("ocircumflex"),
+    Some("odieresis"),
+    Some("otilde"),
+    Some("uacute"),
+    Some("ugrave"),
+    Some("ucircumflex"),
+    Some("udieresis"),
+    Some("dagger"),
+    Some("degree"),
+    Some("cent"),
+    Some("sterling"),
+    Some("section"),
+    Some("bullet"),
+    Some("paragraph"),
+    Some("germandbls"),
+    Some("registered"),
+    Some("copyright"),
+    Some("trademark"),
+    Some("acute"),
+    Some("dieresis"),
+    None,
+    Some("AE"),
+    Some("Oslash"),
+    None,
+    Some("plusminus"),
+    None,
+    None,
+    Some("yen"),
+    Some("mu"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("ordfeminine"),
+    Some("ordmasculine"),
+    None,
+    Some("ae"),
+    Some("oslash"),
+    Some("questiondown"),
+    Some("exclamdown"),
+    Some("logicalnot"),
+    None,
+    Some("florin"),
+    None,
+    None,
+    Some("guillemotleft"),
+    Some("guillemotright"),
+    Some("ellipsis"),
+    None,
+    Some("Agrave"),
+    Some("Atilde"),
+    Some("Otilde"),
+    Some("OE"),
+    Some("oe"),
+    Some("endash"),
+    Some("emdash"),
+    Some("quotedblleft"),
+    Some("quotedblright"),
+    Some("quoteleft"),
+    Some("quoteright"),
+    Some("divide"),
+    None,
+    Some("ydieresis"),
+    Some("Ydieresis"),
+    Some("fraction"),
+    Some("currency"),
+    Some("guilsinglleft"),
+    Some("guilsinglright"),
+    Some("fi"),
+    Some("fl"),
+    Some("daggerdbl"),
+    Some("periodcentered"),
+    Some("quotesinglbase"),
+    Some("quotedblbase"),
+    Some("perthousand"),
+    Some("Acircumflex"),
+    Some("Ecircumflex"),
+    Some("Aacute"),
+    Some("Edieresis"),
+    Some("Egrave"),
+    Some("Iacute"),
+    Some("Icircumflex"),
+    Some("Idieresis"),
+    Some("Igrave"),
+    Some("Oacute"),
+    Some("Ocircumflex"),
+    None,
+    Some("Ograve"),
+    Some("Uacute"),
+    Some("Ucircumflex"),
+    Some("Ugrave"),
+    Some("dotlessi"),
+    Some("circumflex"),
+    Some("tilde"),
+    Some("macron"),
+    Some("breve"),
+    Some("dotaccent"),
+    Some("ring"),
+    Some("cedilla"),
+    Some("hungarumlaut"),
+    Some("ogonek"),
+    Some("caron"),
+];
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_diffs() -> [Option<Box<str>>; 256] {
+        std::array::from_fn(|_| None)
+    }
+
+    #[test]
+    fn base_encoding_known_codes() {
+        // WinAnsi: ASCII letters are identity-positioned; 0x80 = Euro; 0xC9 =
+        // Eacute (CP-1252 high range).
+        assert_eq!(WIN_ANSI_ENCODING[0x41], Some("A"));
+        assert_eq!(WIN_ANSI_ENCODING[0x61], Some("a"));
+        assert_eq!(WIN_ANSI_ENCODING[0x80], Some("Euro"));
+        assert_eq!(WIN_ANSI_ENCODING[0xC9], Some("Eacute"));
+
+        // StandardEncoding: 0x27 is quoteright (not quotesingle), 0x60 is
+        // quoteleft — the classic distinction WinAnsi does not make.
+        assert_eq!(STANDARD_ENCODING[0x27], Some("quoteright"));
+        assert_eq!(STANDARD_ENCODING[0x60], Some("quoteleft"));
+        assert_eq!(STANDARD_ENCODING[0x41], Some("A"));
+
+        // MacRoman: ASCII identity; 0xC7 = guillemotleft (Mac OS Roman).
+        assert_eq!(MAC_ROMAN_ENCODING[0x41], Some("A"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xC7], Some("guillemotleft"));
+    }
+
+    #[test]
+    fn differences_override_base_encoding() {
+        let mut diffs = empty_diffs();
+        // pdfTeX idiom: code 2 → /fi, code 39 → /quoteright.
+        diffs[2] = Some("fi".to_string().into_boxed_str());
+        diffs[39] = Some("quoteright".to_string().into_boxed_str());
+
+        // Code 2 has no WinAnsi name; the Differences override supplies "fi".
+        assert_eq!(
+            glyph_name_for_code(&diffs, BaseEncoding::WinAnsi, 2),
+            Some("fi")
+        );
+        // Code 39 IS WinAnsi 'quotesingle', but Differences wins → quoteright.
+        assert_eq!(
+            glyph_name_for_code(&diffs, BaseEncoding::WinAnsi, 39),
+            Some("quoteright")
+        );
+        // Code 65 has no override → falls back to the base encoding ('A').
+        assert_eq!(
+            glyph_name_for_code(&diffs, BaseEncoding::WinAnsi, 65),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn unmapped_code_yields_no_name() {
+        let diffs = empty_diffs();
+        // StandardEncoding leaves the C0 control range unmapped: no glyph.
+        assert_eq!(glyph_name_for_code(&diffs, BaseEncoding::Standard, 0), None);
+        // 0x80 is unmapped in StandardEncoding (unlike WinAnsi's Euro).
+        assert_eq!(
+            glyph_name_for_code(&diffs, BaseEncoding::Standard, 0x80),
+            None
+        );
+    }
+
+    #[test]
+    fn base_encoding_table_selects_correct_table() {
+        assert_eq!(
+            base_encoding_table(BaseEncoding::Standard)[0x27],
+            Some("quoteright")
+        );
+        assert_eq!(
+            base_encoding_table(BaseEncoding::WinAnsi)[0x27],
+            Some("quotesingle")
+        );
+        assert_eq!(
+            base_encoding_table(BaseEncoding::MacRoman)[0x27],
+            Some("quotesingle")
+        );
+    }
 }

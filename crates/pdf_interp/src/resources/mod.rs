@@ -26,7 +26,7 @@ use pdf::{Dictionary, Document, Object, ObjectId};
 use raster::types::BlendMode;
 
 pub use colorspace::ColorSpace;
-pub use font::{FontDescriptor, PdfFontKind, resolve_font};
+pub use font::{BaseEncoding, FontDescriptor, PdfFontKind, resolve_font};
 /// Re-exported from [`gpu::nvjpeg`] for callers that enable the `nvjpeg` feature.
 /// Create via [`gpu::nvjpeg::NvJpegDecoder::new`] with a raw `CUstream` handle,
 /// then pass to the page renderer's `set_nvjpeg` configuration entry point.
