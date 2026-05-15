@@ -18,13 +18,19 @@ path = "src/main.rs"
 [features]
 # Build FreeType from source (cross-compilation, static builds).
 bundled = ["pdf_raster/bundled"]
-# GPU features require building from the git repository where the
-# internal `rasterrocket-gpu` crate is available.  They are not exposed on crates.io.
-# These stubs keep cfg(feature = "…") gates valid at compile time.
-nvjpeg           = []
-nvjpeg2k         = []
-vaapi            = []
-cache            = []
+# GPU features pull the path-only internal `rasterrocket-gpu` crate (publish = false)
+# and are not available on crates.io.  Each feature forwards to the matching
+# pdf_raster feature, which in turn wires to `dep:gpu` and the gpu-crate feature.
+nvjpeg           = ["pdf_raster/nvjpeg"]
+nvjpeg2k         = ["pdf_raster/nvjpeg2k"]
+vaapi            = ["pdf_raster/vaapi"]
+gpu-aa           = ["pdf_raster/gpu-aa"]
+gpu-icc          = ["pdf_raster/gpu-icc"]
+gpu-deskew       = ["pdf_raster/gpu-deskew"]
+cache            = ["pdf_raster/cache"]
+vulkan           = ["pdf_raster/vulkan"]
+gpu-jpeg-huffman = ["pdf_raster/gpu-jpeg-huffman"]
+gpu-validation   = ["pdf_raster/gpu-validation"]
 
 [dependencies]
 pdf_raster  = { package = "rasterrocket",        path = "../pdf_raster", version = "1.0" }

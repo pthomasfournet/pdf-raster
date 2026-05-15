@@ -436,6 +436,10 @@ impl Args {
                 BackendPolicy::Auto => {
                     unreachable!("matched CpuOnly | ForceCuda | ForceVulkan above")
                 }
+                #[cfg(feature = "vaapi")]
+                BackendPolicy::ForceVaapi => {
+                    unreachable!("matched CpuOnly | ForceCuda | ForceVulkan above")
+                }
             };
             return Err(format!(
                 "--vaapi-device has no effect with --backend {backend_name}.\n\
