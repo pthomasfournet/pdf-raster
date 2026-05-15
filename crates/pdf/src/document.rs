@@ -21,6 +21,15 @@ use crate::{
     xref::{XrefEntry, XrefTable, read_xref},
 };
 
+// ── Limits ───────────────────────────────────────────────────────────────────
+
+/// Aggregate cap on a page's concatenated, decompressed content streams.
+///
+/// A `/Contents` array of many refs (each individually bounded by the
+/// per-stream decompression limit in `stream.rs`) can otherwise sum without
+/// bound. This cap mirrors the per-stream `MAX_DECOMPRESSED` discipline.
+const MAX_PAGE_CONTENT: usize = 512 * 1024 * 1024; // 512 MiB
+
 // ── Document ─────────────────────────────────────────────────────────────────
 
 /// A lazily-parsed PDF document backed by a memory-mapped file.
@@ -364,6 +373,14 @@ impl Document {
             let stream_obj = self.get_object(r)?;
             if let Object::Stream(s) = stream_obj.as_ref() {
                 let decoded = decode_stream(&s.content, &s.dict).map_err(PdfError::DecodeFailed)?;
+                // +1 accounts for the possible '\n' separator pushed below.
+                if out.len().saturating_add(decoded.len()).saturating_add(1) > MAX_PAGE_CONTENT {
+                    return Err(PdfError::DecodeFailed(format!(
+                        "page content exceeds {} MiB aggregate decompressed cap \
+                         (possible decompression bomb)",
+                        MAX_PAGE_CONTENT / (1024 * 1024)
+                    )));
+                }
                 if !out.is_empty() && !out.ends_with(b"\n") {
                     out.push(b'\n');
                 }

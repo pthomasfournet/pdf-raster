@@ -352,6 +352,18 @@ impl<'a> Tokenizer<'a> {
                 }
                 let word = &self.src[start..self.pos];
 
+                // A lone delimiter character (e.g. a stray `>` left over from
+                // an unbalanced `<< ... >>` dict whose depth-counter mismatch
+                // is caused by a hex-string `<...>` nested inside) produces an
+                // empty word because the loop exits immediately.  Advance past
+                // the unrecognised byte and try again so the tokenizer never
+                // stalls on the same position, which would cause an infinite
+                // loop and an OOM from the unbounded `ops` Vec in `parse`.
+                if word.is_empty() {
+                    self.advance();
+                    return self.next_token();
+                }
+
                 if word == b"true" {
                     return Some(Token::Bool(true));
                 }
@@ -526,5 +538,48 @@ mod tests {
     #[test]
     fn only_comment() {
         assert_eq!(tokens(b"% nothing\n"), vec![]);
+    }
+
+    /// A lone `>` in a content stream (left over from a `<<…>>` dict whose
+    /// `>>` depth-counting was thrown off by a nested `<hex-string>`) must not
+    /// cause an infinite loop.  The stray `>` is a delimiter and the default
+    /// arm of `next_token` would produce an empty word without advancing `pos`,
+    /// stalling the tokenizer forever.  The fix: skip the unrecognised byte
+    /// and continue.
+    #[test]
+    fn stray_gt_is_skipped_without_infinite_loop() {
+        // `>` is a delimiter; the tokenizer must skip it and still return
+        // the following tokens normally.
+        let t = tokens(b"> /Name cm");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0], Token::Name(b"Name"));
+        assert_eq!(t[1], Token::Op(b"cm"));
+    }
+
+    /// Reproduces the glfmm livret OOM: a `<</ActualText<FEFF00A0>>>` marked-
+    /// content dict is followed by real operators.  The `<<…>>` scanner exits
+    /// one `>` early (the hex-string's closing `>` matches before the outer
+    /// dict's `>>`), leaving a lone `>` that previously caused an infinite loop.
+    #[test]
+    fn marked_content_dict_with_hex_string_terminates() {
+        let src = b"/Span<</ActualText<FEFF00A0>>> BDC\n( )Tj\nEMC\n";
+        // Should terminate (finite token count) — the exact token sequence is
+        // not load-bearing, only that we don't loop forever.
+        let t = tokens(src);
+        assert!(!t.is_empty());
+        // The last real operators must be present.
+        let ops: Vec<_> = t
+            .iter()
+            .filter_map(|tok| {
+                if let Token::Op(kw) = tok {
+                    Some(*kw)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(ops.contains(&b"BDC".as_ref()), "BDC must appear: {ops:?}");
+        assert!(ops.contains(&b"Tj".as_ref()), "Tj must appear: {ops:?}");
+        assert!(ops.contains(&b"EMC".as_ref()), "EMC must appear: {ops:?}");
     }
 }
