@@ -567,6 +567,46 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
                 "image: SMask (object {smask_id:?}) could not be decoded — blitting image without mask"
             );
         }
+    } else if let Some(mask_obj) = stream.dict.get(b"Mask") {
+        // PDF §8.9.6: an explicit /Mask, distinct from /SMask.  Two forms:
+        //  - /Mask N 0 R           — §8.9.6.3 stencil mask image
+        //  - /Mask [min max …]     — §8.9.6.4 colour-key masking
+        // SMask takes precedence (handled above); /Mask is only consulted when
+        // no /SMask is present.  A decode failure is a soft skip — the base
+        // image is still valid, so it is blitted fully opaque.
+        match mask_obj {
+            Object::Reference(mask_id) => {
+                if let Some(alpha) =
+                    smask::decode_explicit_mask(doc, *mask_id, img.width, img.height)
+                {
+                    img.smask = Some(alpha);
+                } else {
+                    log::warn!(
+                        "image: explicit /Mask (object {mask_id:?}) could not be decoded — blitting image without mask"
+                    );
+                }
+            }
+            Object::Array(ranges) => {
+                if let Some(base) = img.data.as_cpu() {
+                    if let Some(alpha) = smask::colour_key_mask(
+                        ranges,
+                        base,
+                        img.color_space.bytes_per_pixel(),
+                        img.width,
+                        img.height,
+                    ) {
+                        img.smask = Some(alpha);
+                    } else {
+                        log::warn!(
+                            "image: colour-key /Mask malformed or mismatched — blitting image without mask"
+                        );
+                    }
+                }
+            }
+            _ => {
+                log::warn!("image: /Mask is neither a reference nor an array — ignoring");
+            }
+        }
     }
 
     ImageResolution::Ok(img)

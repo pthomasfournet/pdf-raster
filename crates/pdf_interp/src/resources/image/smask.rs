@@ -4,11 +4,13 @@
 //! of the parent image.  This module decodes the `SMask` stream and resamples it
 //! to the parent image's dimensions when they differ.
 
-use pdf::{Document, ObjectId};
+use pdf::{Document, Object, ObjectId};
 
+use super::ImageColorSpace;
 use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp};
 use super::codecs::{decode_ccitt, decode_jbig2};
 use super::filter_name;
+use super::raw::decode_raw;
 use super::validated_dims;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -239,6 +241,153 @@ pub(super) fn scale_smask(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> V
     out
 }
 
+/// Decode an explicit `/Mask N 0 R` stencil-mask image into an alpha buffer.
+///
+/// This is the PDF §8.9.6.3 *explicit mask* (an image `XObject` with
+/// `/ImageMask true`), distinct from `/SMask` (§11.6.5.2 soft mask) and from
+/// the `/Mask [colour-key]` array form (§8.9.6.4).  The mask designates which
+/// parts of the **base image** are painted: per §8.9.6.3 with the default
+/// `Decode [0 1]`, mask sample 0 → the base image is painted (opaque),
+/// mask sample 1 → masked out (the background shows through).
+///
+/// The stencil decoders (`decode_jbig2`/`decode_ccitt`/raw with
+/// `is_mask=true`) return [`ImageColorSpace::Mask`] bytes using the
+/// §8.9.6.1 fill-stencil convention: `0x00` = "paint", `0xFF` =
+/// "transparent".  For an explicit mask those same markers map directly onto
+/// base-image alpha — a "paint" point shows the base image (alpha `0xFF`), a
+/// "transparent" point shows the background (alpha `0x00`).  Hence
+/// `alpha = !mask_byte`.  `Decode [1 0]` on the mask is already folded into
+/// the decoder output, so no extra inversion is applied here.
+///
+/// Returns exactly `img_w * img_h` alpha bytes, resampled (nearest-neighbour)
+/// when the mask grid differs from the base image grid.  Returns `None` if the
+/// referenced object is not a usable stencil image so the caller can blit the
+/// base image unmasked rather than discard it.
+pub(super) fn decode_explicit_mask(
+    doc: &Document,
+    id: ObjectId,
+    img_w: u32,
+    img_h: u32,
+) -> Option<Vec<u8>> {
+    use crate::resources::dict_ext::DictExt as _;
+
+    let obj_arc = doc.get_object(id).ok()?;
+    let stream = obj_arc.as_ref().as_stream()?;
+
+    // §8.9.6.3: an explicit mask must be an image with ImageMask true.
+    if !stream.dict.get_bool(b"ImageMask").unwrap_or(false) {
+        log::warn!("image: /Mask object {id:?} is not an ImageMask stencil — skipping mask");
+        return None;
+    }
+
+    let w_raw = stream.dict.get_i64(b"Width")?;
+    let h_raw = stream.dict.get_i64(b"Height")?;
+    let Some((m_w, m_h)) = validated_dims(w_raw, h_raw) else {
+        log::warn!("image: /Mask degenerate dimensions {w_raw}×{h_raw}, skipping mask");
+        return None;
+    };
+
+    let filter = stream.dict.get(b"Filter").and_then(filter_name);
+
+    // Decode the stencil to ImageColorSpace::Mask bytes (0x00 = paint,
+    // 0xFF = transparent).  Each decoder folds the mask's own /Decode [1 0]
+    // inversion into its output.
+    let desc = match filter.as_deref() {
+        Some("JBIG2Decode") => {
+            let parms = stream.dict.get(b"DecodeParms");
+            decode_jbig2(doc, stream.content.as_slice(), m_w, m_h, true, parms)?
+        }
+        Some("CCITTFaxDecode") => {
+            let parms = stream.dict.get(b"DecodeParms");
+            decode_ccitt(stream.content.as_slice(), m_w, m_h, true, parms)?
+        }
+        Some("FlateDecode") => {
+            let raw = stream.decompressed_content().ok()?;
+            decode_raw(
+                doc,
+                &raw,
+                m_w,
+                m_h,
+                true,
+                &stream.dict,
+                #[cfg(feature = "gpu-icc")]
+                None,
+                #[cfg(feature = "gpu-icc")]
+                None,
+            )?
+        }
+        None => decode_raw(
+            doc,
+            stream.content.as_slice(),
+            m_w,
+            m_h,
+            true,
+            &stream.dict,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )?,
+        Some(other) => {
+            log::warn!("image: /Mask filter {other:?} not supported — skipping mask");
+            return None;
+        }
+    };
+
+    debug_assert_eq!(
+        desc.color_space,
+        ImageColorSpace::Mask,
+        "explicit /Mask decode must yield ImageColorSpace::Mask",
+    );
+
+    // §8.9.6.3: paint marker (0x00) → base image opaque (alpha 0xFF);
+    // transparent marker (0xFF) → background shows (alpha 0x00).
+    let alpha: Vec<u8> = desc.data.as_cpu()?.iter().map(|&b| !b).collect();
+
+    Some(scale_smask(alpha, desc.width, desc.height, img_w, img_h))
+}
+
+/// Build an alpha buffer from a `/Mask [colour-key]` array (§8.9.6.4).
+///
+/// The array holds `2 × n` integers `[min₁ max₁ … minₙ maxₙ]` over the base
+/// image's colour components (here only 1-component `Gray` and 3-component
+/// `Rgb` post-decode buffers are masked).  A base-image pixel whose every
+/// component falls within its `[min, max]` range is *masked* (transparent,
+/// alpha `0x00`); all other pixels are opaque (alpha `0xFF`).
+///
+/// Returns `None` when the array length doesn't match the component count or
+/// the base buffer is the wrong size, so the caller blits unmasked.
+pub(super) fn colour_key_mask(
+    ranges: &[Object],
+    base: &[u8],
+    components: usize,
+    img_w: u32,
+    img_h: u32,
+) -> Option<Vec<u8>> {
+    if components == 0 || ranges.len() != components * 2 {
+        return None;
+    }
+    let bounds: Vec<i64> = ranges.iter().filter_map(pdf::Object::as_i64).collect();
+    if bounds.len() != components * 2 {
+        return None;
+    }
+    let npix = (img_w as usize).checked_mul(img_h as usize)?;
+    if base.len() < npix.checked_mul(components)? {
+        return None;
+    }
+    let alpha: Vec<u8> = (0..npix)
+        .map(|p| {
+            let px = &base[p * components..p * components + components];
+            let in_range = (0..components).all(|c| {
+                let v = i64::from(px[c]);
+                v >= bounds[c * 2] && v <= bounds[c * 2 + 1]
+            });
+            if in_range { 0x00 } else { 0xFF }
+        })
+        .collect();
+    Some(alpha)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -349,5 +498,82 @@ mod tests {
     #[test]
     fn decode_smask_dct_corrupt_returns_none() {
         assert!(decode_smask_dct(&[0xFF, 0xD8, 0xFF], 1, 1).is_none());
+    }
+
+    // ── Explicit /Mask (§8.9.6.3) regression ─────────────────────────────────
+
+    /// PDF §8.9.6.3 explicit `/Mask` polarity (NF-2b regression).
+    ///
+    /// A `/Mask N 0 R` referencing an `/ImageMask true` stencil must produce a
+    /// base-image alpha buffer where the stencil's *paint* points are opaque
+    /// (`0xFF`) and its *masked-out* points are transparent (`0x00`).  The bug
+    /// was that `/Mask` was never resolved at all, leaving JPXDecode pages
+    /// (e.g. 1853-ragon-orthodoxie-maconnique p62) blitted fully opaque over
+    /// the whole page and rendering near-all-dark instead of mostly-white.
+    ///
+    /// Stencil bytes (raw 1-bpp, default `Decode [0 1]`): a `1` bit paints
+    /// (decoder → `0x00`), a `0` bit is transparent (decoder → `0xFF`).  Row
+    /// of 8 px `0b1010_1010`: bits 1,0,1,0,1,0,1,0 ⇒ stencil bytes
+    /// `[00 FF 00 FF 00 FF 00 FF]` ⇒ alpha `!byte` = `[FF 00 FF 00 …]`.
+    #[test]
+    fn explicit_mask_polarity_paint_is_opaque() {
+        // 1 row × 8 px, 1 bpp ⇒ one byte 0b1010_1010.
+        let doc = crate::test_helpers::make_doc_with_stream(
+            &[0b1010_1010u8],
+            " /Subtype /Image /Width 8 /Height 1 /ImageMask true \
+              /BitsPerComponent 1",
+        );
+        let alpha =
+            decode_explicit_mask(&doc, (2, 0), 8, 1).expect("explicit /Mask stencil must decode");
+        // Paint bit (1) → opaque base image (0xFF); 0 bit → background (0x00).
+        assert_eq!(alpha, vec![0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00]);
+    }
+
+    /// A `/Mask` object that is *not* an ImageMask stencil must be rejected
+    /// (returns `None`) so the caller blits the base image unmasked rather
+    /// than mis-applying a non-stencil image as alpha.
+    #[test]
+    fn explicit_mask_rejects_non_imagemask() {
+        let doc = crate::test_helpers::make_doc_with_stream(
+            &[0u8, 0, 0, 0],
+            " /Subtype /Image /Width 2 /Height 2 /BitsPerComponent 8 \
+              /ColorSpace /DeviceGray",
+        );
+        assert!(decode_explicit_mask(&doc, (2, 0), 2, 2).is_none());
+    }
+
+    // ── Colour-key /Mask (§8.9.6.4) ──────────────────────────────────────────
+
+    #[test]
+    fn colour_key_mask_gray_in_range_is_transparent() {
+        // Range [10 20]: pixels 15 (in) → masked (0x00); 5 and 25 (out) → 0xFF.
+        let base = [15u8, 5, 25, 12];
+        let ranges = [Object::Integer(10), Object::Integer(20)];
+        let alpha = colour_key_mask(&ranges, &base, 1, 4, 1).expect("valid colour-key");
+        assert_eq!(alpha, vec![0x00, 0xFF, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn colour_key_mask_rgb_all_components_must_match() {
+        // Range R[0 10] G[0 10] B[0 10]: px0 (5,5,5) in → 0x00;
+        // px1 (5,5,99) one comp out → 0xFF.
+        let base = [5u8, 5, 5, 5, 5, 99];
+        let ranges = [
+            Object::Integer(0),
+            Object::Integer(10),
+            Object::Integer(0),
+            Object::Integer(10),
+            Object::Integer(0),
+            Object::Integer(10),
+        ];
+        let alpha = colour_key_mask(&ranges, &base, 3, 2, 1).expect("valid colour-key");
+        assert_eq!(alpha, vec![0x00, 0xFF]);
+    }
+
+    #[test]
+    fn colour_key_mask_arity_mismatch_returns_none() {
+        // 3 ints for a 1-component image (needs exactly 2) ⇒ None.
+        let ranges = [Object::Integer(0), Object::Integer(1), Object::Integer(2)];
+        assert!(colour_key_mask(&ranges, &[0u8], 1, 1, 1).is_none());
     }
 }
