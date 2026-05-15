@@ -63,6 +63,10 @@ pub enum InterpError {
     InvalidPageGeometry(String),
     /// `FreeType` library initialisation failed (library not available or internal error).
     FontInit(String),
+    /// The page render was aborted because it exceeded the per-page operator
+    /// budget or wall-clock deadline.  The page is pathological; the rendered
+    /// bitmap is partial.
+    PageBudget(String),
 }
 
 impl std::fmt::Display for InterpError {
@@ -81,6 +85,7 @@ impl std::fmt::Display for InterpError {
             }
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
             Self::FontInit(msg) => write!(f, "FreeType initialisation failed: {msg}"),
+            Self::PageBudget(msg) => write!(f, "page render budget exceeded: {msg}"),
         }
     }
 }

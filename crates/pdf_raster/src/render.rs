@@ -58,6 +58,11 @@ pub enum RasterError {
     /// One or more images on the page failed to decode; the rendered page is
     /// incomplete.  Carries the per-image failure messages.
     ImageDecodeFailed(Vec<String>),
+    /// The page render was aborted because it exceeded the per-page operator
+    /// budget or wall-clock deadline.  The page is pathological (e.g.
+    /// infinite-loop content stream or unbounded form-`XObject` recursion).
+    /// The rendered bitmap is partial.
+    PageBudgetExceeded(String),
     /// The per-page render function panicked.
     ///
     /// Caught only under `panic = "unwind"` builds (e.g. test profiles).
@@ -96,6 +101,7 @@ impl std::fmt::Display for RasterError {
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
             Self::BackendUnavailable(msg) => write!(f, "backend unavailable: {msg}"),
             Self::ImageDecodeFailed(v) => write!(f, "image decode failed: {}", v.join("; ")),
+            Self::PageBudgetExceeded(msg) => write!(f, "page render budget exceeded: {msg}"),
             Self::RenderPanic { page, message } => {
                 write!(f, "page {page} render panicked: {message}")
             }
@@ -119,6 +125,7 @@ impl From<pdf_interp::InterpError> for RasterError {
                 Self::PageOutOfRange { page, total }
             }
             pdf_interp::InterpError::InvalidPageGeometry(msg) => Self::InvalidPageGeometry(msg),
+            pdf_interp::InterpError::PageBudget(msg) => Self::PageBudgetExceeded(msg),
             other => Self::Pdf(other),
         }
     }
@@ -679,6 +686,13 @@ fn render_page_rgb_with_geom(
     guard.0.execute(&ops);
     guard.0.render_annotations(page_id);
     drop(guard); // reclaim happens here — exactly once on success path
+
+    // Budget exceeded is checked before decode_errors: a budget breach is more
+    // fundamental (the page may not have finished rendering at all), and the two
+    // conditions are mutually exclusive in practice.
+    if let Some(reason) = renderer.budget_status() {
+        return Err(RasterError::PageBudgetExceeded(reason.to_string()));
+    }
 
     if !renderer.decode_errors().is_empty() {
         return Err(RasterError::ImageDecodeFailed(

@@ -198,6 +198,29 @@ const MAX_TILE_PX: f64 = 4096.0;
 /// cycles.
 const MAX_PATTERN_DEPTH: u32 = 4;
 
+/// Maximum operators executed per page render before aborting.
+///
+/// Blunt safety net — no legitimate page has remotely this many operators.
+/// A pathological page (infinite-loop content stream, runaway form recursion)
+/// reaches this limit quickly; a normal page never comes close.  Not a
+/// performance-tuning knob.
+const MAX_PAGE_OPS: u64 = 50_000_000;
+
+/// Wall-clock deadline per page render in seconds.
+///
+/// Blunt safety net — far longer than any legitimate page needs at any DPI.
+/// A genuine infinite loop hits `MAX_PAGE_OPS` first (much faster), so in
+/// practice this is a last-resort catch for a single extremely-expensive op
+/// that doesn't pass through the op-count check.  Not a performance-tuning
+/// knob.
+const PAGE_RENDER_DEADLINE_SECS: u64 = 60;
+
+/// How many operators to execute between wall-clock deadline checks.
+///
+/// Amortises `Instant::now()` cost: one syscall per 4 096 ops is negligible
+/// overhead.  The overrun after a deadline is bounded to ≤ 4 096 extra ops.
+const DEADLINE_CHECK_INTERVAL: u64 = 4_096;
+
 /// Renders a decoded operator sequence onto a `Bitmap<Rgb8>`.
 pub struct PageRenderer<'doc> {
     /// Target pixel buffer.
@@ -232,6 +255,16 @@ pub struct PageRenderer<'doc> {
     /// Decode failures recorded during this page's render.  Non-empty means the
     /// page is incomplete and the per-page `Result` must be an `Err`.
     decode_errors: Vec<String>,
+    /// Maximum operators this page may execute before the render is aborted.
+    op_budget: u64,
+    /// Absolute wall-clock deadline for this page render.
+    deadline: Option<std::time::Instant>,
+    /// Number of operators executed so far this page.
+    ops_executed: u64,
+    /// Set to `Some(reason)` when the per-page budget is exceeded; `None` means ok.
+    /// Mirrors `decode_errors`: checked after `execute`, surfaces as `Err` in the
+    /// per-page result.
+    budget_exceeded: Option<String>,
     /// Distinct unknown operator keywords already warned about this page,
     /// so a content stream that repeats an unsupported op doesn't flood the log.
     warned_unknown_ops: std::collections::HashSet<Vec<u8>>,
@@ -430,6 +463,13 @@ impl<'doc> PageRenderer<'doc> {
             pattern_depth: 0,
             diag: PageDiagnostics::default(),
             decode_errors: Vec::new(),
+            op_budget: MAX_PAGE_OPS,
+            deadline: Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(PAGE_RENDER_DEADLINE_SECS),
+            ),
+            ops_executed: 0,
+            budget_exceeded: None,
             warned_unknown_ops: std::collections::HashSet::new(),
             filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),
@@ -607,6 +647,42 @@ impl<'doc> PageRenderer<'doc> {
         &self.decode_errors
     }
 
+    /// The per-page work-budget breach reason, if any.
+    ///
+    /// `Some(reason)` means the page was aborted early because it exceeded
+    /// either the operator count cap or the wall-clock deadline.  The rendered
+    /// bitmap is partial and the per-page `Result` must be an `Err`.
+    ///
+    /// Check this after [`execute`](Self::execute) and before
+    /// [`finish`](Self::finish) — mirroring the
+    /// [`decode_errors`](Self::decode_errors) pattern.
+    #[must_use]
+    pub fn budget_status(&self) -> Option<&str> {
+        self.budget_exceeded.as_deref()
+    }
+
+    /// Override the operator-count budget.  Test-only — used to trigger the
+    /// watchdog with a small synthetic vector without running 50 M operators.
+    #[cfg(test)]
+    pub(crate) fn set_op_budget_for_test(&mut self, budget: u64) {
+        self.op_budget = budget;
+    }
+
+    /// Override the wall-clock deadline.  Pass `None` to disable the
+    /// deadline entirely (test-only — lets tests isolate the op-count path).
+    #[cfg(test)]
+    pub(crate) fn set_deadline_for_test(&mut self, dl: Option<std::time::Instant>) {
+        self.deadline = dl;
+    }
+
+    /// Return the number of operators executed so far.  Test-only accessor
+    /// so watchdog unit tests can verify the counter without accessing a
+    /// private field from a child module.
+    #[cfg(test)]
+    pub(crate) fn ops_executed_for_test(&self) -> u64 {
+        self.ops_executed
+    }
+
     /// Consume the renderer and return the finished bitmap and page diagnostics.
     #[must_use]
     pub fn finish(mut self) -> (Bitmap<Rgb8>, PageDiagnostics) {
@@ -702,9 +778,40 @@ impl<'doc> PageRenderer<'doc> {
     }
 
     /// Execute a slice of decoded operators in order.
+    ///
+    /// Stops early and sets [`budget_exceeded`](Self::budget_status) if the
+    /// page exceeds the operator-count cap (`MAX_PAGE_OPS`) or the wall-clock
+    /// deadline (`PAGE_RENDER_DEADLINE_SECS`).  The deadline is checked once
+    /// every `DEADLINE_CHECK_INTERVAL` ops to amortise `Instant::now()` cost.
     pub fn execute(&mut self, ops: &[Operator]) {
         for op in ops {
+            // Bail early if a previous call (e.g. a recursive form XObject)
+            // already tripped the budget.
+            if self.budget_exceeded.is_some() {
+                return;
+            }
             self.execute_one(op);
+            self.ops_executed += 1;
+            if self.ops_executed > self.op_budget {
+                self.budget_exceeded = Some(format!(
+                    "page render exceeded operator budget ({} ops); aborting",
+                    self.ops_executed,
+                ));
+                return;
+            }
+            // Check the wall-clock deadline periodically to keep the syscall cost low.
+            if self.ops_executed.is_multiple_of(DEADLINE_CHECK_INTERVAL)
+                && self
+                    .deadline
+                    .is_some_and(|dl| std::time::Instant::now() >= dl)
+            {
+                self.budget_exceeded = Some(format!(
+                    "page render exceeded {PAGE_RENDER_DEADLINE_SECS}s deadline \
+                     after {} ops; aborting",
+                    self.ops_executed,
+                ));
+                return;
+            }
         }
     }
 
@@ -1180,9 +1287,17 @@ impl<'doc> PageRenderer<'doc> {
     /// into an intermediate group bitmap and composited back (PDF §11.6.6).
     fn do_form_xobject(&mut self, form: &crate::resources::FormXObject) {
         if self.form_depth >= MAX_FORM_DEPTH {
+            self.budget_exceeded = Some(format!(
+                "Form XObject nesting depth {MAX_FORM_DEPTH} exceeded; aborting page render"
+            ));
             log::warn!(
-                "rasterrocket-interp: Form XObject nesting depth {MAX_FORM_DEPTH} exceeded — skipping"
+                "rasterrocket-interp: Form XObject nesting depth {MAX_FORM_DEPTH} exceeded — aborting"
             );
+            return;
+        }
+        // Propagate an already-tripped budget: a recursive form call after
+        // the outer execute() set budget_exceeded must not execute further.
+        if self.budget_exceeded.is_some() {
             return;
         }
 
@@ -1399,11 +1514,15 @@ impl<'doc> PageRenderer<'doc> {
             .max(page_h - y11)
             .ceil() as i64;
 
-        // Clamp to bitmap (all values fit u32 after clamping ≥ 0 and < dim).
-        let bx0 = dx0.max(0) as u32;
-        let bx1 = dx1.min(i64::from(self.width)) as u32;
-        let by0 = dy0.max(0) as u32;
-        let by1 = dy1.min(i64::from(self.height)) as u32;
+        // Clamp to bitmap.  Both ends are clamped to [0, dim] *in i64* before
+        // casting to u32 so that a negative dx1/dy1 (image entirely off the
+        // left or top edge) produces 0 rather than wrapping to a huge u32.
+        // After clamping the values are in [0, width] / [0, height], which fit
+        // u32 on any target where u32::MAX ≥ the maximum image dimension.
+        let bx0 = dx0.max(0).min(i64::from(self.width)) as u32;
+        let bx1 = dx1.max(0).min(i64::from(self.width)) as u32;
+        let by0 = dy0.max(0).min(i64::from(self.height)) as u32;
+        let by1 = dy1.max(0).min(i64::from(self.height)) as u32;
 
         if bx0 >= bx1 || by0 >= by1 {
             return;
@@ -2014,5 +2133,70 @@ mod tests {
         // Worst-case intermediate: 255*254 + 255*1 = 65025, fits u16.
         assert_eq!(blend_u8(255, 255, 254), 255);
         assert_eq!(blend_u8(255, 255, 1), 255);
+    }
+
+    // ── per-page work watchdog ────────────────────────────────────────────────
+
+    /// Verify the operator-count cap fires: a tiny op_budget is tripped,
+    /// fewer than all ops run, and budget_status() reports the breach.
+    #[test]
+    fn watchdog_op_budget_fires() {
+        use crate::content::Operator;
+        use crate::test_helpers::empty_doc;
+
+        let doc = empty_doc();
+        // Construct a minimal renderer; (1,1) = 1-pixel white page at 72 dpi.
+        // empty_doc has no pages, so we use object id (1,0) (the catalog) as
+        // the page_id — no real page resources are needed because EndPath is a
+        // pure graphics-state no-op that touches no resources.
+        let mut renderer =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+
+        // Override op_budget to a small value so the test terminates instantly.
+        renderer.set_op_budget_for_test(10);
+        renderer.set_deadline_for_test(None); // disable wall-clock cap; only op count fires
+
+        // Build a vector of 50 no-op EndPath operators — well over the budget.
+        let ops: Vec<Operator> = std::iter::repeat_n(Operator::EndPath, 50).collect();
+        renderer.execute(&ops);
+
+        assert!(
+            renderer.budget_status().is_some(),
+            "budget_status() must be Some after exceeding op_budget"
+        );
+        assert!(
+            renderer.ops_executed_for_test() <= 11, // budget=10 → fires at op 11
+            "no more than budget+1 ops should have run, got {}",
+            renderer.ops_executed_for_test()
+        );
+    }
+
+    /// Verify the wall-clock deadline fires when set to an already-elapsed instant.
+    #[test]
+    fn watchdog_deadline_fires() {
+        use crate::content::Operator;
+        use crate::test_helpers::empty_doc;
+
+        let doc = empty_doc();
+        let mut renderer =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+
+        // Set an already-elapsed deadline and a very large op budget so the
+        // deadline is the only thing that can fire.
+        renderer.set_op_budget_for_test(u64::MAX);
+        renderer.set_deadline_for_test(Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ));
+
+        // Build exactly DEADLINE_CHECK_INTERVAL no-op ops so the periodic check
+        // is guaranteed to run at least once.
+        let ops: Vec<Operator> =
+            std::iter::repeat_n(Operator::EndPath, DEADLINE_CHECK_INTERVAL as usize).collect();
+        renderer.execute(&ops);
+
+        assert!(
+            renderer.budget_status().is_some(),
+            "budget_status() must be Some after deadline is exceeded"
+        );
     }
 }
