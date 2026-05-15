@@ -196,6 +196,54 @@ impl Object {
 
 // ── Object parser ─────────────────────────────────────────────────────────────
 
+/// Check that a declared stream `/Length` is consistent with the data: the
+/// byte just past `start + len` (after optional EOL whitespace) must be the
+/// `endstream` keyword.  Used to decide whether to trust `/Length` or fall
+/// back to scanning, so that a stale or indirect `/Length` cannot truncate
+/// (or over-read) a stream body.
+fn length_lands_on_endstream(data: &[u8], start: usize, len: usize) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    if end > data.len() {
+        return false;
+    }
+    let mut p = end;
+    // PDF §7.3.8.1: an EOL may sit between the data and `endstream`.
+    while matches!(data.get(p), Some(b'\r' | b'\n' | b' ' | b'\t')) {
+        p += 1;
+    }
+    data[p..].starts_with(b"endstream")
+}
+
+/// Scan forward from `start` for the `endstream` keyword and return the index
+/// of the true end of the stream body (the keyword position, minus a single
+/// trailing EOL that PDF writers insert between the data and `endstream`).
+///
+/// Returns `None` if no `endstream` keyword is found before EOF (truncated /
+/// malformed object), in which case the caller treats the body as empty.
+fn find_endstream(data: &[u8], start: usize) -> Option<usize> {
+    const KW: &[u8] = b"endstream";
+    if start > data.len() {
+        return None;
+    }
+    let rel = data[start..]
+        .windows(KW.len())
+        .position(|w| w == KW)?;
+    let mut end = start + rel;
+    // Trim exactly one EOL (CRLF, LF, or CR) immediately before `endstream`;
+    // that byte sequence is a delimiter, not stream data (PDF §7.3.8.1).
+    if end > start && data[end - 1] == b'\n' {
+        end -= 1;
+        if end > start && data[end - 1] == b'\r' {
+            end -= 1;
+        }
+    } else if end > start && data[end - 1] == b'\r' {
+        end -= 1;
+    }
+    Some(end)
+}
+
 /// Parse one PDF object starting at `*pos` in `data`.  Advances `*pos` past
 /// the object.  Does NOT parse the `<id> <gen> obj … endobj` wrapper — call
 /// `parse_indirect_object` for that.
@@ -232,13 +280,31 @@ pub fn parse_object(data: &[u8], pos: &mut usize) -> Option<Object> {
                     peek += 1;
                 }
                 let stream_start = peek.min(data.len());
-                // Determine stream length from /Length in the dict.
-                let length = dict
+                // Determine stream length.  `/Length` is authoritative when it
+                // is a *direct* integer, but the dvips / pdfTeX idiom writes it
+                // as a forward indirect reference (`/Length N 0 R`) whose value
+                // object appears *after* the stream — unresolvable here because
+                // `parse_object` has no `Document`.  In that case (and whenever
+                // the declared length does not actually land on `endstream`),
+                // fall back to scanning for the `endstream` keyword, which is
+                // what every production PDF reader does for robustness.
+                let declared_len = dict
                     .get(b"Length")
                     .and_then(Object::as_i64)
-                    .unwrap_or(0)
-                    .max(0) as usize;
-                let stream_end = stream_start.saturating_add(length).min(data.len());
+                    .filter(|&n| n >= 0)
+                    .map(|n| n as usize);
+
+                let stream_end = match declared_len {
+                    Some(len)
+                        if length_lands_on_endstream(data, stream_start, len) =>
+                    {
+                        stream_start.saturating_add(len).min(data.len())
+                    }
+                    // Missing, indirect (`N 0 R`), negative, or inconsistent
+                    // `/Length`: locate the real end by searching for the
+                    // `endstream` keyword and trimming the EOL that precedes it.
+                    _ => find_endstream(data, stream_start).unwrap_or(stream_start),
+                };
                 let content = data[stream_start..stream_end].to_vec();
                 // Advance pos past "endstream".
                 *pos = stream_end;
@@ -503,13 +569,55 @@ mod tests {
     }
 
     #[test]
-    fn stream_with_negative_length_does_not_panic() {
-        // /Length = -1 used to overflow when cast to usize; now clamped to 0.
+    fn stream_with_negative_length_recovers_via_endstream_scan() {
+        // /Length = -1 used to overflow when cast to usize, then was clamped
+        // to 0 (silent data loss).  Now an invalid `/Length` falls back to
+        // scanning for the `endstream` keyword, recovering the real body.
         let src = b"<</Length -1>>\nstream\nXY\nendstream";
         let mut pos = 0;
         let obj = parse_object(src, &mut pos).expect("parse");
         match obj {
-            Object::Stream(s) => assert!(s.content.is_empty()),
+            Object::Stream(s) => assert_eq!(s.content, b"XY"),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_with_indirect_length_recovers_via_endstream_scan() {
+        // dvips / pdfTeX idiom: `/Length N 0 R` is a forward indirect
+        // reference, unresolvable at parse time.  Must fall back to the
+        // `endstream` scan instead of yielding an empty (white-page) body.
+        let src = b"<</Length 6 0 R>>\nstream\nhello world\nendstream";
+        let mut pos = 0;
+        let obj = parse_object(src, &mut pos).expect("parse");
+        match obj {
+            Object::Stream(s) => assert_eq!(s.content, b"hello world"),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_with_valid_direct_length_is_byte_exact() {
+        // The fast path must be unchanged for well-formed PDFs: a correct
+        // direct `/Length` is trusted verbatim (no endstream rescan).
+        let src = b"<</Length 5>>\nstream\nABCDE\nendstream";
+        let mut pos = 0;
+        let obj = parse_object(src, &mut pos).expect("parse");
+        match obj {
+            Object::Stream(s) => assert_eq!(s.content, b"ABCDE"),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_with_stale_short_length_falls_back_to_scan() {
+        // A `/Length` that does not land on `endstream` (stale after the file
+        // was hand-edited) must not silently truncate the body.
+        let src = b"<</Length 2>>\nstream\nABCDEFG\nendstream";
+        let mut pos = 0;
+        let obj = parse_object(src, &mut pos).expect("parse");
+        match obj {
+            Object::Stream(s) => assert_eq!(s.content, b"ABCDEFG"),
             other => panic!("expected Stream, got {other:?}"),
         }
     }
