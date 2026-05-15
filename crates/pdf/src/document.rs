@@ -430,6 +430,41 @@ impl Document {
         Ok(Dictionary::new())
     }
 
+    /// Return an inheritable page attribute value for a page object, following
+    /// the `/Parent` chain per ISO 32000-2 §7.7.3.4.
+    ///
+    /// Checks the page leaf first, then walks up the `/Pages` ancestors until
+    /// the key is found or the root is reached.  Returns `None` if the key is
+    /// absent from every node in the chain.
+    ///
+    /// Depth is bounded to 64 hops (matching `page_tree.rs` `MAX_DEPTH`) to
+    /// guard against malformed cyclic `/Parent` references.
+    pub fn get_inherited_page_attr(&self, page_id: ObjectId, key: &[u8]) -> Option<Object> {
+        let mut current_id = Some(page_id);
+        for _ in 0..64 {
+            let id = current_id?;
+            let obj = self.get_object(id).ok()?;
+            let dict = match obj.as_ref() {
+                Object::Dictionary(d) => d,
+                Object::Stream(s) => &s.dict,
+                _ => return None,
+            };
+            if let Some(val) = dict.get(key) {
+                // Resolve one level of indirection so callers always get the
+                // concrete value (e.g. an Array, not a Reference to an Array).
+                let resolved = match val {
+                    Object::Reference(rid) => {
+                        self.get_object(*rid).ok().map(|o| o.as_ref().clone())
+                    }
+                    other => Some(other.clone()),
+                };
+                return resolved;
+            }
+            current_id = dict.get(b"Parent").and_then(Object::as_reference);
+        }
+        None
+    }
+
     /// Take a dictionary value out of an `Object`, resolving one level of
     /// indirection if needed. Non-dict values yield an empty map (matches the
     /// behaviour of malformed-but-recoverable PDFs).
