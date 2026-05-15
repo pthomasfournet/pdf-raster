@@ -392,10 +392,12 @@ impl PageRenderer<'_> {
             Operator::BeginOptionalContent(_) | Operator::EndOptionalContent => {}
 
             Operator::Unknown(kw) => {
-                log::warn!(
-                    "rasterrocket-interp: unknown operator: {}",
-                    String::from_utf8_lossy(kw)
-                );
+                if self.warned_unknown_ops.insert(kw.clone()) {
+                    log::warn!(
+                        "rasterrocket-interp: unsupported content operator {:?} (further occurrences suppressed for this page)",
+                        String::from_utf8_lossy(kw)
+                    );
+                }
             }
 
             // Compile-time exhaustiveness guard.

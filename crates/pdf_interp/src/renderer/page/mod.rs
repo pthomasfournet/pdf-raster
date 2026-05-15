@@ -232,6 +232,9 @@ pub struct PageRenderer<'doc> {
     /// Decode failures recorded during this page's render.  Non-empty means the
     /// page is incomplete and the per-page `Result` must be an `Err`.
     decode_errors: Vec<String>,
+    /// Distinct unknown operator keywords already warned about this page,
+    /// so a content stream that repeats an unsupported op doesn't flood the log.
+    warned_unknown_ops: std::collections::HashSet<Vec<u8>>,
     /// Per-filter blit counts used to compute `diag.dominant_filter`.
     filter_counts: [u32; IMAGE_FILTER_COUNT],
     /// Optional Content Group (OCG) visibility stack.
@@ -399,6 +402,7 @@ impl<'doc> PageRenderer<'doc> {
             pattern_depth: 0,
             diag: PageDiagnostics::default(),
             decode_errors: Vec::new(),
+            warned_unknown_ops: std::collections::HashSet::new(),
             filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),
             #[cfg(feature = "gpu-jpeg-huffman")]
