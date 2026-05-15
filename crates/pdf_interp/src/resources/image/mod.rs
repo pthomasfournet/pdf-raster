@@ -462,14 +462,42 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
 
     let is_mask = stream.dict.get_bool(b"ImageMask").unwrap_or(false);
 
-    let filter = stream.dict.get(b"Filter").and_then(filter_name);
+    let filter_obj = stream.dict.get(b"Filter");
+    let filter_chain = filter_obj.map(image_filter_chain).unwrap_or_default();
+    let filter = filter_obj.and_then(filter_name);
 
     let img_filter = ImageFilter::from_filter_str(filter.as_deref());
+
+    // Resolve the codec input bytes.  For a chained `/Filter` (e.g.
+    // `[/ASCII85Decode /CCITTFaxDecode]`) every filter before the terminal one
+    // is a transport/prefilter (ASCII85, Flate, …); `decompressed_content`
+    // applies those left to right and passes the terminal image codec
+    // (CCITTFax/DCT/JBIG2/JPX) through unchanged, so its output is exactly the
+    // byte stream the terminal codec must decode.  A single transport filter
+    // (plain `FlateDecode`) is also handled here.  A pure-codec single filter
+    // (e.g. just `CCITTFaxDecode`) passes through, so `decompressed_content`
+    // returns the raw content unchanged and behaviour is preserved.
+    //
+    // Fail loudly: a chain we cannot run (unsupported prefilter, corrupt
+    // transport bytes) surfaces as a decode error — never a silent blank page.
+    let codec_input: std::borrow::Cow<'_, [u8]> = if filter_chain.len() > 1 {
+        match stream.decompressed_content() {
+            Ok(data) => std::borrow::Cow::Owned(data),
+            Err(e) => {
+                log::warn!("image: chained-filter prefilter decode failed: {e}");
+                return ImageResolution::DecodeFailed(format!("chained filter: {e}"));
+            }
+        }
+    } else {
+        std::borrow::Cow::Borrowed(stream.content.as_slice())
+    };
+
+    let terminal_parms = terminal_decode_parms(&stream.dict, filter_chain.len());
 
     let opt_img: Option<ImageDescriptor> = match filter.as_deref() {
         None => decode_raw(
             doc,
-            stream.content.as_slice(),
+            &codec_input,
             w,
             h,
             is_mask,
@@ -497,15 +525,12 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
                 return ImageResolution::DecodeFailed(format!("FlateDecode: {e}"));
             }
         },
-        Some("CCITTFaxDecode") => {
-            let parms = stream.dict.get(b"DecodeParms");
-            decode_ccitt(stream.content.as_slice(), w, h, is_mask, parms)
-        }
+        Some("CCITTFaxDecode") => decode_ccitt(&codec_input, w, h, is_mask, terminal_parms),
         Some("DCTDecode") => {
             #[cfg(feature = "cache")]
             let cache_ctx = codecs::DctCacheCtx::from_resources(image_cache, doc_id, stream_id);
             decode_dct(
-                stream.content.as_slice(),
+                &codec_input,
                 w,
                 h,
                 #[cfg(feature = "nvjpeg")]
@@ -525,17 +550,14 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
         Some("JPXDecode") => {
             #[cfg(feature = "nvjpeg2k")]
             {
-                decode_jpx(stream.content.as_slice(), w, h, gpu_j2k)
+                decode_jpx(&codec_input, w, h, gpu_j2k)
             }
             #[cfg(not(feature = "nvjpeg2k"))]
             {
-                decode_jpx(stream.content.as_slice(), w, h)
+                decode_jpx(&codec_input, w, h)
             }
         }
-        Some("JBIG2Decode") => {
-            let parms = stream.dict.get(b"DecodeParms");
-            decode_jbig2(doc, stream.content.as_slice(), w, h, is_mask, parms)
-        }
+        Some("JBIG2Decode") => decode_jbig2(doc, &codec_input, w, h, is_mask, terminal_parms),
         Some(other) => {
             log::warn!("image: unknown filter {other:?}");
             return ImageResolution::DecodeFailed(format!("unsupported filter {other:?}"));
@@ -650,12 +672,31 @@ pub(super) const fn validated_dims(w_raw: i64, h_raw: i64) -> Option<(u32, u32)>
     Some((w_raw as u32, h_raw as u32))
 }
 
-/// Extract the filter name from a `Filter` entry.
+/// Collect every filter name from a `/Filter` entry, in application order.
 ///
-/// Accepts either a bare `Name` or a single-element `Name` array.  PDF allows
-/// chained filters as a multi-element array; chained filters are not supported
-/// here — a warning is emitted and `None` is returned so the caller can skip
-/// the image gracefully rather than trying to decode garbled data.
+/// Accepts a bare `Name` (one filter) or a `Name` array (a filter chain, PDF
+/// §7.4: filters are listed in the order they were applied during encoding, so
+/// decoding applies them left to right).  Non-name array entries are skipped.
+/// An empty or absent array yields an empty vector (no filter).
+pub(crate) fn image_filter_chain(obj: &Object) -> Vec<Cow<'_, str>> {
+    match obj {
+        Object::Name(n) => vec![String::from_utf8_lossy(n)],
+        Object::Array(arr) => arr
+            .iter()
+            .filter_map(|o| o.as_name().map(String::from_utf8_lossy))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extract the *terminal* image filter from a `/Filter` entry.
+///
+/// Accepts a bare `Name`, a single-element `Name` array, or a multi-element
+/// filter chain (e.g. `[/ASCII85Decode /CCITTFaxDecode]`).  For a chain, the
+/// returned name is the LAST filter — the terminal image codec.  Earlier
+/// filters in the chain are transport/prefilters (ASCII85, Flate, …) whose
+/// bytes are produced by [`pdf::Stream::decompressed_content`] before the
+/// terminal codec runs; see the dispatch in `resolve_image`.
 ///
 /// An empty array (`Filter = []`) is treated as no filter (returns `None`)
 /// and a debug message is emitted, matching the behaviour of an absent key.
@@ -667,18 +708,41 @@ pub(crate) fn filter_name(obj: &Object) -> Option<Cow<'_, str>> {
                 log::debug!("image: Filter is an empty array — treating as no filter");
                 return None;
             }
-            if arr.len() > 1 {
-                log::warn!(
-                    "image: chained filters ({} filters in array) not supported — skipping image",
-                    arr.len()
-                );
-                return None;
-            }
-            arr.first()
-                .and_then(|o| o.as_name())
+            arr.iter()
+                .rev()
+                .find_map(|o| o.as_name())
                 .map(String::from_utf8_lossy)
         }
         _ => None,
+    }
+}
+
+/// Resolve the `/DecodeParms` entry that belongs to the *terminal* filter.
+///
+/// `/DecodeParms` is index-aligned to `/Filter` (PDF §7.4.1): entry `i` is the
+/// parameters for filter `i`; a `null` entry or an absent key means "no
+/// parameters".  When `/Filter` is a chain, the terminal codec
+/// (`CCITTFaxDecode`, `JBIG2Decode`, …) must receive ITS entry — the last one —
+/// not the whole array, and not a prefilter's entry.
+///
+/// Forms handled:
+/// - `/DecodeParms` is a dict, `/Filter` is a single name → that dict.
+/// - `/DecodeParms` is an array → the last array element (if a dict / non-null).
+/// - absent / `null` / mismatched → `None`.
+fn terminal_decode_parms(dict: &Dictionary, filter_count: usize) -> Option<&Object> {
+    match dict.get(b"DecodeParms")? {
+        Object::Array(arr) => {
+            // Prefer the entry index-aligned to the terminal (last) filter;
+            // fall back to the last array element if lengths disagree.
+            let idx = filter_count.checked_sub(1).filter(|&i| i < arr.len());
+            let entry = idx.map_or_else(|| arr.last(), |i| arr.get(i))?;
+            match entry {
+                Object::Null => None,
+                other => Some(other),
+            }
+        }
+        Object::Null => None,
+        other => Some(other),
     }
 }
 
@@ -720,5 +784,131 @@ mod tests {
     fn validated_dims_accepts_boundary() {
         assert_eq!(validated_dims(1, 1), Some((1, 1)));
         assert_eq!(validated_dims(65536, 65536), Some((65536, 65536)));
+    }
+
+    // ── Chained-filter dispatch ────────────────────────────────────────────────
+
+    #[test]
+    fn filter_name_single_name() {
+        let obj = Object::Name(b"FlateDecode".to_vec());
+        assert_eq!(filter_name(&obj).as_deref(), Some("FlateDecode"));
+    }
+
+    #[test]
+    fn filter_name_single_element_array() {
+        let obj = Object::Array(vec![Object::Name(b"CCITTFaxDecode".to_vec())]);
+        assert_eq!(filter_name(&obj).as_deref(), Some("CCITTFaxDecode"));
+    }
+
+    #[test]
+    fn filter_name_chain_returns_terminal_codec() {
+        // The scanned-book corpus case: [/ASCII85Decode /CCITTFaxDecode].
+        // The terminal (last) filter is the image codec and must be dispatched
+        // — previously this returned None and the page rendered blank.
+        let obj = Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"CCITTFaxDecode".to_vec()),
+        ]);
+        assert_eq!(filter_name(&obj).as_deref(), Some("CCITTFaxDecode"));
+    }
+
+    #[test]
+    fn filter_name_empty_array_is_none() {
+        assert!(filter_name(&Object::Array(vec![])).is_none());
+    }
+
+    #[test]
+    fn image_filter_chain_orders_left_to_right() {
+        let obj = Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let chain = image_filter_chain(&obj);
+        assert_eq!(chain, vec!["ASCII85Decode", "FlateDecode"]);
+    }
+
+    #[test]
+    fn image_filter_chain_single_name() {
+        let obj = Object::Name(b"DCTDecode".to_vec());
+        assert_eq!(image_filter_chain(&obj), vec!["DCTDecode"]);
+    }
+
+    #[test]
+    fn terminal_decode_parms_picks_last_array_entry() {
+        // [/ASCII85Decode /CCITTFaxDecode] with DecodeParms [null <</K -1>>]:
+        // the CCITT codec must receive its OWN params (index 1), not null and
+        // not the whole array.
+        let mut ccitt = Dictionary::new();
+        ccitt.set(b"K".to_vec(), Object::Integer(-1));
+        let mut dict = Dictionary::new();
+        dict.set(
+            b"DecodeParms".to_vec(),
+            Object::Array(vec![Object::Null, Object::Dictionary(ccitt)]),
+        );
+        let parms = terminal_decode_parms(&dict, 2).expect("terminal parms present");
+        assert_eq!(
+            parms
+                .as_dict()
+                .and_then(|d| d.get(b"K"))
+                .and_then(Object::as_i64),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn terminal_decode_parms_single_dict() {
+        let mut ccitt = Dictionary::new();
+        ccitt.set(b"Columns".to_vec(), Object::Integer(2480));
+        let mut dict = Dictionary::new();
+        dict.set(b"DecodeParms".to_vec(), Object::Dictionary(ccitt));
+        let parms = terminal_decode_parms(&dict, 1).expect("single dict");
+        assert_eq!(
+            parms
+                .as_dict()
+                .and_then(|d| d.get(b"Columns"))
+                .and_then(Object::as_i64),
+            Some(2480)
+        );
+    }
+
+    #[test]
+    fn terminal_decode_parms_null_and_absent_are_none() {
+        let dict = Dictionary::new();
+        assert!(terminal_decode_parms(&dict, 1).is_none());
+
+        let mut with_null = Dictionary::new();
+        with_null.set(
+            b"DecodeParms".to_vec(),
+            Object::Array(vec![Object::Null, Object::Null]),
+        );
+        assert!(terminal_decode_parms(&with_null, 2).is_none());
+    }
+
+    #[test]
+    fn chained_ascii85_then_flate_roundtrip() {
+        // A `[/ASCII85Decode /FlateDecode]` stream the way a PDF stores it:
+        // the payload is flate-compressed, then ASCII85-encoded.  The fixture
+        // bytes below are `"chained filter round-trip payload \x00\x01\x02\xff"`
+        // run through zlib then Adobe ASCII85 (terminated with `~>`).
+        // `decompressed_content` must undo both filters left to right and
+        // recover the original payload — this is exactly the prefilter step
+        // the scanned-book corpus case relies on (only the terminal codec
+        // differs: CCITTFax there, treated as raw here).
+        let original: &[u8] = b"chained filter round-trip payload \x00\x01\x02\xff";
+        let ascii85: &[u8] = b"GaqFP8Bf:N9i4I)bUH+8;CK[@btHG9.EX2<-qLG`a\\PT-?smOA%fdE-%FY~>";
+
+        let mut dict = Dictionary::new();
+        dict.set(
+            b"Filter".to_vec(),
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        let stream = pdf::Stream::new(dict, ascii85.to_vec());
+        let decoded = stream
+            .decompressed_content()
+            .expect("ASCII85 then Flate must round-trip");
+        assert_eq!(decoded, original);
     }
 }
