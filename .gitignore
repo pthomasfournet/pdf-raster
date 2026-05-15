@@ -90,9 +90,11 @@ tests/bench/bench-features-results.json
 *.log
 ROADMAP_INTEL.md
 
-# ── Local audit reports (deferred-finding tracker) ────────────────────────────
+# ── Local QA + audit artifacts ────────────────────────────────────────────────
+# /qa/ holds QA harness artifacts (baselines, runs, tooling).
 # /audit/ holds review findings whose fix is too large for the commit at hand
 # but worth not losing.  Stays local; not part of the project's published docs.
+/qa/
 /audit/
 mutants.out/
 mutants.out.old/
