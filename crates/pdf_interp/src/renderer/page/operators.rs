@@ -394,14 +394,14 @@ impl PageRenderer<'_> {
             // Handled in the OCG pre-pass above; unreachable here.
             Operator::BeginOptionalContent(_) | Operator::EndOptionalContent => {}
 
-            Operator::Unknown(kw) => {
-                if self.warned_unknown_ops.insert(kw.clone()) {
-                    log::warn!(
-                        "rasterrocket-interp: unsupported content operator {:?} (further occurrences suppressed for this page)",
-                        String::from_utf8_lossy(kw)
-                    );
-                }
+            Operator::Unknown(kw) if self.warned_unknown_ops.insert(kw.clone()) => {
+                log::warn!(
+                    "rasterrocket-interp: unsupported content operator {:?} (further occurrences suppressed for this page)",
+                    String::from_utf8_lossy(kw)
+                );
             }
+
+            Operator::Unknown(_) => {}
 
             // Compile-time exhaustiveness guard.
             #[expect(

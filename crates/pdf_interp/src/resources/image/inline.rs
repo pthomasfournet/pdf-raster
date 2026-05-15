@@ -555,8 +555,9 @@ mod tests {
     #[test]
     fn inline_image_mask() {
         // 2×1 mask image (ImageMask=true means Mask colour space).
+        // PDF §8.9.6.1, default Decode=[0,1]: raw bit 1 = paint (0x00), raw bit 0 = transparent (0xFF).
         let params = b"/W 2 /H 1 /IM true /BPC 1";
-        // 1-bpp mask: byte 0b10000000 → pixel 0 = 1 (transparent), pixel 1 = 0 (paint).
+        // byte 0b10000000: bit 7 = 1 (paint), bit 6 = 0 (transparent).
         let data = [0b1000_0000u8];
         let doc = empty_doc();
         let img = decode_inline_image(
@@ -579,9 +580,9 @@ mod tests {
         .expect("decode should succeed");
         assert_eq!(img.color_space, ImageColorSpace::Mask);
         let bytes = img.data.as_cpu().unwrap();
-        // Expanded 1-bpp: bit 7 = 1 → 0xFF, bit 6 = 0 → 0x00
-        assert_eq!(bytes[0], 0xFF); // first pixel: transparent
-        assert_eq!(bytes[1], 0x00); // second pixel: paint
+        // bit 7 = 1 → 0x00 (paint); bit 6 = 0 → 0xFF (transparent).
+        assert_eq!(bytes[0], 0x00); // first pixel: paint
+        assert_eq!(bytes[1], 0xFF); // second pixel: transparent
     }
 
     #[test]

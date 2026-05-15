@@ -55,8 +55,9 @@ pub(super) fn decode_raw(
 
     if is_mask {
         // Stencil mask — always 1 byte per pixel, no colour space conversion.
-        // PDF §8.9.6.2: Decode=[1,0] inverts the stencil polarity so that
-        // sample 1 = paint and sample 0 = transparent instead of the default.
+        // PDF §8.9.6.1: default Decode=[0,1] means raw sample 0 = transparent,
+        // raw sample 1 = paint.  Decode=[1,0] inverts this polarity so that
+        // raw sample 0 = paint and raw sample 1 = transparent.
         let invert = is_mask_inverted(dict);
         return decode_mask_raw(data, width, height, bpc, invert);
     }
@@ -274,8 +275,13 @@ fn is_mask_inverted(dict: &Dictionary) -> bool {
 
 /// Decode a stencil mask (ImageMask=true) from raw data.
 ///
-/// When `invert` is `true` (`Decode=[1,0]`), polarity is flipped: sample 1
-/// maps to 0x00 (paint) and sample 0 maps to 0xFF (transparent).
+/// PDF §8.9.6.1 convention with default `Decode=[0,1]`: a raw sample value of
+/// 0 is transparent (leave background), a raw sample value of 1 is painted
+/// with the current fill colour.  This matches the JBIG2 and `CCITTFax` stencil
+/// conventions (JBIG2 bit=1=black→paint, CCITT bit=1=black→paint).
+///
+/// When `invert` is `true` (`Decode=[1,0]`), polarity is flipped: raw sample 0
+/// maps to 0x00 (paint) and raw sample 1 maps to 0xFF (transparent).
 fn decode_mask_raw(
     data: &[u8],
     width: u32,
@@ -286,9 +292,10 @@ fn decode_mask_raw(
     match bpc {
         1 => {
             let width_usize = usize::try_from(width).ok()?;
-            // Mask images are always 1-component: 1 bit per pixel.
+            // PDF §8.9.6.1: default Decode=[0,1] → raw bit 0 = transparent (0xFF),
+            // raw bit 1 = paint (0x00).  Decode=[1,0] (invert=true) flips polarity.
             let pixels = unpack_packed_bits(data, 1, width_usize, height, |v| {
-                let paint = if invert { v != 0 } else { v == 0 };
+                let paint = if invert { v == 0 } else { v != 0 };
                 if paint { 0x00 } else { 0xFF }
             })?;
             Some(ImageDescriptor {
@@ -543,8 +550,8 @@ mod tests {
 
     #[test]
     fn decode_raw_mask_decode_inverted() {
-        // Decode=[1,0] flips stencil polarity: sample 0 → 0xFF (transparent),
-        // sample 255 → 0x00 (paint).  Without the fix both would stay as-is.
+        // bpc=8: Decode=[1,0] flips stencil polarity for 8-bpc masks.
+        // With Decode=[1,0]: sample 0 → 0xFF (transparent), sample 255 → 0x00 (paint).
         let doc = make_doc();
         let mut dict = Dictionary::new();
         dict.set("BitsPerComponent", Object::Integer(8));
@@ -552,8 +559,7 @@ mod tests {
             "Decode",
             Object::Array(vec![Object::Real(1.0), Object::Real(0.0)]),
         );
-        // pixel 0 → was "paint" in default polarity; with Decode=[1,0] it should
-        // become 0xFF (transparent).  Pixel 255 should become 0x00 (paint).
+        // With Decode=[1,0]: sample 0 → 0xFF (transparent), sample 255 → 0x00 (paint).
         let data = vec![0u8, 255u8];
         let desc = decode_raw(
             &doc,
