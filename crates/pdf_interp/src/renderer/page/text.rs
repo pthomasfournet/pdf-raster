@@ -131,42 +131,68 @@ impl PageRenderer<'_> {
             // Shared helper: push a rasterized glyph into `records` (when painting)
             // and collect its outline path into `clip_paths` (when clipping).
             //
-            // `gid` is the resolved glyph index passed to `make_glyph` directly.
-            // `char_code_for_path` is the raw character code passed to `glyph_path`,
-            // which calls `resolve_gid` internally — so it must be the encoding-level
-            // code, not a pre-resolved GID.
-            let mut push_glyph = |char_code_for_path: u32, gid: u32, pen_x: i32, pen_y: i32| {
-                if do_paint && let Some(bmp) = face.make_glyph(gid, 0) {
-                    records.push(GlyphRecord {
-                        pen_x,
-                        pen_y,
-                        x_off: bmp.x_off,
-                        y_off: bmp.y_off,
-                        width: bmp.width,
-                        height: bmp.height,
-                        aa: bmp.aa,
-                        data: bmp.data,
-                    });
-                }
-                if do_clip {
-                    // Collect the glyph outline in device space.
-                    // `glyph_path` returns coordinates in text space, where the
-                    // FreeType transform (Trm) has already been applied.  The
-                    // origin (0, 0) maps to the pen position; Y is positive-up
-                    // (FreeType convention).  To get device space: translate by
-                    // (pen_x, pen_y) and flip Y (device Y is positive-down).
-                    let path = face.glyph_path(char_code_for_path).map(|mut p| {
-                        let px = f64::from(pen_x);
-                        let py = f64::from(pen_y);
-                        for pt in &mut p.pts {
-                            pt.x += px;
-                            pt.y = py - pt.y;
+            // `gid` is the resolved glyph index.  `char_code_for_path` is the
+            // raw character code.  `by_gid` selects which one FreeType is
+            // indexed by:
+            //
+            // * Simple fonts (`by_gid == false`): the char code is resolved
+            //   through the face's `code_to_gid` table / Unicode charmap by
+            //   `make_glyph` / `glyph_path` (handles `Differences`, the
+            //   standard 14, etc.).
+            // * Type 0 / CIDFonts (`by_gid == true`): the interpreter has
+            //   already mapped the code through the Encoding CMap and
+            //   `CIDToGIDMap` to a final FreeType glyph index.  It must be
+            //   used directly — re-resolving it through the Unicode charmap
+            //   mis-maps every glyph to `.notdef` for a CID-keyed CFF subset
+            //   (whose charmap is absent/unrelated), rendering a blank page.
+            let mut push_glyph =
+                |char_code_for_path: u32, gid: u32, by_gid: bool, pen_x: i32, pen_y: i32| {
+                    let bmp = if do_paint {
+                        if by_gid {
+                            face.make_glyph_by_gid(gid, 0)
+                        } else {
+                            face.make_glyph(gid, 0)
                         }
-                        p
-                    });
-                    clip_paths.push(path);
-                }
-            };
+                    } else {
+                        None
+                    };
+                    if let Some(bmp) = bmp {
+                        records.push(GlyphRecord {
+                            pen_x,
+                            pen_y,
+                            x_off: bmp.x_off,
+                            y_off: bmp.y_off,
+                            width: bmp.width,
+                            height: bmp.height,
+                            aa: bmp.aa,
+                            data: bmp.data,
+                        });
+                    }
+                    if do_clip {
+                        // Collect the glyph outline in device space.
+                        // `glyph_path` returns coordinates in text space, where
+                        // the FreeType transform (Trm) has already been applied.
+                        // The origin (0, 0) maps to the pen position; Y is
+                        // positive-up (FreeType convention).  To get device
+                        // space: translate by (pen_x, pen_y) and flip Y (device
+                        // Y is positive-down).
+                        let outline = if by_gid {
+                            face.glyph_path_by_gid(gid)
+                        } else {
+                            face.glyph_path(char_code_for_path)
+                        };
+                        let path = outline.map(|mut p| {
+                            let px = f64::from(pen_x);
+                            let py = f64::from(pen_y);
+                            for pt in &mut p.pts {
+                                pt.x += px;
+                                pt.y = py - pt.y;
+                            }
+                            p
+                        });
+                        clip_paths.push(path);
+                    }
+                };
 
             if let Some(enc) = cid_enc {
                 // Type 0 composite font: multi-byte character codes via Encoding CMap.
@@ -191,7 +217,7 @@ impl PageRenderer<'_> {
                     let gid = enc.code_to_gid(char_code);
 
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
-                    push_glyph(char_code, gid, pen_x, pen_y);
+                    push_glyph(char_code, gid, true, pen_x, pen_y);
 
                     // CID width lookup uses the CID, not the raw char code.
                     // Advance formula: w/1000 * font_size (PDF §9.7.4.3).
@@ -211,7 +237,7 @@ impl PageRenderer<'_> {
                 // pre-PDF 1.5, where a substitute face supplies metrics).
                 for &byte in bytes {
                     let (pen_x, pen_y) = text_to_device(&ctm, &tm, 0.0, rise, self.height);
-                    push_glyph(u32::from(byte), u32::from(byte), pen_x, pen_y);
+                    push_glyph(u32::from(byte), u32::from(byte), false, pen_x, pen_y);
 
                     // PDF §9.4.4: pen advances even for missing/invisible glyphs.
                     let advance_glyph = descriptor.width_for_code(u32::from(byte)).map_or_else(

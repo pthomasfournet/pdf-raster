@@ -227,9 +227,7 @@ fn find_endstream(data: &[u8], start: usize) -> Option<usize> {
     if start > data.len() {
         return None;
     }
-    let rel = data[start..]
-        .windows(KW.len())
-        .position(|w| w == KW)?;
+    let rel = data[start..].windows(KW.len()).position(|w| w == KW)?;
     let mut end = start + rel;
     // Trim exactly one EOL (CRLF, LF, or CR) immediately before `endstream`;
     // that byte sequence is a delimiter, not stream data (PDF §7.3.8.1).
@@ -295,9 +293,7 @@ pub fn parse_object(data: &[u8], pos: &mut usize) -> Option<Object> {
                     .map(|n| n as usize);
 
                 let stream_end = match declared_len {
-                    Some(len)
-                        if length_lands_on_endstream(data, stream_start, len) =>
-                    {
+                    Some(len) if length_lands_on_endstream(data, stream_start, len) => {
                         stream_start.saturating_add(len).min(data.len())
                     }
                     // Missing, indirect (`N 0 R`), negative, or inconsistent

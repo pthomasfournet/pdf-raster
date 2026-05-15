@@ -146,7 +146,27 @@ impl FontFace {
     #[must_use]
     pub fn make_glyph(&self, char_code: u32, x_frac: u8) -> Option<crate::bitmap::GlyphBitmap> {
         let glyph_id = self.resolve_gid(char_code);
+        self.make_glyph_by_gid(glyph_id, x_frac)
+    }
 
+    /// Rasterize the glyph at `FreeType` glyph index `glyph_id` directly,
+    /// bypassing the char-code → GID charmap resolution in [`Self::resolve_gid`].
+    ///
+    /// Used by the Type 0 / `CIDFont` text path, where the interpreter has
+    /// already mapped the character code through the Encoding `CMap` and
+    /// `CIDToGIDMap` to a final `FreeType` glyph index.  Routing that GID back
+    /// through `resolve_gid` (a Unicode-charmap lookup) would mis-map it —
+    /// for a CID-keyed CFF subset the charmap is absent or unrelated, so the
+    /// lookup yields `.notdef` and every glyph renders blank.
+    ///
+    /// Returns `None` on any `FreeType` failure (load, render, or zero-size
+    /// output) — the caller should treat `None` as a blank/missing glyph.
+    #[must_use]
+    pub fn make_glyph_by_gid(
+        &self,
+        glyph_id: u32,
+        x_frac: u8,
+    ) -> Option<crate::bitmap::GlyphBitmap> {
         // Sub-pixel offset: xFrac * fractionMul * 64 in 26.6 units.
         let frac_mul = 1.0 / f64::from(crate::key::FRACTION);
         let x_offset_f = f64::from(x_frac) * frac_mul * 64.0;
@@ -226,12 +246,20 @@ impl FontFace {
     /// bitmap-only font).
     #[must_use]
     pub fn glyph_path(&self, char_code: u32) -> Option<Path> {
+        let glyph_id = self.resolve_gid(char_code);
+        self.glyph_path_by_gid(glyph_id)
+    }
+
+    /// Decompose the outline at `FreeType` glyph index `glyph_id` directly,
+    /// bypassing [`Self::resolve_gid`].  The Type 0 / `CIDFont` clip path uses
+    /// this for the same reason [`Self::make_glyph_by_gid`] exists.
+    #[must_use]
+    pub fn glyph_path_by_gid(&self, glyph_id: u32) -> Option<Path> {
         // Mirror the near-zero check used in FontFace::new to catch subnormals.
         if self.text_scale < f64::EPSILON {
             return None;
         }
 
-        let glyph_id = self.resolve_gid(char_code);
         let mut matrix = self.ft_text_matrix;
         let mut delta = Vector { x: 0, y: 0 };
         self.face.set_transform(&mut matrix, &mut delta);
@@ -253,7 +281,13 @@ impl FontFace {
     #[must_use]
     pub fn glyph_advance(&self, char_code: u32) -> Option<f64> {
         let glyph_id = self.resolve_gid(char_code);
+        self.glyph_advance_by_gid(glyph_id)
+    }
 
+    /// Advance width at `FreeType` glyph index `glyph_id`, bypassing
+    /// [`Self::resolve_gid`].  Mirrors [`Self::make_glyph_by_gid`].
+    #[must_use]
+    pub fn glyph_advance_by_gid(&self, glyph_id: u32) -> Option<f64> {
         // Identity matrix + zero offset for advance measurement.
         let mut matrix = Matrix {
             xx: 65536,
@@ -324,5 +358,114 @@ fn to_ft_matrix_norm(mat: &FontMatrix, divisor: f64) -> Matrix {
         yx: ((mat[1] / divisor) * 65536.0) as i64,
         xy: ((mat[2] / divisor) * 65536.0) as i64,
         yy: ((mat[3] / divisor) * 65536.0) as i64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::{FaceParams, FontEngine};
+    use crate::hinting::FontKind;
+
+    /// A few candidate system fonts; the test is skipped if none exist so it
+    /// stays green on minimal CI images.
+    const CANDIDATE_FONTS: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ];
+
+    fn first_existing_font() -> Option<&'static str> {
+        CANDIDATE_FONTS
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).exists())
+    }
+
+    /// Regression for the PDF-1.5 / CIDFontType0C blank-page bug.
+    ///
+    /// A Type 0 / CIDFont caller resolves a character code through the
+    /// Encoding CMap + `CIDToGIDMap` to a *final* FreeType glyph index, then
+    /// must hand that GID to FreeType directly.  The pre-fix code routed it
+    /// back through `resolve_gid` (a Unicode-charmap lookup), which for a
+    /// CID-keyed CFF subset maps every glyph to `.notdef` → blank page.
+    ///
+    /// This asserts the two routing modes are genuinely distinct: a
+    /// `code_to_gid` remap table that hijacks `make_glyph` must NOT touch
+    /// `make_glyph_by_gid` (which indexes FreeType directly).
+    #[test]
+    fn make_glyph_by_gid_bypasses_charmap_resolution() {
+        let Some(path) = first_existing_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        let eng_shared = FontEngine::init(true, false, false).expect("font engine");
+        let mut eng = eng_shared.lock().expect("engine lock");
+
+        // Resolve two genuinely different glyph indices via the font's own
+        // charmap, using a throwaway identity-mapped face.
+        let probe = eng
+            .load_file_face(
+                path,
+                0,
+                FaceParams {
+                    kind: FontKind::TrueType,
+                    code_to_gid: Vec::new(),
+                    mat: [40.0, 0.0, 0.0, 40.0],
+                    text_mat: [40.0, 0.0, 0.0, 40.0],
+                },
+            )
+            .expect("load probe face");
+        let gid_a = probe.raw_get_char_index('A' as u32);
+        let gid_w = probe.raw_get_char_index('W' as u32);
+        assert!(gid_a != 0 && gid_w != 0, "expected real glyph indices");
+        assert!(gid_a != gid_w, "'A' and 'W' must have distinct glyphs");
+        drop(probe);
+
+        // A `code_to_gid` hijack table: char code 65 ('A') is forced to
+        // resolve to 'W'`s glyph index.  Only the charmap path consults it.
+        let mut hijack = vec![0u32; 256];
+        hijack[65] = gid_w;
+
+        let face = eng
+            .load_file_face(
+                path,
+                0,
+                FaceParams {
+                    kind: FontKind::TrueType,
+                    code_to_gid: hijack,
+                    mat: [40.0, 0.0, 0.0, 40.0],
+                    text_mat: [40.0, 0.0, 0.0, 40.0],
+                },
+            )
+            .expect("load system face");
+
+        // `make_glyph(65)` consults the hijack table → renders 'W'.
+        let via_charmap = face
+            .make_glyph(65, 0)
+            .expect("charmap path rasterizes a glyph");
+        // `make_glyph_by_gid(gid_a)` ignores the hijack entirely and indexes
+        // FreeType directly → renders 'A'.  This is the path the CIDFont text
+        // loop now uses; pre-fix it went through resolve_gid and broke.
+        let via_gid = face
+            .make_glyph_by_gid(gid_a, 0)
+            .expect("by-gid path rasterizes the real glyph");
+        assert!(
+            via_gid.width > 0 && via_gid.height > 0,
+            "by-gid glyph must be non-empty"
+        );
+        // 'A' and 'W' differ in shape → the two paths produced different
+        // bitmaps, proving by-gid did NOT route through the hijack table.
+        assert_ne!(
+            (via_charmap.width, via_charmap.height, &via_charmap.data),
+            (via_gid.width, via_gid.height, &via_gid.data),
+            "by-gid path must bypass code_to_gid resolution"
+        );
+
+        // The outline variant must behave the same way.
+        assert!(
+            face.glyph_path_by_gid(gid_a).is_some(),
+            "by-gid outline must resolve the real glyph"
+        );
     }
 }

@@ -677,4 +677,127 @@ startxref\n180\n%%EOF"
         let doc = Document::from_bytes_owned(bytes).expect("indirect-Kids PDF");
         assert_eq!(doc.page_count(), 1, "expected 1 page through indirect Kids");
     }
+
+    /// Build a minimal PDF-1.5 whose cross-reference is a `/Type /XRef`
+    /// stream (`/W [1 2 2]`) and whose Catalog / Pages / Page objects live
+    /// inside a `/Type /ObjStm` compressed object stream.  This is the
+    /// structure emitted by virtually every modern PDF toolchain (pdfTeX,
+    /// LibreOffice, …); the streams here are left uncompressed (no `/Filter`)
+    /// so the fixture needs no zlib round-trip.
+    ///
+    /// Regression for the PDF-1.5 blank-render class: the page object (obj 3)
+    /// is reachable only via an xref-stream **type-2** entry → ObjStm
+    /// extraction.  If `/W` decoding, type-2 `get_object` routing, or ObjStm
+    /// directory parsing is wrong, the page object is unresolvable and the
+    /// page renders blank.
+    #[test]
+    fn pdf15_xref_stream_with_objstm_resolves_in_objstm_page() {
+        let header = b"%PDF-1.5\n";
+
+        // Bodies for the three objects packed into the ObjStm.
+        let b1 = b"<</Type/Catalog/Pages 2 0 R>>";
+        let b2 = b"<</Type/Pages/Kids[3 0 R]/Count 1>>";
+        let b3 = b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>";
+        let o1 = 0usize;
+        let o2 = o1 + b1.len() + 1; // +1 for the '\n' body separator
+        let o3 = o2 + b2.len() + 1;
+        let directory = format!("1 {o1} 2 {o2} 3 {o3} ").into_bytes();
+        let first = directory.len();
+        let mut objstm_data = directory.clone();
+        for body in [&b1[..], &b2[..], &b3[..]] {
+            objstm_data.extend_from_slice(body);
+            objstm_data.push(b'\n');
+        }
+        let mut objstm = format!(
+            "4 0 obj\n<</Type/ObjStm/N 3/First {first}/Length {}>>\nstream\n",
+            objstm_data.len()
+        )
+        .into_bytes();
+        objstm.extend_from_slice(&objstm_data);
+        objstm.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let off4 = header.len();
+        let off5 = off4 + objstm.len();
+
+        // /W [1 2 2] entries for object numbers 0..=5.
+        let entry = |t: u8, f1: u32, f2: u32| -> [u8; 5] {
+            let a = (f1 as u16).to_be_bytes();
+            let b = (f2 as u16).to_be_bytes();
+            [t, a[0], a[1], b[0], b[1]]
+        };
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&entry(0, 0, 65535)); // 0 free
+        entries.extend_from_slice(&entry(2, 4, 0)); // 1 → ObjStm 4, idx 0
+        entries.extend_from_slice(&entry(2, 4, 1)); // 2 → ObjStm 4, idx 1
+        entries.extend_from_slice(&entry(2, 4, 2)); // 3 → ObjStm 4, idx 2 (PAGE)
+        entries.extend_from_slice(&entry(1, off4 as u32, 0)); // 4 direct
+        entries.extend_from_slice(&entry(1, off5 as u32, 0)); // 5 direct (self)
+
+        let mut xref = format!(
+            "5 0 obj\n<</Type/XRef/Size 6/W[1 2 2]/Root 1 0 R/Length {}>>\nstream\n",
+            entries.len()
+        )
+        .into_bytes();
+        xref.extend_from_slice(&entries);
+        xref.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&objstm);
+        bytes.extend_from_slice(&xref);
+        bytes.extend_from_slice(format!("startxref\n{off5}\n%%EOF").as_bytes());
+
+        let doc = Document::from_bytes_owned(bytes).expect("PDF-1.5 xref-stream+ObjStm");
+
+        // Catalog (obj 1) resolves out of the ObjStm.
+        let catalog = doc.catalog().expect("catalog via ObjStm");
+        assert!(catalog.get(b"Pages".as_slice()).is_some());
+
+        // The page tree descends through ObjStm-resident Pages → Page.
+        assert_eq!(doc.page_count(), 1, "one page via xref-stream type-2");
+        let pages: Vec<_> = doc.get_pages().collect();
+        assert_eq!(pages.len(), 1);
+
+        // The page object itself (obj 3, an xref type-2 entry) resolves.
+        let (_, page_id) = pages[0];
+        assert_eq!(page_id.0, 3);
+        let page = doc.get_object(page_id).expect("in-ObjStm page object");
+        let pd = page.as_dict().expect("page is a dict");
+        assert_eq!(
+            pd.get(b"Type".as_slice()).and_then(Object::as_name),
+            Some(&b"Page"[..])
+        );
+    }
+
+    /// Direct unit test of the xref-stream `/W [1 2 2]` binary entry decoder
+    /// for a **type-2** (in-object-stream) record.  Locks the big-endian
+    /// field decode + the container/index assignment that the PDF-1.5
+    /// resolution path depends on.
+    #[test]
+    fn xref_stream_w_type2_entry_decode() {
+        // Single uncompressed xref stream, obj 1, /Size 2, covering objs 0..1.
+        //   obj 0: type 0 (free)        → 00 0000 0000
+        //   obj 1: type 2, container 7, index 3 → 02 0007 0003
+        let entries: [u8; 10] = [0, 0, 0, 0, 0, 2, 0, 7, 0, 3];
+        let body = format!(
+            "1 0 obj\n<</Type/XRef/Size 2/W[1 2 2]/Root 9 0 R/Length {}>>\nstream\n",
+            entries.len()
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.5\n");
+        let startxref = bytes.len();
+        bytes.extend_from_slice(body.as_bytes());
+        bytes.extend_from_slice(&entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF").as_bytes());
+
+        let table = crate::xref::read_xref(&bytes).expect("xref stream parse");
+        match table.get(1) {
+            Some(crate::xref::XrefEntry::InObjStm { container, index }) => {
+                assert_eq!(container, 7, "type-2 field2 = ObjStm container number");
+                assert_eq!(index, 3, "type-2 field3 = index within ObjStm");
+            }
+            other => panic!("expected InObjStm entry for obj 1, got {other:?}"),
+        }
+    }
 }
