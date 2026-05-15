@@ -190,6 +190,30 @@ pub fn release_gpu_decoders() {
     gpu_init::release_jpeg_vk_this_thread();
 }
 
+/// True when the PDF at `path` is encrypted (uses the PDF Standard
+/// Security Handler — an `/Encrypt` entry in the trailer).
+///
+/// A cheap structural probe: only the xref table and trailer are parsed,
+/// no objects are decoded.  Returns `false` (rather than erroring) when
+/// the file cannot be opened or parsed — callers that need a hard parse
+/// error get it from [`open_session`] proper; this probe exists solely so
+/// the CLI can decide whether to show its decryption liability prompt
+/// without paying a full session open.
+#[must_use]
+pub fn is_encrypted(path: &Path) -> bool {
+    pdf::Document::open(path).is_ok_and(|d| d.is_encrypted())
+}
+
+/// Message shown when an encrypted document's decryption is not authorised.
+///
+/// Used when the CLI liability gate is declined, or on a non-interactive
+/// run with no operator bypass.  Never the misleading "document has no
+/// pages".
+#[must_use]
+pub fn decrypt_gate_declined_message() -> String {
+    pdf::msg_gate_declined()
+}
+
 // ── Backend policy ────────────────────────────────────────────────────────────
 
 /// Controls which compute backend is used for image decoding and GPU fills.
@@ -340,6 +364,18 @@ pub struct SessionConfig {
     /// initialisation fails (no cache → nowhere to prefetch into).
     #[cfg(feature = "cache")]
     pub prefetch: bool,
+    /// Whether the caller has authorised qpdf-assisted decryption of an
+    /// encrypted (PDF Standard Security Handler) document.
+    ///
+    /// Default `false`.  When the document is encrypted and this is
+    /// `false`, [`open_session`] returns a clear [`RasterError::Pdf`]
+    /// explaining the document is encrypted (never the misleading
+    /// "no pages").  The CLI sets this only after an interactive
+    /// private-copy / liability confirmation or an explicit
+    /// `--decrypt-owned` / `RROCKET_DECRYPT_OWNED=1` operator bypass; the
+    /// private QA harness sets it unconditionally for its owned-texts
+    /// automation.  No effect on unencrypted documents.
+    pub decrypt_authorized: bool,
 }
 
 impl SessionConfig {
@@ -359,6 +395,7 @@ impl SessionConfig {
             vaapi_device: DEFAULT_VAAPI_DEVICE.to_owned(),
             #[cfg(feature = "cache")]
             prefetch: false,
+            decrypt_authorized: false,
         }
     }
 }

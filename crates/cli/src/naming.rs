@@ -81,6 +81,7 @@ mod tests {
             thin_line_mode: ThinLineMode::Default,
             owner_password: None,
             user_password: None,
+            decrypt_owned: false,
             num_threads: 0,
             separator: sep,
             force_num_digits: force,

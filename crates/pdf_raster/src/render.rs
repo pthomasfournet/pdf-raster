@@ -319,7 +319,9 @@ pub fn open_session(
     path: &std::path::Path,
     config: &SessionConfig,
 ) -> Result<RasterSession, RasterError> {
-    let doc = Arc::new(pdf_interp::open(path).map_err(RasterError::from)?);
+    let doc = Arc::new(
+        pdf_interp::open_decrypting(path, config.decrypt_authorized).map_err(RasterError::from)?,
+    );
     let total_pages = doc.page_count_fast();
 
     // Reject `ForceVulkan` at the policy gate when the `vulkan` feature

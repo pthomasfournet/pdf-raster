@@ -21,6 +21,12 @@ pub enum PdfError {
         page: u32,
         total: u32,
     },
+    /// The document is encrypted (PDF Standard Security Handler) and could
+    /// not be transparently decrypted.  The string carries an accurate,
+    /// actionable explanation (qpdf missing, password-protected, or the
+    /// CLI liability gate was declined) — never the misleading
+    /// "document has no pages".
+    EncryptedDocument(String),
 }
 
 impl fmt::Display for PdfError {
@@ -35,6 +41,7 @@ impl fmt::Display for PdfError {
             Self::PageOutOfRange { page, total } => {
                 write!(f, "page {page} out of range (document has {total} pages)")
             }
+            Self::EncryptedDocument(msg) => write!(f, "{msg}"),
         }
     }
 }

@@ -14,6 +14,7 @@
 //! Public types mirror `lopdf` naming so `rasterrocket-interp` can migrate
 //! file-by-file with mostly mechanical changes.
 
+mod decrypt;
 mod dictionary;
 mod document;
 mod error;
@@ -26,6 +27,7 @@ mod page_tree;
 mod stream;
 mod xref;
 
+pub use decrypt::{DecryptGuard, msg_gate_declined};
 pub use dictionary::Dictionary;
 pub use document::Document;
 pub use error::PdfError;

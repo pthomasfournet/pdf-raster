@@ -12,6 +12,7 @@ use std::{
 use memmap2::Mmap;
 
 use crate::{
+    decrypt::{self, DecryptGuard},
     dictionary::Dictionary,
     error::PdfError,
     linearization::LinearizationHints,
@@ -51,6 +52,15 @@ pub struct Document {
     page_count_cache: OnceLock<u32>,
     /// Cached linearization hints, parsed lazily on first access.
     lin_hints: OnceLock<Option<LinearizationHints>>,
+    /// Owns the qpdf-decrypted temporary file (if any) so it outlives the
+    /// memory map taken over it.  A no-op guard for documents that were
+    /// not encrypted.  Dropped with the `Document`, unlinking the temp
+    /// plaintext — no leaked decrypted copies.
+    #[expect(
+        dead_code,
+        reason = "lifetime anchor only; Drop unlinks the temp file when the Document is dropped"
+    )]
+    decrypt_guard: DecryptGuard,
 }
 
 /// Memory source: mmap for file paths, Vec<u8> for in-memory use (tests, fuzz).
@@ -74,20 +84,54 @@ impl Document {
     /// Reads and parses only the xref table(s) and trailer.  Individual objects
     /// are parsed on first access and cached for subsequent calls.
     pub fn open(path: &Path) -> Result<Self, PdfError> {
+        Self::open_at(path, DecryptGuard::none())
+    }
+
+    /// Open `path`, transparently qpdf-decrypting first when the document
+    /// is encrypted and `authorized` is `true`.
+    ///
+    /// The decision to authorise decryption is made by the caller (the CLI
+    /// gates it behind an interactive liability waiver / explicit operator
+    /// bypass; the QA harness auto-authorises).  This constructor only
+    /// performs the mechanical decrypt and anchors the resulting temp
+    /// file's lifetime to the returned `Document`.
+    ///
+    /// Unencrypted documents take the original path with no qpdf spawn and
+    /// no temp file — a pure structural trailer check.
+    ///
+    /// # Errors
+    /// - [`PdfError::EncryptedDocument`] when the document is encrypted and
+    ///   `authorized` is `false`, when `qpdf` is absent, or when qpdf
+    ///   cannot decrypt (password-protected).  Never the misleading
+    ///   "document has no pages".
+    pub fn open_decrypting(path: &Path, authorized: bool) -> Result<Self, PdfError> {
+        // Cheap probe: open the original to read the trailer's /Encrypt.
+        // No objects are parsed, so this is the same cost as `open`.
+        let probe = Self::open_at(path, DecryptGuard::none())?;
+        let encrypted = probe.is_encrypted();
+        drop(probe);
+
+        let (source, guard) = decrypt::resolve_source(path, encrypted, authorized)?;
+        Self::open_at(&source, guard)
+    }
+
+    /// Open `path` and take ownership of `guard` (the qpdf temp-file RAII
+    /// anchor, or a no-op guard).
+    fn open_at(path: &Path, guard: DecryptGuard) -> Result<Self, PdfError> {
         let file = std::fs::File::open(path)?;
         crate::madvise::advise_random(&file);
         // SAFETY: we do not mutate the file while it is mapped.
         let mmap = unsafe { Mmap::map(&file)? };
         let data = Arc::new(MmapOrVec::Mapped(mmap));
-        Self::from_bytes(data)
+        Self::from_bytes_with_guard(data, guard)
     }
 
     /// Construct from an in-memory byte slice (used by tests).
     pub fn from_bytes_owned(bytes: Vec<u8>) -> Result<Self, PdfError> {
-        Self::from_bytes(Arc::new(MmapOrVec::Owned(bytes)))
+        Self::from_bytes_with_guard(Arc::new(MmapOrVec::Owned(bytes)), DecryptGuard::none())
     }
 
-    fn from_bytes(data: Arc<MmapOrVec>) -> Result<Self, PdfError> {
+    fn from_bytes_with_guard(data: Arc<MmapOrVec>, guard: DecryptGuard) -> Result<Self, PdfError> {
         let xref = read_xref(data.as_bytes())?;
         Ok(Self {
             data,
@@ -98,6 +142,7 @@ impl Document {
             pages_root_id: OnceLock::new(),
             page_count_cache: OnceLock::new(),
             lin_hints: OnceLock::new(),
+            decrypt_guard: guard,
         })
     }
 
@@ -278,6 +323,17 @@ impl Document {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         self.data.as_bytes()
+    }
+
+    /// True when the trailer carries an `/Encrypt` entry, i.e. the document
+    /// uses the PDF Standard Security Handler.  This is a pure structural
+    /// check — no decryption is attempted and no objects are parsed.
+    ///
+    /// Used to route encrypted documents through the qpdf-assisted decrypt
+    /// preprocess instead of failing with the misleading "no pages".
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        self.xref.trailer.contains_key(b"Encrypt")
     }
 
     /// Return the number of pages in the document.

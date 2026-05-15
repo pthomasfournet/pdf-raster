@@ -120,7 +120,32 @@ impl From<pdf::PdfError> for InterpError {
 /// - [`InterpError::Pdf`] if the file cannot be read or is not a valid PDF.
 /// - [`InterpError::JavaScript`] if any JavaScript entry point is detected.
 pub fn open(path: impl AsRef<Path>) -> Result<Document, InterpError> {
-    let doc = Document::open(path.as_ref())?;
+    open_decrypting(path, false)
+}
+
+/// Open a PDF, transparently qpdf-decrypting it first when it is encrypted
+/// and `decrypt_authorized` is `true`.
+///
+/// `decrypt_authorized` MUST reflect a deliberate caller decision — the
+/// CLI gates it behind an interactive private-copy / liability waiver or
+/// an explicit operator bypass; the private QA harness auto-authorises.
+/// When the document is encrypted and `decrypt_authorized` is `false`,
+/// this returns [`InterpError::Pdf`] wrapping
+/// [`pdf::PdfError::EncryptedDocument`] with an accurate, actionable
+/// message — never the misleading "document has no pages".
+///
+/// Unencrypted documents take the fast path: no qpdf spawn, no temp file.
+///
+/// # Errors
+/// - [`InterpError::Pdf`] if the file cannot be read, is not a valid PDF,
+///   or is encrypted and could not be (or was not authorised to be)
+///   decrypted.
+/// - [`InterpError::JavaScript`] if any JavaScript entry point is detected.
+pub fn open_decrypting(
+    path: impl AsRef<Path>,
+    decrypt_authorized: bool,
+) -> Result<Document, InterpError> {
+    let doc = Document::open_decrypting(path.as_ref(), decrypt_authorized)?;
     reject_javascript(&doc)?;
     Ok(doc)
 }

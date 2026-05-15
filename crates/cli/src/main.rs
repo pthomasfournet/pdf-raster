@@ -1,4 +1,5 @@
 mod args;
+mod decrypt_gate;
 mod diagnostics;
 mod naming;
 mod ram;
@@ -46,10 +47,28 @@ fn main() {
         std::process::exit(1);
     });
 
-    let session_config = args.session_config().unwrap_or_else(|e| {
+    let mut session_config = args.session_config().unwrap_or_else(|e| {
         eprintln!("rrocket: {e}");
         std::process::exit(1);
     });
+
+    // Encrypted-document liability gate (production/CLI path only). Probe
+    // the input cheaply; only an encrypted document triggers the gate, so
+    // unencrypted documents pay zero cost and see no prompt. `-` (stdin)
+    // cannot be probed and is treated as unencrypted — an encrypted stdin
+    // stream surfaces the clear EncryptedDocument error from open_session
+    // below, never a silent strip.
+    if args.input != "-" && pdf_raster::is_encrypted(std::path::Path::new(&args.input)) {
+        // Never silently strip in production: require an explicit decision.
+        let authorized = decrypt_gate::prompt_decrypt(args.decrypt_owned);
+        if !authorized {
+            // Abort with the accurate, actionable error — not the
+            // misleading "document has no pages", not a silent strip.
+            eprintln!("rrocket: {}", pdf_raster::decrypt_gate_declined_message());
+            std::process::exit(1);
+        }
+        session_config.decrypt_authorized = true;
+    }
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.num_threads)

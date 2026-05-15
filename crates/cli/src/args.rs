@@ -170,6 +170,21 @@ pub struct Args {
     #[arg(long = "upw", value_name = "PASSWORD")]
     pub user_password: Option<String>,
 
+    // ── Encrypted-document decryption ────────────────────────────────────────
+    /// Authorise qpdf-assisted decryption of an encrypted (PDF Standard
+    /// Security Handler) document without the interactive liability
+    /// confirmation.
+    ///
+    /// Intended SOLELY for documents you own or are otherwise legally
+    /// entitled to access.  Setting this (or the `RROCKET_DECRYPT_OWNED=1`
+    /// environment variable) affirms you have the lawful right to decrypt
+    /// the document.  Without it, an encrypted document triggers an
+    /// interactive private-copy / liability prompt (default: no); a
+    /// non-interactive run with neither set aborts with a clear error
+    /// rather than silently stripping protection.
+    #[arg(long = "decrypt-owned")]
+    pub decrypt_owned: bool,
+
     // ── Parallelism ──────────────────────────────────────────────────────────
     /// Number of threads (0 = auto-detect).
     #[arg(long = "threads", value_name = "N", default_value_t = 0)]
