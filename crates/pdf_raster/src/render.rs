@@ -673,9 +673,12 @@ fn render_page_rgb_with_geom(
     renderer.set_image_cache(session.image_cache.as_ref().map(Arc::clone), session.doc_id);
 
     lend_decoders(session, &mut renderer, effective_policy)?;
-    renderer.execute(&ops);
-    renderer.render_annotations(page_id);
-    reclaim_decoders(&mut renderer);
+    // RAII guard: reclaim_decoders runs on both normal return and unwind.
+    // Drop releases the &mut borrow, so `renderer` is usable directly below.
+    let guard = DecoderReclaim(&mut renderer);
+    guard.0.execute(&ops);
+    guard.0.render_annotations(page_id);
+    drop(guard); // reclaim happens here — exactly once on success path
 
     if !renderer.decode_errors().is_empty() {
         return Err(RasterError::ImageDecodeFailed(
@@ -866,6 +869,28 @@ fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
             *slot = renderer.take_nvjpeg2k();
         }
     });
+}
+
+// ── RAII guard: return decoder handles to TLS even on unwind ─────────────────
+
+/// RAII guard that calls [`reclaim_decoders`] when dropped.
+///
+/// `lend_decoders` moves per-thread GPU decoder handles out of TLS into
+/// the `PageRenderer`. If `execute` or `render_annotations` panics under
+/// `panic=unwind` (test builds or unwind-configured embedders), the stack
+/// unwind triggers this guard's `Drop`, returning the handles to TLS rather
+/// than dropping them. Subsequent pages on the same Rayon worker thread then
+/// continue to find their decoder slots populated.
+///
+/// On the success path, `drop(guard)` is called explicitly — the `&mut`
+/// borrow is released and `renderer` is accessible directly for the
+/// `decode_errors()`/`finish()` tail. Reclaim runs exactly once either way.
+struct DecoderReclaim<'r, 'doc>(&'r mut pdf_interp::renderer::PageRenderer<'doc>);
+
+impl Drop for DecoderReclaim<'_, '_> {
+    fn drop(&mut self) {
+        reclaim_decoders(self.0);
+    }
 }
 
 // ── Sequential iterator ───────────────────────────────────────────────────────
@@ -1515,5 +1540,91 @@ mod channel_tests {
             );
         }
         assert_eq!(yielded, vec![1, u32::MAX]);
+    }
+}
+
+#[cfg(test)]
+mod decoder_reclaim_guard_tests {
+    use std::cell::Cell;
+
+    // ── Stand-in for PageRenderer ─────────────────────────────────────────────
+    //
+    // Wiring a real PageRenderer into a unit test requires a parsed PDF
+    // document, which is too heavy.  Instead we verify the RAII contract with a
+    // minimal stand-in that records whether reclaim was called and how many
+    // times — proving the guard's Drop semantics without exercising the actual
+    // GPU decoder logic.
+
+    thread_local! {
+        static RECLAIM_COUNT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    struct FakeRenderer;
+
+    fn fake_reclaim(_r: &mut FakeRenderer) {
+        RECLAIM_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    // Mirror of DecoderReclaim but parameterised on FakeRenderer so we can
+    // test the exact Drop-calls-reclaim contract without touching GPU state.
+    struct FakeGuard<'r>(&'r mut FakeRenderer);
+
+    impl Drop for FakeGuard<'_> {
+        fn drop(&mut self) {
+            fake_reclaim(self.0);
+        }
+    }
+
+    fn reset() {
+        RECLAIM_COUNT.with(|c| c.set(0));
+    }
+
+    fn count() -> u32 {
+        RECLAIM_COUNT.with(|c| c.get())
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn reclaim_called_exactly_once_on_normal_exit() {
+        reset();
+        let mut r = FakeRenderer;
+        {
+            let guard = FakeGuard(&mut r);
+            drop(guard); // explicit drop — mirrors the success path in render_page_rgb_with_geom
+        }
+        assert_eq!(
+            count(),
+            1,
+            "reclaim must be called exactly once on success path"
+        );
+    }
+
+    #[test]
+    fn reclaim_called_exactly_once_on_unwind() {
+        reset();
+        let mut r = FakeRenderer;
+        // Catch the panic so the test harness doesn't see it as a failure.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = FakeGuard(&mut r);
+            panic!("synthetic mid-page panic");
+        }));
+        assert!(result.is_err(), "catch_unwind must see the panic");
+        assert_eq!(count(), 1, "reclaim must be called exactly once on unwind");
+    }
+
+    #[test]
+    fn reclaim_not_called_twice_if_dropped_explicitly_then_scope_ends() {
+        // Regression guard: explicit drop(guard) + end-of-scope must NOT
+        // double-reclaim.  After drop(guard) the guard value is gone;
+        // the scope ending has nothing left to drop.
+        reset();
+        let mut r = FakeRenderer;
+        let guard = FakeGuard(&mut r);
+        drop(guard);
+        // `r` is usable again here — borrow was released — mirrors the
+        // decode_errors()/finish() tail in render_page_rgb_with_geom.
+        let _ = &r;
+        assert_eq!(count(), 1, "must not double-reclaim after explicit drop");
     }
 }
