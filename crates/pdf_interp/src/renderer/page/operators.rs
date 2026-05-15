@@ -45,7 +45,10 @@ impl PageRenderer<'_> {
 
             Operator::ConcatMatrix(m) => {
                 let old = self.gstate.current().ctm;
-                self.gstate.current_mut().ctm = ctm_multiply(&old, m);
+                // PDF §8.3.4: `cm M` sets new_CTM = M × old_CTM.  The argument
+                // matrix M maps the new user space to the old user space; the old
+                // CTM then maps old user space to device space.
+                self.gstate.current_mut().ctm = ctm_multiply(m, &old);
             }
 
             Operator::SetLineWidth(w) => self.gstate.current_mut().line_width = *w,
