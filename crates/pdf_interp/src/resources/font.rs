@@ -504,7 +504,7 @@ fn resolve_type0_font(doc: &Document, dict: &Dictionary) -> FontDescriptor {
     // 5. CIDFont metrics: DW and W.
     let (default_width, widths) = descendant
         .as_ref()
-        .map_or((1000, vec![]), extract_cid_widths);
+        .map_or((1000, vec![]), |d| extract_cid_widths(doc, d));
 
     // 6. Determine font kind from CIDFont Subtype.
     let kind = descendant
@@ -813,10 +813,21 @@ fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32
 /// Returns `(default_width, segments)` where segments match the PDF `W` format:
 /// `[first_cid, [w0, w1, …]]` (the `c [w...]` variant only; the `c1 c2 w`
 /// range variant is also handled).
-fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
-    let dw = dict.get_i64(b"DW").map_or(1000, pdf_width_to_i32);
+fn extract_cid_widths(doc: &Document, dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
+    // `DW`/`W` may be indirect references; MuPDF's `pdf_dict_get` resolves them
+    // transparently (source_pdf/pdf-font.c load_cid_font), so we must too — an
+    // unresolved `/W 119 0 R` would otherwise drop every per-CID width and make
+    // all glyphs advance by `DW` (1000/em), spreading text far too wide.
+    let dw = dict
+        .get(b"DW")
+        .and_then(|o| doc.resolve(o).ok())
+        .and_then(|o| o.as_i64())
+        .map_or(1000, pdf_width_to_i32);
 
-    let Some(w_arr) = dict.get(b"W").and_then(Object::as_array) else {
+    let Some(w_obj) = dict.get(b"W").and_then(|o| doc.resolve(o).ok()) else {
+        return (dw, vec![]);
+    };
+    let Some(w_arr) = w_obj.as_array() else {
         return (dw, vec![]);
     };
 
@@ -824,8 +835,9 @@ fn extract_cid_widths(dict: &Dictionary) -> (i32, Vec<(u32, Vec<i32>)>) {
     let mut i = 0;
 
     while i < w_arr.len() {
-        // Each segment starts with a non-negative CID integer.
-        let Some(first_cid_raw) = w_arr[i].as_i64() else {
+        // Each segment starts with a non-negative CID integer (may be indirect).
+        let first_elem = doc.resolve(&w_arr[i]).ok();
+        let Some(first_cid_raw) = first_elem.as_ref().and_then(|o| o.as_i64()) else {
             i += 1;
             continue;
         };
@@ -1106,7 +1118,60 @@ mod tests {
         );
     }
 
-    use crate::test_helpers::empty_doc;
+    use crate::test_helpers::{empty_doc, make_doc_with_object};
+
+    #[test]
+    fn cid_widths_resolve_indirect_w_array() {
+        // Real-world CIDFonts (Word/Acrobat output) emit `/W` as an indirect
+        // reference (`/W 119 0 R`).  PDF §9.7.4.3: the value is a (possibly
+        // indirect) array.  MuPDF reads it via `pdf_dict_get` which resolves
+        // references transparently (source_pdf/pdf-font.c:1266).  Without
+        // resolving, every per-CID width is dropped and all glyphs advance by
+        // `DW` (1000/em), piling text into an unreadable scramble.
+        let doc = make_doc_with_object("[ 3 3 250 5 [ 500 600 ] ]");
+        let dict = make_dict(&[
+            (b"DW", Object::Integer(1000)),
+            (b"W", Object::Reference((2, 0))),
+        ]);
+        let (dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(dw, 1000);
+        // `3 3 250` (range form) → CID 3 width 250; `5 [500 600]` → CIDs 5,6.
+        assert_eq!(segs, vec![(3, vec![250]), (5, vec![500, 600])]);
+    }
+
+    #[test]
+    fn cid_widths_resolve_indirect_dw() {
+        // `/DW` may also be an indirect reference; it must resolve too, else
+        // the default advance silently falls back to the 1000 hardcoded
+        // default instead of the document's intended em width.
+        let doc = make_doc_with_object("742");
+        let dict = make_dict(&[(b"DW", Object::Reference((2, 0)))]);
+        let (dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(dw, 742);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn cid_widths_inline_w_array_unaffected() {
+        // Inline (non-reference) `/W` arrays — the case for already-passing
+        // CID PDFs — must keep working: `doc.resolve` is a transparent
+        // pass-through for a non-reference Object, so this proves the indirect
+        // fix does not regress the inline path.
+        let doc = empty_doc();
+        let dict = make_dict(&[
+            (b"DW", Object::Integer(500)),
+            (
+                b"W",
+                Object::Array(vec![
+                    Object::Integer(10),
+                    Object::Array(vec![Object::Integer(333), Object::Integer(444)]),
+                ]),
+            ),
+        ]);
+        let (dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(dw, 500);
+        assert_eq!(segs, vec![(10, vec![333, 444])]);
+    }
 
     #[test]
     fn no_embedded_bytes_returns_none() {

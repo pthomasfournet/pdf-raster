@@ -85,6 +85,34 @@ pub fn make_doc_with_stream(stream_bytes: &[u8], dict_extras: &str) -> Document 
     Document::from_bytes_owned(bytes).expect("test PDF with stream parse")
 }
 
+/// Build a minimal valid PDF whose object `(2, 0)` is the verbatim
+/// `obj2_body` (e.g. an array literal `[ 3 3 250 ]`).  Returned alongside is
+/// nothing — callers fetch `(2, 0)` via [`Document::get_object`] or build a
+/// dictionary that references it (`Object::Reference((2, 0))`) and resolve it
+/// through [`Document::resolve`].
+///
+/// Object layout:
+/// - `1 0 obj` — Catalog with `/Pages 3 0 R`
+/// - `2 0 obj` — the caller's body, written verbatim
+/// - `3 0 obj` — empty Pages tree
+pub fn make_doc_with_object(obj2_body: &str) -> Document {
+    let header = "%PDF-1.4\n";
+    let obj1 = "1 0 obj\n<</Type /Catalog /Pages 3 0 R>>\nendobj\n";
+    let obj2 = format!("2 0 obj\n{obj2_body}\nendobj\n");
+    let obj3 = "3 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n";
+    let off1 = header.len();
+    let off2 = off1 + obj1.len();
+    let off3 = off2 + obj2.len();
+    let xref_start = off3 + obj3.len();
+    let xref = format!(
+        "xref\n0 4\n0000000000 65535 f\r\n\
+         {off1:010} 00000 n\r\n{off2:010} 00000 n\r\n{off3:010} 00000 n\r\n"
+    );
+    let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+    let bytes = format!("{header}{obj1}{obj2}{obj3}{xref}{trailer}").into_bytes();
+    Document::from_bytes_owned(bytes).expect("test PDF with object parse")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
