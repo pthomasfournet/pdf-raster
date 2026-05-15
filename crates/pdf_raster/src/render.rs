@@ -58,6 +58,17 @@ pub enum RasterError {
     /// One or more images on the page failed to decode; the rendered page is
     /// incomplete.  Carries the per-image failure messages.
     ImageDecodeFailed(Vec<String>),
+    /// The per-page render function panicked.
+    ///
+    /// Caught only under `panic = "unwind"` builds (e.g. test profiles).
+    /// Under the crate's default `panic = "abort"` release profile the panic
+    /// aborts the process before this variant can be constructed.
+    RenderPanic {
+        /// The 1-based page number that panicked.
+        page: u32,
+        /// The panic message extracted from the payload, if available.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for RasterError {
@@ -85,6 +96,9 @@ impl std::fmt::Display for RasterError {
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
             Self::BackendUnavailable(msg) => write!(f, "backend unavailable: {msg}"),
             Self::ImageDecodeFailed(v) => write!(f, "image decode failed: {}", v.join("; ")),
+            Self::RenderPanic { page, message } => {
+                write!(f, "page {page} render panicked: {message}")
+            }
         }
     }
 }
@@ -977,6 +991,69 @@ impl std::iter::FusedIterator for PageIter {}
 
 // ── Channel-based render ──────────────────────────────────────────────────────
 
+/// Catch a panic from a render closure and convert it to `RasterError::RenderPanic`.
+///
+/// Under `panic = "abort"` (the default release profile) `catch_unwind` is a
+/// no-op: a panicking page still aborts the process.  Under `panic = "unwind"`
+/// (test builds, and any embedder that opts in) the panic is caught and
+/// returned as a per-page error so the render loop can continue.
+///
+/// Extracted as a generic helper so the panic-catch logic can be unit-tested
+/// by injecting an arbitrary render function.
+fn catch_page_panic<F>(page_num: u32, f: F) -> (u32, Result<RenderedPage, RasterError>)
+where
+    F: FnOnce() -> Result<RenderedPage, RasterError> + std::panic::UnwindSafe,
+{
+    let result = std::panic::catch_unwind(f);
+    let outcome = match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let message = payload.downcast_ref::<&str>().map_or_else(
+                || {
+                    payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_else(|| "panicked".to_owned())
+                },
+                |s| (*s).to_owned(),
+            );
+            Err(RasterError::RenderPanic {
+                page: page_num,
+                message,
+            })
+        }
+    };
+    (page_num, outcome)
+}
+
+/// Render one page, mapping any panic to `Err(RasterError::RenderPanic)`.
+///
+/// # `AssertUnwindSafe` justification
+///
+/// `render_one` receives a shared `&RenderState` and does not mutate any field
+/// of the struct itself — `session`, `opts`, and `cursor` are all read-only
+/// within `render_one`.  The only interior mutation that occurs is in
+/// `lend_decoders`/`reclaim_decoders`, which move GPU decoder handles out of
+/// thread-local storage into a locally-owned `PageRenderer` and back.  If a
+/// panic occurs between those two calls the decoder handle is dropped rather
+/// than returned to TLS, causing subsequent pages on that Rayon worker to fall
+/// back to CPU decode for the decoder type that was lost.  This is a decoder-
+/// loss degradation, not a memory-safety issue, and does not corrupt any state
+/// shared with other pages.  Crucially, if a panic occurs, we do not attempt
+/// to reuse the panicking page's local state — we discard it and move on to
+/// the next page number.  `AssertUnwindSafe` is therefore sound: a panic
+/// cannot leave `state` in an inconsistent state that would corrupt subsequent
+/// pages.
+fn render_one_caught(
+    state: &RenderState,
+    page_num: u32,
+) -> (u32, Result<RenderedPage, RasterError>) {
+    catch_page_panic(
+        page_num,
+        std::panic::AssertUnwindSafe(|| render_one(state, page_num)),
+    )
+}
+
 #[must_use]
 pub fn render_channel(
     path: &std::path::Path,
@@ -1012,8 +1089,8 @@ pub fn render_channel(
         };
 
         while let Some(page_num) = state.next_in_range() {
-            let result = render_one(&state, page_num);
-            if tx.send((page_num, result)).is_err() {
+            let item = render_one_caught(&state, page_num);
+            if tx.send(item).is_err() {
                 return;
             }
         }
@@ -1274,6 +1351,92 @@ mod channel_tests {
         assert!(
             validate_opts(&opts).is_none(),
             "zero first/last_page must be accepted when pages=Some"
+        );
+    }
+
+    // ── panic-contract tests ──────────────────────────────────────────────
+    //
+    // These tests exercise `catch_page_panic` directly by injecting a
+    // panicking (or ok-returning) closure.  Test builds use panic=unwind, so
+    // catch_unwind is effective here even though the release profile uses
+    // panic=abort.  This proves the catch→(page,Err)→continue semantics
+    // that render_one_caught relies on.
+
+    #[test]
+    fn catch_page_panic_maps_panic_to_render_panic_variant() {
+        // A closure that panics with a known message must arrive as
+        // (page_num, Err(RasterError::RenderPanic { page, message })).
+        let (pn, res) = catch_page_panic(7u32, || -> Result<RenderedPage, RasterError> {
+            panic!("boom from page 7");
+        });
+        assert_eq!(pn, 7, "page number must be preserved through the catch");
+        match res {
+            Err(RasterError::RenderPanic { page, message }) => {
+                assert_eq!(page, 7);
+                assert!(
+                    message.contains("boom from page 7"),
+                    "panic message should be forwarded; got: {message:?}"
+                );
+            }
+            other => panic!("expected RenderPanic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catch_page_panic_ok_path_is_transparent() {
+        // A non-panicking closure must pass through unchanged.
+        let dummy = RenderedPage {
+            page_num: 3,
+            width: 1,
+            height: 1,
+            pixels: vec![128u8],
+            dpi: 72.0,
+            effective_dpi: 72.0,
+            diagnostics: Default::default(),
+        };
+        let (pn, res) = catch_page_panic(3u32, move || -> Result<RenderedPage, RasterError> {
+            Ok(dummy)
+        });
+        assert_eq!(pn, 3);
+        assert!(res.is_ok(), "ok path must not be disturbed; got {res:?}");
+    }
+
+    #[test]
+    fn catch_page_panic_loop_continues_after_panic() {
+        // Simulate the render loop: two pages where page 1 panics, page 2
+        // succeeds.  The consumer must receive (1, Err) then (2, Ok).
+        let pages: &[(u32, bool)] = &[(1, true), (2, false)]; // (page_num, should_panic)
+        let mut results = Vec::new();
+        for &(page_num, should_panic) in pages {
+            let item = catch_page_panic(page_num, move || -> Result<RenderedPage, RasterError> {
+                if should_panic {
+                    panic!("synthetic panic on page {page_num}");
+                }
+                Ok(RenderedPage {
+                    page_num,
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0u8],
+                    dpi: 72.0,
+                    effective_dpi: 72.0,
+                    diagnostics: Default::default(),
+                })
+            });
+            results.push(item);
+        }
+        // Page 1 must be (1, Err(RenderPanic))
+        assert_eq!(results[0].0, 1);
+        assert!(
+            matches!(results[0].1, Err(RasterError::RenderPanic { page: 1, .. })),
+            "page 1 must be RenderPanic; got {:?}",
+            results[0].1
+        );
+        // Page 2 must be (2, Ok(_)) — loop continued past the panic
+        assert_eq!(results[1].0, 2);
+        assert!(
+            results[1].1.is_ok(),
+            "page 2 must succeed; got {:?}",
+            results[1].1
         );
     }
 

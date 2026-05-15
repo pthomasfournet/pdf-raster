@@ -574,6 +574,12 @@ pub struct RenderedPage {
 /// - [`RasterError::BackendUnavailable`] — `PDF_RASTER_BACKEND` requested a
 ///   forced backend (e.g. `cuda`, `vulkan`) and that backend's runtime
 ///   is unavailable.  Cannot occur if the env var is unset or `auto`.
+///
+/// Per-page render errors are yielded as `(page_num, Err(...))` and the
+/// iterator advances to the next page.  If the renderer panics on a page,
+/// the panic propagates out of `Iterator::next` — this iterator does not
+/// catch panics.  Use [`render_channel`] for panic-isolated delivery under
+/// `panic = "unwind"` builds.
 pub fn raster_pdf(
     path: &Path,
     opts: &RasterOptions,
@@ -599,7 +605,15 @@ pub fn raster_pdf(
 /// - Forced backend unavailable (e.g. `PDF_RASTER_BACKEND=cuda` with no
 ///   CUDA driver) → `(1, Err(RasterError::BackendUnavailable(...)))`,
 ///   channel closes.
-/// - Per-page failures → `(page_num, Err(...))`, rendering of subsequent pages continues.
+/// - Per-page render errors → `(page_num, Err(...))`, rendering of
+///   subsequent pages continues.
+/// - Per-page panics → delivered as `(page_num, Err(RasterError::RenderPanic
+///   { .. }))` and rendering continues, **but only under `panic = "unwind"`
+///   builds** (test profiles, and embedders that override the panic strategy).
+///   Under the crate's default `panic = "abort"` release profile a panicking
+///   page aborts the entire process before any recovery is possible.
+///   Panic-freedom on the supported corpus is pursued by hardening the
+///   renderer to return errors rather than panicking.
 #[must_use]
 pub fn render_channel(
     path: &Path,
