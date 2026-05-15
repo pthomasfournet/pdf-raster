@@ -361,9 +361,23 @@ impl Document {
             Some(obj) => obj.clone(),
         };
 
-        // /Contents may be a single reference or an array of references.
+        // /Contents (ISO 32000-2 §7.7.3.3) is either a single content stream
+        // or an array of streams whose decoded bytes are concatenated.  Either
+        // form may itself be reached through an indirect reference, so a
+        // reference can resolve to a *stream* OR to an *array of stream
+        // references* — modern producers (LibreOffice, many imposition tools)
+        // emit `/Contents N 0 R` where object N is `[a 0 R b 0 R c 0 R]`.
+        // The previous code treated such a reference as a single stream;
+        // `get_object` returned the Array, the `Object::Stream` match failed,
+        // and the page rendered blank.  Resolve one indirection level so a
+        // ref-to-array expands into its element references.
         let refs: Vec<ObjectId> = match &contents {
-            Object::Reference(id) => vec![*id],
+            Object::Reference(id) => match self.get_object(*id)?.as_ref() {
+                Object::Array(arr) => arr.iter().filter_map(Object::as_reference).collect(),
+                // Stream (or anything else): keep the single ref; the decode
+                // loop below filters non-streams.
+                _ => vec![*id],
+            },
             Object::Array(arr) => arr.iter().filter_map(Object::as_reference).collect(),
             _ => return Ok(Vec::new()),
         };
@@ -799,5 +813,69 @@ startxref\n180\n%%EOF"
             }
             other => panic!("expected InObjStm entry for obj 1, got {other:?}"),
         }
+    }
+
+    /// Regression: a page whose `/Contents` is an *indirect reference to an
+    /// array* of content-stream references (legal per ISO 32000-2 §7.7.3.3;
+    /// emitted by LibreOffice and many imposition tools).  The pre-fix code
+    /// dereferenced the single ref, found an `Object::Array` instead of an
+    /// `Object::Stream`, skipped it, and returned an empty content buffer —
+    /// every glyph-bearing page rendered pure white.  This asserts the array
+    /// is expanded and all member streams are concatenated.
+    #[test]
+    fn get_page_content_contents_ref_to_array() {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n";
+        // /Contents is a single indirect reference (obj 5), NOT an inline array.
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R /Contents 5 0 R \
+                    /MediaBox [0 0 612 792]>>\nendobj\n";
+        // obj 5 resolves to an ARRAY of two content-stream references.
+        let obj5 = "5 0 obj\n[6 0 R 7 0 R]\nendobj\n";
+        let s6 = "q\n";
+        let obj6 = format!(
+            "6 0 obj\n<</Length {}>>\nstream\n{s6}\nendstream\nendobj\n",
+            s6.len()
+        );
+        let s7 = "BT ET\n";
+        let obj7 = format!(
+            "7 0 obj\n<</Length {}>>\nstream\n{s7}\nendstream\nendobj\n",
+            s7.len()
+        );
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        // obj 4 is unused; reserve a free slot so xref indices stay simple.
+        let off5 = off3 + obj3.len();
+        let off6 = off5 + obj5.len();
+        let off7 = off6 + obj6.len();
+        let xref_start = off7 + obj7.len();
+        let xref = format!(
+            "xref\n0 8\n0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n{off2:010} 00000 n\r\n\
+             {off3:010} 00000 n\r\n0000000000 65535 f\r\n\
+             {off5:010} 00000 n\r\n{off6:010} 00000 n\r\n{off7:010} 00000 n\r\n"
+        );
+        let trailer = format!("trailer\n<</Size 8 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes =
+            format!("{header}{obj1}{obj2}{obj3}{obj5}{obj6}{obj7}{xref}{trailer}").into_bytes();
+
+        let doc = Document::from_bytes_owned(bytes).expect("contents-ref-to-array PDF");
+        let page_id = doc.get_pages().next().expect("one page").1;
+        let content = doc.get_page_content(page_id).expect("page content");
+        // Both member streams must be present, concatenated with a separator.
+        assert!(
+            !content.is_empty(),
+            "ref-to-array /Contents must not yield empty content (the blank-page bug)"
+        );
+        let text = String::from_utf8_lossy(&content);
+        assert!(
+            text.contains("q"),
+            "first content stream (obj 6) missing: {text:?}"
+        );
+        assert!(
+            text.contains("BT ET"),
+            "second content stream (obj 7) missing: {text:?}"
+        );
     }
 }
