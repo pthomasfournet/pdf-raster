@@ -55,6 +55,9 @@ pub enum RasterError {
     InvalidPageGeometry(String),
     /// A backend was required via [`BackendPolicy`] but could not be initialised.
     BackendUnavailable(String),
+    /// One or more images on the page failed to decode; the rendered page is
+    /// incomplete.  Carries the per-image failure messages.
+    ImageDecodeFailed(Vec<String>),
 }
 
 impl std::fmt::Display for RasterError {
@@ -81,6 +84,7 @@ impl std::fmt::Display for RasterError {
             Self::Deskew(msg) => write!(f, "deskew failed: {msg}"),
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
             Self::BackendUnavailable(msg) => write!(f, "backend unavailable: {msg}"),
+            Self::ImageDecodeFailed(v) => write!(f, "image decode failed: {}", v.join("; ")),
         }
     }
 }
@@ -656,6 +660,12 @@ fn render_page_rgb_with_geom(
     renderer.execute(&ops);
     renderer.render_annotations(page_id);
     reclaim_decoders(&mut renderer);
+
+    if !renderer.decode_errors().is_empty() {
+        return Err(RasterError::ImageDecodeFailed(
+            renderer.decode_errors().to_vec(),
+        ));
+    }
 
     Ok(renderer.finish())
 }

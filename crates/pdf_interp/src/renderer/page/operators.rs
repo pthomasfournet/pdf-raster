@@ -367,7 +367,11 @@ impl PageRenderer<'_> {
                 if let Some(img) = decoded {
                     self.blit_image(&img);
                 } else {
-                    log::warn!("rasterrocket-interp: inline image decode failed — skipping");
+                    // Inline image data is present by definition — None here is a
+                    // genuine decode failure, not an absent resource.
+                    log::debug!("rasterrocket-interp: inline image decode failed");
+                    self.decode_errors
+                        .push("inline image: decode failed".to_owned());
                 }
             }
             Operator::PaintShading(name) => {

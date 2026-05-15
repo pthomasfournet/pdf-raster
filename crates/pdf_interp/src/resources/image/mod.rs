@@ -192,6 +192,22 @@ pub mod fuzz_entry {
     }
 }
 
+// ── Resolution tri-state ─────────────────────────────────────────────────────
+
+/// Outcome of [`resolve_image`]: distinguishes a genuine decode failure from a
+/// legitimately-absent resource so callers can surface errors rather than silently
+/// rendering a blank region.
+pub enum ImageResolution {
+    /// Image decoded successfully.
+    Ok(ImageDescriptor),
+    /// The codec returned `None` or the stream was structurally invalid.  The
+    /// page is incomplete; the message should be surfaced to the caller.
+    DecodeFailed(String),
+    /// The named resource is not an image (wrong `Subtype`, not present in the
+    /// `XObject` dict, etc.).  The renderer should skip silently — nothing to draw.
+    Absent,
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Colour space of the decoded image pixels.
@@ -362,11 +378,12 @@ pub struct ImageDescriptor {
 /// Look up a named `XObject` in the page resource dictionary and, if it is an
 /// image, decode and return its pixels.
 ///
-/// Returns `None` if:
-/// - the name is not present in the `XObject` resource dict,
-/// - the object is not an image (`Subtype != Image`),
-/// - the filter is unsupported (a warning is logged), or
-/// - any decoding error occurs.
+/// Returns:
+/// - [`ImageResolution::Ok`] on success,
+/// - [`ImageResolution::Absent`] if the name is not present or the object is not
+///   an image (legitimately nothing to draw — skip silently),
+/// - [`ImageResolution::DecodeFailed`] when the codec returns `None` or the stream
+///   is structurally invalid (genuine failure — surface to the caller).
 #[must_use]
 #[expect(
     clippy::too_many_lines,
@@ -405,26 +422,42 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
     #[cfg(feature = "gpu-icc")] clut_cache: Option<&mut IccClutCache>,
     #[cfg(feature = "cache")] image_cache: Option<&std::sync::Arc<gpu::cache::DeviceImageCache>>,
     #[cfg(feature = "cache")] doc_id: Option<gpu::cache::DocId>,
-) -> Option<ImageDescriptor> {
+) -> ImageResolution {
     use codecs::{decode_ccitt, decode_dct, decode_jbig2, decode_jpx};
     use raw::decode_raw;
     use smask::decode_smask;
 
-    let stream_id = xobject_id(doc, page_dict, name)?;
+    let Some(stream_id) = xobject_id(doc, page_dict, name) else {
+        return ImageResolution::Absent;
+    };
     // Bind the Arc to a local so the borrow into the stream below stays alive.
-    let obj_arc = doc.get_object(stream_id).ok()?;
-    let stream = obj_arc.as_ref().as_stream()?;
+    let Some(obj_arc) = doc.get_object(stream_id).ok() else {
+        return ImageResolution::Absent;
+    };
+    let Some(stream) = obj_arc.as_ref().as_stream() else {
+        return ImageResolution::Absent;
+    };
 
     // Must be an Image subtype.
-    if stream.dict.get_name(b"Subtype")? != b"Image" {
-        return None;
+    let Some(subtype) = stream.dict.get_name(b"Subtype") else {
+        return ImageResolution::Absent;
+    };
+    if subtype != b"Image" {
+        return ImageResolution::Absent;
     }
 
-    let w_raw = stream.dict.get_i64(b"Width")?;
-    let h_raw = stream.dict.get_i64(b"Height")?;
+    let Some(w_raw) = stream.dict.get_i64(b"Width") else {
+        return ImageResolution::Absent;
+    };
+    let Some(h_raw) = stream.dict.get_i64(b"Height") else {
+        return ImageResolution::Absent;
+    };
     let Some((w, h)) = validated_dims(w_raw, h_raw) else {
         log::warn!("image: degenerate dimensions {w_raw}×{h_raw}, skipping");
-        return None;
+        return ImageResolution::DecodeFailed(format!(
+            "image /{}: invalid dimensions {w_raw}×{h_raw}",
+            String::from_utf8_lossy(name)
+        ));
     };
 
     let is_mask = stream.dict.get_bool(b"ImageMask").unwrap_or(false);
@@ -433,7 +466,7 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
 
     let img_filter = ImageFilter::from_filter_str(filter.as_deref());
 
-    let mut img = match filter.as_deref() {
+    let opt_img: Option<ImageDescriptor> = match filter.as_deref() {
         None => decode_raw(
             doc,
             stream.content.as_slice(),
@@ -461,7 +494,7 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
             ),
             Err(e) => {
                 log::warn!("image: FlateDecode decompression failed: {e}");
-                None
+                return ImageResolution::DecodeFailed(format!("FlateDecode: {e}"));
             }
         },
         Some("CCITTFaxDecode") => {
@@ -505,9 +538,20 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
         }
         Some(other) => {
             log::warn!("image: unknown filter {other:?}");
-            None
+            return ImageResolution::DecodeFailed(format!("unsupported filter {other:?}"));
         }
-    }?;
+    };
+
+    let Some(mut img) = opt_img else {
+        let codec = match filter.as_deref() {
+            Some("CCITTFaxDecode") => "CCITTFaxDecode decode failed",
+            Some("DCTDecode") => "DCTDecode decode failed",
+            Some("JPXDecode") => "JPXDecode decode failed",
+            Some("JBIG2Decode") => "JBIG2Decode decode failed",
+            _ => "raw/unfiltered decode failed",
+        };
+        return ImageResolution::DecodeFailed(codec.to_owned());
+    };
     img.filter = img_filter;
 
     // Resolve and decode the soft mask (`SMask`), if present.
@@ -515,16 +559,17 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
         if let Some(alpha) = decode_smask(doc, *smask_id, img.width, img.height) {
             img.smask = Some(alpha);
         } else {
-            // `SMask` is present but could not be decoded.  Blitting without a
-            // mask would paint the image's colour over a large area it should not
-            // cover (e.g. a solid-colour overlay that is transparent everywhere
-            // the mask is zero).  Skip the image instead.
-            log::warn!("image: skipping image — SMask (object {smask_id:?}) could not be decoded");
-            return None;
+            // SMask decode failed.  Treat as a soft skip: the base image pixels
+            // are valid so we return them without a mask rather than propagating
+            // an error — an SMask failure should not discard an otherwise-correct
+            // image from the page.  The renderer will blit the image fully opaque.
+            log::warn!(
+                "image: SMask (object {smask_id:?}) could not be decoded — blitting image without mask"
+            );
         }
     }
 
-    Some(img)
+    ImageResolution::Ok(img)
 }
 
 // ── Colour space convenience wrapper ─────────────────────────────────────────

@@ -32,7 +32,10 @@ pub use font::{FontDescriptor, PdfFontKind, resolve_font};
 /// then pass to the page renderer's `set_nvjpeg` configuration entry point.
 #[cfg(feature = "nvjpeg")]
 pub use gpu::nvjpeg::NvJpegDecoder;
-pub use image::{IMAGE_FILTER_COUNT, ImageColorSpace, ImageDescriptor, ImageFilter, resolve_image};
+pub use image::{
+    IMAGE_FILTER_COUNT, ImageColorSpace, ImageDescriptor, ImageFilter, ImageResolution,
+    resolve_image,
+};
 
 /// Selected parameters extracted from a PDF `ExtGState` resource dictionary.
 ///
@@ -340,8 +343,10 @@ impl<'doc> PageResources<'doc> {
             &std::sync::Arc<gpu::cache::DeviceImageCache>,
         >,
         #[cfg(feature = "cache")] doc_id: Option<gpu::cache::DocId>,
-    ) -> Option<image::ImageDescriptor> {
-        let page_dict = self.ctx_dict()?;
+    ) -> image::ImageResolution {
+        let Some(page_dict) = self.ctx_dict() else {
+            return image::ImageResolution::Absent;
+        };
         image::resolve_image(
             self.doc,
             &page_dict,

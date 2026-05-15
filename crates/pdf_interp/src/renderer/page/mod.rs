@@ -229,6 +229,9 @@ pub struct PageRenderer<'doc> {
     pub(super) pattern_depth: u32,
     /// Accumulated page diagnostics, populated during rendering.
     diag: PageDiagnostics,
+    /// Decode failures recorded during this page's render.  Non-empty means the
+    /// page is incomplete and the per-page `Result` must be an `Err`.
+    decode_errors: Vec<String>,
     /// Per-filter blit counts used to compute `diag.dominant_filter`.
     filter_counts: [u32; IMAGE_FILTER_COUNT],
     /// Optional Content Group (OCG) visibility stack.
@@ -395,6 +398,7 @@ impl<'doc> PageRenderer<'doc> {
             form_depth: 0,
             pattern_depth: 0,
             diag: PageDiagnostics::default(),
+            decode_errors: Vec::new(),
             filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),
             #[cfg(feature = "gpu-jpeg-huffman")]
@@ -560,6 +564,15 @@ impl<'doc> PageRenderer<'doc> {
             doc_id,
             page_buffer: None,
         });
+    }
+
+    /// Decode failures accumulated during this page's render.
+    ///
+    /// A non-empty slice means one or more images failed to decode; the rendered page
+    /// is incomplete.  The caller should check this **before** calling `finish()`.
+    #[must_use]
+    pub fn decode_errors(&self) -> &[String] {
+        &self.decode_errors
     }
 
     /// Consume the renderer and return the finished bitmap and page diagnostics.
@@ -992,7 +1005,7 @@ impl<'doc> PageRenderer<'doc> {
         // Each branch is a separately monomorphised call; no decoder is wasted.
         #[cfg(all(feature = "gpu-jpeg-huffman", feature = "vulkan"))]
         if self.jpeg_vk.is_some() {
-            let img = self.resources.image(
+            let resolution = self.resources.image(
                 name,
                 #[cfg(feature = "nvjpeg")]
                 self.nvjpeg.as_mut(),
@@ -1010,17 +1023,10 @@ impl<'doc> PageRenderer<'doc> {
                 #[cfg(feature = "cache")]
                 self.cache_state.as_ref().map(|cs| cs.doc_id),
             );
-            if let Some(img) = img {
-                self.blit_image(&img);
-                return;
-            }
-            log::debug!(
-                "rasterrocket-interp: Do /{} skipped (unsupported filter or missing resource)",
-                String::from_utf8_lossy(name)
-            );
+            self.handle_image_resolution(name, resolution);
             return;
         }
-        let img = self.resources.image(
+        let resolution = self.resources.image(
             name,
             #[cfg(feature = "nvjpeg")]
             self.nvjpeg.as_mut(),
@@ -1039,15 +1045,38 @@ impl<'doc> PageRenderer<'doc> {
             #[cfg(feature = "cache")]
             self.cache_state.as_ref().map(|cs| cs.doc_id),
         );
-        if let Some(img) = img {
-            self.blit_image(&img);
-            return;
+        self.handle_image_resolution(name, resolution);
+    }
+
+    /// Dispatch on an [`ImageResolution`] returned from [`PageResources::image`].
+    ///
+    /// - `Ok` → blit the image.
+    /// - `DecodeFailed` → record the error in `decode_errors` so the caller can
+    ///   surface it; the pixel region is left as-is (white background).
+    /// - `Absent` → log a debug message and skip silently (nothing to draw).
+    fn handle_image_resolution(
+        &mut self,
+        name: &[u8],
+        resolution: crate::resources::image::ImageResolution,
+    ) {
+        use crate::resources::image::ImageResolution;
+        match resolution {
+            ImageResolution::Ok(img) => {
+                self.blit_image(&img);
+            }
+            ImageResolution::DecodeFailed(msg) => {
+                let name_str = String::from_utf8_lossy(name);
+                log::debug!("rasterrocket-interp: Do /{name_str} decode failed: {msg}");
+                self.decode_errors
+                    .push(format!("page image /{name_str}: {msg}"));
+            }
+            ImageResolution::Absent => {
+                log::debug!(
+                    "rasterrocket-interp: Do /{} skipped (not an image resource)",
+                    String::from_utf8_lossy(name)
+                );
+            }
         }
-        // Missing resource or unsupported filter.
-        log::debug!(
-            "rasterrocket-interp: Do /{} skipped (unsupported filter or missing resource)",
-            String::from_utf8_lossy(name)
-        );
     }
 
     /// Execute an `sh` shading operator.
