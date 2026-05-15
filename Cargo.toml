@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["fuzz", "qa"]
 members = [
     "crates/color",
     "crates/raster",
