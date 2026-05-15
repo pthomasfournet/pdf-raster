@@ -1506,6 +1506,10 @@ impl<'doc> PageRenderer<'doc> {
                             // length precheck guarantees src+3 ≤ img_bytes.len().
                             let rgb = &img_bytes[src..src + 3];
                             let pixel_off = row_off + dx as usize * 3;
+                            // Destination bounds guard: the last pixel of a clipped row can round past the bitmap; skip rather than panic.
+                            if pixel_off + 3 > data.len() {
+                                continue;
+                            }
                             if alpha == 255 {
                                 data[pixel_off..pixel_off + 3].copy_from_slice(rgb);
                             } else {
@@ -1529,6 +1533,10 @@ impl<'doc> PageRenderer<'doc> {
                             // Same bounds rationale as RGB arm.
                             let v = img_bytes[img_idx];
                             let pixel_off = row_off + dx as usize * 3;
+                            // Destination bounds guard: the last pixel of a clipped row can round past the bitmap; skip rather than panic.
+                            if pixel_off + 3 > data.len() {
+                                continue;
+                            }
                             if alpha == 255 {
                                 data[pixel_off] = v;
                                 data[pixel_off + 1] = v;
@@ -1553,6 +1561,10 @@ impl<'doc> PageRenderer<'doc> {
                             // Same bounds rationale as RGB arm.
                             if img_bytes[img_idx] == 0x00 {
                                 let pixel_off = row_off + dx as usize * 3;
+                                // Destination bounds guard: the last pixel of a clipped row can round past the bitmap; skip rather than panic.
+                                if pixel_off + 3 > data.len() {
+                                    continue;
+                                }
                                 data[pixel_off..pixel_off + 3].copy_from_slice(&fill_color);
                             }
                         }
