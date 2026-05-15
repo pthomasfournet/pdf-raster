@@ -231,6 +231,17 @@ pub struct PageGeometry {
     /// Specifies the size of one default user-space unit in 1/72-inch increments.
     /// `1.0` for the vast majority of documents.  Validated to `[0.1, 10.0]`.
     pub user_unit: f64,
+    /// X-coordinate of the selected page box's lower-left corner in PDF user space (ISO 32000-2 §14.11.2).
+    ///
+    /// For the vast majority of documents this is `0.0`.  Non-zero for scanned PDFs
+    /// whose `CropBox`/`MediaBox` does not start at the origin — e.g. a `CropBox`
+    /// of `[36 36 576 756]` has `origin_x = 36`.  The initial CTM pre-translates by
+    /// `(-origin_x, -origin_y)` so that the box's lower-left maps to device origin.
+    pub origin_x: f64,
+    /// Y-coordinate of the selected page box's lower-left corner in PDF user space.
+    ///
+    /// See `origin_x`.
+    pub origin_y: f64,
 }
 
 /// Return the geometry for page `page_num` (1-based).
@@ -270,6 +281,8 @@ pub fn page_size_pts_by_id(
         height_pts: 792.0,
         rotate_cw: 0,
         user_unit: 1.0,
+        origin_x: 0.0,
+        origin_y: 0.0,
     };
 
     let Ok(dict) = doc.get_dict(page_id) else {
@@ -286,7 +299,10 @@ pub fn page_size_pts_by_id(
         _ => 0.0,
     };
 
-    let box_wh = |key: &[u8]| -> Option<(f64, f64)> {
+    // Returns (x0, y0, w, h) — the lower-left origin and dimensions of the box.
+    // The origin is needed to pre-translate the initial CTM so the box lower-left
+    // maps to device origin (ISO 32000-2 §8.3.2: user space origin = box lower-left).
+    let box_origin_wh = |key: &[u8]| -> Option<(f64, f64, f64, f64)> {
         let arr = match dict.get(key) {
             Some(pdf::Object::Array(a)) if a.len() == 4 => a,
             _ => return None,
@@ -300,7 +316,8 @@ pub fn page_size_pts_by_id(
         let w = (x1 - x0).abs();
         let h = (y1 - y0).abs();
         if w > 0.0 && h > 0.0 {
-            Some((w, h))
+            // Normalise: lower-left is the minimum corner regardless of array order.
+            Some((x0.min(x1), y0.min(y1), w, h))
         } else {
             None
         }
@@ -308,7 +325,9 @@ pub fn page_size_pts_by_id(
 
     // CropBox is the display box — the region actually shown to the viewer.
     // Falls back to MediaBox when CropBox is absent (spec: CropBox defaults to MediaBox).
-    let Some((w_pts, h_pts)) = box_wh(b"CropBox").or_else(|| box_wh(b"MediaBox")) else {
+    let Some((box_left, box_bottom, w_pts, h_pts)) =
+        box_origin_wh(b"CropBox").or_else(|| box_origin_wh(b"MediaBox"))
+    else {
         return Ok(fallback);
     };
 
@@ -362,11 +381,18 @@ pub fn page_size_pts_by_id(
         (w_pts * user_unit, h_pts * user_unit)
     };
 
+    // The origin is kept in unscaled PDF user-space coordinates (before UserUnit scaling).
+    // The CTM in new_scaled applies (scale = dpi/72 * user_unit) already, so the
+    // pre-translation by (-origin_x, -origin_y) in unscaled points is correct there.
+    let (origin_x, origin_y) = (box_left, box_bottom);
+
     Ok(PageGeometry {
         width_pts,
         height_pts,
         rotate_cw,
         user_unit,
+        origin_x,
+        origin_y,
     })
 }
 

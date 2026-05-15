@@ -332,7 +332,7 @@ impl<'doc> PageRenderer<'doc> {
         doc: &'doc Document,
         page_id: ObjectId,
     ) -> Result<Self, InterpError> {
-        Self::new_scaled(width, height, 1.0, 0, doc, page_id)
+        Self::new_scaled(width, height, 1.0, 0, 0.0, 0.0, doc, page_id)
     }
 
     /// Create a renderer with an initial uniform scale in the CTM.
@@ -340,6 +340,9 @@ impl<'doc> PageRenderer<'doc> {
     /// `scale = dpi / 72.0` maps PDF points to device pixels.  `rotate_cw` is
     /// the page `/Rotate` value (one of 0, 90, 180, 270); the bitmap dimensions
     /// must already be swapped for 90°/270° before calling this method.
+    /// `origin_x`/`origin_y` are the lower-left corner of the selected page box
+    /// in PDF user space (from `PageGeometry::origin_x`/`origin_y`); zero for
+    /// the common case where the box starts at the origin.
     ///
     /// # Panics
     ///
@@ -348,11 +351,17 @@ impl<'doc> PageRenderer<'doc> {
     /// # Errors
     ///
     /// Returns [`InterpError::FontInit`] if `FreeType` cannot be initialised.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "renderer configuration has no natural grouping; a builder would add more boilerplate than it removes"
+    )]
     pub fn new_scaled(
         width: u32,
         height: u32,
         scale: f64,
         rotate_cw: u16,
+        origin_x: f64,
+        origin_y: f64,
         doc: &'doc Document,
         page_id: ObjectId,
     ) -> Result<Self, InterpError> {
@@ -366,20 +375,39 @@ impl<'doc> PageRenderer<'doc> {
 
         let mut gstate = GStateStack::new(width, height);
         // Build the initial CTM combining scale with the page rotation.
+        //
         // The `to_device` helper applies an additional Y-flip (`height - dy`) so
         // the formulas below account for that flip.  `w` and `h` are the output
         // bitmap dimensions in points (`width_px / scale`, `height_px / scale`).
-        let w = f64::from(width) / scale;
-        let h = f64::from(height) / scale;
+        //
+        // PDF user-space origin is the page box's lower-left corner (llx, lly).
+        // Content-stream coordinates are relative to that corner, so a point at
+        // page-space (px, py) lies at PDF coordinates (px + llx, py + lly).
+        // The initial CTM must pre-translate by (-llx, -lly) = (-origin_x, -origin_y)
+        // so that the box's lower-left maps to device pixel (0, 0).
+        //
+        // The pre-translation is applied by composing T(-llx,-lly) as the innermost
+        // transform: `ctm_multiply(&T, &scale_rotate) = T then scale_rotate`.
+        // Per branch, this gives:
+        //   Rotate 0   → [s, 0, 0, s, -llx·s, -lly·s]
+        //   Rotate 90  → [0, -s, -s, 0, (h+lly)·s, (w+llx)·s]
+        //   Rotate 180 → [-s, 0, 0, s, (w+llx)·s, -lly·s]
+        //   Rotate 270 → [0, s, s, 0, -lly·s, -llx·s]
+        // When llx=lly=0 every branch reduces to the pre-fix value (pixel-neutral).
+        let s = scale;
+        let llx = origin_x;
+        let lly = origin_y;
+        let w = f64::from(width) / s;
+        let h = f64::from(height) / s;
         let ctm: [f64; 6] = match rotate_cw % 360 {
             // Rotate 0: standard scale + y-flip handled by to_device.
-            0 => [scale, 0.0, 0.0, scale, 0.0, 0.0],
+            0 => [s, 0.0, 0.0, s, -llx * s, -lly * s],
             // Rotate 90 CW: swap axes. Width of bitmap = original H, height = original W.
-            90 => [0.0, -scale, -scale, 0.0, h * scale, w * scale],
+            90 => [0.0, -s, -s, 0.0, (h + lly) * s, (w + llx) * s],
             // Rotate 180: flip both axes.
-            180 => [-scale, 0.0, 0.0, scale, w * scale, 0.0],
+            180 => [-s, 0.0, 0.0, s, (w + llx) * s, -lly * s],
             // Rotate 270 CW (= 90 CCW): swap axes, opposite orientation.
-            _ => [0.0, scale, scale, 0.0, 0.0, 0.0],
+            _ => [0.0, s, s, 0.0, -lly * s, -llx * s],
         };
         gstate.current_mut().ctm = ctm;
 
@@ -1169,10 +1197,8 @@ impl<'doc> PageRenderer<'doc> {
         self.form_depth += 1;
 
         // Concatenate the form's Matrix onto the current CTM.
-        // PDF §8.10.1: the form's /Matrix maps form user space to parent user space;
-        // new_CTM = form.matrix × old_CTM (same concatenation order as `cm`).
         let old_ctm = self.gstate.current().ctm;
-        self.gstate.current_mut().ctm = ctm_multiply(&form.matrix, &old_ctm);
+        self.gstate.current_mut().ctm = ctm_multiply(&old_ctm, &form.matrix);
 
         // Switch to the form's resource context, keeping the parent for restore.
         let child_resources = self.resources.for_form(form);

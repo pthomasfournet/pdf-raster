@@ -657,6 +657,8 @@ fn render_page_rgb_with_geom(
         h_px,
         scale_f32.into(),
         geom.rotate_cw,
+        geom.origin_x,
+        geom.origin_y,
         doc,
         page_id,
     )?;

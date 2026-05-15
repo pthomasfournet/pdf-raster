@@ -82,6 +82,8 @@ fn main() {
         h,
         scale,
         geom.rotate_cw,
+        geom.origin_x,
+        geom.origin_y,
         &doc,
         page_id,
     )
