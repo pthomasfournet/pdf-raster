@@ -131,13 +131,22 @@ impl Document {
     ///   cannot decrypt (password-protected).  Never the misleading
     ///   "document has no pages".
     pub fn open_decrypting(path: &Path, authorized: bool) -> Result<Self, PdfError> {
-        // Cheap probe: open the original to read the trailer's /Encrypt.
-        // No objects are parsed, so this is the same cost as `open`.
+        // Open the original once to read the trailer's /Encrypt.  No
+        // objects are parsed, so this is the same cost as `open`.
         let probe = Self::open_at(path, DecryptGuard::none())?;
-        let encrypted = probe.is_encrypted();
+        if !probe.is_encrypted() {
+            // Unencrypted hot path: the probe IS the document — return it
+            // directly.  No qpdf spawn, no temp file, and crucially no
+            // second mmap+xref parse (re-opening here would double the
+            // cost of every unencrypted open).
+            return Ok(probe);
+        }
         drop(probe);
 
-        let (source, guard) = decrypt::resolve_source(path, encrypted, authorized)?;
+        // Encrypted: qpdf-decrypt to a temp file (gated on `authorized`),
+        // then open that plaintext copy.  The re-open is unavoidable here
+        // because the bytes the parser must read are a different file.
+        let (source, guard) = decrypt::resolve_source(path, true, authorized)?;
         Self::open_at(&source, guard)
     }
 

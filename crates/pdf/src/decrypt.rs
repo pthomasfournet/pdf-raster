@@ -103,8 +103,27 @@ impl DecryptGuard {
 ///   protected or otherwise undecryptable).
 /// - [`PdfError::Io`] if the temp file could not be created.
 pub fn qpdf_decrypt_to_temp(input: &Path) -> Result<(PathBuf, DecryptGuard), PdfError> {
-    // NamedTempFile under the system temp dir; its Drop unlinks the file
-    // even on the error paths below (the early returns drop the partially
+    // Argument-injection hardening: qpdf takes its input as a bare
+    // positional argument and (as of 11.x) honours NO `--`
+    // end-of-options separator, so a path whose first byte is `-`
+    // (e.g. a relative `-enc.pdf`) would be misparsed as an unknown
+    // option rather than opened as the input file.  Canonicalising to
+    // an absolute path guarantees a leading `/`, which qpdf can never
+    // mistake for an option, and also makes the spawn independent of
+    // the current working directory.  `canonicalize` also fails loudly
+    // here if the input vanished between the encryption probe and now.
+    let input_abs = input.canonicalize().map_err(|e| {
+        PdfError::EncryptedDocument(format!(
+            "document is encrypted but its path could not be resolved for \
+             decryption ({}): {e}",
+            input.display()
+        ))
+    })?;
+
+    // NamedTempFile under the system temp dir; created with mode 0600 on
+    // Unix (owner-only — the decrypted plaintext of the user's private
+    // document is never world-readable).  Its Drop unlinks the file even
+    // on the error paths below (the early returns drop the partially
     // written temp), so no decrypted plaintext is leaked.
     let tmp = tempfile::Builder::new()
         .prefix("rrocket-decrypt-")
@@ -115,7 +134,7 @@ pub fn qpdf_decrypt_to_temp(input: &Path) -> Result<(PathBuf, DecryptGuard), Pdf
     let output = Command::new("qpdf")
         .arg("--decrypt")
         .arg("--password=")
-        .arg(input)
+        .arg(&input_abs)
         .arg(&tmp_path)
         .output();
 
@@ -135,6 +154,21 @@ pub fn qpdf_decrypt_to_temp(input: &Path) -> Result<(PathBuf, DecryptGuard), Pdf
     if !matches!(code, Some(0) | Some(3)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(PdfError::EncryptedDocument(msg_password_protected(&stderr)));
+    }
+
+    // qpdf reported success, but verify it actually wrote a non-empty
+    // file before handing it to the parser.  Without this, a qpdf that
+    // exits 0/3 yet produced an empty or truncated output (disk full,
+    // killed mid-write, an unexpected qpdf bug) would surface downstream
+    // as a confusing generic xref/parse error instead of the accurate
+    // "could not decrypt" message — a regression of the NF-3 sin.
+    match std::fs::metadata(&tmp_path) {
+        Ok(m) if m.len() > 0 => {}
+        Ok(_) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(PdfError::EncryptedDocument(msg_password_protected(&stderr)));
+        }
+        Err(e) => return Err(PdfError::Io(e)),
     }
 
     Ok((tmp_path, DecryptGuard { temp: Some(tmp) }))
@@ -215,5 +249,29 @@ mod tests {
         assert!(m.contains("password"));
         assert!(!m.contains("install qpdf"));
         assert!(!m.contains("no pages"));
+    }
+
+    /// The decrypted plaintext of a user's private document must never be
+    /// world-readable.  This pins the `tempfile` builder's owner-only
+    /// (0600) creation so a future dependency or refactor cannot silently
+    /// widen it.
+    #[cfg(unix)]
+    #[test]
+    fn decrypt_temp_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::Builder::new()
+            .prefix("rrocket-decrypt-")
+            .suffix(".pdf")
+            .tempfile()
+            .expect("create temp");
+        let mode = std::fs::metadata(tmp.path())
+            .expect("stat temp")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "decrypted-plaintext temp must be 0600, was {mode:o}"
+        );
     }
 }
