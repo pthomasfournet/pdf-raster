@@ -661,6 +661,188 @@ mod tests {
         v.to_be_bytes()
     }
 
+    /// `usize` byte length as a big-endian `u32`, panicking with a clear
+    /// message if a synthetic table somehow exceeds 4 GiB (it never will —
+    /// these fixtures are a few hundred bytes — but an unchecked `as u32`
+    /// would silently truncate, which is the kind of bug this campaign hunts).
+    fn len_be32(n: usize) -> [u8; 4] {
+        be32(u32::try_from(n).expect("synthetic TrueType table fits in u32"))
+    }
+
+    /// The `glyf` table: GID 0 empty, GID 1 a single-contour box.
+    ///
+    /// The box is `(0,0)→(500,0)→(500,700)→(0,700)`; those deltas are signed,
+    /// so the points use word-sized (non-short) coordinates.
+    fn synth_glyf() -> Vec<u8> {
+        let mut g = Vec::new();
+        g.extend_from_slice(&be16(1)); // numberOfContours
+        g.extend_from_slice(&be16(0)); // xMin
+        g.extend_from_slice(&be16(0)); // yMin
+        g.extend_from_slice(&be16(500)); // xMax
+        g.extend_from_slice(&be16(700)); // yMax
+        g.extend_from_slice(&be16(3)); // endPtsOfContours[0] (4 pts)
+        g.extend_from_slice(&be16(0)); // instructionLength
+        g.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags: all on-curve, word coords
+        for d in [0i16, 500, 0, -500] {
+            g.extend_from_slice(&d.to_be_bytes()); // x deltas
+        }
+        for d in [0i16, 0, 700, 0] {
+            g.extend_from_slice(&d.to_be_bytes()); // y deltas
+        }
+        while g.len() % 2 != 0 {
+            g.push(0);
+        }
+        g
+    }
+
+    /// The `head` table (version 1.0, short `loca`).
+    fn synth_head() -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&be32(0x0001_0000)); // version
+        h.extend_from_slice(&be32(0x0001_0000)); // fontRevision
+        h.extend_from_slice(&be32(0)); // checkSumAdjustment
+        h.extend_from_slice(&be32(0x5F0F_3CF5)); // magic
+        h.extend_from_slice(&be16(0)); // flags
+        h.extend_from_slice(&be16(1000)); // unitsPerEm
+        h.extend_from_slice(&be32(0));
+        h.extend_from_slice(&be32(0)); // created
+        h.extend_from_slice(&be32(0));
+        h.extend_from_slice(&be32(0)); // modified
+        h.extend_from_slice(&be16(0)); // xMin
+        h.extend_from_slice(&be16(0)); // yMin
+        h.extend_from_slice(&be16(500)); // xMax
+        h.extend_from_slice(&be16(700)); // yMax
+        h.extend_from_slice(&be16(0)); // macStyle
+        h.extend_from_slice(&be16(8)); // lowestRecPPEM
+        h.extend_from_slice(&be16(2)); // fontDirectionHint
+        h.extend_from_slice(&be16(0)); // indexToLocFormat (0 = short)
+        h.extend_from_slice(&be16(0)); // glyphDataFormat
+        h
+    }
+
+    /// The `hhea` table (2 hmetrics).
+    fn synth_hhea() -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&be32(0x0001_0000));
+        h.extend_from_slice(&be16(700)); // ascent
+        h.extend_from_slice(&(-200i16).to_be_bytes()); // descent
+        h.extend_from_slice(&be16(0)); // lineGap
+        h.extend_from_slice(&be16(500)); // advanceWidthMax
+        h.extend_from_slice(&be16(0));
+        h.extend_from_slice(&be16(0));
+        h.extend_from_slice(&be16(500));
+        h.extend_from_slice(&be16(0));
+        h.extend_from_slice(&be16(0));
+        h.extend_from_slice(&be16(0));
+        h.extend_from_slice(&[0u8; 8]);
+        h.extend_from_slice(&be16(0)); // metricDataFormat
+        h.extend_from_slice(&be16(2)); // numberOfHMetrics
+        h
+    }
+
+    /// The cmap subtable for the (1,0) Macintosh-Roman platform: a format-0
+    /// byte table that maps code 7 directly to GID 1.
+    fn synth_cmap_mac() -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&be16(0)); // format
+        c.extend_from_slice(&be16(262)); // length
+        c.extend_from_slice(&be16(0)); // language
+        let mut g = [0u8; 256];
+        g[7] = 1; // code 7 -> GID 1
+        c.extend_from_slice(&g);
+        c
+    }
+
+    /// The cmap subtable for the (3,0) Microsoft-Symbol platform: a format-4
+    /// table whose single segment maps 0xF007 (the 0xF000-shifted code 7) to
+    /// GID 1.
+    fn synth_cmap_symbol() -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(&be16(4)); // format
+        c.extend_from_slice(&be16(32)); // length
+        c.extend_from_slice(&be16(0)); // language
+        c.extend_from_slice(&be16(4)); // segCountX2 (2 segs)
+        c.extend_from_slice(&be16(4)); // searchRange
+        c.extend_from_slice(&be16(1)); // entrySelector
+        c.extend_from_slice(&be16(0)); // rangeShift
+        c.extend_from_slice(&be16(0xF007)); // endCode[0]
+        c.extend_from_slice(&be16(0xFFFF)); // endCode[1]
+        c.extend_from_slice(&be16(0)); // reservedPad
+        c.extend_from_slice(&be16(0xF007)); // startCode[0]
+        c.extend_from_slice(&be16(0xFFFF)); // startCode[1]
+        // idDelta: gid = (code + delta) mod 65536; for code 0xF007 -> 1 the
+        // delta is 1 - 0xF007 (mod 65536).
+        let delta = u16::try_from(1u32.wrapping_sub(0xF007) & 0xFFFF).expect("masked to 16 bits");
+        c.extend_from_slice(&be16(delta));
+        c.extend_from_slice(&be16(1)); // idDelta[1] (0xFFFF -> 0)
+        c.extend_from_slice(&be16(0)); // idRangeOffset[0]
+        c.extend_from_slice(&be16(0)); // idRangeOffset[1]
+        c
+    }
+
+    /// The cmap table header plus the two subtables (Mac-Roman, MS-Symbol) —
+    /// deliberately *no* Unicode subtable.
+    fn synth_cmap() -> Vec<u8> {
+        let mac = synth_cmap_mac();
+        let symbol = synth_cmap_symbol();
+        let mut c = Vec::new();
+        c.extend_from_slice(&be16(0)); // version
+        c.extend_from_slice(&be16(2)); // numTables
+        let rec_end: usize = 4 + 8 * 2; // header + two 8-byte records
+        let off0 = rec_end;
+        let off1 = off0 + mac.len();
+        c.extend_from_slice(&be16(1)); // platform 1 (Mac)
+        c.extend_from_slice(&be16(0)); // encoding 0 (Roman)
+        c.extend_from_slice(&len_be32(off0));
+        c.extend_from_slice(&be16(3)); // platform 3 (MS)
+        c.extend_from_slice(&be16(0)); // encoding 0 (Symbol)
+        c.extend_from_slice(&len_be32(off1));
+        c.extend_from_slice(&mac);
+        c.extend_from_slice(&symbol);
+        c
+    }
+
+    /// Assemble the sfnt directory + table bodies into a complete font blob.
+    fn assemble_sfnt(mut tables: Vec<(&[u8; 4], Vec<u8>)>) -> Vec<u8> {
+        tables.sort_by(|a, b| a.0.cmp(b.0));
+
+        let num = u16::try_from(tables.len()).expect("table count fits in u16");
+        let mut out = Vec::new();
+        out.extend_from_slice(&be32(0x0001_0000)); // sfnt version
+        out.extend_from_slice(&be16(num));
+        let mut sr = 1u16;
+        let mut es = 0u16;
+        while sr * 2 <= num {
+            sr *= 2;
+            es += 1;
+        }
+        out.extend_from_slice(&be16(sr * 16));
+        out.extend_from_slice(&be16(es));
+        out.extend_from_slice(&be16(num * 16 - sr * 16));
+        let dir_len = 12 + 16 * tables.len();
+        let mut body = Vec::new();
+        for (tag, data) in &tables {
+            let cs: u32 = data
+                .chunks(4)
+                .map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    u32::from_be_bytes(w)
+                })
+                .fold(0u32, u32::wrapping_add);
+            out.extend_from_slice(*tag);
+            out.extend_from_slice(&be32(cs));
+            out.extend_from_slice(&len_be32(dir_len + body.len()));
+            out.extend_from_slice(&len_be32(data.len()));
+            body.extend_from_slice(data);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        out.extend_from_slice(&body);
+        out
+    }
+
     /// Build a minimal-but-valid TrueType font with exactly two glyphs
     /// (`.notdef` + one filled box at GID 1) and **only** a (1,0)
     /// Macintosh-Roman and a (3,0) Microsoft-Symbol cmap — deliberately *no*
@@ -668,66 +850,16 @@ mod tests {
     /// and 0xF007 maps to GID 1 in the (3,0) cmap (PUA offset), mirroring the
     /// real scanned-book subset fonts in the NF-2 corpus.
     fn synth_symbolic_ttf() -> Vec<u8> {
-        // glyf: GID 0 = empty; GID 1 = a simple 1-contour box.
-        let mut box_glyph = Vec::new();
-        box_glyph.extend_from_slice(&be16(1)); // numberOfContours
-        box_glyph.extend_from_slice(&be16(0)); // xMin
-        box_glyph.extend_from_slice(&be16(0)); // yMin
-        box_glyph.extend_from_slice(&be16(500)); // xMax
-        box_glyph.extend_from_slice(&be16(700)); // yMax
-        box_glyph.extend_from_slice(&be16(3)); // endPtsOfContours[0] (4 pts)
-        box_glyph.extend_from_slice(&be16(0)); // instructionLength
-        box_glyph.extend_from_slice(&[0x01, 0x01, 0x01, 0x01]); // 4 on-curve flags, x&y short+pos
-        // x deltas (short, positive): 0, +500, 0(-500 via neg bit not set→use words? keep simple)
-        // Use the "repeat-free, all-short, all-positive-then-mirror" trick:
-        // pts: (0,0)->(500,0)->(500,700)->(0,700) needs signed deltas, so
-        // switch to NON-short coords (words).
-        box_glyph.truncate(box_glyph.len() - 4);
-        box_glyph.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags: all on-curve, word coords
-        for d in [0i16, 500, 0, -500] {
-            box_glyph.extend_from_slice(&d.to_be_bytes());
-        }
-        for d in [0i16, 0, 700, 0] {
-            box_glyph.extend_from_slice(&d.to_be_bytes());
-        }
-        while box_glyph.len() % 2 != 0 {
-            box_glyph.push(0);
-        }
-        let glyf = {
-            let mut g = Vec::new();
-            // GID 0: empty (zero-length)
-            g.extend_from_slice(&box_glyph); // GID 1
-            g
-        };
-        let loca: Vec<u8> = {
+        let glyf = synth_glyf();
+        // Short `loca`: stored offsets are byte-offset / 2.  GID 0 is empty
+        // (offset 0), GID 1 starts at 0, and the end offset is glyf.len()/2.
+        let loca = {
             let mut l = Vec::new();
-            l.extend_from_slice(&be16(0)); // glyph 0 offset/2 = 0
-            l.extend_from_slice(&be16(0)); // glyph 1 offset/2 = 0 (glyph 0 empty)
-            l.extend_from_slice(&be16((glyf.len() / 2) as u16)); // end
+            l.extend_from_slice(&be16(0)); // glyph 0 offset/2
+            l.extend_from_slice(&be16(0)); // glyph 1 offset/2 (glyph 0 empty)
+            let end = u16::try_from(glyf.len() / 2).expect("glyf length/2 fits in u16");
+            l.extend_from_slice(&be16(end));
             l
-        };
-        let head = {
-            let mut h = Vec::new();
-            h.extend_from_slice(&be32(0x0001_0000)); // version
-            h.extend_from_slice(&be32(0x0001_0000)); // fontRevision
-            h.extend_from_slice(&be32(0)); // checkSumAdjustment
-            h.extend_from_slice(&be32(0x5F0F_3CF5)); // magic
-            h.extend_from_slice(&be16(0)); // flags
-            h.extend_from_slice(&be16(1000)); // unitsPerEm
-            h.extend_from_slice(&be32(0));
-            h.extend_from_slice(&be32(0)); // created
-            h.extend_from_slice(&be32(0));
-            h.extend_from_slice(&be32(0)); // modified
-            h.extend_from_slice(&be16(0)); // xMin
-            h.extend_from_slice(&be16(0)); // yMin
-            h.extend_from_slice(&be16(500)); // xMax
-            h.extend_from_slice(&be16(700)); // yMax
-            h.extend_from_slice(&be16(0)); // macStyle
-            h.extend_from_slice(&be16(8)); // lowestRecPPEM
-            h.extend_from_slice(&be16(2)); // fontDirectionHint
-            h.extend_from_slice(&be16(0)); // indexToLocFormat (0 = short)
-            h.extend_from_slice(&be16(0)); // glyphDataFormat
-            h
         };
         let maxp = {
             let mut m = Vec::new();
@@ -736,24 +868,6 @@ mod tests {
             m.extend_from_slice(&[0u8; 26]); // remaining 1.0 fields
             m
         };
-        let hhea = {
-            let mut h = Vec::new();
-            h.extend_from_slice(&be32(0x0001_0000));
-            h.extend_from_slice(&be16(700)); // ascent
-            h.extend_from_slice(&((-200i16).to_be_bytes())); // descent
-            h.extend_from_slice(&be16(0)); // lineGap
-            h.extend_from_slice(&be16(500)); // advanceWidthMax
-            h.extend_from_slice(&be16(0));
-            h.extend_from_slice(&be16(0));
-            h.extend_from_slice(&be16(500));
-            h.extend_from_slice(&be16(0));
-            h.extend_from_slice(&be16(0));
-            h.extend_from_slice(&be16(0));
-            h.extend_from_slice(&[0u8; 8]);
-            h.extend_from_slice(&be16(0)); // metricDataFormat
-            h.extend_from_slice(&be16(2)); // numberOfHMetrics
-            h
-        };
         let hmtx = {
             let mut m = Vec::new();
             m.extend_from_slice(&be16(500)); // gid0 advance
@@ -761,57 +875,6 @@ mod tests {
             m.extend_from_slice(&be16(500)); // gid1 advance
             m.extend_from_slice(&be16(0));
             m
-        };
-        // cmap: (1,0) format-0 and (3,0) format-4.
-        let cmap0 = {
-            let mut c = Vec::new();
-            c.extend_from_slice(&be16(0)); // format
-            c.extend_from_slice(&be16(262)); // length
-            c.extend_from_slice(&be16(0)); // language
-            let mut g = [0u8; 256];
-            g[7] = 1; // code 7 -> GID 1
-            c.extend_from_slice(&g);
-            c
-        };
-        let cmap4 = {
-            // segments: [0xF007..0xF007 -> gid 1], [0xFFFF terminator]
-            let mut c = Vec::new();
-            c.extend_from_slice(&be16(4)); // format
-            c.extend_from_slice(&be16(32)); // length
-            c.extend_from_slice(&be16(0)); // language
-            c.extend_from_slice(&be16(4)); // segCountX2 (2 segs)
-            c.extend_from_slice(&be16(4)); // searchRange
-            c.extend_from_slice(&be16(1)); // entrySelector
-            c.extend_from_slice(&be16(0)); // rangeShift
-            c.extend_from_slice(&be16(0xF007)); // endCode[0]
-            c.extend_from_slice(&be16(0xFFFF)); // endCode[1]
-            c.extend_from_slice(&be16(0)); // reservedPad
-            c.extend_from_slice(&be16(0xF007)); // startCode[0]
-            c.extend_from_slice(&be16(0xFFFF)); // startCode[1]
-            // idDelta: gid = (code + delta) mod 65536. code 0xF007 -> 1
-            // => delta = 1 - 0xF007 (mod 65536)
-            c.extend_from_slice(&be16((1u32.wrapping_sub(0xF007) & 0xFFFF) as u16));
-            c.extend_from_slice(&be16(1)); // idDelta[1] (0xFFFF -> 0)
-            c.extend_from_slice(&be16(0)); // idRangeOffset[0]
-            c.extend_from_slice(&be16(0)); // idRangeOffset[1]
-            c
-        };
-        let cmap = {
-            let mut c = Vec::new();
-            c.extend_from_slice(&be16(0)); // version
-            c.extend_from_slice(&be16(2)); // numTables
-            let rec_end = 4 + 8 * 2;
-            let off0 = rec_end as u32;
-            let off1 = off0 + cmap0.len() as u32;
-            c.extend_from_slice(&be16(1)); // platform 1 (Mac)
-            c.extend_from_slice(&be16(0)); // encoding 0 (Roman)
-            c.extend_from_slice(&be32(off0));
-            c.extend_from_slice(&be16(3)); // platform 3 (MS)
-            c.extend_from_slice(&be16(0)); // encoding 0 (Symbol)
-            c.extend_from_slice(&be32(off1));
-            c.extend_from_slice(&cmap0);
-            c.extend_from_slice(&cmap4);
-            c
         };
         let post = {
             let mut p = Vec::new();
@@ -827,73 +890,35 @@ mod tests {
             n
         };
 
-        let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
-            (b"cmap", cmap),
+        assemble_sfnt(vec![
+            (b"cmap", synth_cmap()),
             (b"glyf", glyf),
-            (b"head", head),
-            (b"hhea", hhea),
+            (b"head", synth_head()),
+            (b"hhea", synth_hhea()),
             (b"hmtx", hmtx),
             (b"loca", loca),
             (b"maxp", maxp),
             (b"name", name),
             (b"post", post),
-        ];
-        tables.sort_by(|a, b| a.0.cmp(b.0));
-
-        let num = tables.len() as u16;
-        let mut out = Vec::new();
-        out.extend_from_slice(&be32(0x0001_0000)); // sfnt version
-        out.extend_from_slice(&be16(num));
-        let mut sr = 1u16;
-        let mut es = 0u16;
-        while sr * 2 <= num {
-            sr *= 2;
-            es += 1;
-        }
-        out.extend_from_slice(&be16(sr * 16));
-        out.extend_from_slice(&be16(es));
-        out.extend_from_slice(&be16(num * 16 - sr * 16));
-        let mut offset = 12 + 16 * tables.len();
-        let mut body = Vec::new();
-        for (tag, data) in &tables {
-            let cs: u32 = data
-                .chunks(4)
-                .map(|c| {
-                    let mut w = [0u8; 4];
-                    w[..c.len()].copy_from_slice(c);
-                    u32::from_be_bytes(w)
-                })
-                .fold(0u32, u32::wrapping_add);
-            out.extend_from_slice(*tag);
-            out.extend_from_slice(&be32(cs));
-            out.extend_from_slice(&be32(offset as u32));
-            out.extend_from_slice(&be32(data.len() as u32));
-            body.extend_from_slice(data);
-            while body.len() % 4 != 0 {
-                body.push(0);
-            }
-            offset = 12 + 16 * tables.len() + body.len();
-        }
-        out.extend_from_slice(&body);
-        out
+        ])
     }
 
     /// NF-2 Group A regression: a symbolic embedded TrueType subset whose only
     /// cmaps are (1,0) Macintosh-Roman and (3,0) Microsoft-Symbol must still
     /// resolve its small content-stream codes to real glyphs.
     ///
-    /// Pre-fix, FreeType's default charmap priority activated the (3,0) Symbol
-    /// cmap; `get_char_index(7)` returned `.notdef`, every glyph rendered
-    /// blank, and text-only deep pages of scanned books came out pure white
-    /// (lecouteux p194, etc.).  The fix points the face at the (1,0) cmap (or
-    /// uses the 0xF000 PUA offset on the Symbol cmap).
+    /// Pre-fix, `FreeType`'s default charmap priority activated the (3,0)
+    /// Symbol cmap; `get_char_index(7)` returned `.notdef`, every glyph
+    /// rendered blank, and text-only deep pages of scanned books came out
+    /// pure white (lecouteux p194, etc.).  The fix points the face at the
+    /// (1,0) cmap (or uses the 0xF000 PUA offset on the Symbol cmap).
     #[test]
     fn symbolic_truetype_subset_resolves_via_mac_or_symbol_cmap() {
         let ttf = synth_symbolic_ttf();
         let eng_shared = FontEngine::init(true, false, false).expect("font engine");
-        let mut eng = eng_shared.lock().expect("engine lock");
-        let face = eng
-            .load_memory_face(
+        let face = {
+            let mut eng = eng_shared.lock().expect("engine lock");
+            eng.load_memory_face(
                 ttf,
                 0,
                 FaceParams {
@@ -903,7 +928,8 @@ mod tests {
                     text_mat: [40.0, 0.0, 0.0, 40.0],
                 },
             )
-            .expect("load synthetic symbolic TTF");
+            .expect("load synthetic symbolic TTF")
+        };
 
         // Code 7 is the glyph the (1,0)/(3,0) cmaps map to GID 1 (the box).
         // This is exactly the resolution that was broken (blank page).
