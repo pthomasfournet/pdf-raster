@@ -461,7 +461,7 @@ pub(super) fn decode_dct<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::G
     use zune_core::options::DecoderOptions;
     use zune_jpeg::JpegDecoder;
 
-    // Phase 9 cache fast path: if a cache is wired in and the encoded
+    // Device-image-cache fast path: if a cache is wired in and the encoded
     // bytes are already cached (cross-document content-hash dedup),
     // return the device-resident handle with zero CPU decode work.
     // On miss, retain the precomputed BLAKE3 hash so the post-decode
@@ -694,7 +694,7 @@ pub(super) fn decode_dct<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::G
         _ => unreachable!("DCTDecode: unexpected out_cs variant"),
     };
 
-    // Phase 9: insert into the cache so the next render of this PDF
+    // Insert into the cache so the next render of this PDF
     // (or a different PDF with the same image content) hits the
     // device-resident fast path instead of decoding again.  Reuse
     // the hash from the lookup-miss path to skip a second BLAKE3.
@@ -705,13 +705,13 @@ pub(super) fn decode_dct<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::G
     Some(cpu_desc)
 }
 
-/// Phase 9 cache plumbing for `decode_dct`.  When set, [`decode_dct`]
+/// Device-image-cache plumbing for `decode_dct`.  When set, [`decode_dct`]
 /// (a) probes the cache by content hash before any decode work and,
 /// on a miss, (b) inserts the decoded bytes after the CPU decode
 /// completes so the next render hits the cache.
 #[cfg(feature = "cache")]
 pub(super) struct DctCacheCtx<'a> {
-    /// Phase 9 device image cache.  Borrowed; the cache outlives the
+    /// Device-resident image cache.  Borrowed; the cache outlives the
     /// renderer for the duration of a `raster_pdf` call.
     pub cache: &'a Arc<DeviceImageCache>,
     /// Stable identifier for the source PDF.

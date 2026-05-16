@@ -560,7 +560,8 @@ fn parse_ps_op(word: &str) -> Option<PsOp> {
 /// PDF §7.10.5 calculator functions are PostScript, which treats `%` as a
 /// line comment to end-of-line.  Comments are stripped here so an otherwise
 /// well-formed commented program is not rejected wholesale (a rejected tint
-/// transform silently falls back to the gray heuristic — the NF-5 class).
+/// transform silently falls back to the gray heuristic, blanking
+/// spot-colour pages).
 fn ps_lex(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1498,9 +1499,9 @@ mod tests {
 
     #[test]
     fn ps_sot_apprenti_tint_program() {
-        // The exact obj-12 tint transform from sot-apprenti-1774 (the NF-5
-        // repro): Separation /Black → DeviceCMYK, mapping tint t to
-        // [0 0 0 t].  A regression here re-blanks the page.
+        // The exact obj-12 tint transform from sot-apprenti-1774:
+        // Separation /Black → DeviceCMYK, mapping tint t to [0 0 0 t].
+        // A regression here re-blanks the page.
         let prog = "{dup 0 mul exch dup 0 mul exch dup 0 mul exch 1 mul }";
         let f = make_ps_stream(prog, &[(0.0, 1.0), (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)]);
         let doc = empty_doc();

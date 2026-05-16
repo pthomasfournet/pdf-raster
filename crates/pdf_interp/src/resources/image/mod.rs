@@ -302,7 +302,7 @@ pub const IMAGE_FILTER_COUNT: usize = 6;
 pub enum ImageData {
     /// Host-resident pixel bytes — layout defined by [`ImageColorSpace`].
     Cpu(Vec<u8>),
-    /// Device-resident image, owned by the Phase 9 cache.  The `Arc`
+    /// Device-resident image, owned by the device image cache.  The `Arc`
     /// keeps the slab alive past in-flight kernel reads even if the
     /// cache evicts; see `gpu::cache::CachedDeviceImage` docs.
     #[cfg(feature = "cache")]

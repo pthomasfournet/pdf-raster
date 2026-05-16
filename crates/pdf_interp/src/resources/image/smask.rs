@@ -576,7 +576,7 @@ mod tests {
 
     // ── Explicit /Mask (§8.9.6.3) regression ─────────────────────────────────
 
-    /// PDF §8.9.6.3 explicit `/Mask` polarity (NF-2b regression).
+    /// PDF §8.9.6.3 explicit `/Mask` polarity.
     ///
     /// A `/Mask N 0 R` referencing an `/ImageMask true` stencil must produce a
     /// base-image alpha buffer where the stencil's *paint* points are opaque

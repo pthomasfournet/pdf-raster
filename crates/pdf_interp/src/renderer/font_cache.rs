@@ -221,9 +221,8 @@ pub(crate) fn trm_pixel_size_valid(trm: [f64; 4]) -> bool {
 // ── Simple-font name → GID resolution ────────────────────────────────────────
 
 /// Decide whether the glyph-name → charset resolution path applies, given
-/// the descriptor's shape.  This is the load-bearing dispatch gate for the
-/// NF-6 fix and must fire *only* for a simple embedded Type1/Type1C/CFF
-/// font:
+/// the descriptor's shape.  This is the load-bearing dispatch gate that
+/// must fire *only* for a simple embedded Type1/Type1C/CFF font:
 ///
 /// - `has_bytes` false  → non-embedded standard-14: the fallback face's own
 ///   active charmap resolves codes; name resolution on a substitute face
@@ -1615,8 +1614,9 @@ mod tests {
     }
 
     /// The simple-font name path must yield `.notdef` (0) for an unresolvable
-    /// code — never code-identity.  Code-identity for a subsetted program is
-    /// the original NF-6 garble; this pins the regression.
+    /// code — never code-identity.  Code-identity for a subsetted program
+    /// produces wrong characters on a pixel-correct page; this pins that
+    /// regression.
     #[test]
     fn unresolvable_code_is_notdef_never_identity() {
         let diffs = empty_diffs();

@@ -868,7 +868,7 @@ mod tests {
         );
     }
 
-    // ── 1-bpc raw stencil-mask polarity (the FIX-04c regression class) ─────────
+    // ── 1-bpc raw stencil-mask polarity ───────────────────────────────────────
 
     /// Build a dict for a 1-bpc raw ImageMask, optionally with a `/Decode`.
     fn stencil_dict(decode: Option<Vec<Object>>) -> Dictionary {

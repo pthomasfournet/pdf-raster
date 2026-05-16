@@ -325,7 +325,7 @@ pub struct PageRenderer<'doc> {
     /// / `try_gpu_tile_fill` and the ICC CMYK→RGB path prefer the Vulkan
     /// trait surface (`alloc → upload → record_* → submit → wait → download`)
     /// over the CUDA `GpuCtx` path.  Mutually exclusive with `gpu_ctx` in
-    /// practice — Phase 9 cache is CUDA-only, so opening a session under
+    /// practice — the device image cache is CUDA-only, so opening a session under
     /// `ForceVulkan` skips CUDA init entirely (`rasterrocket::render::open_session`).
     /// The image-blit path (`DevicePageBuffer`) stays CUDA-only and is gated
     /// behind `gpu_ctx`, so under Vulkan blits silently land on the CPU
@@ -337,15 +337,15 @@ pub struct PageRenderer<'doc> {
     /// common case in press PDFs) only pay the bake cost once per page.
     #[cfg(feature = "gpu-icc")]
     icc_clut_cache: crate::resources::image::IccClutCache,
-    /// Phase 9 cache state.  `Some` only when the `cache` feature is
+    /// Device-image-cache state.  `Some` only when the `cache` feature is
     /// on AND a cache was wired in via [`Self::set_image_cache`];
     /// `None` keeps the renderer fully CPU-resident.
     #[cfg(feature = "cache")]
     cache_state: Option<CacheState>,
 }
 
-/// Phase 9 renderer-side state bundled together so the "cache wired
-/// in" condition is a single `Option<CacheState>` rather than three
+/// Renderer-side device-image-cache state bundled together so the "cache
+/// wired in" condition is a single `Option<CacheState>` rather than three
 /// implicit invariants on separate fields.
 ///
 /// Without this bundling, `doc_id: DocId` had to default to
@@ -353,7 +353,7 @@ pub struct PageRenderer<'doc> {
 /// using the all-zeros doc id, a sharp foot-gun.
 #[cfg(feature = "cache")]
 struct CacheState {
-    /// Phase 9 device-resident image cache.  Shared across pages so
+    /// Device-resident image cache.  Shared across pages so
     /// content-hash dedup spans the whole render session.
     cache: Arc<DeviceImageCache>,
     /// Stable identifier for the source PDF — combined with the
@@ -639,15 +639,15 @@ impl<'doc> PageRenderer<'doc> {
     /// not removed; it remains live for sessions opened with
     /// `BackendPolicy::Auto` / `BackendPolicy::ForceCuda` (defined in `rasterrocket`).
     ///
-    /// The Phase 9 device-resident image cache (`DeviceImageCache`,
+    /// The device-resident image cache (`DeviceImageCache`,
     /// `DevicePageBuffer`) is CUDA-only — under Vulkan the renderer
-    /// runs uncached, matching Phase 9-pre-2026-05-07 behaviour.
+    /// runs uncached (CPU-resident image decode + blit).
     #[cfg(feature = "vulkan")]
     pub fn set_vk_backend(&mut self, backend: Option<Arc<VulkanBackend>>) {
         self.vk_backend = backend;
     }
 
-    /// Attach a Phase 9 device-resident image cache.
+    /// Attach a device-resident image cache.
     ///
     /// When set, JPEG image decode goes through the cache: a content-
     /// hash hit returns an `Arc<CachedDeviceImage>` with no decode
@@ -797,7 +797,7 @@ impl<'doc> PageRenderer<'doc> {
             .max_by_key(|(count, _)| *count)
             .map(|(_, filter)| *filter);
 
-        // Phase 9: download the device-resident image-blit buffer (if
+        // Download the device-resident image-blit buffer (if
         // any GPU image-blit ran on this page) and source-over
         // composite it onto the host bitmap.  Pixels the kernel
         // didn't write read back as alpha=0 → no-op for the
@@ -1974,7 +1974,7 @@ impl<'doc> PageRenderer<'doc> {
         }
     }
 
-    /// Phase 9 GPU image blit dispatcher.
+    /// GPU image blit dispatcher.
     ///
     /// Lazy-allocates `device_page_buffer` on first call, builds the
     /// inverse-CTM coefficients, computes the destination AABB, and
