@@ -115,7 +115,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "bench"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "rasterrocket",
  "rasterrocket-color",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "pdf_bridge"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "cc",
  "log",
@@ -997,7 +997,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rasterrocket"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "log",
  "rasterrocket-color",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "clap",
  "env_logger",
@@ -1026,14 +1026,14 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-color"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
 name = "rasterrocket-encode"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "png 0.17.16",
  "rasterrocket-color",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-font"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "freetype-rs",
  "quick_cache",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-gpu"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ash",
  "blake3",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-interp"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bytemuck",
  "env_logger",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-parser"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "flate2",
  "libdeflater",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "rasterrocket-render"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
