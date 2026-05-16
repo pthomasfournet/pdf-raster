@@ -113,6 +113,70 @@ pub fn make_doc_with_object(obj2_body: &str) -> Document {
     Document::from_bytes_owned(bytes).expect("test PDF with object parse")
 }
 
+/// Build a minimal valid PDF containing arbitrary extra indirect objects.
+///
+/// `objects` is a slice of `(id, body)` pairs; each becomes
+/// `{id} 0 obj\n{body}\nendobj\n`, written verbatim in the given order.  Ids
+/// must be unique, all `> 3` (objects 1–3 are reserved for the Catalog and
+/// page tree), and contiguous from 4 upward so the single-subsection xref
+/// stays valid.  This supports tests that need indirect *inner* elements
+/// (e.g. a `/W` array whose width entries are `9 0 R 10 0 R`) or deliberate
+/// reference cycles (`5 0 obj 5 0 R endobj`) to prove cycle-bounded resolution.
+///
+/// Object layout:
+/// - `1 0 obj` — Catalog with `/Pages 3 0 R`
+/// - `2 0 obj` — empty (reserved; kept so ids line up with the other helpers)
+/// - `3 0 obj` — empty Pages tree
+/// - `4..` — caller's `objects`
+pub fn make_doc_with_objects(objects: &[(u32, &str)]) -> Document {
+    // The xref is a single `0 N` subsection, so the kth offset is bound to
+    // object id k.  Ids must therefore be exactly 4, 5, 6, … in order; a gap
+    // would silently bind the wrong object to a reference.  Assert loudly so a
+    // mis-numbered test fails on construction, not on a confusing later value.
+    for (expected, (id, _)) in (4u32..).zip(objects) {
+        assert_eq!(
+            *id, expected,
+            "make_doc_with_objects requires contiguous ids from 4 upward"
+        );
+    }
+
+    let header = "%PDF-1.4\n";
+    let fixed = [
+        "1 0 obj\n<</Type /Catalog /Pages 3 0 R>>\nendobj\n".to_string(),
+        "2 0 obj\nnull\nendobj\n".to_string(),
+        "3 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n".to_string(),
+    ];
+    let extra: Vec<String> = objects
+        .iter()
+        .map(|(id, body)| format!("{id} 0 obj\n{body}\nendobj\n"))
+        .collect();
+
+    // Byte offset of each object, in id order (1, 2, 3, then the extras).
+    let mut offsets = Vec::with_capacity(3 + extra.len());
+    let mut cursor = header.len();
+    for section in fixed.iter().chain(extra.iter()) {
+        offsets.push(cursor);
+        cursor += section.len();
+    }
+    let xref_start = cursor;
+    let count = offsets.len() + 1; // +1 for the free object 0.
+
+    let mut xref = format!("xref\n0 {count}\n0000000000 65535 f\r\n");
+    for off in &offsets {
+        xref.push_str(&format!("{off:010} 00000 n\r\n"));
+    }
+    let trailer = format!("trailer\n<</Size {count} /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+
+    let mut body = String::with_capacity(xref_start + xref.len() + trailer.len());
+    body.push_str(header);
+    for section in fixed.iter().chain(extra.iter()) {
+        body.push_str(section);
+    }
+    body.push_str(&xref);
+    body.push_str(&trailer);
+    Document::from_bytes_owned(body.into_bytes()).expect("test PDF with objects parse")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

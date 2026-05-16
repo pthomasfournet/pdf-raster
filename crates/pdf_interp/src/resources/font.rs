@@ -23,6 +23,8 @@
 //! When no bytes are embedded (standard 14, or unembedded third-party fonts)
 //! we fall back to a hardcoded Helvetica substitute shipped with the `font` crate.
 
+use std::sync::Arc;
+
 use pdf::{Dictionary, Document, Object};
 
 use crate::resources::cmap::{CMap, parse_cmap};
@@ -808,6 +810,147 @@ fn extract_cid_to_gid(doc: &Document, descendant: &Dictionary) -> Option<Vec<u32
     }
 }
 
+/// Hard cap on the number of CID→width entries materialised from one `/W`
+/// array.  The range form `cfirst clast w` expands to `clast − cfirst + 1`
+/// width slots; a hostile or corrupt PDF can chain many maximal ranges to
+/// amplify a tiny `/W` array into gigabytes of `Vec<i32>`.  CIDs are 16-bit
+/// (PDF §9.7.4.3 — at most 65 536 distinct CIDs), so a font can never
+/// legitimately need more than this many slots; past it we stop appending
+/// and warn rather than let the allocator OOM the process (fail loud-graceful,
+/// not silent-hang).
+const MAX_CID_WIDTH_ENTRIES: usize = 0x1_0000;
+
+/// Resolve a single `/W` array element (possibly an indirect reference per
+/// PDF §9.7.4.3 — *any* number in `[ c [w…] cfirst clast w … ]` may be
+/// indirect) to its `Object`.  `doc.resolve` is a no-op pass-through for an
+/// inline (non-reference) element and is depth/cycle-bounded, so a self- or
+/// ring-referential `/W` element degrades to `None` (skip) rather than
+/// hanging or panicking.
+fn resolve_w_elem(doc: &Document, elem: &Object) -> Option<Arc<Object>> {
+    doc.resolve(elem).ok()
+}
+
+/// Parse the `W` array body into `(first_cid, widths)` segments.
+///
+/// `w_arr` is the already-resolved top-level array.  Per PDF §9.7.4.3 the
+/// grammar is `[ c [w1 w2 …]  cfirst clast w  … ]` and *every* element — the
+/// leading CID, the nested width array and each of its elements, the range
+/// `cfirst`/`clast`, and the range width — may itself be an indirect
+/// reference.  Resolving only the top-level `/W` still drops widths for a PDF
+/// that emits indirect *inner* elements, re-creating the "every glyph advances
+/// a full em → scrambled body text" defect on a different input.
+/// `resolve_w_elem` is a cycle-bounded no-op for inline elements, so inline-/W
+/// PDFs are unaffected.
+fn parse_w_segments(doc: &Document, w_arr: &[Object]) -> Vec<(u32, Vec<i32>)> {
+    let mut segments: Vec<(u32, Vec<i32>)> = Vec::new();
+    let mut materialised: usize = 0;
+    let mut i = 0;
+
+    while i < w_arr.len() {
+        let Some(first_obj) = resolve_w_elem(doc, &w_arr[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some(first_cid_raw) = first_obj.as_i64() else {
+            i += 1;
+            continue;
+        };
+        if first_cid_raw < 0 {
+            log::warn!("font: W array has negative CID {first_cid_raw}, skipping entry");
+            i += 1;
+            continue;
+        }
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "first_cid_raw validated >= 0 and PDF CIDs fit in u32"
+        )]
+        let first_cid = first_cid_raw as u32;
+        i += 1;
+
+        if i >= w_arr.len() {
+            break;
+        }
+
+        // The form discriminator (nested width array vs. range `last_cid`) may
+        // itself be indirect, so resolve it before matching on its shape.
+        let Some(second_obj) = resolve_w_elem(doc, &w_arr[i]) else {
+            i += 1;
+            continue;
+        };
+        match second_obj.as_ref() {
+            // `first_cid [w0 w1 …]` form.  Each width may be indirect.
+            Object::Array(ws) => {
+                let widths: Vec<i32> = ws
+                    .iter()
+                    .map(|o| {
+                        resolve_w_elem(doc, o)
+                            .and_then(|r| r.as_i64())
+                            .map_or(0, pdf_width_to_i32)
+                    })
+                    .collect();
+                if materialised.saturating_add(widths.len()) > MAX_CID_WIDTH_ENTRIES {
+                    log::warn!(
+                        "font: W array exceeds {MAX_CID_WIDTH_ENTRIES} CID width slots \
+                         (16-bit CID space) — truncating remaining segments"
+                    );
+                    break;
+                }
+                materialised += widths.len();
+                segments.push((first_cid, widths));
+                i += 1;
+            }
+            // `first_cid last_cid w` form.
+            Object::Integer(last_cid_raw) => {
+                let last_cid_raw = *last_cid_raw;
+                if last_cid_raw < 0 {
+                    log::warn!(
+                        "font: W array has negative last_cid {last_cid_raw}, skipping entry"
+                    );
+                    i += 1;
+                    continue;
+                }
+                #[expect(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "last_cid_raw validated >= 0 and PDF CIDs fit in u32"
+                )]
+                let last_cid = last_cid_raw as u32;
+                i += 1;
+                if i >= w_arr.len() {
+                    break;
+                }
+                let w = resolve_w_elem(doc, &w_arr[i])
+                    .and_then(|r| r.as_i64())
+                    .map_or(0, pdf_width_to_i32);
+                i += 1;
+
+                if last_cid >= first_cid && last_cid - first_cid < 0x1_0000 {
+                    let count = (last_cid - first_cid + 1) as usize;
+                    if materialised.saturating_add(count) > MAX_CID_WIDTH_ENTRIES {
+                        log::warn!(
+                            "font: W array exceeds {MAX_CID_WIDTH_ENTRIES} CID width slots \
+                             (16-bit CID space) — truncating remaining segments"
+                        );
+                        break;
+                    }
+                    materialised += count;
+                    segments.push((first_cid, vec![w; count]));
+                } else {
+                    log::warn!(
+                        "font: W array degenerate CID range {first_cid}–{last_cid}, skipping"
+                    );
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    segments
+}
+
 /// Parse `DW` and `W` from a `CIDFont` dictionary.
 ///
 /// Returns `(default_width, segments)` where segments match the PDF `W` format:
@@ -831,81 +974,7 @@ fn extract_cid_widths(doc: &Document, dict: &Dictionary) -> (i32, Vec<(u32, Vec<
         return (dw, vec![]);
     };
 
-    let mut segments: Vec<(u32, Vec<i32>)> = Vec::new();
-    let mut i = 0;
-
-    while i < w_arr.len() {
-        // Each segment starts with a non-negative CID integer (may be indirect).
-        let first_elem = doc.resolve(&w_arr[i]).ok();
-        let Some(first_cid_raw) = first_elem.as_ref().and_then(|o| o.as_i64()) else {
-            i += 1;
-            continue;
-        };
-        if first_cid_raw < 0 {
-            log::warn!("font: W array has negative CID {first_cid_raw}, skipping entry");
-            i += 1;
-            continue;
-        }
-        #[expect(
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation,
-            reason = "first_cid_raw validated >= 0 and PDF CIDs fit in u32"
-        )]
-        let first_cid = first_cid_raw as u32;
-        i += 1;
-
-        if i >= w_arr.len() {
-            break;
-        }
-
-        match &w_arr[i] {
-            // `first_cid [w0 w1 …]` form.
-            Object::Array(ws) => {
-                let widths: Vec<i32> = ws
-                    .iter()
-                    .map(|o| o.as_i64().map_or(0, pdf_width_to_i32))
-                    .collect();
-                segments.push((first_cid, widths));
-                i += 1;
-            }
-            // `first_cid last_cid w` form.
-            Object::Integer(last_cid_raw) => {
-                if *last_cid_raw < 0 {
-                    log::warn!(
-                        "font: W array has negative last_cid {last_cid_raw}, skipping entry"
-                    );
-                    i += 1;
-                    continue;
-                }
-                #[expect(
-                    clippy::cast_sign_loss,
-                    clippy::cast_possible_truncation,
-                    reason = "last_cid_raw validated >= 0 and PDF CIDs fit in u32"
-                )]
-                let last_cid = *last_cid_raw as u32;
-                i += 1;
-                if i >= w_arr.len() {
-                    break;
-                }
-                let w = w_arr[i].as_i64().map_or(0, pdf_width_to_i32);
-                i += 1;
-
-                if last_cid >= first_cid && last_cid - first_cid < 0x1_0000 {
-                    let count = (last_cid - first_cid + 1) as usize;
-                    segments.push((first_cid, vec![w; count]));
-                } else {
-                    log::warn!(
-                        "font: W array degenerate CID range {first_cid}–{last_cid}, skipping"
-                    );
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    (dw, segments)
+    (dw, parse_w_segments(doc, w_arr))
 }
 
 /// Parse the `Differences` array from a dictionary-form `Encoding` object.
@@ -1171,6 +1240,112 @@ mod tests {
         let (dw, segs) = extract_cid_widths(&doc, &dict);
         assert_eq!(dw, 500);
         assert_eq!(segs, vec![(10, vec![333, 444])]);
+    }
+
+    #[test]
+    fn cid_widths_resolve_indirect_inner_w_elements() {
+        // PDF §9.7.4.3: *any* number in `/W` may be an indirect reference —
+        // including the elements of the nested width array and the range
+        // `last_cid`/`w`.  Resolving only the top-level `/W` and the leading
+        // CID leaves an inner `5 0 R`/`6 0 R` width collapsing to 0-advance
+        // (overlapping glyphs — the scramble defect on a different input).
+        // This proves inner elements resolve too.
+        //
+        // obj 4 = `/W` array: `1 [ 5 0 R 6 0 R ]  20 7 0 R  8 0 R`
+        //   → CID 1 widths [333, 444] (indirect), CIDs 20..21 width 555 from
+        //     an indirect last_cid (obj 7 = 21) and indirect range width
+        //     (obj 8 = 555).  Object ids MUST stay contiguous (4,5,6,7,8) so
+        //     the single-subsection test xref stays valid.
+        let doc = crate::test_helpers::make_doc_with_objects(&[
+            (4, "[ 1 [ 5 0 R 6 0 R ] 20 7 0 R 8 0 R ]"),
+            (5, "333"),
+            (6, "444"),
+            (7, "21"),
+            (8, "555"),
+        ]);
+        let dict = make_dict(&[(b"W", Object::Reference((4, 0)))]);
+        let (dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(dw, 1000, "DW absent → spec default");
+        assert_eq!(
+            segs,
+            vec![(1, vec![333, 444]), (20, vec![555, 555])],
+            "indirect inner width-array elements and indirect range last_cid/w \
+             must resolve, not collapse to 0"
+        );
+    }
+
+    #[test]
+    fn cid_widths_cyclic_w_ref_is_loud_graceful() {
+        // A self-referential `/W` (`/W 4 0 R; 4 0 obj 4 0 R`) is the
+        // recursive-resolve DoS class.  `Document::resolve` is depth-bounded
+        // (32) and returns an error on the cycle; `extract_cid_widths` maps
+        // that to the empty-segment fallback (graceful — glyphs advance by DW,
+        // never a panic, hang, or OOM).
+        let doc = crate::test_helpers::make_doc_with_objects(&[(4, "4 0 R")]);
+        let dict = make_dict(&[
+            (b"DW", Object::Integer(600)),
+            (b"W", Object::Reference((4, 0))),
+        ]);
+        let (dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(dw, 600, "DW still honoured when /W is a broken cycle");
+        assert!(
+            segs.is_empty(),
+            "cyclic /W must degrade to no per-CID widths, not hang or panic"
+        );
+    }
+
+    #[test]
+    fn cid_widths_malformed_w_array_is_loud_graceful() {
+        // Hostile/corrupt `/W`, parsed strictly left-to-right per the PDF
+        // §9.7.4.3 grammar.  Sequence (with how the cursor consumes it):
+        //   Name        → bad leading element, skip 1
+        //   5 [ -7 9 ]  → well-formed width-array form: CID 5 widths [-7, 9]
+        //                 (negative width saturates via pdf_width_to_i32, it is
+        //                 NOT silently zeroed or panicked)
+        //   50 40 200   → range form, cfirst(50) > clast(40) → degenerate,
+        //                 logged + skipped, all 3 consumed
+        //   99          → dangling leading CID with no value → loop breaks
+        // No panic, no silent corruption of the one valid entry.
+        let doc = empty_doc();
+        let dict = make_dict(&[(
+            b"W",
+            Object::Array(vec![
+                Object::Name(b"NotACid".to_vec()),
+                Object::Integer(5),
+                Object::Array(vec![Object::Integer(-7), Object::Integer(9)]),
+                Object::Integer(50),
+                Object::Integer(40),
+                Object::Integer(200),
+                Object::Integer(99),
+            ]),
+        )]);
+        let (dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(dw, 1000);
+        assert_eq!(segs, vec![(5, vec![-7, 9])]);
+    }
+
+    #[test]
+    fn cid_widths_oversized_range_is_capped() {
+        // A chain of maximal ranges must not amplify a tiny `/W` into
+        // gigabytes of Vec<i32>.  Two back-to-back full-16-bit ranges request
+        // 2 × 65 536 slots; the second crosses MAX_CID_WIDTH_ENTRIES and is
+        // truncated (loud-graceful) rather than OOMing.
+        let doc = empty_doc();
+        let dict = make_dict(&[(
+            b"W",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0xFFFF),
+                Object::Integer(500),
+                Object::Integer(0x1_0000),
+                Object::Integer(0x1_FFFF),
+                Object::Integer(600),
+            ]),
+        )]);
+        let (_dw, segs) = extract_cid_widths(&doc, &dict);
+        assert_eq!(segs.len(), 1, "second range exceeds the entry cap");
+        assert_eq!(segs[0].0, 0);
+        assert_eq!(segs[0].1.len(), 0x1_0000);
     }
 
     #[test]
