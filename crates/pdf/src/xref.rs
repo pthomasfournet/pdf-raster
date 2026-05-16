@@ -439,10 +439,8 @@ fn read_xref_stream(
             ));
         }
     };
-    let raw_stream = &raw_stream[..];
-
     // Decode the stream (almost always FlateDecode).
-    let stream_bytes = decode_xref_stream(raw_stream, &dict)?;
+    let stream_bytes = decode_xref_stream(&raw_stream, &dict)?;
 
     // Read /W field widths.
     let w = match dict.get(b"W") {

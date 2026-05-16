@@ -161,7 +161,7 @@ pub fn qpdf_decrypt_to_temp(input: &Path) -> Result<(PathBuf, DecryptGuard), Pdf
     // exits 0/3 yet produced an empty or truncated output (disk full,
     // killed mid-write, an unexpected qpdf bug) would surface downstream
     // as a confusing generic xref/parse error instead of the accurate
-    // "could not decrypt" message — a regression of the NF-3 sin.
+    // "could not decrypt" message.
     match std::fs::metadata(&tmp_path) {
         Ok(m) if m.len() > 0 => {}
         Ok(_) => {
