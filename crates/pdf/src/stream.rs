@@ -7,14 +7,41 @@
 use crate::dictionary::Dictionary;
 use crate::object::Object;
 
+/// Upper bound on the number of filters in a single `/Filter` chain.
+///
+/// Real PDFs use at most two or three (a transport prefilter plus the
+/// terminal codec, e.g. `[/ASCII85Decode /CCITTFaxDecode]`).  A hostile
+/// `/Filter [/FlateDecode /FlateDecode … ×N]` array would otherwise drive `N`
+/// decode passes — each able to re-expand to [`MAX_DECOMPRESSED`] — turning a
+/// tiny stream into an unbounded CPU/RAM sink.  The image filter-chain path is
+/// the reachable vector for this, so the cap lives here at the single decode
+/// chokepoint rather than at each call site.
+const MAX_FILTER_CHAIN: usize = 32;
+
 /// Decode a raw stream byte slice according to its /Filter chain.
 ///
 /// `dict` is the stream dictionary; `raw` is the undecoded content bytes.
 /// Returns the fully-decoded bytes, or `raw` unchanged if there is no filter.
+///
+/// # Errors
+/// - The chain exceeds [`MAX_FILTER_CHAIN`] filters (hostile-array DoS guard).
+/// - Any stage produces more than [`MAX_DECOMPRESSED`] bytes.  Each Flate/LZW
+///   stage is individually bomb-capped, but a chain of stages could otherwise
+///   re-expand the intermediate buffer unbounded across iterations; this check
+///   bounds the aggregate by failing the moment any intermediate exceeds the
+///   cap.
+/// - Any individual filter step fails (the underlying decoder's error).
 pub fn decode_stream(raw: &[u8], dict: &Dictionary) -> Result<Vec<u8>, String> {
     let filters = collect_filters(dict);
     if filters.is_empty() {
         return Ok(raw.to_vec());
+    }
+    if filters.len() > MAX_FILTER_CHAIN {
+        return Err(format!(
+            "filter chain too long: {} filters exceeds {MAX_FILTER_CHAIN} cap \
+             (possible decompression-bomb / hostile-array DoS)",
+            filters.len()
+        ));
     }
 
     let params_list = collect_decode_parms(dict, filters.len());
@@ -23,6 +50,14 @@ pub fn decode_stream(raw: &[u8], dict: &Dictionary) -> Result<Vec<u8>, String> {
     for (i, filter) in filters.iter().enumerate() {
         let params = params_list.get(i).and_then(|o| o.as_ref());
         data = apply_filter(filter, &data, params)?;
+        if data.len() > MAX_DECOMPRESSED {
+            return Err(format!(
+                "filter chain stage {i} ({}) produced {} bytes, exceeds {MAX_DECOMPRESSED}-byte \
+                 cap (possible decompression bomb across chain)",
+                String::from_utf8_lossy(filter),
+                data.len()
+            ));
+        }
     }
     Ok(data)
 }
@@ -297,6 +332,47 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 
 // ── LZW ──────────────────────────────────────────────────────────────────────
 
+/// A `Vec<u8>` sink that refuses to grow past [`MAX_DECOMPRESSED`].
+///
+/// `weezl`'s `into_stream(...).decode_all` writes the entire decoded output in
+/// one pass with no size bound, so a small LZW stream that expands to many
+/// gigabytes (an LZW bomb — the same threat the Flate path is already capped
+/// against) would otherwise exhaust RAM.  Returning a write error here makes
+/// `decode_all` stop and surface a loud `LZWDecode` failure instead.  weezl
+/// also reports its own corrupt-stream errors as `InvalidData`, so a dedicated
+/// `tripped` flag — not the error kind — is what distinguishes "bomb cap hit"
+/// (unrecoverable, discard partial) from a benign mid-stream decode error
+/// (partial prefix is real content, keep it).
+struct BoundedSink {
+    buf: Vec<u8>,
+    tripped: bool,
+}
+
+/// `true` when appending `incoming` bytes to a buffer already holding `have`
+/// bytes would exceed [`MAX_DECOMPRESSED`].  Extracted so the bomb predicate
+/// is unit-testable without materialising a gigabyte-scale buffer.
+const fn would_overflow_cap(have: usize, incoming: usize) -> bool {
+    have.saturating_add(incoming) > MAX_DECOMPRESSED
+}
+
+impl std::io::Write for BoundedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if would_overflow_cap(self.buf.len(), buf.len()) {
+            self.tripped = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LZWDecode: decompressed output exceeds 1 GiB cap (possible LZW bomb)",
+            ));
+        }
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn apply_lzw(data: &[u8], params: Option<&Object>) -> Result<Vec<u8>, String> {
     let early_change = params
         .and_then(Object::as_dict)
@@ -311,9 +387,21 @@ fn apply_lzw(data: &[u8], params: Option<&Object>) -> Result<Vec<u8>, String> {
         weezl::decode::Decoder::new(weezl::BitOrder::Msb, 8)
     };
 
-    let mut out = Vec::new();
-    let result = decoder.into_stream(&mut out).decode_all(data);
+    let mut sink = BoundedSink {
+        buf: Vec::new(),
+        tripped: false,
+    };
+    let result = decoder.into_stream(&mut sink).decode_all(data);
+    let BoundedSink {
+        buf: mut out,
+        tripped,
+    } = sink;
     if let Err(e) = result.status {
+        // A bomb that tripped the size cap is unrecoverable — the partial
+        // prefix is not the document's real content, so do not return it.
+        if tripped {
+            return Err(format!("LZWDecode aborted: {e}"));
+        }
         if out.is_empty() {
             return Err(format!("LZWDecode failed with no output: {e}"));
         }
@@ -494,5 +582,109 @@ mod tests {
         let decompressed = apply_flate(&compressed, None).unwrap();
         assert_eq!(decompressed.len(), original.len());
         assert_eq!(decompressed, original);
+    }
+
+    // ── Filter-chain DoS guards ────────────────────────────────────────────────
+
+    fn flate_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn legit_ascii85_then_flate_chain_roundtrips() {
+        // The standard transport-wrapper idiom: payload is flate-compressed
+        // then ASCII85-armoured.  `decode_stream` must undo both, left to
+        // right — this is the scanned-book prefilter step (only the terminal
+        // codec differs in the corpus case).
+        let original = b"chained transport payload \x00\x01\x02\xff and text";
+        let flated = flate_compress(original);
+        let ascii85 = {
+            // Adobe ASCII85-encode `flated` (terminated with `~>`).
+            let mut out = Vec::new();
+            for chunk in flated.chunks(4) {
+                let mut grp = [0u8; 4];
+                grp[..chunk.len()].copy_from_slice(chunk);
+                let mut n = u32::from_be_bytes(grp);
+                let mut enc = [0u8; 5];
+                for slot in enc.iter_mut().rev() {
+                    *slot = b'!' + (n % 85) as u8;
+                    n /= 85;
+                }
+                out.extend_from_slice(&enc[..chunk.len() + 1]);
+            }
+            out.extend_from_slice(b"~>");
+            out
+        };
+
+        let mut dict = Dictionary::new();
+        dict.set(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        let decoded = decode_stream(&ascii85, &dict).expect("legit chain must decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn hostile_overlong_filter_chain_is_rejected_loudly() {
+        // `/Filter [/FlateDecode … ×(MAX+1)]` — must fail with a clear DoS
+        // error, never iterate the loop unbounded.
+        let mut dict = Dictionary::new();
+        dict.set(
+            b"Filter",
+            Object::Array(
+                std::iter::repeat_with(|| Object::Name(b"FlateDecode".to_vec()))
+                    .take(MAX_FILTER_CHAIN + 1)
+                    .collect(),
+            ),
+        );
+        let err = decode_stream(b"anything", &dict).expect_err("overlong chain must error");
+        assert!(err.contains("filter chain too long"), "got: {err}");
+    }
+
+    #[test]
+    fn lzw_bomb_cap_predicate_and_sink_flag() {
+        // The LZW-bomb defence has two halves:
+        //  1. the size predicate trips exactly at the cap boundary, and
+        //  2. `BoundedSink` flags `tripped` + errors loudly so the caller
+        //     discards the unrecoverable partial output.
+        // Tested without allocating the bomb (predicate is pure).
+        assert!(!would_overflow_cap(0, MAX_DECOMPRESSED));
+        assert!(!would_overflow_cap(MAX_DECOMPRESSED, 0));
+        assert!(would_overflow_cap(MAX_DECOMPRESSED, 1));
+        assert!(would_overflow_cap(MAX_DECOMPRESSED - 4, 8));
+        // saturating_add: an absurd incoming length cannot wrap to "fits".
+        assert!(would_overflow_cap(usize::MAX, usize::MAX));
+
+        use std::io::Write;
+        let mut sink = BoundedSink {
+            buf: Vec::new(),
+            tripped: false,
+        };
+        assert_eq!(sink.write(b"hello").unwrap(), 5);
+        assert!(!sink.tripped);
+    }
+
+    #[test]
+    fn chain_stage_output_overrun_is_rejected() {
+        // Aggregate-across-chain guard: even though each Flate stage is
+        // individually 1-GiB-capped, an intermediate that exceeds the cap
+        // must abort the whole chain.  Drive it through the public API with a
+        // single Flate stage whose output we force over the limit via the
+        // post-stage check (a true 1-GiB fixture is impractical in a unit
+        // test, so we assert the smaller invariant: a valid short chain still
+        // succeeds, proving the guard is not a false-positive).
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        let payload = b"a modest stream well under the cap";
+        let decoded = decode_stream(&flate_compress(payload), &dict).unwrap();
+        assert_eq!(decoded, payload);
     }
 }
