@@ -256,8 +256,8 @@ pub enum BackendPolicy {
     /// the device-resident image cache (`DeviceImageCache`,
     /// `DevicePageBuffer`) is CUDA-only, so under `ForceVulkan` JPEG
     /// images decode and composite via the CPU path, and ICC CMYK→RGB
-    /// also stays on the CPU AVX-512 fallback.  This matches Phase 9-pre
-    /// behaviour where the cache wasn't yet present.
+    /// also stays on the CPU AVX-512 fallback (the behaviour from before
+    /// the device-resident cache existed).
     ForceVulkan,
 }
 

@@ -404,8 +404,8 @@ pub fn open_session(
     });
 
     // DocId: BLAKE3 of the PDF bytes.  Stable per content; editing
-    // the PDF naturally invalidates the disk tier (Task 5) because
-    // the hash changes.  Costs one full BLAKE3 hash at session open
+    // the PDF naturally invalidates the disk tier because the hash
+    // changes.  Costs one full BLAKE3 hash at session open
     // (~250 MB/s; ~40ms for a 10MB PDF) — paid once per session, not
     // per page.  Borrows the bytes already mmapped by `pdf_interp::open`
     // so the hash adds zero IO.
@@ -1777,7 +1777,7 @@ mod decoder_reclaim_guard_tests {
 
     #[test]
     fn reclaim_runs_when_lend_fails_partway_because_guard_armed_first() {
-        // The FIX-07c invariant: the guard is armed BEFORE the fallible lend,
+        // The guard-ordering invariant: the guard is armed BEFORE the fallible lend,
         // so a `?`-early-return from a later ensure_* step (modelled here as a
         // fallible fake_lend returning Err after the guard exists) still drops
         // the guard and reclaims partially-moved handles.  If the guard were
