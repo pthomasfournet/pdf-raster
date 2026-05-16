@@ -379,7 +379,7 @@ Direct use of `rasterrocket-interp` is not required for most consumers. Use it w
 pub fn open(path: impl AsRef<Path>) -> Result<pdf::Document, InterpError>
 ```
 
-Opens and validates a PDF. If a JavaScript entry point is detected (checked locations: `/OpenAction`, catalog `/AA`, `/Names/JavaScript`, `/AcroForm/AA`, each flagged only when genuinely a `/S /JavaScript` action), a loud `WARN` is emitted per location and the document still opens — rasterrocket has no JavaScript engine and never executes `/JS`, so a script's structural presence cannot change the static rendered page. No JS is parsed or evaluated.
+Opens and validates a PDF. If a JavaScript entry point is detected (checked locations: `/OpenAction`, catalog `/AA`, `/Names/JavaScript`, `/AcroForm/AA`, and page-level `/AA` / per-annotation `/A`/`/AA`, each flagged only when genuinely a `/S /JavaScript` action), a loud `WARN` is emitted per location and the document still opens — rasterrocket has no JavaScript engine and never executes `/JS`, so a script's structural presence cannot change the static rendered page. No JS is parsed or evaluated. The page/annotation walk is bounded and stops at the first hit, so a pathological multi-thousand-page document may not be fully scanned.
 
 The returned `pdf::Document` comes from the in-tree `pdf` crate (replaced lopdf 0.40 in v0.6.0). It is a lazy, mmap-backed reader: opening the file parses only the xref table and trailer; individual objects resolve on demand via byte-offset seek with a per-object `Arc` cache shared safely across worker threads. Object stream (`ObjStm`) decompression is cached once and reused. The API mirrors the lopdf method names previously used here.
 

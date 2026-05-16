@@ -224,8 +224,9 @@ Flagged only when genuinely JavaScript (never on bare key presence — that woul
 - `/Catalog/AA` with a `/S /JavaScript` sub-action (a transition/GoTo `/AA` is not flagged)
 - `/Catalog/Names/JavaScript` (the JS-specific name subtree)
 - `/Catalog/AcroForm/AA` with a `/S /JavaScript` sub-action (a `/S /SubmitForm` AcroForm is not flagged)
+- page-level `/AA` and per-annotation/widget `/A`/`/AA` with a `/S /JavaScript` action (the calculate/format/validate JS of a fillable form lives here — the most common real-world placement)
 
-Not detected: page-level `/AA` and per-annotation/widget `/A`/`/AA` scripts (the scan is catalog-only).
+The page/annotation walk is bounded and stops at the first hit (one disclosure suffices): at most a few thousand pages and annotations are inspected, so a pathological multi-thousand-page document may not be fully scanned — an unbounded walk on a hostile input is the worse failure than a missed disclosure.
 
 ## Building the CLI
 
