@@ -684,13 +684,25 @@ fn render_page_rgb_with_geom(
     #[cfg(feature = "cache")]
     renderer.set_image_cache(session.image_cache.as_ref().map(Arc::clone), session.doc_id);
 
-    lend_decoders(session, &mut renderer, effective_policy)?;
-    // RAII guard: reclaim_decoders runs on both normal return and unwind.
-    // Drop releases the &mut borrow, so `renderer` is usable directly below.
+    // RAII guard armed BEFORE lend_decoders, not after.  lend_decoders moves
+    // handles out of TLS into the renderer one decoder at a time and is
+    // fallible per step: a `?` early-return from a later `ensure_*` would
+    // otherwise drop the renderer (and any handle already moved in) without
+    // reclaim — a partial-move leak.  Arming the guard first makes lend
+    // transactional: every exit from lend OR the render body — `?`-early-return,
+    // normal return, or panic-unwind — drops the guard and runs reclaim exactly
+    // once.  reclaim is safe after a partial lend: each decoder's
+    // ensure+take+set runs atomically per feature, so earlier features are
+    // fully lent (TLS cell `Ready(None)`, handle in renderer) and reclaim
+    // restores them, while a feature whose `ensure_*` failed left its TLS cell
+    // non-`Ready` and reclaim's `if let Ready` guard skips it (no clobber).
     let guard = DecoderReclaim(&mut renderer);
+    lend_decoders(session, guard.0, effective_policy)?;
     guard.0.execute(&ops);
     guard.0.render_annotations(page_id);
-    drop(guard); // reclaim happens here — exactly once on success path
+    // Drop reclaims exactly once and releases the &mut borrow, so `renderer`
+    // is usable directly for the budget/decode-errors/finish tail below.
+    drop(guard);
 
     // Budget exceeded is checked before decode_errors: a budget breach is more
     // fundamental (the page may not have finished rendering at all), and the two
@@ -894,16 +906,25 @@ fn reclaim_decoders(renderer: &mut pdf_interp::renderer::PageRenderer) {
 
 /// RAII guard that calls [`reclaim_decoders`] when dropped.
 ///
-/// `lend_decoders` moves per-thread GPU decoder handles out of TLS into
-/// the `PageRenderer`. If `execute` or `render_annotations` panics under
-/// `panic=unwind` (test builds or unwind-configured embedders), the stack
-/// unwind triggers this guard's `Drop`, returning the handles to TLS rather
-/// than dropping them. Subsequent pages on the same Rayon worker thread then
-/// continue to find their decoder slots populated.
+/// `lend_decoders` moves per-thread GPU decoder handles out of TLS into the
+/// `PageRenderer`. The guard is armed *before* `lend_decoders` is called so it
+/// covers three exit paths, each running `reclaim_decoders` exactly once:
 ///
-/// On the success path, `drop(guard)` is called explicitly — the `&mut`
-/// borrow is released and `renderer` is accessible directly for the
-/// `decode_errors()`/`finish()` tail. Reclaim runs exactly once either way.
+/// - **`?`-early-return inside `lend_decoders`**: a later `ensure_*` failing
+///   would otherwise drop the renderer with earlier handles already moved in —
+///   a partial-move leak. The armed guard reclaims them on the way out.
+/// - **panic-unwind in `execute`/`render_annotations`** (`panic=unwind` test
+///   builds or unwind-configured embedders): the stack unwind triggers `Drop`,
+///   returning the handles to TLS rather than dropping them, so subsequent
+///   pages on the same Rayon worker still find their decoder slots populated.
+/// - **normal success**: `drop(guard)` is called explicitly — the `&mut`
+///   borrow is released and `renderer` is accessible directly for the
+///   `budget_status()`/`decode_errors()`/`finish()` tail.
+///
+/// Reclaim is sound after a *partial* lend: each decoder's ensure+take+set is
+/// atomic per feature, so earlier features are fully lent and reclaim restores
+/// them, while a feature whose `ensure_*` failed left its TLS cell non-`Ready`
+/// and reclaim's `if let Ready` guard skips it (no clobber).
 struct DecoderReclaim<'r, 'doc>(&'r mut pdf_interp::renderer::PageRenderer<'doc>);
 
 impl Drop for DecoderReclaim<'_, '_> {
@@ -1752,5 +1773,39 @@ mod decoder_reclaim_guard_tests {
         // decode_errors()/finish() tail in render_page_rgb_with_geom.
         let _ = &r;
         assert_eq!(count(), 1, "must not double-reclaim after explicit drop");
+    }
+
+    #[test]
+    fn reclaim_runs_when_lend_fails_partway_because_guard_armed_first() {
+        // The FIX-07c invariant: the guard is armed BEFORE the fallible lend,
+        // so a `?`-early-return from a later ensure_* step (modelled here as a
+        // fallible fake_lend returning Err after the guard exists) still drops
+        // the guard and reclaims partially-moved handles.  If the guard were
+        // armed *after* lend (the pre-fix order), an early Err would skip
+        // reclaim entirely and leak — this test would observe count() == 0.
+        fn fake_lend(_r: &mut FakeRenderer, fail: bool) -> Result<(), ()> {
+            // Models lend_decoders moving handle 1 in, then a later ensure_*
+            // failing before handle 2 is moved.
+            if fail {
+                return Err(());
+            }
+            Ok(())
+        }
+
+        reset();
+        let mut r = FakeRenderer;
+        let outcome: Result<(), ()> = (|| {
+            let guard = FakeGuard(&mut r);
+            fake_lend(guard.0, true)?; // partway failure: `?` returns Err here
+            drop(guard); // unreachable on the failing path
+            Ok(())
+        })();
+        assert!(outcome.is_err(), "fake_lend must propagate the partway error");
+        assert_eq!(
+            count(),
+            1,
+            "reclaim must run exactly once even when lend fails partway \
+             (guard armed before the fallible lend)"
+        );
     }
 }
