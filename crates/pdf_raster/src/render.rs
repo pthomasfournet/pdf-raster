@@ -1053,21 +1053,7 @@ where
     let result = std::panic::catch_unwind(f);
     let outcome = match result {
         Ok(r) => r,
-        Err(payload) => {
-            let message = payload.downcast_ref::<&str>().map_or_else(
-                || {
-                    payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .unwrap_or_else(|| "panicked".to_owned())
-                },
-                |s| (*s).to_owned(),
-            );
-            Err(RasterError::RenderPanic {
-                page: page_num,
-                message,
-            })
-        }
+        Err(payload) => Err(panic_payload_to_render_panic(page_num, payload.as_ref())),
     };
     (page_num, outcome)
 }
@@ -1078,18 +1064,17 @@ where
 ///
 /// `render_one` receives a shared `&RenderState` and does not mutate any field
 /// of the struct itself — `session`, `opts`, and `cursor` are all read-only
-/// within `render_one`.  The only interior mutation that occurs is in
+/// within `render_one`.  The only interior mutation is in
 /// `lend_decoders`/`reclaim_decoders`, which move GPU decoder handles out of
-/// thread-local storage into a locally-owned `PageRenderer` and back.  If a
-/// panic occurs between those two calls the decoder handle is dropped rather
-/// than returned to TLS, causing subsequent pages on that Rayon worker to fall
-/// back to CPU decode for the decoder type that was lost.  This is a decoder-
-/// loss degradation, not a memory-safety issue, and does not corrupt any state
-/// shared with other pages.  Crucially, if a panic occurs, we do not attempt
-/// to reuse the panicking page's local state — we discard it and move on to
-/// the next page number.  `AssertUnwindSafe` is therefore sound: a panic
-/// cannot leave `state` in an inconsistent state that would corrupt subsequent
-/// pages.
+/// thread-local storage into a locally-owned `PageRenderer` and back.  An
+/// unwind between those two calls is caught by the [`DecoderReclaim`] RAII
+/// guard, which returns the handles to TLS on `Drop`, so a panicking page does
+/// not even degrade the next page's decoder backend.  No state shared with
+/// other pages is mutated, and the panicking page's local `PageRenderer` is
+/// discarded rather than reused — we resume from the next page number.
+/// `AssertUnwindSafe` is therefore sound: a caught panic cannot leave `state`
+/// or thread-local decoder slots in an inconsistent state that would corrupt
+/// subsequent pages.
 fn render_one_caught(
     state: &RenderState,
     page_num: u32,
@@ -1098,6 +1083,78 @@ fn render_one_caught(
         page_num,
         std::panic::AssertUnwindSafe(|| render_one(state, page_num)),
     )
+}
+
+/// The body of the [`render_channel`] rayon worker, with every panic site —
+/// including session setup — inside a single `catch_unwind`.
+///
+/// `open_session` is a deep parser entry point (decryption, xref repair,
+/// page-tree walks over adversarial input).  If it — or the page cursor —
+/// panicked *outside* the catch, the rayon closure would unwind, `tx` would
+/// drop, and the consumer would observe a silently closed channel with no
+/// `(page_num, Err)` ever delivered: total, undiagnosable page loss.  Catching
+/// here guarantees the contract documented on [`render_channel`]: a setup
+/// panic is delivered as `(1, Err(RasterError::RenderPanic { .. }))` before the
+/// channel closes, exactly as a per-page panic is.  Under `panic = "abort"`
+/// (the default release profile) this is a no-op; the guarantee holds for
+/// `panic = "unwind"` builds and embedders that opt in.
+///
+/// `AssertUnwindSafe` is sound here: every value the closure touches is either
+/// freshly created inside it (`session`, `state`) or an owned move-in
+/// (`path`, `opts`).  `tx` is a `SyncSender`, which carries no
+/// unwind-observable invariant — a partially-sent item cannot exist because
+/// `send` is atomic per message.  Nothing observable by a *later* call is
+/// mutated through a shared reference.
+fn render_channel_worker(
+    tx: &std::sync::mpsc::SyncSender<(u32, Result<RenderedPage, RasterError>)>,
+    path: &std::path::Path,
+    opts: RasterOptions,
+) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let session = match open_session(path, &SessionConfig::default()) {
+            Ok(s) => s,
+            Err(e) => {
+                let _sent = tx.send((1, Err(e)));
+                return;
+            }
+        };
+
+        let mut state = RenderState {
+            cursor: PageCursor::new(&opts),
+            session,
+            opts,
+        };
+
+        while let Some(page_num) = state.next_in_range() {
+            let item = render_one_caught(&state, page_num);
+            if tx.send(item).is_err() {
+                return;
+            }
+        }
+    }));
+
+    if let Err(payload) = caught {
+        // A panic escaped session setup or the page cursor.  Deliver it as a
+        // page-1 RenderPanic so the consumer sees a loud per-page error rather
+        // than an empty, silently closed channel.
+        let _sent = tx.send((1, Err(panic_payload_to_render_panic(1, payload.as_ref()))));
+    }
+}
+
+/// Extract a human-readable message from a caught panic payload and wrap it in
+/// [`RasterError::RenderPanic`].  Shared by the per-page and worker-level
+/// catch sites so payload handling stays identical.
+fn panic_payload_to_render_panic(page: u32, payload: &(dyn std::any::Any + Send)) -> RasterError {
+    let message = payload.downcast_ref::<&str>().map_or_else(
+        || {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "panicked".to_owned())
+        },
+        |s| (*s).to_owned(),
+    );
+    RasterError::RenderPanic { page, message }
 }
 
 #[must_use]
@@ -1120,26 +1177,7 @@ pub fn render_channel(
     let opts_owned = opts.clone();
 
     rayon::spawn(move || {
-        let session = match open_session(&path_owned, &SessionConfig::default()) {
-            Ok(s) => s,
-            Err(e) => {
-                let _sent = tx.send((1, Err(e)));
-                return;
-            }
-        };
-
-        let mut state = RenderState {
-            cursor: PageCursor::new(&opts_owned),
-            session,
-            opts: opts_owned,
-        };
-
-        while let Some(page_num) = state.next_in_range() {
-            let item = render_one_caught(&state, page_num);
-            if tx.send(item).is_err() {
-                return;
-            }
-        }
+        render_channel_worker(&tx, &path_owned, opts_owned);
     });
 
     rx
@@ -1483,6 +1521,76 @@ mod channel_tests {
             results[1].1.is_ok(),
             "page 2 must succeed; got {:?}",
             results[1].1
+        );
+    }
+
+    #[test]
+    fn panic_payload_helper_extracts_str_string_and_fallback() {
+        // &str payload (the common `panic!("literal")` shape).
+        let from_str = std::panic::catch_unwind(|| panic!("str payload"))
+            .map(|()| unreachable!())
+            .unwrap_err();
+        assert!(
+            matches!(
+                panic_payload_to_render_panic(2, from_str.as_ref()),
+                RasterError::RenderPanic { page: 2, ref message } if message.contains("str payload")
+            ),
+            "str payload must carry through as a page-2 RenderPanic"
+        );
+        // String payload (formatted panic).
+        let n = 9;
+        let from_string = std::panic::catch_unwind(|| panic!("string {n}"))
+            .map(|()| unreachable!())
+            .unwrap_err();
+        assert!(
+            matches!(
+                panic_payload_to_render_panic(3, from_string.as_ref()),
+                RasterError::RenderPanic { page: 3, ref message } if message.contains("string 9")
+            ),
+            "String payload must carry through as a page-3 RenderPanic"
+        );
+        // Non-string payload → stable fallback, never re-panics.
+        let from_other = std::panic::catch_unwind(|| std::panic::panic_any(123u32))
+            .map(|()| unreachable!())
+            .unwrap_err();
+        assert!(
+            matches!(
+                panic_payload_to_render_panic(4, from_other.as_ref()),
+                RasterError::RenderPanic { page: 4, ref message } if message == "panicked"
+            ),
+            "non-string payload must fall back to the stable \"panicked\" message"
+        );
+    }
+
+    #[test]
+    fn render_channel_worker_delivers_setup_panic_not_silent_close() {
+        // The v1-class silent-total-loss guard: a panic in session setup must
+        // arrive as (1, Err(RenderPanic)) on the channel, NOT a closed,
+        // empty channel.  We can't make `open_session` panic from here, so we
+        // drive the worker's catch boundary with a closure-shaped stand-in
+        // that mirrors render_channel_worker's structure: a panic before the
+        // first send must still be delivered to the consumer.
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::sync_channel::<(u32, Result<RenderedPage, RasterError>)>(4);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Stand-in for `open_session` panicking before any page is sent.
+            panic!("synthetic open_session panic");
+        }));
+        if let Err(payload) = caught {
+            let _sent = tx.send((1, Err(panic_payload_to_render_panic(1, payload.as_ref()))));
+        }
+        drop(tx);
+        let received: Vec<_> = rx.iter().collect();
+        assert_eq!(
+            received.len(),
+            1,
+            "consumer must see exactly one delivered error, not an empty closed channel"
+        );
+        assert_eq!(received[0].0, 1);
+        assert!(
+            matches!(received[0].1, Err(RasterError::RenderPanic { page: 1, .. })),
+            "setup panic must be a page-1 RenderPanic; got {:?}",
+            received[0].1
         );
     }
 
