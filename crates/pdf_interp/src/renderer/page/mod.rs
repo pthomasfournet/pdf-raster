@@ -1582,21 +1582,26 @@ impl<'doc> PageRenderer<'doc> {
         let img_h = f64::from(img.height);
         let img_width_usize = img.width as usize;
 
-        // Phase 9 GPU image-blit fast path: device-resident pixels +
-        // CUDA kernel transform writing into a per-page DevicePageBuffer.
-        // Returns true if the GPU path handled the image; false to fall
-        // through to the CPU sampler below.
+        // GPU image-blit fast path: device-resident pixels + CUDA kernel
+        // transform writing into a per-page DevicePageBuffer.  Returns true
+        // if the GPU path handled the image; false to fall through to the
+        // CPU sampler below.
         #[cfg(feature = "cache")]
         if let crate::resources::image::ImageData::Gpu(cached) = &img.data {
             if self.try_gpu_blit_image(cached, &ctm, page_h) {
                 return;
             }
-            // Promotion or kernel dispatch failed; we don't have host
-            // bytes either, so log and skip the image rather than CPU
-            // sampling something that isn't there.
-            log::warn!(
-                "blit_image: GPU image-blit failed (no fallback bytes available — image will be missing from output)"
+            // Promotion or kernel dispatch failed and there are no host
+            // bytes to fall back to.  The image decoded successfully but
+            // cannot be rendered: this is the same silent-blank class the
+            // `ImageResolution` contract eradicates upstream, so record it
+            // on `decode_errors` to surface as a per-page `Err` rather than
+            // dropping the image with only a log line.
+            log::debug!(
+                "blit_image: GPU image-blit failed with no host fallback bytes"
             );
+            self.decode_errors
+                .push("page image: GPU blit failed, no host fallback".to_owned());
             return;
         }
 
@@ -1605,9 +1610,14 @@ impl<'doc> PageRenderer<'doc> {
         // case if `try_gpu_blit_image` somehow falls through (it
         // currently doesn't, but the explicit None check is cheap).
         let Some(img_bytes) = img.data.as_cpu() else {
-            log::warn!(
-                "blit_image: image data not host-resident and GPU dispatch unavailable — skipping"
+            // Decoded pixels exist but are device-resident with no GPU
+            // dispatch available to blit them — unrenderable, not absent.
+            // Surface as a decode failure (silent-blank parity).
+            log::debug!(
+                "blit_image: image data not host-resident and GPU dispatch unavailable"
             );
+            self.decode_errors
+                .push("page image: pixels device-resident but GPU dispatch unavailable".to_owned());
             return;
         };
         // Decoder contract: bytes.len() == width × height × bpp.  Promote
@@ -1620,18 +1630,23 @@ impl<'doc> PageRenderer<'doc> {
         match check_image_bytes_len(img.width, img.height, bpp, img_bytes.len()) {
             Ok(_) => {}
             Err(ImageLenError::DimensionOverflow) => {
-                log::warn!(
-                    "blit_image: image dimensions overflow usize ({}×{}×{bpp} bpp) — skipping",
-                    img.width,
-                    img.height,
+                // A decoder-contract violation on an image the codec
+                // reported as decoded — surface, never silently blank.
+                let msg = format!(
+                    "page image: dimensions overflow usize ({}×{}×{bpp} bpp)",
+                    img.width, img.height,
                 );
+                log::debug!("blit_image: {msg}");
+                self.decode_errors.push(msg);
                 return;
             }
             Err(ImageLenError::ShortBuffer { expected }) => {
-                log::warn!(
-                    "blit_image: decoder produced short buffer ({} bytes, expected {expected}) — skipping",
+                let msg = format!(
+                    "page image: decoder produced short buffer ({} bytes, expected {expected})",
                     img_bytes.len(),
                 );
+                log::debug!("blit_image: {msg}");
+                self.decode_errors.push(msg);
                 return;
             }
         }
