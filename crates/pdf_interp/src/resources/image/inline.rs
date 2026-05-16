@@ -347,6 +347,17 @@ pub(super) fn inline_token_to_object(tok: &crate::content::tokenizer::Token<'_>)
         Token::Bool(b) => Object::Boolean(*b),
         Token::String(s) => Object::String(s.clone(), pdf::StringFormat::Literal),
         Token::Array(items) => Object::Array(items.iter().map(inline_token_to_object).collect()),
+        // The content tokenizer emits an inline `<< … >>` dictionary as a raw
+        // `Op` byte slice (it has no PDF-object parser of its own).  Inline
+        // image `/DP` (DecodeParms) is exactly such a dictionary — e.g.
+        // `<</K -1 /Columns 277>>` for a CCITT G4 ImageMask.  Re-parse it with
+        // the PDF object parser so DecodeParms keys (K, Columns, BlackIs1, …)
+        // reach the codec; otherwise they are silently dropped and a G4 stream
+        // is misrouted to the G3-1D decoder, which then yields zero rows.
+        Token::Op(raw) if raw.starts_with(b"<<") => {
+            let mut pos = 0usize;
+            pdf::parse_object(raw, &mut pos).unwrap_or(Object::Null)
+        }
         _ => Object::Null,
     }
 }
@@ -469,6 +480,40 @@ mod tests {
         assert_eq!(dict.get_i64(b"Width"), Some(3));
         assert_eq!(dict.get_i64(b"Height"), Some(1));
         assert_eq!(dict.get_i64(b"BitsPerComponent"), Some(8));
+    }
+
+    #[test]
+    fn parse_inline_params_decodeparms_dict() {
+        use crate::resources::dict_ext::DictExt;
+        // A CCITT G4 ImageMask inline image: the /DP value is an inline
+        // dictionary `<</K -1 /Columns 277>>`.  It must round-trip into a
+        // real Object::Dictionary so the codec sees /K = -1 (Group 4) rather
+        // than defaulting to 0 (Group 3 1D) and producing zero rows.
+        let params = b"/IM true /W 277 /H 102 /BPC 1 /F /CCF /DP<</K -1 /Columns 277>>";
+        let dict = parse_inline_params(params);
+        let dp = dict
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("DecodeParms must parse into a dictionary");
+        assert_eq!(dp.get_i64(b"K"), Some(-1));
+        assert_eq!(dp.get_i64(b"Columns"), Some(277));
+    }
+
+    #[test]
+    fn parse_inline_params_decodeparms_dict_blackis1() {
+        use crate::resources::dict_ext::DictExt;
+        // Boolean and predictor keys inside the inline DecodeParms dict must
+        // also survive the round-trip (regression guard for the wider class
+        // of dropped inline-DecodeParms keys).
+        let params = b"/W 8 /H 8 /BPC 1 /F /CCF /DP<</K 0 /BlackIs1 true /EncodedByteAlign true>>";
+        let dict = parse_inline_params(params);
+        let dp = dict
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("DecodeParms must parse into a dictionary");
+        assert_eq!(dp.get_i64(b"K"), Some(0));
+        assert_eq!(dp.get_bool(b"BlackIs1"), Some(true));
+        assert_eq!(dp.get_bool(b"EncodedByteAlign"), Some(true));
     }
 
     // ── decode_run_length ──────────────────────────────────────────────────────
