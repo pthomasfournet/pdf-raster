@@ -301,90 +301,108 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Return the next token, or `None` at end of stream.
+    ///
+    /// Skipped bytes (stray `]`, lone delimiters) are consumed in a loop, not
+    /// by re-entering this method, so an adversarial stream of millions of
+    /// stray delimiters cannot drive unbounded call depth and a stack overflow.
     pub fn next_token(&mut self) -> Option<Token<'a>> {
-        self.skip_whitespace_and_comments();
-        let b = self.peek()?;
+        loop {
+            self.skip_whitespace_and_comments();
+            let b = self.peek()?;
 
-        match b {
-            b'/' => Some(Token::Name(self.read_name())),
-            b'(' => Some(Token::String(self.read_literal_string())),
-            b'<' if self.src.get(self.pos + 1) == Some(&b'<') => {
-                // Inline dictionary (`<< … >>`). Rare in content streams (only
-                // appears in some inline-image parameter dicts). Emit as a raw
-                // Op slice so the dispatcher can surface a clear error instead
-                // of silently producing wrong output.
-                let start = self.pos;
-                self.pos += 2;
-                let mut depth = 1usize;
-                while self.pos < self.src.len() {
-                    if self.src[self.pos..].starts_with(b"<<") {
-                        depth += 1;
-                        self.pos += 2;
-                    } else if self.src[self.pos..].starts_with(b">>") {
-                        depth -= 1;
-                        self.pos += 2;
-                        if depth == 0 {
+            // Each loop iteration either returns a token or strictly advances
+            // `self.pos` before re-scanning (the stray-`]` and empty-word skip
+            // paths both `advance()`), guaranteeing termination on any finite
+            // input. `before` anchors the per-iteration progress assertions.
+            let before = self.pos;
+
+            match b {
+                b'/' => return Some(Token::Name(self.read_name())),
+                b'(' => return Some(Token::String(self.read_literal_string())),
+                b'<' if self.src.get(self.pos + 1) == Some(&b'<') => {
+                    // Inline dictionary (`<< … >>`). Rare in content streams (only
+                    // appears in some inline-image parameter dicts). Emit as a raw
+                    // Op slice so the dispatcher can surface a clear error instead
+                    // of silently producing wrong output.
+                    let start = self.pos;
+                    self.pos += 2;
+                    let mut depth = 1usize;
+                    while self.pos < self.src.len() {
+                        if self.src[self.pos..].starts_with(b"<<") {
+                            depth += 1;
+                            self.pos += 2;
+                        } else if self.src[self.pos..].starts_with(b">>") {
+                            depth -= 1;
+                            self.pos += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            self.pos += 1;
+                        }
+                    }
+                    return Some(Token::Op(&self.src[start..self.pos]));
+                }
+                b'<' => return Some(Token::String(self.read_hex_string())),
+                b'[' => return Some(Token::Array(self.read_array())),
+                b']' => {
+                    // Stray closing bracket — skip and re-scan on the next
+                    // loop iteration. Looping (not recursing) keeps a stream of
+                    // millions of stray `]` from overflowing the stack.
+                    self.advance();
+                    debug_assert!(self.pos > before, "tokenizer must advance past stray ']'");
+                }
+                _ => {
+                    // Number, boolean, or operator keyword — all start with an
+                    // ASCII character that is not a delimiter.
+                    let start = self.pos;
+                    while let Some(c) = self.peek() {
+                        if is_whitespace(c) || is_delimiter(c) {
                             break;
                         }
-                    } else {
-                        self.pos += 1;
+                        self.advance();
                     }
-                }
-                Some(Token::Op(&self.src[start..self.pos]))
-            }
-            b'<' => Some(Token::String(self.read_hex_string())),
-            b'[' => Some(Token::Array(self.read_array())),
-            b']' => {
-                // Stray closing bracket — skip iteratively (not recursively) to
-                // avoid unbounded call depth on malformed input.
-                self.advance();
-                self.next_token()
-            }
-            _ => {
-                // Number, boolean, or operator keyword — all start with an
-                // ASCII character that is not a delimiter.
-                let start = self.pos;
-                while let Some(c) = self.peek() {
-                    if is_whitespace(c) || is_delimiter(c) {
-                        break;
+                    let word = &self.src[start..self.pos];
+
+                    // An unmatched delimiter (e.g. a stray `>` left over when
+                    // the `<<…>>` scanner's depth counter is thrown off by a
+                    // hex-string `<…>` nested inside a marked-content dict)
+                    // yields an empty word: the loop above breaks immediately
+                    // on the delimiter. Skip the byte and re-scan on the next
+                    // iteration rather than emitting a zero-length `Op` without
+                    // advancing — that stalled the tokenizer and grew the `ops`
+                    // Vec in `parse` without bound until OOM.
+                    if word.is_empty() {
+                        self.advance();
+                        debug_assert!(
+                            self.pos > before,
+                            "tokenizer must advance past unrecognised delimiter"
+                        );
+                        continue;
                     }
-                    self.advance();
-                }
-                let word = &self.src[start..self.pos];
 
-                // A lone delimiter character (e.g. a stray `>` left over from
-                // an unbalanced `<< ... >>` dict whose depth-counter mismatch
-                // is caused by a hex-string `<...>` nested inside) produces an
-                // empty word because the loop exits immediately.  Advance past
-                // the unrecognised byte and try again so the tokenizer never
-                // stalls on the same position, which would cause an infinite
-                // loop and an OOM from the unbounded `ops` Vec in `parse`.
-                if word.is_empty() {
-                    self.advance();
-                    return self.next_token();
-                }
+                    if word == b"true" {
+                        return Some(Token::Bool(true));
+                    }
+                    if word == b"false" {
+                        return Some(Token::Bool(false));
+                    }
 
-                if word == b"true" {
-                    return Some(Token::Bool(true));
-                }
-                if word == b"false" {
-                    return Some(Token::Bool(false));
-                }
+                    // Try parsing as an integer or real number.
+                    if let Ok(s) = std::str::from_utf8(word)
+                        && let Ok(n) = s.parse::<f64>()
+                    {
+                        return Some(Token::Number(n));
+                    }
 
-                // Try parsing as an integer or real number.
-                if let Ok(s) = std::str::from_utf8(word)
-                    && let Ok(n) = s.parse::<f64>()
-                {
-                    return Some(Token::Number(n));
-                }
+                    // Inline image: consume params + data into a single token so
+                    // the caller never has to handle a bare `BI` operator.
+                    if word == b"BI" {
+                        return Some(self.read_inline_image());
+                    }
 
-                // Inline image: consume params + data into a single token so
-                // the caller never has to handle a bare `BI` operator.
-                if word == b"BI" {
-                    return Some(self.read_inline_image());
+                    return Some(Token::Op(word));
                 }
-
-                Some(Token::Op(word))
             }
         }
     }
@@ -581,5 +599,26 @@ mod tests {
         assert!(ops.contains(&b"BDC".as_ref()), "BDC must appear: {ops:?}");
         assert!(ops.contains(&b"Tj".as_ref()), "Tj must appear: {ops:?}");
         assert!(ops.contains(&b"EMC".as_ref()), "EMC must appear: {ops:?}");
+    }
+
+    /// A long run of stray delimiters (the exact bytes an unbalanced `<<…>>`
+    /// scanner can leave behind, repeated) must not recurse per byte. Skipping
+    /// is done by looping inside `next_token`, not by re-entering it, so even a
+    /// half-million stray delimiters tokenize on a 256 KiB stack without a
+    /// stack overflow. Run on a deliberately small-stack thread: before the
+    /// loop conversion this recursed once per skipped byte and aborted.
+    #[test]
+    fn millions_of_stray_delimiters_do_not_overflow_the_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let src = vec![b'>'; 500_000];
+                Tokenizer::new(&src).count()
+            })
+            .expect("spawn small-stack tokenizer thread");
+        let n = handle
+            .join()
+            .expect("tokenizer must not overflow the stack on stray delimiters");
+        assert_eq!(n, 0, "all stray `>` are skipped, yielding no tokens");
     }
 }
