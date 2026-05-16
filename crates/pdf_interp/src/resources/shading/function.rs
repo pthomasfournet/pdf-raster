@@ -427,6 +427,21 @@ fn eval_sampled_approx(fn_dict: &Dictionary, t: f64, n: usize) -> Vec<f64> {
 /// that nests `if`/`ifelse` to blow the budget.
 const MAX_PS_STEPS: u32 = 100_000;
 
+/// Cap on `{ }` procedure nesting.  Both the parser and the executor recurse
+/// per nested block, so unbounded depth can overflow the native stack on a
+/// hand-crafted `{{{{…}}}}` program (the step budget does not bound parse
+/// recursion, which runs before any step is charged, nor the executor's
+/// native frame depth on conditional branches).  Real tint transforms nest a
+/// handful of levels at most; 64 is far beyond any legitimate program.
+const MAX_PS_DEPTH: usize = 64;
+
+/// Cap on the operand stack.  A single `copy`/`dup`/`index` can request a
+/// huge push while charging only one step against [`MAX_PS_STEPS`], so the
+/// step budget alone does not bound memory; `{ 0 0 2000000000 copy }` would
+/// otherwise allocate billions of slots.  §7.10.5 calculator programs operate
+/// on a tiny working set (tint in, a few colorants out); 100k is generous.
+const MAX_PS_STACK: usize = 100_000;
+
 /// A value on the Type-4 operand stack: a real number or a boolean.  PDF
 /// §7.10.5 booleans arise from relational/boolean operators and are consumed
 /// only by `if`/`ifelse`.
@@ -541,11 +556,30 @@ fn parse_ps_op(word: &str) -> Option<PsOp> {
 
 /// Split the decoded program text into whitespace/brace-delimited lexemes.
 /// `{` and `}` are returned as standalone tokens; everything else is a word.
+///
+/// PDF §7.10.5 calculator functions are PostScript, which treats `%` as a
+/// line comment to end-of-line.  Comments are stripped here so an otherwise
+/// well-formed commented program is not rejected wholesale (a rejected tint
+/// transform silently falls back to the gray heuristic — the NF-5 class).
 fn ps_lex(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut in_comment = false;
     for ch in src.chars() {
+        if in_comment {
+            // A PostScript comment runs to the next end-of-line.
+            if ch == '\n' || ch == '\r' {
+                in_comment = false;
+            }
+            continue;
+        }
         match ch {
+            '%' => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                in_comment = true;
+            }
             '{' | '}' => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
@@ -568,14 +602,22 @@ fn ps_lex(src: &str) -> Vec<String> {
 
 /// Parse a lexeme slice starting just after a `{` into a token list, stopping
 /// at the matching `}`.  Returns the tokens and the index just past the `}`.
-fn parse_ps_block(lexemes: &[String], mut i: usize) -> Option<(Vec<PsTok>, usize)> {
+///
+/// `depth` is the current `{ }` nesting level; recursion is refused past
+/// [`MAX_PS_DEPTH`] so a `{{{{…}}}}` bomb cannot overflow the native stack
+/// during parsing (it returns `None`, which the caller logs and falls back
+/// on, rather than aborting the process).
+fn parse_ps_block(lexemes: &[String], mut i: usize, depth: usize) -> Option<(Vec<PsTok>, usize)> {
+    if depth > MAX_PS_DEPTH {
+        return None;
+    }
     let mut toks = Vec::new();
     while i < lexemes.len() {
         let lx = lexemes[i].as_str();
         match lx {
             "}" => return Some((toks, i + 1)),
             "{" => {
-                let (inner, next) = parse_ps_block(lexemes, i + 1)?;
+                let (inner, next) = parse_ps_block(lexemes, i + 1, depth + 1)?;
                 toks.push(PsTok::Proc(inner));
                 i = next;
             }
@@ -600,7 +642,7 @@ fn parse_ps_program(src: &str) -> Option<Vec<PsTok>> {
     if first != "{" {
         return None;
     }
-    let (toks, end) = parse_ps_block(&lexemes, 1)?;
+    let (toks, end) = parse_ps_block(&lexemes, 1, 0)?;
     // The top-level block must be the entire program; trailing lexemes after
     // the matching `}` mean the input is malformed.
     if end != lexemes.len() {
@@ -706,7 +748,9 @@ fn int_binary(stack: &mut Vec<PsVal>, f: impl Fn(f64, f64) -> f64) -> Option<()>
         return None;
     }
     let r = f(a, b);
-    if r.is_nan() {
+    // §7.10.5 leaves a non-finite result undefined; refuse it rather than
+    // let an Inf/NaN flow into the tint→colour conversion (silent-wrong).
+    if !r.is_finite() {
         return None;
     }
     stack.push(PsVal::Num(r));
@@ -773,21 +817,27 @@ fn ps_roll(stack: &mut Vec<PsVal>) -> Option<()> {
     Some(())
 }
 
+/// Pop one number, apply `f`, push the result.  A non-finite result (e.g.
+/// `sqrt` of a negative, `ln`/`log` of a non-positive) is undefined per
+/// §7.10.5; refuse it loud-graceful so no Inf/NaN reaches colour conversion.
 fn unary(stack: &mut Vec<PsVal>, f: impl Fn(f64) -> f64) -> Option<()> {
     let a = ps_pop_num(stack)?;
     let r = f(a);
-    if r.is_nan() {
+    if !r.is_finite() {
         return None;
     }
     stack.push(PsVal::Num(r));
     Some(())
 }
 
+/// Pop two numbers, apply `f`, push the result.  A non-finite result (e.g.
+/// `1 0 div` → Inf, `exp` overflow) is undefined per §7.10.5; refuse it
+/// loud-graceful so no Inf/NaN reaches colour conversion.
 fn binary(stack: &mut Vec<PsVal>, f: impl Fn(f64, f64) -> f64) -> Option<()> {
     let b = ps_pop_num(stack)?;
     let a = ps_pop_num(stack)?;
     let r = f(a, b);
-    if r.is_nan() {
+    if !r.is_finite() {
         return None;
     }
     stack.push(PsVal::Num(r));
@@ -858,7 +908,17 @@ fn ps_to_usize(n: f64) -> Option<usize> {
 /// Walk a token list, executing it while resolving `if`/`ifelse`.  The parser
 /// places procedure blocks as `Proc` tokens immediately before the `if` /
 /// `ifelse` operator; this pass consumes them as the conditional branches.
-fn exec_ps(toks: &[PsTok], stack: &mut Vec<PsVal>, steps: &mut u32) -> Option<()> {
+///
+/// `depth` mirrors the `{ }` nesting and bounds this function's own native
+/// recursion: a deeply nested conditional chain (each `if` consuming only one
+/// step) could otherwise recurse far enough to overflow the native stack
+/// before [`MAX_PS_STEPS`] is reached.  The operand stack is also capped at
+/// [`MAX_PS_STACK`] because a single `copy`/`dup`/`index` can push many
+/// values while charging only one step.
+fn exec_ps(toks: &[PsTok], stack: &mut Vec<PsVal>, steps: &mut u32, depth: usize) -> Option<()> {
+    if depth > MAX_PS_DEPTH {
+        return None;
+    }
     let mut i = 0;
     while i < toks.len() {
         if *steps == 0 {
@@ -879,7 +939,7 @@ fn exec_ps(toks: &[PsTok], stack: &mut Vec<PsVal>, steps: &mut u32) -> Option<()
                 *steps -= 1;
                 let cond = ps_pop_bool(stack)?;
                 if cond {
-                    exec_ps(proc, stack, steps)?;
+                    exec_ps(proc, stack, steps, depth + 1)?;
                 }
                 i += 1;
             }
@@ -892,9 +952,9 @@ fn exec_ps(toks: &[PsTok], stack: &mut Vec<PsVal>, steps: &mut u32) -> Option<()
                 *steps -= 1;
                 let cond = ps_pop_bool(stack)?;
                 if cond {
-                    exec_ps(p1, stack, steps)?;
+                    exec_ps(p1, stack, steps, depth + 1)?;
                 } else {
-                    exec_ps(p2, stack, steps)?;
+                    exec_ps(p2, stack, steps, depth + 1)?;
                 }
                 i += 1;
             }
@@ -919,6 +979,13 @@ fn exec_ps(toks: &[PsTok], stack: &mut Vec<PsVal>, steps: &mut u32) -> Option<()
                 run_ps_op(*op, stack)?;
                 i += 1;
             }
+        }
+        // Bound operand-stack growth.  `copy`/`dup`/`index` and bare literals
+        // can grow the stack while charging at most one step, so the step
+        // budget alone is not a memory bound; refuse loud-graceful past
+        // MAX_PS_STACK rather than let a `copy` bomb exhaust memory.
+        if stack.len() > MAX_PS_STACK {
+            return None;
         }
     }
     Some(())
@@ -948,7 +1015,7 @@ fn eval_postscript(
 
     let mut stack: Vec<PsVal> = vec![PsVal::Num(t_in)];
     let mut steps = MAX_PS_STEPS;
-    exec_ps(&program, &mut stack, &mut steps)?;
+    exec_ps(&program, &mut stack, &mut steps, 0)?;
 
     if stack.len() < n {
         return None;
@@ -960,7 +1027,10 @@ fn eval_postscript(
             PsVal::Bool(_) => None,
         })
         .collect::<Option<Vec<f64>>>()?;
-    if out.iter().any(|x| x.is_nan()) {
+    // Reject any non-finite output (NaN or ±Inf — e.g. a literal `1e400`
+    // parses to Inf).  A non-finite colour component is silent-wrong garbage
+    // once it reaches the rasterizer, so fail loud-graceful here instead.
+    if out.iter().any(|x| !x.is_finite()) {
         return None;
     }
     Some(out)
@@ -1332,6 +1402,119 @@ mod tests {
         // Not enough outputs requested vs produced.
         let bad4 = make_ps_stream("{ }", &[(0.0, 1.0), (0.0, 1.0)]);
         assert!(eval_function(&doc, &bad4, 0.5, 2).is_none());
+    }
+
+    #[test]
+    fn ps_recursion_bomb_is_bounded() {
+        // Deeply nested `{{{{…}}}}` must terminate loud-graceful (None), not
+        // overflow the native stack during parse or exec.  Spawn on a thread
+        // with a small stack so an unbounded recursion would actually abort
+        // the test rather than silently pass on a large default stack.
+        let depth = MAX_PS_DEPTH + 5_000;
+        let mut prog = String::with_capacity(depth * 2 + 8);
+        prog.push('{');
+        for _ in 0..depth {
+            prog.push('{');
+        }
+        for _ in 0..depth {
+            prog.push('}');
+        }
+        prog.push_str(" if }");
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let doc = empty_doc();
+                let f = make_ps_stream(&prog, &[(0.0, 1.0)]);
+                eval_function(&doc, &f, 0.5, 1)
+            })
+            .expect("spawn bounded-stack thread");
+        let result = handle.join().expect("recursion-bomb must not overflow");
+        assert!(
+            result.is_none(),
+            "over-deep program must fail loud-graceful"
+        );
+    }
+
+    #[test]
+    fn ps_stack_bomb_is_bounded() {
+        // `n copy` duplicates the top n elements; feeding it the exact
+        // current stack length doubles the stack with a single step.  A
+        // chain of doublings reaches MAX_PS_STACK in a handful of ops while
+        // charging almost no step budget, so only the operand-stack cap
+        // stops it.  Build the doubling chain statically (length is known
+        // after each `copy`): start at 1, then `1 copy`→2, `2 copy`→4, …
+        let mut prog = String::from("{");
+        let mut len: usize = 1; // the single input tint already on the stack
+        while len <= MAX_PS_STACK {
+            prog.push(' ');
+            prog.push_str(&len.to_string());
+            prog.push_str(" copy");
+            len *= 2;
+        }
+        prog.push_str(" }");
+        let doc = empty_doc();
+        let f = make_ps_stream(&prog, &[(0.0, 1.0)]);
+        assert!(
+            eval_function(&doc, &f, 0.5, 1).is_none(),
+            "operand-stack bomb must fail loud-graceful, not OOM"
+        );
+    }
+
+    #[test]
+    fn ps_div_zero_and_domain_errors_fail_graceful() {
+        let doc = empty_doc();
+        // 1 0 div → +Inf: must not leak Inf into the colour.
+        let f = make_ps_stream("{ pop 1 0 div }", &[(-1e9, 1e9)]);
+        assert!(
+            eval_function(&doc, &f, 0.5, 1).is_none(),
+            "div-by-zero must fail loud-graceful, not push Inf"
+        );
+        // -1 sqrt → NaN.
+        let f2 = make_ps_stream("{ pop -1 sqrt }", &[(-1e9, 1e9)]);
+        assert!(
+            eval_function(&doc, &f2, 0.5, 1).is_none(),
+            "sqrt(-1) → None"
+        );
+        // 0 ln → -Inf.
+        let f3 = make_ps_stream("{ pop 0 ln }", &[(-1e9, 1e9)]);
+        assert!(eval_function(&doc, &f3, 0.5, 1).is_none(), "ln(0) → None");
+        // idiv by zero.
+        let f4 = make_ps_stream("{ pop 5 0 idiv }", &[(-1e9, 1e9)]);
+        assert!(eval_function(&doc, &f4, 0.5, 1).is_none(), "idiv 0 → None");
+        // A literal that parses to Inf must not reach the output.
+        let f5 = make_ps_stream("{ pop 1e400 }", &[(-1e9, 1e9)]);
+        assert!(eval_function(&doc, &f5, 0.5, 1).is_none(), "1e400 → None");
+    }
+
+    #[test]
+    fn ps_comments_are_stripped() {
+        // A PostScript `%` comment to end-of-line must not break parsing.
+        let prog = "{ % map tint through\n 2 mul % double it\n }";
+        let f = make_ps_stream(prog, &[(0.0, 10.0)]);
+        let doc = empty_doc();
+        let r = eval_function(&doc, &f, 0.5, 1).expect("commented program evaluates");
+        assert!((r[0] - 1.0).abs() < 1e-9, "expected 1.0, got {}", r[0]);
+    }
+
+    #[test]
+    fn ps_sot_apprenti_tint_program() {
+        // The exact obj-12 tint transform from sot-apprenti-1774 (the NF-5
+        // repro): Separation /Black → DeviceCMYK, mapping tint t to
+        // [0 0 0 t].  A regression here re-blanks the page.
+        let prog = "{dup 0 mul exch dup 0 mul exch dup 0 mul exch 1 mul }";
+        let f = make_ps_stream(prog, &[(0.0, 1.0), (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)]);
+        let doc = empty_doc();
+        let r = eval_function(&doc, &f, 1.0, 4).expect("sot-apprenti tint at t=1");
+        assert_eq!(r.len(), 4);
+        assert!(
+            r[0].abs() < 1e-9 && r[1].abs() < 1e-9 && r[2].abs() < 1e-9,
+            "C/M/Y must be 0, got {r:?}"
+        );
+        assert!(
+            (r[3] - 1.0).abs() < 1e-9,
+            "K must equal the tint (1.0), got {}",
+            r[3]
+        );
     }
 
     #[test]
