@@ -101,11 +101,17 @@ impl From<pdf::PdfError> for InterpError {
 /// the structural presence of a script has no effect on the static rendered
 /// page, and refusing valid documents would be a false-negative total loss.
 ///
-/// Checked locations (PDF 2.0 §12.6):
-/// - `/Catalog/OpenAction` with `/S /JavaScript`
-/// - `/Catalog/AA` (catalog-level additional actions)
-/// - `/Catalog/Names/JavaScript` (document JS name tree)
-/// - `/Catalog/AcroForm/AA` (`AcroForm` additional actions)
+/// Checked locations (PDF 2.0 §12.6), each flagged only when the construct
+/// is genuinely JavaScript (a `/S /JavaScript` action), never on bare key
+/// presence — a spurious warning would erode the security signal:
+/// - `/Catalog/OpenAction` whose action has `/S /JavaScript`
+/// - `/Catalog/AA` with a `/S /JavaScript` sub-action (vs. a transition/GoTo)
+/// - `/Catalog/Names/JavaScript` (the JS-specific name subtree)
+/// - `/Catalog/AcroForm/AA` with a `/S /JavaScript` sub-action
+///
+/// Not detected: page-level `/AA` and per-annotation/widget `/A`/`/AA`
+/// JavaScript actions (catalog-only scan). A document whose only script is
+/// on a widget will not be flagged — see the `/audit` note for this gap.
 ///
 /// # Errors
 /// - [`InterpError::Pdf`] if the file cannot be read or is not a valid PDF.
@@ -174,12 +180,22 @@ fn javascript_locations(doc: &Document) -> Vec<&'static str> {
         found.push("/OpenAction");
     }
 
-    // 2. Catalog-level additional actions (/AA)
-    if catalog.get(b"AA").is_some() {
+    // 2. Catalog-level additional actions (/AA).  An /AA dictionary holds
+    //    named sub-entries that are themselves action dictionaries
+    //    (PDF 2.0 §12.6.3, Table 197/198).  Only flag it when at least one
+    //    sub-action is /S /JavaScript: a /WC document-close transition or a
+    //    /S /GoTo additional action is NOT JavaScript, and warning on bare
+    //    /AA presence would cry wolf and erode the security signal.
+    if let Some(aa_obj) = catalog.get(b"AA")
+        && aa_dict_has_js_action(doc, aa_obj)
+    {
         found.push("/AA (catalog additional actions)");
     }
 
-    // 3. Document JS name tree (/Names/JavaScript)
+    // 3. Document JS name tree (/Names/JavaScript).  /Names also carries
+    //    non-JS trees (/Dests, /EmbeddedFiles, …); the /JavaScript subtree
+    //    is the JS-specific one, so this discriminates correctly and does
+    //    not fire on a /Names <</Dests …>> document.
     if let Some(names_obj) = catalog.get(b"Names")
         && let Some(names_dict) = resources::resolve_dict(doc, names_obj)
         && names_dict.get(b"JavaScript").is_some()
@@ -187,10 +203,13 @@ fn javascript_locations(doc: &Document) -> Vec<&'static str> {
         found.push("/Names/JavaScript");
     }
 
-    // 4. AcroForm additional actions
+    // 4. AcroForm additional actions.  Same discrimination as branch 2: an
+    //    AcroForm /AA whose only action is /S /SubmitForm (a plain HTTP/FDF
+    //    form submit, extremely common on fillable forms) is NOT JavaScript.
     if let Some(acroform_obj) = catalog.get(b"AcroForm")
         && let Some(acroform) = resources::resolve_dict(doc, acroform_obj)
-        && acroform.get(b"AA").is_some()
+        && let Some(aa_obj) = acroform.get(b"AA")
+        && aa_dict_has_js_action(doc, aa_obj)
     {
         found.push("/AcroForm/AA");
     }
@@ -206,6 +225,27 @@ fn action_is_js(doc: &Document, obj: &pdf::Object) -> bool {
     d.get(b"S")
         .and_then(pdf::Object::as_name)
         .is_some_and(|name| name == b"JavaScript")
+}
+
+/// Return `true` if `aa_obj` resolves to an additional-actions (`/AA`)
+/// dictionary in which **any** named sub-entry is a `/S /JavaScript` action.
+///
+/// An `/AA` dictionary's values are themselves action dictionaries keyed by
+/// trigger name (`/O`, `/C`, `/WC`, `/K`, …); the action's `/S` subtype is
+/// what makes it JavaScript versus a `/S /Transition`, `/S /GoTo`,
+/// `/S /SubmitForm` or `/S /Named` action.  Flagging bare `/AA` presence
+/// would be a false positive on the many non-JS additional-action documents
+/// in the wild, which dilutes the "this document contains JavaScript" signal
+/// an operator relies on.
+///
+/// Detection stays purely structural: only `/S` subtype names are read; no
+/// `/JS` script string is decoded, parsed, or evaluated.
+fn aa_dict_has_js_action(doc: &Document, aa_obj: &pdf::Object) -> bool {
+    let Some(aa) = resources::resolve_dict(doc, aa_obj) else {
+        return false;
+    };
+    aa.iter()
+        .any(|(_trigger, action)| action_is_js(doc, action))
 }
 
 /// Return the number of pages in `doc`.
@@ -618,6 +658,47 @@ mod js_guard_tests {
         let doc = make_doc("");
         assert!(javascript_locations(&doc).is_empty());
         warn_if_javascript(&doc); // no-op, must not panic
+    }
+
+    #[test]
+    fn catalog_aa_without_js_action_does_not_cry_wolf() {
+        // /WC document-close additional action that is a /S /GoTo, not JS.
+        // Bare /AA presence must NOT be reported as JavaScript.
+        let doc = make_doc(" /AA <</WC <</S /GoTo /D [0 /Fit]>>>>");
+        assert!(
+            javascript_locations(&doc).is_empty(),
+            "non-JS catalog /AA must not be flagged as JavaScript"
+        );
+    }
+
+    #[test]
+    fn acroform_aa_submitform_is_not_javascript() {
+        // A fillable form whose AcroForm /AA only submits via HTTP/FDF
+        // (/S /SubmitForm) — extremely common, and NOT JavaScript.
+        let doc = make_doc(" /AcroForm <</AA <</C <</S /SubmitForm /F (https://example/x) >>>>>>");
+        assert!(
+            javascript_locations(&doc).is_empty(),
+            "AcroForm /AA with only /S /SubmitForm must not be flagged as JavaScript"
+        );
+    }
+
+    #[test]
+    fn open_action_goto_dest_array_is_not_javascript() {
+        // /OpenAction may be a destination array (go-to-page-on-open), which
+        // is not even an action dictionary — must not be flagged.
+        let doc = make_doc(" /OpenAction [0 /Fit]");
+        assert!(javascript_locations(&doc).is_empty());
+    }
+
+    #[test]
+    fn aa_with_mixed_actions_flags_when_any_is_js() {
+        // A non-JS /WC transition next to a JS /O open action: the presence
+        // of the JS action must still be detected (no false negative).
+        let doc = make_doc(" /AA <</WC <</S /GoTo /D [0 /Fit]>> /O <</S /JavaScript>>>>");
+        assert_eq!(
+            javascript_locations(&doc),
+            vec!["/AA (catalog additional actions)"]
+        );
     }
 }
 

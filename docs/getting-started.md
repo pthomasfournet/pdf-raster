@@ -212,16 +212,20 @@ for (page_num, result) in raster_pdf(path, &opts) {
 }
 ```
 
-Document-open errors (bad path, corrupt PDF, JavaScript detected) are yielded as `(1, Err(...))` and the iterator ends immediately after.
+Document-open errors (bad path, corrupt PDF) are yielded as `(1, Err(...))` and the iterator ends immediately after.
 
 ## Security
 
-rasterrocket refuses to open PDFs that contain JavaScript entry points and returns `RasterError::Pdf(InterpError::JavaScript { location })` immediately. No JavaScript is parsed or evaluated. This check covers:
+rasterrocket is a rasterizer with no JavaScript engine: it never parses, decodes, or executes `/JS`. JavaScript-bearing PDFs (common in Acrobat/InDesign interactive exports and gov/tax/bank forms) still open and render — refusing them would be a false-negative total loss on valid documents. When a JavaScript entry point is detected, a loud `WARN` is emitted on stderr (by default, no `RUST_LOG` opt-in needed) naming each location, so the operator knows the script was ignored. Detection is purely structural (dict-key presence and `/S` subtype names); no JavaScript string is ever read.
 
-- `/Catalog/OpenAction` with `/S /JavaScript`
-- `/Catalog/AA` (catalog-level additional actions)
-- `/Catalog/Names/JavaScript` (document JS name tree)
-- `/Catalog/AcroForm/AA` (AcroForm additional actions)
+Flagged only when genuinely JavaScript (never on bare key presence — that would cry wolf):
+
+- `/Catalog/OpenAction` whose action has `/S /JavaScript`
+- `/Catalog/AA` with a `/S /JavaScript` sub-action (a transition/GoTo `/AA` is not flagged)
+- `/Catalog/Names/JavaScript` (the JS-specific name subtree)
+- `/Catalog/AcroForm/AA` with a `/S /JavaScript` sub-action (a `/S /SubmitForm` AcroForm is not flagged)
+
+Not detected: page-level `/AA` and per-annotation/widget `/A`/`/AA` scripts (the scan is catalog-only).
 
 ## Building the CLI
 
