@@ -515,12 +515,31 @@ impl Document {
     /// the key is found or the root is reached.  Returns `None` if the key is
     /// absent from every node in the chain.
     ///
-    /// Depth is bounded to 64 hops (matching `page_tree.rs` `MAX_DEPTH`) to
-    /// guard against malformed cyclic `/Parent` references.
+    /// A hostile PDF can build a cyclic `/Parent` ring (page → pages → page) or
+    /// a pathologically deep chain.  Both are defended: a visited-object set
+    /// detects revisits on the first repeat, and the walk is hard-bounded to
+    /// `PARENT_CHAIN_MAX_HOPS` (matching `page_tree.rs` `MAX_DEPTH`).  Either
+    /// guard tripping is a malformed page tree, so it is logged loudly and the
+    /// lookup fails closed (`None` → caller falls back to a default box) rather
+    /// than spinning, recursing, or terminating silently.
     pub fn get_inherited_page_attr(&self, page_id: ObjectId, key: &[u8]) -> Option<Object> {
+        // Matches `page_tree.rs` MAX_DEPTH so both /Parent walkers agree on the
+        // legal page-tree depth bound.
+        const PARENT_CHAIN_MAX_HOPS: usize = 64;
+
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut current_id = Some(page_id);
-        for _ in 0..64 {
+        for _ in 0..PARENT_CHAIN_MAX_HOPS {
             let id = current_id?;
+            if !visited.insert(id.0) {
+                log::warn!(
+                    "cyclic /Parent reference at object {} while resolving inheritable \
+                     attribute {:?}; treating as absent (malformed PDF, ISO 32000-2 §7.7.3.4)",
+                    id.0,
+                    String::from_utf8_lossy(key),
+                );
+                return None;
+            }
             let obj = self.get_object(id).ok()?;
             let dict = match obj.as_ref() {
                 Object::Dictionary(d) => d,
@@ -540,6 +559,14 @@ impl Document {
             }
             current_id = dict.get(b"Parent").and_then(Object::as_reference);
         }
+        // Ran out of hops without finding the key or hitting the root.  A
+        // conforming page tree is far shallower than the bound, so this is a
+        // hostile/over-deep chain — surface it instead of silently defaulting.
+        log::warn!(
+            "/Parent chain exceeded {PARENT_CHAIN_MAX_HOPS} hops while resolving inheritable \
+             attribute {:?}; treating as absent (malformed PDF, ISO 32000-2 §7.7.3.4)",
+            String::from_utf8_lossy(key),
+        );
         None
     }
 

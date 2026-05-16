@@ -350,6 +350,15 @@ pub fn page_size_pts_by_id(
             to_f64(&arr[2]),
             to_f64(&arr[3]),
         );
+        // Reject non-finite coordinates before any arithmetic.  A hostile PDF
+        // can write a magnitude that overflows f32 (e.g. /MediaBox
+        // [0 0 1e40 1e40]) which the lexer stores as Real(inf); without this
+        // guard `w`/`h` would be inf, pass the `> 0.0` test, and propagate an
+        // infinite page box.  `build_initial_ctm` documents that its origin
+        // inputs are finite — this is the upstream check that makes that hold.
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return None;
+        }
         let w = (x1 - x0).abs();
         let h = (y1 - y0).abs();
         if w > 0.0 && h > 0.0 {
@@ -438,8 +447,37 @@ pub fn page_size_pts_by_id(
         reason = "rem_euclid(360) is always 0..=359, which fits u16"
     )]
     let rotate_cw: u16 = match doc.get_inherited_page_attr(page_id, b"Rotate") {
-        Some(pdf::Object::Integer(n)) => n.rem_euclid(360) as u16 / 90 * 90,
-        _ => 0,
+        Some(pdf::Object::Integer(n)) => {
+            // rem_euclid maps any sign into 0..=359 (so -90 → 270, 450 → 90).
+            let normalized = n.rem_euclid(360) as u16;
+            if !normalized.is_multiple_of(90) {
+                // §7.7.3.4: /Rotate "shall be a multiple of 90".  A
+                // non-multiple is malformed; snapping to the nearest lower
+                // quadrant keeps the page upright-ish rather than rotating it
+                // to a garbage angle, but the author's intent is unknowable —
+                // say so instead of silently mis-rotating.
+                log::warn!(
+                    "/Rotate {n} on page object {} is not a multiple of 90 \
+                     (malformed PDF, ISO 32000-2 §7.7.3.4); snapping to {}",
+                    page_id.0,
+                    normalized / 90 * 90,
+                );
+            }
+            normalized / 90 * 90
+        }
+        // Absent /Rotate is the common, conforming case (no rotation) — silent.
+        None => 0,
+        // get_inherited_page_attr already resolves indirection, so any value
+        // reaching here that is not an Integer is a malformed /Rotate type.
+        Some(other) => {
+            log::warn!(
+                "/Rotate on page object {} is not an integer (got {}); \
+                 assuming 0 (malformed PDF, ISO 32000-2 §7.7.3.4)",
+                page_id.0,
+                other.enum_variant(),
+            );
+            0
+        }
     };
 
     // UserUnit (PDF 1.6+, ISO 32000-2 §14.11.2): scales one default user-space unit
@@ -759,6 +797,99 @@ mod page_box_tests {
         assert_eq!(
             (geom_num.width_pts, geom_num.height_pts),
             (geom_id.width_pts, geom_id.height_pts)
+        );
+    }
+
+    /// Build a hostile one-page PDF whose /Parent chain is a cycle and which
+    /// has NO MediaBox anywhere, so resolving the inheritable box forces a full
+    /// traversal of the ring.  The page leaf's /Parent points at the /Pages
+    /// node, and the /Pages node's /Parent points back at the page leaf —
+    /// `page leaf 3 0 ⇄ pages 2 0`.  A naive walker loops forever / overflows;
+    /// the depth + visited-set guard must terminate fast and fall back.
+    fn make_cyclic_parent_doc() -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        // /Pages node points back DOWN to the page leaf via /Parent — a ring.
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1 /Parent 3 0 R>>\nendobj\n";
+        // Page leaf has no MediaBox; its /Parent is the /Pages node.
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R>>\nendobj\n";
+
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        let xref_start = off3 + obj3.len();
+        let xref = format!(
+            "xref\n0 4\n\
+             0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n\
+             {off2:010} 00000 n\r\n\
+             {off3:010} 00000 n\r\n"
+        );
+        let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes = format!("{header}{obj1}{obj2}{obj3}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("cyclic-parent test PDF parse")
+    }
+
+    /// DoS guard: a cyclic /Parent ring must terminate (no hang, no
+    /// stack-overflow) and fall back to the 612×792 default rather than
+    /// spinning.  This is the campaign's recurring hostile-PDF class.
+    #[test]
+    fn cyclic_parent_chain_terminates_with_fallback() {
+        let doc = make_cyclic_parent_doc();
+        let geom = page_size_pts(&doc, 1).expect("page_size_pts must not hang/panic on a cycle");
+        assert_eq!(
+            (geom.width_pts, geom.height_pts),
+            (612.0, 792.0),
+            "cyclic /Parent with no MediaBox must fall back to 612×792, got {}×{}",
+            geom.width_pts,
+            geom.height_pts
+        );
+    }
+
+    /// Build a PDF where MediaBox [0 0 600 800] and CropBox [900 900 1000 1000]
+    /// are disjoint (CropBox entirely outside MediaBox).  §14.11.2: the
+    /// intersection is empty, so the effective box must fall back to MediaBox —
+    /// never a zero/negative-area box and never the 612×792 default.
+    fn make_disjoint_cropbox_doc() -> Document {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n";
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R \
+                    /MediaBox [0 0 600 800] /CropBox [900 900 1000 1000]>>\nendobj\n";
+
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        let xref_start = off3 + obj3.len();
+        let xref = format!(
+            "xref\n0 4\n\
+             0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n\
+             {off2:010} 00000 n\r\n\
+             {off3:010} 00000 n\r\n"
+        );
+        let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes = format!("{header}{obj1}{obj2}{obj3}{xref}{trailer}").into_bytes();
+        Document::from_bytes_owned(bytes).expect("disjoint-cropbox test PDF parse")
+    }
+
+    /// §14.11.2 degenerate case: CropBox disjoint from MediaBox → empty
+    /// intersection → fall back to MediaBox (not a zero-area box, not 612×792).
+    #[test]
+    fn disjoint_cropbox_falls_back_to_mediabox() {
+        let doc = make_disjoint_cropbox_doc();
+        let geom = page_size_pts(&doc, 1).expect("page_size_pts failed");
+        assert_eq!(
+            (geom.width_pts, geom.height_pts),
+            (600.0, 800.0),
+            "disjoint CropBox must fall back to MediaBox 600×800, got {}×{}",
+            geom.width_pts,
+            geom.height_pts
+        );
+        assert_eq!(
+            (geom.origin_x, geom.origin_y),
+            (0.0, 0.0),
+            "fallback origin must be the MediaBox lower-left"
         );
     }
 }
