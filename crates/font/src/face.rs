@@ -483,29 +483,12 @@ mod tests {
             .find(|p| std::path::Path::new(p).exists())
     }
 
-    /// Regression for the PDF-1.5 / CIDFontType0C blank-page bug.
-    ///
-    /// A Type 0 / CIDFont caller resolves a character code through the
-    /// Encoding CMap + `CIDToGIDMap` to a *final* FreeType glyph index, then
-    /// must hand that GID to FreeType directly.  The pre-fix code routed it
-    /// back through `resolve_gid` (a Unicode-charmap lookup), which for a
-    /// CID-keyed CFF subset maps every glyph to `.notdef` → blank page.
-    ///
-    /// This asserts the two routing modes are genuinely distinct: a
-    /// `code_to_gid` remap table that hijacks `make_glyph` must NOT touch
-    /// `make_glyph_by_gid` (which indexes FreeType directly).
-    #[test]
-    fn make_glyph_by_gid_bypasses_charmap_resolution() {
-        let Some(path) = first_existing_font() else {
-            eprintln!("no system font available; skipping");
-            return;
-        };
-        let eng_shared = FontEngine::init(true, false, false).expect("font engine");
-        let mut eng = eng_shared.lock().expect("engine lock");
-
-        // Resolve two genuinely different glyph indices via the font's own
-        // charmap, using a throwaway identity-mapped face.
-        let probe = eng
+    /// Load an identity-mapped (`code_to_gid` empty) face at 40px from the
+    /// shared engine.  The engine `Mutex` guard is scoped to this call so it
+    /// is never held across the test's assertions.
+    fn load_identity_face(eng: &std::sync::Mutex<FontEngine>, path: &str) -> super::FontFace {
+        eng.lock()
+            .expect("engine lock")
             .load_file_face(
                 path,
                 0,
@@ -516,7 +499,31 @@ mod tests {
                     text_mat: [40.0, 0.0, 0.0, 40.0],
                 },
             )
-            .expect("load probe face");
+            .expect("load identity face")
+    }
+
+    /// Regression for the PDF-1.5 / `CIDFontType0C` blank-page bug.
+    ///
+    /// A `Type 0` / `CIDFont` caller resolves a character code through the
+    /// Encoding `CMap` + `CIDToGIDMap` to a *final* `FreeType` glyph index,
+    /// then must hand that GID to `FreeType` directly.  The pre-fix code
+    /// routed it back through `resolve_gid` (a Unicode-charmap lookup), which
+    /// for a CID-keyed CFF subset maps every glyph to `.notdef` → blank page.
+    ///
+    /// This asserts the two routing modes are genuinely distinct: a
+    /// `code_to_gid` remap table that hijacks `make_glyph` must NOT touch
+    /// `make_glyph_by_gid` (which indexes `FreeType` directly).
+    #[test]
+    fn make_glyph_by_gid_bypasses_charmap_resolution() {
+        let Some(path) = first_existing_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        let eng_shared = FontEngine::init(true, false, false).expect("font engine");
+
+        // Resolve two genuinely different glyph indices via the font's own
+        // charmap, using a throwaway identity-mapped face.
+        let probe = load_identity_face(&eng_shared, path);
         let gid_a = probe.raw_get_char_index('A' as u32);
         let gid_w = probe.raw_get_char_index('W' as u32);
         assert!(gid_a != 0 && gid_w != 0, "expected real glyph indices");
@@ -528,7 +535,9 @@ mod tests {
         let mut hijack = vec![0u32; 256];
         hijack[65] = gid_w;
 
-        let face = eng
+        let face = eng_shared
+            .lock()
+            .expect("engine lock")
             .load_file_face(
                 path,
                 0,
@@ -567,6 +576,79 @@ mod tests {
         assert!(
             face.glyph_path_by_gid(gid_a).is_some(),
             "by-gid outline must resolve the real glyph"
+        );
+    }
+
+    /// Hostile-input guard for the by-GID path.
+    ///
+    /// A `Type 0` PDF supplies untrusted character codes; the Encoding `CMap`
+    /// plus `CIDToGIDMap` can map them to an arbitrary GID, including one far
+    /// past the embedded subset's glyph count (a corrupt or adversarial
+    /// `CIDToGIDMap` entry, or an Identity map fed an out-of-range CID).  That
+    /// GID reaches `FreeType` *unmolested* through `make_glyph_by_gid` (the
+    /// whole point of the bypass), so the bound check lives in `FreeType`'s
+    /// `FT_Load_Glyph`.  This asserts the contract the text loop relies on:
+    /// an out-of-range GID resolves to `None` (graceful .notdef / skipped
+    /// glyph) and never panics, indexes out of bounds, or yields garbage.
+    /// The outline and advance variants must behave the same way.
+    #[test]
+    fn by_gid_out_of_range_is_graceful_not_panic() {
+        let Some(path) = first_existing_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        let eng_shared = FontEngine::init(true, false, false).expect("font engine");
+        let face = load_identity_face(&eng_shared, path);
+
+        // No real subset has 4 billion glyphs; this is the worst case a u32
+        // CID/GID can produce.  u32::MAX and a merely-large value both probe
+        // the `FreeType` bound, not just an off-by-one past the last glyph.
+        for &bogus in &[u32::MAX, 1_000_000, 65_535] {
+            assert!(
+                face.make_glyph_by_gid(bogus, 0).is_none(),
+                "out-of-range GID {bogus} must yield None, not a panic/garbage glyph"
+            );
+            assert!(
+                face.glyph_path_by_gid(bogus).is_none(),
+                "out-of-range GID {bogus} outline must yield None"
+            );
+            // Advance may be `Some(0.0)` (`FreeType` loads .notdef metrics) or
+            // `None` depending on the driver; the contract is only that it
+            // does not panic and returns a finite value when `Some`.
+            if let Some(adv) = face.glyph_advance_by_gid(bogus) {
+                assert!(
+                    adv.is_finite(),
+                    "out-of-range GID {bogus} advance must be finite, got {adv}"
+                );
+            }
+        }
+    }
+
+    /// Dispatch invariant: the by-GID and by-char-code paths must reach the
+    /// *same* glyph when no remap table is in play (identity `code_to_gid`,
+    /// Unicode charmap).  This is the safety net for the campaign's recurring
+    /// mis-dispatch class — if a future refactor wired the CID branch to the
+    /// charmap path (or vice versa) for an identity-mapped face, this catches
+    /// the silent divergence before it ships as a blank page.
+    #[test]
+    fn by_gid_and_charmap_agree_for_identity_face() {
+        let Some(path) = first_existing_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        let eng_shared = FontEngine::init(true, false, false).expect("font engine");
+        let face = load_identity_face(&eng_shared, path);
+
+        // 'M' via the charmap (simple-font path) and the same glyph fetched
+        // by its resolved GID (CIDFont path) must rasterize byte-identically.
+        let gid_m = face.raw_get_char_index('M' as u32);
+        assert!(gid_m != 0, "expected a real glyph for 'M'");
+        let via_charmap = face.make_glyph('M' as u32, 0).expect("charmap 'M'");
+        let via_gid = face.make_glyph_by_gid(gid_m, 0).expect("by-gid 'M'");
+        assert_eq!(
+            (via_charmap.width, via_charmap.height, &via_charmap.data),
+            (via_gid.width, via_gid.height, &via_gid.data),
+            "identity-face by-gid and charmap paths must reach the same glyph"
         );
     }
 
