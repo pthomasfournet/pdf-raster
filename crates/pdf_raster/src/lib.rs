@@ -758,7 +758,15 @@ mod page_set_tests {
         };
         assert!(opts.pages.is_none());
         let default_opts = RasterOptions::default();
-        assert_eq!(default_opts.dpi, 300.0);
+        #[expect(
+            clippy::float_cmp,
+            reason = "asserts the exact hardcoded default dpi constant (300.0_f32, exactly \
+                      representable); an epsilon comparison would weaken the test by passing on \
+                      an unintended drift of the default"
+        )]
+        {
+            assert_eq!(default_opts.dpi, 300.0);
+        }
         assert_eq!(default_opts.first_page, 1);
         assert_eq!(default_opts.last_page, u32::MAX);
         assert!(!default_opts.deskew);

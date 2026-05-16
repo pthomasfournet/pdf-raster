@@ -846,10 +846,10 @@ mod tests {
         // the CCITT codec must receive its OWN params (index 1), not null and
         // not the whole array.
         let mut ccitt = Dictionary::new();
-        ccitt.set(b"K".to_vec(), Object::Integer(-1));
+        ccitt.set(b"K", Object::Integer(-1));
         let mut dict = Dictionary::new();
         dict.set(
-            b"DecodeParms".to_vec(),
+            b"DecodeParms",
             Object::Array(vec![Object::Null, Object::Dictionary(ccitt)]),
         );
         let parms = terminal_decode_parms(&dict, 2).expect("terminal parms present");
@@ -865,9 +865,9 @@ mod tests {
     #[test]
     fn terminal_decode_parms_single_dict() {
         let mut ccitt = Dictionary::new();
-        ccitt.set(b"Columns".to_vec(), Object::Integer(2480));
+        ccitt.set(b"Columns", Object::Integer(2480));
         let mut dict = Dictionary::new();
-        dict.set(b"DecodeParms".to_vec(), Object::Dictionary(ccitt));
+        dict.set(b"DecodeParms", Object::Dictionary(ccitt));
         let parms = terminal_decode_parms(&dict, 1).expect("single dict");
         assert_eq!(
             parms
@@ -885,7 +885,7 @@ mod tests {
 
         let mut with_null = Dictionary::new();
         with_null.set(
-            b"DecodeParms".to_vec(),
+            b"DecodeParms",
             Object::Array(vec![Object::Null, Object::Null]),
         );
         assert!(terminal_decode_parms(&with_null, 2).is_none());
@@ -906,7 +906,7 @@ mod tests {
 
         let mut dict = Dictionary::new();
         dict.set(
-            b"Filter".to_vec(),
+            b"Filter",
             Object::Array(vec![
                 Object::Name(b"ASCII85Decode".to_vec()),
                 Object::Name(b"FlateDecode".to_vec()),

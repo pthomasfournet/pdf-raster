@@ -870,7 +870,7 @@ mod tests {
 
     // ── 1-bpc raw stencil-mask polarity ───────────────────────────────────────
 
-    /// Build a dict for a 1-bpc raw ImageMask, optionally with a `/Decode`.
+    /// Build a dict for a 1-bpc raw `ImageMask`, optionally with a `/Decode`.
     fn stencil_dict(decode: Option<Vec<Object>>) -> Dictionary {
         let mut dict = Dictionary::new();
         dict.set("BitsPerComponent", Object::Integer(1));

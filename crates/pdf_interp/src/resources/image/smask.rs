@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(result, &[10, 20, 30, 40]);
     }
 
-    /// A 1×1 grayscale JPEG (PIL-encoded, quality=90) decoded as an SMask buffer
+    /// A 1×1 grayscale JPEG (PIL-encoded, quality=90) decoded as an `SMask` buffer
     /// must produce exactly 1 byte with a value in the mid-grey range.
     ///
     /// The JPEG bytes are a valid baseline JFIF stream produced by PIL/Pillow
@@ -581,7 +581,7 @@ mod tests {
     /// A `/Mask N 0 R` referencing an `/ImageMask true` stencil must produce a
     /// base-image alpha buffer where the stencil's *paint* points are opaque
     /// (`0xFF`) and its *masked-out* points are transparent (`0x00`).  The bug
-    /// was that `/Mask` was never resolved at all, leaving JPXDecode pages
+    /// was that `/Mask` was never resolved at all, leaving `JPXDecode` pages
     /// (e.g. 1853-ragon-orthodoxie-maconnique p62) blitted fully opaque over
     /// the whole page and rendering near-all-dark instead of mostly-white.
     ///
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(alpha, vec![0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00]);
     }
 
-    /// A `/Mask` object that is *not* an ImageMask stencil must be rejected
+    /// A `/Mask` object that is *not* an `ImageMask` stencil must be rejected
     /// (returns `None`) so the caller blits the base image unmasked rather
     /// than mis-applying a non-stencil image as alpha.
     #[test]

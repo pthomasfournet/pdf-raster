@@ -2,6 +2,8 @@
 
 #![cfg(test)]
 
+use std::fmt::Write as _;
+
 use pdf::Document;
 
 /// Build a minimal valid PDF byte-stream with one empty page tree and parse
@@ -163,7 +165,7 @@ pub fn make_doc_with_objects(objects: &[(u32, &str)]) -> Document {
 
     let mut xref = format!("xref\n0 {count}\n0000000000 65535 f\r\n");
     for off in &offsets {
-        xref.push_str(&format!("{off:010} 00000 n\r\n"));
+        write!(xref, "{off:010} 00000 n\r\n").expect("writing to a String is infallible");
     }
     let trailer = format!("trailer\n<</Size {count} /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
 

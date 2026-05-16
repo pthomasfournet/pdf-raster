@@ -710,14 +710,14 @@ mod page_box_tests {
 
     use super::{page_size_pts, page_size_pts_by_id};
 
-    /// Build a minimal one-page PDF where the MediaBox is on the /Pages node
+    /// Build a minimal one-page PDF where the `MediaBox` is on the /Pages node
     /// (inherited), not on the page leaf.  The leaf has only /Type /Page and a
     /// /Parent back-reference.
     ///
     /// Object layout:
     ///   1 0 — Catalog (/Pages 2 0 R)
-    ///   2 0 — Pages root (/MediaBox [0 0 500 700] /Kids [3 0 R] /Count 1)
-    ///   3 0 — Page leaf (/Type /Page /Parent 2 0 R — no MediaBox)
+    ///   2 0 — Pages root (/`MediaBox` [0 0 500 700] /Kids [3 0 R] /Count 1)
+    ///   3 0 — Page leaf (/Type /Page /Parent 2 0 R — no `MediaBox`)
     fn make_inherited_mediabox_doc() -> Document {
         let header = "%PDF-1.4\n";
         let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
@@ -741,8 +741,8 @@ mod page_box_tests {
         Document::from_bytes_owned(bytes).expect("inherited-mediabox test PDF parse")
     }
 
-    /// Build a one-page PDF where the page leaf has its own MediaBox [0 0 600 800]
-    /// and a CropBox [0 0 700 900] that extends beyond the MediaBox.  After the
+    /// Build a one-page PDF where the page leaf has its own `MediaBox` [0 0 600 800]
+    /// and a `CropBox` [0 0 700 900] that extends beyond the `MediaBox`.  After the
     /// §14.11.2 clamp the effective box must be [0 0 600 800] (the intersection).
     fn make_cropbox_exceeds_mediabox_doc() -> Document {
         let header = "%PDF-1.4\n";
@@ -768,9 +768,9 @@ mod page_box_tests {
         Document::from_bytes_owned(bytes).expect("cropbox-exceeds-mediabox test PDF parse")
     }
 
-    /// Build a one-page PDF where the page leaf has both MediaBox [0 0 612 792]
-    /// and CropBox [72 72 540 720] (CropBox ⊆ MediaBox — the common born-digital
-    /// case).  The result must match the CropBox exactly (pixel-neutral invariant).
+    /// Build a one-page PDF where the page leaf has both `MediaBox` [0 0 612 792]
+    /// and `CropBox` [72 72 540 720] (`CropBox` ⊆ `MediaBox` — the common born-digital
+    /// case).  The result must match the `CropBox` exactly (pixel-neutral invariant).
     fn make_cropbox_inside_mediabox_doc() -> Document {
         let header = "%PDF-1.4\n";
         let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
@@ -794,7 +794,7 @@ mod page_box_tests {
         Document::from_bytes_owned(bytes).expect("cropbox-inside-mediabox test PDF parse")
     }
 
-    /// §7.7.3.4: a page leaf without its own MediaBox must inherit from the
+    /// §7.7.3.4: a page leaf without its own `MediaBox` must inherit from the
     /// nearest ancestor /Pages node.  Before this fix the result would have
     /// been the hardcoded 612×792 fallback.
     #[test]
@@ -810,7 +810,7 @@ mod page_box_tests {
         );
     }
 
-    /// §7.7.3.4 negative: before the fix, a leaf without its own MediaBox would
+    /// §7.7.3.4 negative: before the fix, a leaf without its own `MediaBox` would
     /// have returned the 612×792 fallback instead of the inherited value.  This
     /// assertion confirms the old wrong behavior is gone.
     #[test]
@@ -824,7 +824,7 @@ mod page_box_tests {
         );
     }
 
-    /// §14.11.2: CropBox extending beyond MediaBox must be clamped to MediaBox.
+    /// §14.11.2: `CropBox` extending beyond `MediaBox` must be clamped to `MediaBox`.
     /// Effective box = intersection([0 0 700 900], [0 0 600 800]) = [0 0 600 800].
     #[test]
     fn cropbox_exceeding_mediabox_is_clamped() {
@@ -845,9 +845,9 @@ mod page_box_tests {
         );
     }
 
-    /// Pixel-neutrality invariant: CropBox ⊆ MediaBox → result equals the
-    /// CropBox exactly (no change from pre-fix behavior for the common case).
-    /// CropBox [72 72 540 720] inside MediaBox [0 0 612 792] → 468×648.
+    /// Pixel-neutrality invariant: `CropBox` ⊆ `MediaBox` → result equals the
+    /// `CropBox` exactly (no change from pre-fix behavior for the common case).
+    /// `CropBox` [72 72 540 720] inside `MediaBox` [0 0 612 792] → 468×648.
     #[test]
     fn cropbox_inside_mediabox_is_unchanged() {
         let doc = make_cropbox_inside_mediabox_doc();
@@ -882,7 +882,7 @@ mod page_box_tests {
     }
 
     /// Build a hostile one-page PDF whose /Parent chain is a cycle and which
-    /// has NO MediaBox anywhere, so resolving the inheritable box forces a full
+    /// has NO `MediaBox` anywhere, so resolving the inheritable box forces a full
     /// traversal of the ring.  The page leaf's /Parent points at the /Pages
     /// node, and the /Pages node's /Parent points back at the page leaf —
     /// `page leaf 3 0 ⇄ pages 2 0`.  A naive walker loops forever / overflows;
@@ -911,7 +911,7 @@ mod page_box_tests {
         Document::from_bytes_owned(bytes).expect("cyclic-parent test PDF parse")
     }
 
-    /// DoS guard: a cyclic /Parent ring must terminate (no hang, no
+    /// `DoS` guard: a cyclic /Parent ring must terminate (no hang, no
     /// stack-overflow) and fall back to the 612×792 default rather than
     /// spinning.  This is the campaign's recurring hostile-PDF class.
     #[test]
@@ -927,9 +927,9 @@ mod page_box_tests {
         );
     }
 
-    /// Build a PDF where MediaBox [0 0 600 800] and CropBox [900 900 1000 1000]
-    /// are disjoint (CropBox entirely outside MediaBox).  §14.11.2: the
-    /// intersection is empty, so the effective box must fall back to MediaBox —
+    /// Build a PDF where `MediaBox` [0 0 600 800] and `CropBox` [900 900 1000 1000]
+    /// are disjoint (`CropBox` entirely outside `MediaBox`).  §14.11.2: the
+    /// intersection is empty, so the effective box must fall back to `MediaBox` —
     /// never a zero/negative-area box and never the 612×792 default.
     fn make_disjoint_cropbox_doc() -> Document {
         let header = "%PDF-1.4\n";
@@ -954,8 +954,8 @@ mod page_box_tests {
         Document::from_bytes_owned(bytes).expect("disjoint-cropbox test PDF parse")
     }
 
-    /// §14.11.2 degenerate case: CropBox disjoint from MediaBox → empty
-    /// intersection → fall back to MediaBox (not a zero-area box, not 612×792).
+    /// §14.11.2 degenerate case: `CropBox` disjoint from `MediaBox` → empty
+    /// intersection → fall back to `MediaBox` (not a zero-area box, not 612×792).
     #[test]
     fn disjoint_cropbox_falls_back_to_mediabox() {
         let doc = make_disjoint_cropbox_doc();

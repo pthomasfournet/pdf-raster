@@ -1497,7 +1497,7 @@ mod channel_tests {
             pixels: vec![128u8],
             dpi: 72.0,
             effective_dpi: 72.0,
-            diagnostics: Default::default(),
+            diagnostics: crate::PageDiagnostics::default(),
         };
         let (pn, res) = catch_page_panic(3u32, move || -> Result<RenderedPage, RasterError> {
             Ok(dummy)
@@ -1514,9 +1514,7 @@ mod channel_tests {
         let mut results = Vec::new();
         for &(page_num, should_panic) in pages {
             let item = catch_page_panic(page_num, move || -> Result<RenderedPage, RasterError> {
-                if should_panic {
-                    panic!("synthetic panic on page {page_num}");
-                }
+                assert!(!should_panic, "synthetic panic on page {page_num}");
                 Ok(RenderedPage {
                     page_num,
                     width: 1,
@@ -1524,7 +1522,7 @@ mod channel_tests {
                     pixels: vec![0u8],
                     dpi: 72.0,
                     effective_dpi: 72.0,
-                    diagnostics: Default::default(),
+                    diagnostics: crate::PageDiagnostics::default(),
                 })
             });
             results.push(item);
@@ -1727,7 +1725,7 @@ mod decoder_reclaim_guard_tests {
     }
 
     fn count() -> u32 {
-        RECLAIM_COUNT.with(|c| c.get())
+        RECLAIM_COUNT.with(std::cell::Cell::get)
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1800,7 +1798,10 @@ mod decoder_reclaim_guard_tests {
             drop(guard); // unreachable on the failing path
             Ok(())
         })();
-        assert!(outcome.is_err(), "fake_lend must propagate the partway error");
+        assert!(
+            outcome.is_err(),
+            "fake_lend must propagate the partway error"
+        );
         assert_eq!(
             count(),
             1,

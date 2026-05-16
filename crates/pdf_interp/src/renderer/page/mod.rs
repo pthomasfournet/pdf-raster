@@ -746,14 +746,14 @@ impl<'doc> PageRenderer<'doc> {
     /// Override the operator-count budget.  Test-only — used to trigger the
     /// watchdog with a small synthetic vector without running 50 M operators.
     #[cfg(test)]
-    pub(crate) fn set_op_budget_for_test(&mut self, budget: u64) {
+    pub(crate) const fn set_op_budget_for_test(&mut self, budget: u64) {
         self.op_budget = budget;
     }
 
     /// Override the wall-clock deadline.  Pass `None` to disable the
     /// deadline entirely (test-only — lets tests isolate the op-count path).
     #[cfg(test)]
-    pub(crate) fn set_deadline_for_test(&mut self, dl: Option<std::time::Instant>) {
+    pub(crate) const fn set_deadline_for_test(&mut self, dl: Option<std::time::Instant>) {
         self.deadline = dl;
     }
 
@@ -761,7 +761,7 @@ impl<'doc> PageRenderer<'doc> {
     /// so watchdog unit tests can verify the counter without accessing a
     /// private field from a child module.
     #[cfg(test)]
-    pub(crate) fn ops_executed_for_test(&self) -> u64 {
+    pub(crate) const fn ops_executed_for_test(&self) -> u64 {
         self.ops_executed
     }
 
@@ -2393,8 +2393,8 @@ mod tests {
 
     // ── per-page work watchdog ────────────────────────────────────────────────
 
-    /// Verify the operator-count cap fires: a tiny op_budget is tripped,
-    /// fewer than all ops run, and budget_status() reports the breach.
+    /// Verify the operator-count cap fires: a tiny `op_budget` is tripped,
+    /// fewer than all ops run, and `budget_status()` reports the breach.
     #[test]
     fn watchdog_op_budget_fires() {
         use crate::content::Operator;
@@ -2441,13 +2441,18 @@ mod tests {
         // deadline is the only thing that can fire.
         renderer.set_op_budget_for_test(u64::MAX);
         renderer.set_deadline_for_test(Some(
-            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
         ));
 
         // Build exactly DEADLINE_CHECK_INTERVAL no-op ops so the periodic check
         // is guaranteed to run at least once.
-        let ops: Vec<Operator> =
-            std::iter::repeat_n(Operator::EndPath, DEADLINE_CHECK_INTERVAL as usize).collect();
+        let ops: Vec<Operator> = std::iter::repeat_n(
+            Operator::EndPath,
+            usize::try_from(DEADLINE_CHECK_INTERVAL).unwrap(),
+        )
+        .collect();
         renderer.execute(&ops);
 
         assert!(
