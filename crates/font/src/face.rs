@@ -848,7 +848,7 @@ mod tests {
     /// Macintosh-Roman and a (3,0) Microsoft-Symbol cmap — deliberately *no*
     /// Unicode cmap.  Char code 7 maps to GID 1 in the (1,0) cmap (direct)
     /// and 0xF007 maps to GID 1 in the (3,0) cmap (PUA offset), mirroring the
-    /// real scanned-book subset fonts in the NF-2 corpus.
+    /// real scanned-book subset fonts that motivated this regression test.
     fn synth_symbolic_ttf() -> Vec<u8> {
         let glyf = synth_glyf();
         // Short `loca`: stored offsets are byte-offset / 2.  GID 0 is empty
@@ -903,9 +903,9 @@ mod tests {
         ])
     }
 
-    /// NF-2 Group A regression: a symbolic embedded TrueType subset whose only
-    /// cmaps are (1,0) Macintosh-Roman and (3,0) Microsoft-Symbol must still
-    /// resolve its small content-stream codes to real glyphs.
+    /// Symbolic-subset cmap regression: a symbolic embedded TrueType subset
+    /// whose only cmaps are (1,0) Macintosh-Roman and (3,0) Microsoft-Symbol
+    /// must still resolve its small content-stream codes to real glyphs.
     ///
     /// Pre-fix, `FreeType`'s default charmap priority activated the (3,0)
     /// Symbol cmap; `get_char_index(7)` returned `.notdef`, every glyph
