@@ -77,7 +77,7 @@ pub mod session {
 pub fn open_session(path: &Path, config: &SessionConfig) -> Result<RasterSession, RasterError>
 ```
 
-Opens the PDF and builds an O(1) page-ID map. Also initialises the shared GPU context (for `gpu-aa` / `gpu-icc` features) according to `config.policy`. Errors with `RasterError::Pdf` if the file is unreadable, corrupt, or contains JavaScript. Errors with `RasterError::BackendUnavailable` if `config.policy` is `ForceCuda` or `ForceVaapi` and the required GPU cannot be initialised.
+Opens the PDF and builds an O(1) page-ID map. Also initialises the shared GPU context (for `gpu-aa` / `gpu-icc` features) according to `config.policy`. Errors with `RasterError::Pdf` if the file is unreadable or corrupt. A JavaScript-bearing PDF is **not** an error — it opens and renders normally; a loud `WARN` is emitted per detected JS entry point (see `open` below) and no `/JS` is ever decoded or executed. Errors with `RasterError::BackendUnavailable` if `config.policy` is `ForceCuda` or `ForceVaapi` and the required GPU cannot be initialised.
 
 ```rust
 pub fn render_page_rgb(

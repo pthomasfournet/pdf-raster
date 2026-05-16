@@ -14,6 +14,18 @@ rasterrocket = "1.0"
 cargo install rasterrocket-cli
 ```
 
+## What's new in v1.0.3
+
+**v1.0.2 remediation + hardening.** A broad external corpus exposed
+silent rendering loss after v1.0.2 — blank or partially-blank pages on
+input variants the curated suite did not cover. Every root cause is
+fixed and the codebase hardened per-commit; a 238-PDF exhaustive corpus
+is now 100% legible (zero silent loss, zero crash) measured by OCR
+against a MuPDF oracle. No public API changes. See
+[ROADMAP.md](ROADMAP.md#release-history) for the full breakdown
+(NF-1…NF-12 silent-loss roots, the per-commit hardening pass, DoS caps,
+and the page/annotation JavaScript-disclosure work).
+
 ## What's new in v1.0.0
 
 - **Spec-correct simple-font text.** The `Widths`-array lookup now prevails over FreeType metrics for all embedded and non-embedded simple fonts, per PDF §9.2.4. Academic and English-language PDFs show the largest improvement: avg RMSE vs pdftoppm dropped 17–19 points on corpus-05 and corpus-14.
@@ -167,9 +179,11 @@ rasterrocket parses untrusted PDF input. Its hardening posture:
   cap, and a total-raster-area cap; per-page panics are isolated so one bad
   page cannot abort a batch.
 - **No script execution.** rasterrocket has no JavaScript engine. A PDF
-  containing JavaScript (`/OpenAction`, `/AA`, `/Names/JavaScript`) is
-  rendered for its static appearance and a warning is logged; no `/JS` is
-  ever decoded or evaluated.
+  containing JavaScript — catalog `/OpenAction`, `/AA`, `/Names/JavaScript`,
+  `/AcroForm/AA`, or a page-level `/AA` / per-annotation/widget `/A`/`/AA`
+  (the bounded page/annotation scan stops at the first hit) — is rendered
+  for its static appearance and a loud warning is logged per entry point;
+  detection is purely structural and no `/JS` is ever decoded or evaluated.
 - **Native FFI trust boundary.** Two transitive dependencies wrap C
   libraries: glyph rasterization links the system **FreeType**
   (`libfreetype6`) and JPEG 2000 decoding links the system **OpenJPEG**

@@ -27,6 +27,49 @@ Phase 5 is complete. The API exists and is integrated.
 
 ## Release history
 
+### v1.0.3 (May 2026)
+
+**v1.0.2 remediation + hardening campaign.** External QA found ~76% of
+pages on a broad corpus were wrong after v1.0.2 — every root cause a
+*silent* total- or partial-loss on an input variant the curated test
+suite did not contain. This release fixes all of them and hardens the
+codebase per-commit. A 238-PDF exhaustive corpus is now 100% legible
+(zero silent loss, zero crash) measured by OCR against a MuPDF oracle.
+
+- **Silent total/partial-loss roots (NF-1 … NF-12)**: blank text/vector
+  pages (indirect `/Length`, `/ObjStm` object streams, TrueType
+  CIDFontType2); partial text drop-out; JPX+`/Mask` blank scans;
+  page-tree resolution returning "no pages"; chained-filter images
+  silently skipped; FunctionType-4 PostScript-calculator Separation tints
+  blank; CFF/Type1C glyph-garble and dense-book text-fidelity; misleading
+  errors on malformed/empty/non-PDF input; JavaScript-bearing PDFs
+  hard-refused instead of rendered; CCITTFax G3/G4 ImageMask "no rows";
+  JPXDecode CMYK unsupported.
+- **Per-commit hardening**: each substantive campaign commit hardened at
+  root — additional silent-loss paths closed, multiple DoS classes fixed
+  (stack-overflow, unbounded memory, raster-area, LZW-bomb,
+  filter-chain flood, Type-4 recursion/operand-bomb, watchdog escape,
+  unbounded endstream scan), a git-proven latent form-XObject CTM
+  regression restored, 17 missing PDF Appendix D.2 encoding slots,
+  non-deterministic catalogue selection, qpdf decrypt arg-injection,
+  JS-detection false-positives.
+- **Security/robustness**: max-raster-area DoS cap (`MAX_PX_AREA`,
+  `u64`-computed to avoid a latent overflow that would let a hostile
+  page pass); FFI trust-boundary documented (system FreeType/OpenJPEG
+  must be patched — `cargo audit` covers the Rust tree only); bounded
+  deterministic decoder property/fuzz harness; page-level and
+  per-annotation/widget JavaScript entry points now detected (bounded,
+  first-hit; structural `/S` only, `/JS` never decoded or executed).
+- **Closeout**: every deferred finding fixed at root, not documented
+  around — stale example crate path; JS annotation-detection gap;
+  `gpu-validation` JPEG-oracle cfg-boundary; a pre-existing multi-backend
+  `resolve_image` type-inference break it unmasked; lazy_session tests
+  hard-failing on intentionally-optional private fixtures.
+
+No public API changes. Decrypt remains private-copy-only behind a
+default-No liability gate; JavaScript is detected and disclosed but never
+executed.
+
 ### v1.0.2 (May 2026)
 
 Rendering correctness fixes. All bugs produced visually wrong output silently.
