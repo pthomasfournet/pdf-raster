@@ -73,7 +73,7 @@ use raster::{
 
 use super::color::RasterColor;
 use super::font_cache::FontCache;
-use super::gstate::{GStateStack, ctm_multiply, ctm_transform};
+use super::gstate::{Ctm, GStateStack, ctm_multiply, ctm_transform};
 use crate::InterpError;
 use crate::content::Operator;
 use crate::resources::{
@@ -366,6 +366,63 @@ struct CacheState {
     page_buffer: Option<DevicePageBuffer>,
 }
 
+/// Build the initial page CTM that maps PDF user space to device pixels.
+///
+/// `scale = dpi / 72`.  `rotate_cw` is the page `/Rotate` (0/90/180/270; any
+/// other multiple of 90 falls through to the 270 branch as the spec only
+/// defines those four).  `origin_x`/`origin_y` are the selected page box's
+/// lower-left corner in PDF user space (ISO 32000-2 §14.11.2); zero for the
+/// common box-at-origin case.
+///
+/// The `to_device` helper applies an additional Y-flip (`height_px - dy`), so
+/// these matrices only carry scale + rotation + the box-origin pre-translation;
+/// the flip is not folded in here.  `w`/`h` are the output bitmap dimensions in
+/// points (`width_px / scale`, `height_px / scale`); for 90°/270° the caller has
+/// already swapped the pixel dimensions, so here `w` is the post-rotation width.
+///
+/// PDF user-space content coordinates are absolute: a content point at PDF
+/// `(X, Y)` with `X ∈ [llx, llx+boxW]`, `Y ∈ [lly, lly+boxH]`.  We want the box
+/// lower-left `(llx, lly)` to land at device origin, so each branch is the
+/// box-at-origin matrix with the substitution `X → X-llx`, `Y → Y-lly` — i.e. an
+/// innermost pre-translation `T(-llx, -lly)` composed under scale+rotate.  Per
+/// branch (`s = scale`):
+///   Rotate 0   → `[ s,  0,  0,  s,        -llx·s,  -lly·s]`
+///   Rotate 90  → `[ 0, -s, -s,  0,  (h+lly)·s,  (w+llx)·s]`
+///   Rotate 180 → `[-s,  0,  0,  s,  (w+llx)·s,     -lly·s]`
+///   Rotate 270 → `[ 0,  s,  s,  0,     -lly·s,     -llx·s]`
+/// When `llx = lly = 0` every branch reduces to the box-at-origin value, so
+/// origin-at-zero PDFs (the vast majority) are bit-for-bit unchanged.
+///
+/// Degenerate inputs cannot reach here as silent garbage: `scale` is asserted
+/// finite-positive by the sole caller, and `origin_x`/`origin_y` originate from
+/// `page_size_pts_by_id`, which rejects non-finite / zero-area boxes upstream
+/// and logs malformed-box recovery.  This function therefore performs only the
+/// arithmetic; it does not re-validate.
+fn build_initial_ctm(
+    width: u32,
+    height: u32,
+    scale: f64,
+    rotate_cw: u16,
+    origin_x: f64,
+    origin_y: f64,
+) -> Ctm {
+    let s = scale;
+    let llx = origin_x;
+    let lly = origin_y;
+    let w = f64::from(width) / s;
+    let h = f64::from(height) / s;
+    match rotate_cw % 360 {
+        // Rotate 0: standard scale + y-flip handled by to_device.
+        0 => [s, 0.0, 0.0, s, -llx * s, -lly * s],
+        // Rotate 90 CW: swap axes. Bitmap width = original H, height = original W.
+        90 => [0.0, -s, -s, 0.0, (h + lly) * s, (w + llx) * s],
+        // Rotate 180: flip both axes.
+        180 => [-s, 0.0, 0.0, s, (w + llx) * s, -lly * s],
+        // Rotate 270 CW (= 90 CCW): swap axes, opposite orientation.
+        _ => [0.0, s, s, 0.0, -lly * s, -llx * s],
+    }
+}
+
 impl<'doc> PageRenderer<'doc> {
     /// Create a renderer for a blank white page of `width × height` pixels,
     /// where 1 user-space unit = 1 device pixel (72 dpi).
@@ -423,42 +480,8 @@ impl<'doc> PageRenderer<'doc> {
         bitmap.data_mut().fill(255u8); // white background
 
         let mut gstate = GStateStack::new(width, height);
-        // Build the initial CTM combining scale with the page rotation.
-        //
-        // The `to_device` helper applies an additional Y-flip (`height - dy`) so
-        // the formulas below account for that flip.  `w` and `h` are the output
-        // bitmap dimensions in points (`width_px / scale`, `height_px / scale`).
-        //
-        // PDF user-space origin is the page box's lower-left corner (llx, lly).
-        // Content-stream coordinates are relative to that corner, so a point at
-        // page-space (px, py) lies at PDF coordinates (px + llx, py + lly).
-        // The initial CTM must pre-translate by (-llx, -lly) = (-origin_x, -origin_y)
-        // so that the box's lower-left maps to device pixel (0, 0).
-        //
-        // The pre-translation is applied by composing T(-llx,-lly) as the innermost
-        // transform: `ctm_multiply(&T, &scale_rotate) = T then scale_rotate`.
-        // Per branch, this gives:
-        //   Rotate 0   → [s, 0, 0, s, -llx·s, -lly·s]
-        //   Rotate 90  → [0, -s, -s, 0, (h+lly)·s, (w+llx)·s]
-        //   Rotate 180 → [-s, 0, 0, s, (w+llx)·s, -lly·s]
-        //   Rotate 270 → [0, s, s, 0, -lly·s, -llx·s]
-        // When llx=lly=0 every branch reduces to the pre-fix value (pixel-neutral).
-        let s = scale;
-        let llx = origin_x;
-        let lly = origin_y;
-        let w = f64::from(width) / s;
-        let h = f64::from(height) / s;
-        let ctm: [f64; 6] = match rotate_cw % 360 {
-            // Rotate 0: standard scale + y-flip handled by to_device.
-            0 => [s, 0.0, 0.0, s, -llx * s, -lly * s],
-            // Rotate 90 CW: swap axes. Width of bitmap = original H, height = original W.
-            90 => [0.0, -s, -s, 0.0, (h + lly) * s, (w + llx) * s],
-            // Rotate 180: flip both axes.
-            180 => [-s, 0.0, 0.0, s, (w + llx) * s, -lly * s],
-            // Rotate 270 CW (= 90 CCW): swap axes, opposite orientation.
-            _ => [0.0, s, s, 0.0, -lly * s, -llx * s],
-        };
-        gstate.current_mut().ctm = ctm;
+        gstate.current_mut().ctm =
+            build_initial_ctm(width, height, scale, rotate_cw, origin_x, origin_y);
 
         let engine: SharedEngine = FontEngine::init(true, true, false)
             .map_err(|e| InterpError::FontInit(e.to_string()))?;
@@ -2148,6 +2171,110 @@ mod tests {
     fn suggested_dpi_none_when_no_images() {
         let diag = PageDiagnostics::default(); // source_ppi_hint is None
         assert_eq!(diag.suggested_dpi(150.0, 300.0), None);
+    }
+
+    // ── build_initial_ctm: per-/Rotate-branch + page-box origin ────────────
+    //
+    // Each expected matrix below is hand-computed from ISO 32000-2 §8.3.4 by
+    // composing the box-at-origin scale+rotate with an innermost pre-translation
+    // T(-llx, -lly).  The locked render-regression baseline only exercises
+    // (0,0)-origin pages, so it cannot catch an origin-sign error; these tests
+    // pin the sign for every rotation against an independent derivation.
+
+    fn assert_ctm_eq(got: Ctm, want: Ctm) {
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-9,
+                "ctm[{i}]: got {g}, want {w} (full got {got:?}, want {want:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_ctm_zero_origin_is_pixel_neutral_for_every_rotation() {
+        // With llx = lly = 0 each branch must equal the pre-origin-fix matrix,
+        // proving origin-at-zero PDFs (the overwhelming majority) are unchanged.
+        let (wpx, hpx, s) = (600u32, 800u32, 2.0);
+        let w = f64::from(wpx) / s;
+        let h = f64::from(hpx) / s;
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 0, 0.0, 0.0),
+            [s, 0.0, 0.0, s, 0.0, 0.0],
+        );
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 90, 0.0, 0.0),
+            [0.0, -s, -s, 0.0, h * s, w * s],
+        );
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 180, 0.0, 0.0),
+            [-s, 0.0, 0.0, s, w * s, 0.0],
+        );
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 270, 0.0, 0.0),
+            [0.0, s, s, 0.0, 0.0, 0.0],
+        );
+    }
+
+    #[test]
+    fn initial_ctm_nonzero_origin_pretranslates_per_rotation() {
+        // CropBox like the lecouteux repro: non-zero lower-left origin.
+        let (wpx, hpx, s) = (794u32, 1286u32, 2.0);
+        let (llx, lly) = (462.0_f64, 23.0_f64);
+        let w = f64::from(wpx) / s;
+        let h = f64::from(hpx) / s;
+
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 0, llx, lly),
+            [s, 0.0, 0.0, s, -llx * s, -lly * s],
+        );
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 90, llx, lly),
+            [0.0, -s, -s, 0.0, (h + lly) * s, (w + llx) * s],
+        );
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 180, llx, lly),
+            [-s, 0.0, 0.0, s, (w + llx) * s, -lly * s],
+        );
+        assert_ctm_eq(
+            build_initial_ctm(wpx, hpx, s, 270, llx, lly),
+            [0.0, s, s, 0.0, -lly * s, -llx * s],
+        );
+    }
+
+    #[test]
+    fn initial_ctm_rotate0_maps_box_corners_to_device_pixels() {
+        // End-to-end check of the §8.3.4 transform + the to_device Y-flip for a
+        // non-(0,0)-origin box: the box lower-left must land at device (0, H_px)
+        // and the upper-right at (W_px, 0).  This is the sign check the locked
+        // (0,0)-origin baseline structurally cannot perform.
+        let (wpx, hpx, s) = (400u32, 600u32, 2.0);
+        let (llx, lly) = (50.0_f64, 30.0_f64);
+        let ctm = build_initial_ctm(wpx, hpx, s, 0, llx, lly);
+        let box_w = f64::from(wpx) / s; // 200 pt
+        let box_h = f64::from(hpx) / s; // 300 pt
+
+        // Box lower-left (PDF user coords = (llx, lly)).
+        let (dx, dy) = ctm_transform(&ctm, llx, lly);
+        let (px, py) = (dx, f64::from(hpx) - dy);
+        assert!((px - 0.0).abs() < 1e-9, "lower-left x: {px}");
+        assert!((py - f64::from(hpx)).abs() < 1e-9, "lower-left y: {py}");
+
+        // Box upper-right (PDF user coords = (llx+box_w, lly+box_h)).
+        let (dx, dy) = ctm_transform(&ctm, llx + box_w, lly + box_h);
+        let (px, py) = (dx, f64::from(hpx) - dy);
+        assert!((px - f64::from(wpx)).abs() < 1e-9, "upper-right x: {px}");
+        assert!((py - 0.0).abs() < 1e-9, "upper-right y: {py}");
+    }
+
+    #[test]
+    fn initial_ctm_unknown_rotation_falls_through_to_270_branch() {
+        // page_size_pts_by_id normalises /Rotate to {0,90,180,270}, but defend
+        // the helper directly: any other multiple takes the 270 arm rather than
+        // panicking or producing an unscaled identity.
+        assert_ctm_eq(
+            build_initial_ctm(100, 100, 1.0, 45, 0.0, 0.0),
+            [0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        );
     }
 
     // ── check_image_bytes_len ──────────────────────────────────────────────

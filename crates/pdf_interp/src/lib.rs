@@ -378,7 +378,20 @@ pub fn page_size_pts_by_id(
     let Some((box_left, box_bottom, w_pts, h_pts)) = (match (media_box, crop_box) {
         (None, None) => None,
         (Some(m), None) => Some(m),
-        (None, Some(c)) => Some(c), // malformed but recover gracefully
+        (None, Some(c)) => {
+            // MediaBox is mandatory (§7.7.3.3); reaching here means it was
+            // absent or unparseable on every node of the /Parent chain.  We
+            // recover using CropBox so the page still renders, but the
+            // selected box (and therefore the initial-CTM origin) may not be
+            // what the author intended — surface it rather than silently
+            // placing content against a guessed box.
+            log::warn!(
+                "page object {} has no usable MediaBox; falling back to CropBox \
+                 for page geometry (malformed PDF, §7.7.3.3)",
+                page_id.0
+            );
+            Some(c)
+        }
         (Some(m), Some(c)) => {
             // Clamp CropBox to the MediaBox bounds (§14.11.2 intersection).
             let x0 = c.0.max(m.0);
@@ -391,7 +404,25 @@ pub fn page_size_pts_by_id(
                 Some((x0, y0, w, h))
             } else {
                 // Degenerate intersection (CropBox entirely outside MediaBox):
-                // fall back to MediaBox so the page is not empty.
+                // fall back to MediaBox so the page is not empty.  This is a
+                // malformed PDF — the displayed region and the initial-CTM
+                // origin now derive from MediaBox, not the authored CropBox,
+                // so the placement differs from a conforming viewer's. Log it
+                // rather than rendering a silently-relocated page.
+                log::warn!(
+                    "page object {page} CropBox [{cx} {cy} {cw}×{ch}] does not \
+                     intersect MediaBox [{mx} {my} {mw}×{mh}]; using MediaBox \
+                     for page geometry (malformed PDF, §14.11.2)",
+                    page = page_id.0,
+                    cx = c.0,
+                    cy = c.1,
+                    cw = c.2,
+                    ch = c.3,
+                    mx = m.0,
+                    my = m.1,
+                    mw = m.2,
+                    mh = m.3,
+                );
                 Some(m)
             }
         }
