@@ -50,14 +50,6 @@ pub enum InterpError {
     },
     /// A required resource (font, image, colour space, …) could not be resolved.
     MissingResource(String),
-    /// The document contains JavaScript.  We refuse to open it.
-    ///
-    /// The location field names the PDF construct that triggered the check
-    /// (e.g. `"/OpenAction"`, `"/Names/JavaScript"`).
-    JavaScript {
-        /// Which entry point in the PDF triggered the rejection.
-        location: &'static str,
-    },
     /// A Page dictionary entry has a value that is structurally valid PDF but
     /// outside the range permitted by the spec or our safety limits.
     InvalidPageGeometry(String),
@@ -80,9 +72,6 @@ impl std::fmt::Display for InterpError {
                 )
             }
             Self::MissingResource(name) => write!(f, "missing PDF resource: {name}"),
-            Self::JavaScript { location } => {
-                write!(f, "document contains JavaScript ({location}) — refused")
-            }
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
             Self::FontInit(msg) => write!(f, "FreeType initialisation failed: {msg}"),
             Self::PageBudget(msg) => write!(f, "page render budget exceeded: {msg}"),
@@ -106,9 +95,11 @@ impl From<pdf::PdfError> for InterpError {
 
 /// Open a PDF document from a file path.
 ///
-/// Returns [`InterpError::JavaScript`] immediately if the document contains
-/// any JavaScript entry point — we treat JS in PDFs as an attack surface and
-/// refuse to proceed rather than silently ignoring it.
+/// If the document contains any JavaScript entry point, a loud `WARN` is
+/// emitted for each location found and the document still opens: rasterrocket
+/// is a rasterizer with no JavaScript engine, so it never executes `/JS` —
+/// the structural presence of a script has no effect on the static rendered
+/// page, and refusing valid documents would be a false-negative total loss.
 ///
 /// Checked locations (PDF 2.0 §12.6):
 /// - `/Catalog/OpenAction` with `/S /JavaScript`
@@ -118,7 +109,6 @@ impl From<pdf::PdfError> for InterpError {
 ///
 /// # Errors
 /// - [`InterpError::Pdf`] if the file cannot be read or is not a valid PDF.
-/// - [`InterpError::JavaScript`] if any JavaScript entry point is detected.
 pub fn open(path: impl AsRef<Path>) -> Result<Document, InterpError> {
     open_decrypting(path, false)
 }
@@ -140,40 +130,53 @@ pub fn open(path: impl AsRef<Path>) -> Result<Document, InterpError> {
 /// - [`InterpError::Pdf`] if the file cannot be read, is not a valid PDF,
 ///   or is encrypted and could not be (or was not authorised to be)
 ///   decrypted.
-/// - [`InterpError::JavaScript`] if any JavaScript entry point is detected.
 pub fn open_decrypting(
     path: impl AsRef<Path>,
     decrypt_authorized: bool,
 ) -> Result<Document, InterpError> {
     let doc = Document::open_decrypting(path.as_ref(), decrypt_authorized)?;
-    reject_javascript(&doc)?;
+    warn_if_javascript(&doc);
     Ok(doc)
 }
 
-/// Scan the document catalog for JavaScript entry points and return
-/// [`InterpError::JavaScript`] for the first one found.
+/// Scan the document catalog for JavaScript entry points and emit a loud
+/// `WARN` for every location present.  Never fails: rasterrocket has no
+/// JavaScript engine and never executes `/JS`, so a script's structural
+/// presence cannot change the static rendered page — the correct behaviour
+/// is to render the document and tell the operator the JS was ignored.
 ///
 /// No JS content is read, parsed, or evaluated — the check is purely
 /// structural (dict key presence / subtype name).
-fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
+fn warn_if_javascript(doc: &Document) {
+    for location in javascript_locations(doc) {
+        log::warn!(
+            "document contains JavaScript ({location}); JavaScript is ignored — \
+             rasterrocket does not execute scripts, rendering static content only"
+        );
+    }
+}
+
+/// Return every JavaScript entry point present in the document catalog, in
+/// scan order.  Empty when the catalog is unreadable or carries no JS.
+///
+/// Split out from [`warn_if_javascript`] so the four detection branches are
+/// unit-testable without capturing log output.
+fn javascript_locations(doc: &Document) -> Vec<&'static str> {
+    let mut found = Vec::new();
     let Ok(catalog) = doc.catalog() else {
-        return Ok(());
+        return found;
     };
 
     // 1. OpenAction with /S /JavaScript
     if let Some(action) = catalog.get(b"OpenAction")
         && action_is_js(doc, action)
     {
-        return Err(InterpError::JavaScript {
-            location: "/OpenAction",
-        });
+        found.push("/OpenAction");
     }
 
     // 2. Catalog-level additional actions (/AA)
     if catalog.get(b"AA").is_some() {
-        return Err(InterpError::JavaScript {
-            location: "/AA (catalog additional actions)",
-        });
+        found.push("/AA (catalog additional actions)");
     }
 
     // 3. Document JS name tree (/Names/JavaScript)
@@ -181,9 +184,7 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
         && let Some(names_dict) = resources::resolve_dict(doc, names_obj)
         && names_dict.get(b"JavaScript").is_some()
     {
-        return Err(InterpError::JavaScript {
-            location: "/Names/JavaScript",
-        });
+        found.push("/Names/JavaScript");
     }
 
     // 4. AcroForm additional actions
@@ -191,12 +192,10 @@ fn reject_javascript(doc: &Document) -> Result<(), InterpError> {
         && let Some(acroform) = resources::resolve_dict(doc, acroform_obj)
         && acroform.get(b"AA").is_some()
     {
-        return Err(InterpError::JavaScript {
-            location: "/AcroForm/AA",
-        });
+        found.push("/AcroForm/AA");
     }
 
-    Ok(())
+    found
 }
 
 /// Return `true` if `obj` (or the dict it resolves to) has `/S /JavaScript`.
@@ -494,38 +493,62 @@ pub fn parse_page_by_id(
 #[cfg(test)]
 mod js_guard_tests {
     use super::test_helpers::make_doc;
-    use super::{InterpError, reject_javascript};
+    use super::{javascript_locations, warn_if_javascript};
 
     #[test]
-    fn open_action_javascript_is_rejected() {
+    fn open_action_javascript_is_warned_not_rejected() {
         let doc = make_doc(" /OpenAction <</S /JavaScript>>");
-        let err = reject_javascript(&doc).unwrap_err();
-        assert!(
-            matches!(err, InterpError::JavaScript { location } if location.contains("OpenAction")),
-            "expected JavaScript error, got: {err}"
-        );
+        // Detected, but the document is renderable: warn, never fail.
+        assert_eq!(javascript_locations(&doc), vec!["/OpenAction"]);
+        warn_if_javascript(&doc); // must not panic
     }
 
     #[test]
-    fn open_action_goto_is_allowed() {
+    fn open_action_goto_is_not_javascript() {
         let doc = make_doc(" /OpenAction <</S /GoTo>>");
-        assert!(reject_javascript(&doc).is_ok());
+        assert!(javascript_locations(&doc).is_empty());
     }
 
     #[test]
-    fn names_javascript_is_rejected() {
+    fn names_javascript_is_warned_not_rejected() {
         let doc = make_doc(" /Names <</JavaScript <</Names []>>>>");
-        let err = reject_javascript(&doc).unwrap_err();
-        assert!(
-            matches!(err, InterpError::JavaScript { location } if location.contains("Names")),
-            "expected JavaScript error, got: {err}"
+        assert_eq!(javascript_locations(&doc), vec!["/Names/JavaScript"]);
+        warn_if_javascript(&doc); // must not panic
+    }
+
+    #[test]
+    fn aa_and_acroform_aa_are_detected() {
+        let doc =
+            make_doc(" /AA <</WC <</S /JavaScript>>>> /AcroForm <</AA <</K <</S /JavaScript>>>>>>");
+        assert_eq!(
+            javascript_locations(&doc),
+            vec!["/AA (catalog additional actions)", "/AcroForm/AA"]
         );
     }
 
     #[test]
-    fn clean_document_is_allowed() {
+    fn all_four_javascript_locations_detected() {
+        let doc = make_doc(
+            " /OpenAction <</S /JavaScript>> /AA <</WC <</S /JavaScript>>>> \
+             /Names <</JavaScript <</Names []>>>> /AcroForm <</AA <</K <</S /JavaScript>>>>>>",
+        );
+        assert_eq!(
+            javascript_locations(&doc),
+            vec![
+                "/OpenAction",
+                "/AA (catalog additional actions)",
+                "/Names/JavaScript",
+                "/AcroForm/AA"
+            ]
+        );
+        warn_if_javascript(&doc); // must not panic
+    }
+
+    #[test]
+    fn clean_document_has_no_javascript() {
         let doc = make_doc("");
-        assert!(reject_javascript(&doc).is_ok());
+        assert!(javascript_locations(&doc).is_empty());
+        warn_if_javascript(&doc); // no-op, must not panic
     }
 }
 
