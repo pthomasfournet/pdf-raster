@@ -1576,9 +1576,8 @@ mod channel_tests {
             // Stand-in for `open_session` panicking before any page is sent.
             panic!("synthetic open_session panic");
         }));
-        if let Err(payload) = caught {
-            let _sent = tx.send((1, Err(panic_payload_to_render_panic(1, payload.as_ref()))));
-        }
+        let payload = caught.expect_err("synthetic closure always panics");
+        let _sent = tx.send((1, Err(panic_payload_to_render_panic(1, payload.as_ref()))));
         drop(tx);
         let received: Vec<_> = rx.iter().collect();
         assert_eq!(
