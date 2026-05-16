@@ -6,7 +6,7 @@
 //! `image/mod.rs`, which bridge the visibility gap without widening it in normal builds.
 
 use hayro_jbig2::Decoder as Jbig2Decoder;
-use jpeg2k::{Image as Jp2Image, ImageFormat, ImagePixelData};
+use jpeg2k::{ColorSpace as Jp2ColorSpace, Image as Jp2Image, ImageFormat, ImagePixelData};
 use pdf::{Document, Object};
 
 use super::{ImageColorSpace, ImageData, ImageDescriptor, ImageFilter};
@@ -1068,6 +1068,14 @@ pub(super) fn decode_jpx(
         .map_err(|e| log::warn!("image: JPXDecode open error: {e}"))
         .ok()?;
 
+    // CMYK JPEG 2000 must be intercepted before `get_pixels`: the `jpeg2k`
+    // crate's `get_pixels` only emits Gray/RGB(A) and errors out on CMYK.  Pull
+    // the four raw component planes instead and route them through the same
+    // CMYK→RGB conversion used for DeviceCMYK raw images and JPEG-CMYK.
+    if matches!(img.color_space(), Jp2ColorSpace::CMYK) || img.num_components() == 4 {
+        return decode_jpx_cmyk(&img, pdf_w, pdf_h);
+    }
+
     let img_data = img
         .get_pixels(None)
         .map_err(|e| log::warn!("image: JPXDecode get_pixels error: {e}"))
@@ -1166,6 +1174,106 @@ pub(super) fn decode_jpx(
             Some(desc)
         }
     }
+}
+
+/// Decode a 4-component (CMYK) JPEG 2000 image to RGB.
+///
+/// The `jpeg2k` crate's `get_pixels` rejects CMYK outright, so this path reads
+/// the four raw component planes directly and feeds packed CMYK bytes through
+/// [`cmyk_raw_to_rgb`] — the exact same conversion used for `DeviceCMYK` raw
+/// images and JPEG-CMYK, so the output matches the rest of the pipeline.
+///
+/// Correctness notes:
+///  - `ImageComponent::data_u8` already rescales each plane from its native
+///    sample precision (1–16 bit, signed or unsigned) to 8-bit, so this path
+///    handles non-8-bpc codestreams without assuming a bit depth.
+///  - JPEG 2000 stores CMYK as direct ink density (0 = no ink, 255 = full
+///    ink), unlike the inverted convention Adobe uses in JPEG/DCT.  We pass
+///    `inverted = false` so the conversion matches `DeviceCMYK` raw images
+///    (`raw.rs`), not the JPEG-CMYK path.
+///  - The PDF `/ColorSpace` and `/Decode` are intentionally ignored for JPX,
+///    exactly as the Gray/RGB JPX paths do: the codestream is self-describing
+///    and the decoded RGB is final.
+///
+/// Sub-sampled components (different per-plane dimensions) are rejected with a
+/// clear error rather than producing garbage; this is rare for scanned CMYK
+/// and the common 1:1 case renders correctly.
+fn decode_jpx_cmyk(img: &Jp2Image, pdf_w: u32, pdf_h: u32) -> Option<ImageDescriptor> {
+    let comps = img.components();
+    let [c, m, y, k] = comps else {
+        log::warn!(
+            "image: JPXDecode: CMYK image has {} components, expected 4",
+            comps.len()
+        );
+        return None;
+    };
+
+    let (jw, jh) = (c.width(), c.height());
+    if jw == 0 || jh == 0 {
+        log::warn!("image: JPXDecode: CMYK component reports zero dimensions {jw}×{jh}");
+        return None;
+    }
+
+    // All four planes must share the base resolution.  A sub-sampled component
+    // would require per-plane upsampling that this path does not implement;
+    // fail loudly rather than interleaving mismatched-length planes.
+    if [m, y, k]
+        .iter()
+        .any(|p| p.width() != jw || p.height() != jh)
+    {
+        log::warn!(
+            "image: JPXDecode: sub-sampled CMYK components unsupported \
+             (planes {:?})",
+            [
+                (c.width(), c.height()),
+                (m.width(), m.height()),
+                (y.width(), y.height()),
+                (k.width(), k.height()),
+            ]
+        );
+        return None;
+    }
+
+    if jw != pdf_w || jh != pdf_h {
+        log::debug!(
+            "image: JPXDecode: PDF dict says {pdf_w}×{pdf_h}, JP2 reports {jw}×{jh} — using JP2 dims"
+        );
+    }
+
+    let npx = (jw as usize).checked_mul(jh as usize)?;
+    let mut cmyk = Vec::with_capacity(npx.checked_mul(4)?);
+    // `data_u8` yields the plane already scaled to 8-bit; zipping the four
+    // iterators interleaves them into packed CMYK without intermediate Vecs.
+    for (((cc, mm), yy), kk) in c
+        .data_u8()
+        .zip(m.data_u8())
+        .zip(y.data_u8())
+        .zip(k.data_u8())
+    {
+        cmyk.extend_from_slice(&[cc, mm, yy, kk]);
+    }
+
+    if cmyk.len() != npx * 4 {
+        log::warn!(
+            "image: JPXDecode: CMYK plane interleave produced {} bytes, expected {}",
+            cmyk.len(),
+            npx * 4
+        );
+        return None;
+    }
+
+    let rgb = cmyk_raw_to_rgb(
+        &cmyk,
+        false,
+        #[cfg(feature = "gpu-icc")]
+        None,
+        #[cfg(feature = "gpu-icc")]
+        None,
+        #[cfg(feature = "gpu-icc")]
+        None,
+    )?;
+
+    Some(jpx_rgb(jw, jh, rgb))
 }
 
 /// GPU-accelerated JPEG 2000 decode via nvJPEG2000.
@@ -1589,5 +1697,64 @@ mod tests {
     fn jpx_rgb_smask_none_by_default() {
         let desc = jpx_rgb(2, 2, vec![0u8; 12]);
         assert!(desc.smask.is_none(), "jpx_rgb must not inject a smask");
+    }
+
+    // ── JPX-CMYK convention ───────────────────────────────────────────────────
+    //
+    // `decode_jpx_cmyk` cannot be exercised directly without a real JP2
+    // codestream (the `jpeg2k` crate exposes no public constructor for a
+    // synthetic 4-component CMYK `Image`).  This test instead pins the one
+    // non-obvious decision in that path: JPEG 2000 stores CMYK as *direct* ink
+    // density, so the conversion must use `inverted = false` — the same as
+    // DeviceCMYK raw images, and the opposite of the JPEG-CMYK path.  A
+    // regression that flipped the flag would invert every CMYK JPX page's
+    // colours; this asserts the two interpretations are distinct and that the
+    // direct one is what `decode_jpx_cmyk` requests.
+    #[test]
+    fn jpx_cmyk_uses_direct_ink_convention_not_jpeg_inverted() {
+        // Pure-cyan ink at full density: direct convention (0 = no ink).
+        let cyan_direct = [255u8, 0, 0, 0];
+
+        let direct = cmyk_raw_to_rgb(
+            &cyan_direct,
+            false,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .expect("direct CMYK→RGB");
+        let inverted = cmyk_raw_to_rgb(
+            &cyan_direct,
+            true,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+            #[cfg(feature = "gpu-icc")]
+            None,
+        )
+        .expect("inverted CMYK→RGB");
+
+        // Full cyan ink absorbs red → R must be the smallest channel.
+        let [r, g, b] = direct[..3] else {
+            unreachable!("3 bytes per pixel")
+        };
+        assert!(
+            r < g && r < b,
+            "full cyan ink (direct convention) must darken red: got rgb=({r},{g},{b})"
+        );
+
+        // The inverted (JPEG) reading of the same bytes is a *different* colour;
+        // if it were not, the convention choice would not matter and a flipped
+        // flag would silently regress.
+        assert_ne!(
+            &direct[..3],
+            &inverted[..3],
+            "direct and JPEG-inverted CMYK readings must differ — \
+             this is why decode_jpx_cmyk must pass inverted = false"
+        );
     }
 }
