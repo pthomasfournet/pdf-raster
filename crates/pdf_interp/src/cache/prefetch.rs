@@ -344,7 +344,7 @@ fn decode_one(doc: &Document, doc_id: DocId, cache: &Arc<DeviceImageCache>, job:
         #[cfg(feature = "nvjpeg2k")]
         None,
         #[cfg(feature = "gpu-jpeg-huffman")]
-        None,
+        None::<&mut gpu::jpeg_decoder::JpegGpuDecoder<gpu::backend::cuda::CudaBackend>>,
         #[cfg(feature = "gpu-icc")]
         None,
         #[cfg(feature = "gpu-icc")]
