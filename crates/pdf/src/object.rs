@@ -216,21 +216,12 @@ fn length_lands_on_endstream(data: &[u8], start: usize, len: usize) -> bool {
     data[p..].starts_with(b"endstream")
 }
 
-/// Scan forward from `start` for the `endstream` keyword and return the index
-/// of the true end of the stream body (the keyword position, minus a single
-/// trailing EOL that PDF writers insert between the data and `endstream`).
-///
-/// Returns `None` if no `endstream` keyword is found before EOF (truncated /
-/// malformed object), in which case the caller treats the body as empty.
-fn find_endstream(data: &[u8], start: usize) -> Option<usize> {
-    const KW: &[u8] = b"endstream";
-    if start > data.len() {
-        return None;
-    }
-    let rel = data[start..].windows(KW.len()).position(|w| w == KW)?;
-    let mut end = start + rel;
-    // Trim exactly one EOL (CRLF, LF, or CR) immediately before `endstream`;
-    // that byte sequence is a delimiter, not stream data (PDF §7.3.8.1).
+/// Trim the single EOL delimiter (CRLF, LF, or CR) that PDF writers insert
+/// between the stream data and the `endstream` keyword (PDF §7.3.8.1).  `kw`
+/// is the index of the `e` in `endstream`; the returned index is the true end
+/// of the body.  Lower-bounded by `start` so an empty stream stays empty.
+fn trim_eol_before(data: &[u8], start: usize, kw: usize) -> usize {
+    let mut end = kw;
     if end > start && data[end - 1] == b'\n' {
         end -= 1;
         if end > start && data[end - 1] == b'\r' {
@@ -239,7 +230,86 @@ fn find_endstream(data: &[u8], start: usize) -> Option<usize> {
     } else if end > start && data[end - 1] == b'\r' {
         end -= 1;
     }
-    Some(end)
+    end
+}
+
+/// A scan for `endstream` must be bounded: when the keyword is missing or
+/// far away (truncated object, or binary data with no terminator) an
+/// unbounded `windows().position()` over a memory-mapped multi-GB file would
+/// do O(file size) work *per object* during page resolution.  No legitimate
+/// single *undecoded* stream body exceeds this; it tracks the 512 MiB
+/// aggregate decoded-content cap in `document.rs` with generous headroom for
+/// the compressed-to-decoded ratio, so a real stream is always found while a
+/// missing terminator fails fast and loudly instead of degrading throughput.
+const MAX_STREAM_SCAN: usize = 1usize << 31; // 2 GiB
+
+/// Scan forward from `start` for the true end of the stream body.
+///
+/// The hard part is *which* `endstream` is the terminator: `/Length` is
+/// indirect (the dvips / pdfTeX `N 0 R` idiom) and unresolvable here, so the
+/// declared length cannot disambiguate, and a compressed binary body can
+/// legitimately contain the literal bytes `endstream`.  Taking the first raw
+/// match would truncate such a stream to a corrupt prefix — silently blank,
+/// the exact regression the indirect-`/Length` fix exists to prevent.
+///
+/// A well-formed indirect object always closes `…data EOL endstream EOL
+/// endobj` (PDF §7.3.8 / §7.3.10), so the terminator is the `endstream` that
+/// is **EOL-preceded and followed — after whitespace — by `endobj`**.  A
+/// false `endstream` embedded in compressed data essentially never satisfies
+/// both.  Preference order, mirroring poppler / pdf.js / mutool recovery:
+///   1. first EOL-preceded `endstream` immediately followed by `endobj`
+///      (the strong terminator — every well-formed object has exactly this,
+///      so stop at the first to keep the scan O(stream) not O(file));
+///   2. else last EOL-preceded `endstream` (writers always EOL-precede it; a
+///      stray in-body hit is followed by more data then the real terminator,
+///      so the *last* such hit is the safer pick);
+///   3. else first raw `endstream` (degenerate input — recover *something*
+///      rather than dropping the whole page).
+///
+/// Returns `None` if no `endstream` keyword is found within
+/// [`MAX_STREAM_SCAN`] of `start` (truncated / malformed object, or no
+/// terminator), so the caller fails loudly rather than scanning unbounded.
+fn find_endstream(data: &[u8], start: usize) -> Option<usize> {
+    const KW: &[u8] = b"endstream";
+    if start > data.len() {
+        return None;
+    }
+    let scan_end = start.saturating_add(MAX_STREAM_SCAN).min(data.len());
+    let window = &data[start..scan_end];
+
+    let mut first_raw: Option<usize> = None;
+    let mut last_eol_preceded: Option<usize> = None;
+
+    for rel in 0..window.len().saturating_sub(KW.len() - 1) {
+        if &window[rel..rel + KW.len()] != KW {
+            continue;
+        }
+        let kw = start + rel;
+        if first_raw.is_none() {
+            first_raw = Some(kw);
+        }
+        // A delimiter EOL must sit immediately before a terminating keyword.
+        if kw == start || !matches!(data[kw - 1], b'\r' | b'\n') {
+            continue;
+        }
+        last_eol_preceded = Some(kw);
+        // …and the object must continue with `endobj` after the keyword and
+        // any intervening whitespace, or this only looks like a terminator.
+        let mut p = kw + KW.len();
+        while matches!(
+            data.get(p),
+            Some(b'\r' | b'\n' | b' ' | b'\t' | b'\x0c' | b'\0')
+        ) {
+            p += 1;
+        }
+        if data[p..].starts_with(b"endobj") {
+            // Strong terminator — done; no need to scan the rest of the file.
+            return Some(trim_eol_before(data, start, kw));
+        }
+    }
+
+    let kw = last_eol_preceded.or(first_raw)?;
+    Some(trim_eol_before(data, start, kw))
 }
 
 /// Parse one PDF object starting at `*pos` in `data`.  Advances `*pos` past
@@ -299,7 +369,22 @@ pub fn parse_object(data: &[u8], pos: &mut usize) -> Option<Object> {
                     // Missing, indirect (`N 0 R`), negative, or inconsistent
                     // `/Length`: locate the real end by searching for the
                     // `endstream` keyword and trimming the EOL that precedes it.
-                    _ => find_endstream(data, stream_start).unwrap_or(stream_start),
+                    _ => match find_endstream(data, stream_start) {
+                        Some(end) => end,
+                        // No `endstream` within the scan bound: the object is
+                        // truncated or the file is not a valid PDF.  Surface
+                        // it loudly — an empty body here would render a silent
+                        // blank page, the exact failure the indirect-`/Length`
+                        // recovery exists to prevent.
+                        None => {
+                            log::warn!(
+                                "stream at offset {stream_start}: no `endstream` \
+                                 terminator within {MAX_STREAM_SCAN} bytes \
+                                 (truncated or malformed object); content dropped"
+                            );
+                            stream_start
+                        }
+                    },
                 };
                 let content = data[stream_start..stream_end].to_vec();
                 // Advance pos past "endstream".
@@ -616,6 +701,64 @@ mod tests {
             Object::Stream(s) => assert_eq!(s.content, b"ABCDEFG"),
             other => panic!("expected Stream, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn indirect_length_stream_with_literal_endstream_in_binary_body() {
+        // The v1 silent-blank sin: an indirect-`/Length` stream (dvips / arXiv
+        // idiom) whose *compressed* body legitimately contains the literal
+        // bytes `endstream`.  Taking the first raw match would truncate the
+        // body to a corrupt prefix → decode failure → blank page.  The real
+        // terminator is the one that is EOL-preceded and `endobj`-followed.
+        let mut src = Vec::new();
+        src.extend_from_slice(b"<</Length 9 0 R>>\nstream\n");
+        src.extend_from_slice(b"PART-ONE\x00\x01endstream\x02\x03PART-TWO");
+        src.extend_from_slice(b"\nendstream\nendobj");
+        let mut pos = 0;
+        let obj = parse_object(&src, &mut pos).expect("parse");
+        match obj {
+            Object::Stream(s) => assert_eq!(
+                s.content, b"PART-ONE\x00\x01endstream\x02\x03PART-TWO",
+                "false `endstream` in binary body truncated the stream"
+            ),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indirect_length_stream_with_no_endstream_terminates_bounded() {
+        // Truncated object: indirect `/Length`, no `endstream` anywhere.  Must
+        // not scan unbounded / hang; `find_endstream` returns `None` and the
+        // caller drops the body (and logs loudly) rather than spinning.
+        let src = b"<</Length 9 0 R>>\nstream\nthis body never terminates at all";
+        let mut pos = 0;
+        let obj = parse_object(src, &mut pos).expect("parse");
+        match obj {
+            Object::Stream(s) => assert!(
+                s.content.is_empty(),
+                "no terminator must yield an empty body, not a guess"
+            ),
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_endstream_scan_is_bounded() {
+        // Directly assert the scan is bounded: no `endstream` in a buffer
+        // larger than the keyword returns `None` without scanning forever.
+        let big = vec![b'A'; 4 * 1024 * 1024];
+        assert_eq!(find_endstream(&big, 0), None);
+        // Start past EOF is rejected, not an out-of-bounds slice.
+        assert_eq!(find_endstream(b"abc", 99), None);
+    }
+
+    #[test]
+    fn find_endstream_prefers_eol_and_endobj_anchored_terminator() {
+        // An early EOL-preceded `endstream` that is NOT `endobj`-followed is
+        // body data; the real terminator is the `endobj`-anchored one.
+        let data = b"data\nendstream more data here\nendstream\nendobj";
+        let end = find_endstream(data, 0).expect("found");
+        assert_eq!(&data[0..end], b"data\nendstream more data here");
     }
 
     #[test]
