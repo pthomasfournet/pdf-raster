@@ -16,7 +16,7 @@ mod corpus;
 use crate::backend::params::{HUFFMAN_CODEBOOK_ENTRIES, HuffmanParams, HuffmanPhase};
 use crate::backend::{BackendError, GpuBackend, Result};
 use crate::jpeg::CanonicalCodebook;
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 use crate::jpeg_decoder::PackedBitstream;
 use crate::jpeg_decoder::dispatch_util::DeviceBufferGuard;
 use crate::jpeg_decoder::phase1_oracle::SubsequenceState;
@@ -46,7 +46,7 @@ fn flatten_codebooks<'a>(
     out
 }
 
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 #[must_use]
 fn build_gpu_codebook(codebooks: &[CanonicalCodebook]) -> Vec<u32> {
     flatten_codebooks(codebooks.iter())
@@ -66,7 +66,7 @@ fn build_gpu_codebook_refs(codebooks: &[&CanonicalCodebook]) -> Vec<u32> {
 /// # Errors
 /// Returns `BackendError` for any alloc / upload / dispatch / download
 /// failure, or if `build_mcu_schedule` rejects an out-of-range selector.
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 fn dispatch_jpeg_phase1_intra_sync<B: GpuBackend>(
     backend: &B,
     prep: &crate::jpeg_decoder::JpegPreparedInput,
@@ -170,7 +170,7 @@ fn dispatch_jpeg_phase1_intra_sync<B: GpuBackend>(
 /// # Errors
 /// Returns `BackendError` if any alloc/upload/dispatch/download
 /// fails. Bound-exceeded is reported via the outcome, not as an error.
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 fn dispatch_jpeg_phase1_then_phase2<B: GpuBackend>(
     backend: &B,
     prep: &crate::jpeg_decoder::JpegPreparedInput,
@@ -538,7 +538,7 @@ pub(crate) fn dispatch_jpeg_phase1_through_phase4<B: GpuBackend>(
 /// Returns `BackendError` for invalid arguments, or the underlying
 /// driver error if any allocation, upload, dispatch, or download
 /// fails.
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 fn dispatch_phase1_intra_sync<B: GpuBackend>(
     backend: &B,
     stream: &PackedBitstream,
@@ -645,7 +645,7 @@ fn dispatch_phase1_intra_sync<B: GpuBackend>(
 /// Returns `BackendError` if any alloc/upload/dispatch/download
 /// fails. Bound-exceeded is reported via the outcome, not as an
 /// error.
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 fn dispatch_phase1_then_phase2<B: GpuBackend>(
     backend: &B,
     stream: &PackedBitstream,
@@ -786,7 +786,7 @@ fn dispatch_phase1_then_phase2<B: GpuBackend>(
 /// # Errors
 /// Returns `BackendError` if any alloc/upload/dispatch/download
 /// fails, or if Phase 2 fails to converge within the retry bound.
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 #[expect(
     clippy::too_many_lines,
     reason = "linear 4-phase procedural script; splitting would obscure the phase-by-phase flow and force the per-phase param structs through tiny helper functions"
@@ -1013,7 +1013,7 @@ fn dispatch_phase1_through_phase4<B: GpuBackend>(
 /// Returns the underlying `BackendError` from
 /// `dispatch_blelloch_scan` if any allocation, upload, dispatch, or
 /// download fails.
-#[cfg(feature = "gpu-validation")]
+#[cfg(all(test, feature = "gpu-validation"))]
 fn dispatch_phase3_offsets<B: GpuBackend>(
     backend: &B,
     s_info: &[SubsequenceState],
