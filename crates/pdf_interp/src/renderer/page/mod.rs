@@ -1362,8 +1362,13 @@ impl<'doc> PageRenderer<'doc> {
         self.form_depth += 1;
 
         // Concatenate the form's Matrix onto the current CTM.
+        // PDF §8.10.1: the form's /Matrix maps form space to the parent user
+        // space in effect when `Do` was invoked; it pre-multiplies, exactly as
+        // `cm` does (§8.3.4) — new_CTM = form.matrix × old_CTM, never the
+        // reverse.  Post-multiplying scales the matrix's translation by the
+        // wrong factor and pushes nested-form content off the device page.
         let old_ctm = self.gstate.current().ctm;
-        self.gstate.current_mut().ctm = ctm_multiply(&old_ctm, &form.matrix);
+        self.gstate.current_mut().ctm = ctm_multiply(&form.matrix, &old_ctm);
 
         // Switch to the form's resource context, keeping the parent for restore.
         let child_resources = self.resources.for_form(form);

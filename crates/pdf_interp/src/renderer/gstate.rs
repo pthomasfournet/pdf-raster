@@ -268,6 +268,66 @@ mod tests {
     }
 
     #[test]
+    fn ctm_multiply_is_non_commutative_premultiply() {
+        // PDF §8.3.4: `cm M` sets new_CTM = M × old_CTM.  The two operands do
+        // NOT commute once a translation is present, which is precisely why the
+        // original argument-order bug was invisible on single-`cm` pages but
+        // catastrophic on chained ones.  Hand-computed reference:
+        //   M     = [1 0 0 1 5 7]   (pure translate by (5,7))
+        //   old   = [2 0 0 3 0 0]   (scale x2, y3)
+        //   M×old : translation maps through old's linear part →
+        //           e' = 5·2 + 7·0 + 0 = 10 ; f' = 5·0 + 7·3 + 0 = 21
+        let m = [1.0, 0.0, 0.0, 1.0, 5.0, 7.0];
+        let old = [2.0, 0.0, 0.0, 3.0, 0.0, 0.0];
+        let correct = ctm_multiply(&m, &old);
+        assert!((correct[4] - 10.0).abs() < 1e-12, "e' = {}", correct[4]);
+        assert!((correct[5] - 21.0).abs() < 1e-12, "f' = {}", correct[5]);
+        // The reversed order (the historic bug) gives a different translation,
+        // proving the operands are non-commutative and the order is load-bearing.
+        let wrong = ctm_multiply(&old, &m);
+        assert!((wrong[4] - 5.0).abs() < 1e-12, "e (wrong) = {}", wrong[4]);
+        assert!((wrong[5] - 7.0).abs() < 1e-12, "f (wrong) = {}", wrong[5]);
+    }
+
+    #[test]
+    fn ctm_chained_cm_matches_section_8_3_4() {
+        // Two `cm` operators in sequence, each emulated as the renderer does it:
+        //   ctm = ctm_multiply(&M, &ctm).
+        // cm1 = [3 0 0 3 0 0]            (scale ×3)
+        // cm2 = [1 0 0 1 10 20]          (translate (10,20) in cm1's space)
+        // Geometric expectation: a point p in the post-cm2 space maps as
+        //   p → cm2 → cm1 → device, i.e. CTM = cm1 × cm2 applied right-to-left;
+        // with premultiply concatenation that is exactly
+        //   ctm_multiply(&cm2, &ctm_multiply(&cm1, &CTM_IDENTITY)).
+        let cm1 = [3.0, 0.0, 0.0, 3.0, 0.0, 0.0];
+        let cm2 = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+        let after1 = ctm_multiply(&cm1, &CTM_IDENTITY);
+        let after2 = ctm_multiply(&cm2, &after1);
+        // Hand-computed: linear part stays [3 0 0 3]; the (10,20) translate is
+        // scaled by the ×3 already in effect → device translate (30,60).
+        assert!((after2[0] - 3.0).abs() < 1e-12);
+        assert!((after2[3] - 3.0).abs() < 1e-12);
+        assert!((after2[4] - 30.0).abs() < 1e-12, "e = {}", after2[4]);
+        assert!((after2[5] - 60.0).abs() < 1e-12, "f = {}", after2[5]);
+    }
+
+    #[test]
+    fn form_matrix_concatenation_premultiplies() {
+        // PDF §8.10.1: a form XObject's /Matrix concatenates onto the CTM in
+        // effect at `Do` with the same premultiply order as `cm` —
+        // new_CTM = form.matrix × old_CTM.  Mirrors do_form_xobject().
+        let old_ctm = [2.0, 0.0, 0.0, 2.0, 100.0, 50.0];
+        let form_matrix = [1.0, 0.0, 0.0, 1.0, 8.0, 4.0]; // translate in form space
+        let new_ctm = ctm_multiply(&form_matrix, &old_ctm);
+        // Form-space origin (0,0) must land at the old CTM's origin; a form-space
+        // (8,4) translate is scaled by old's ×2 linear part → device (+16,+8).
+        assert!((new_ctm[0] - 2.0).abs() < 1e-12);
+        assert!((new_ctm[3] - 2.0).abs() < 1e-12);
+        assert!((new_ctm[4] - 116.0).abs() < 1e-12, "e = {}", new_ctm[4]);
+        assert!((new_ctm[5] - 58.0).abs() < 1e-12, "f = {}", new_ctm[5]);
+    }
+
+    #[test]
     fn ctm_transform_translation() {
         let ctm = [1.0, 0.0, 0.0, 1.0, 100.0, 200.0];
         let (x, y) = ctm_transform(&ctm, 0.0, 0.0);
