@@ -5,16 +5,16 @@
 //! between feature configurations.
 //!
 //! Run (libdeflate, default):
-//!   cargo run --release -p pdf --example flate_bench -- <path-to-pdf>
+//!   cargo run --release -p rasterrocket-parser --example flate_bench -- <path-to-pdf>
 //!
 //! Run (miniz_oxide fallback):
-//!   cargo run --release -p pdf --no-default-features --example flate_bench -- <path-to-pdf>
+//!   cargo run --release -p rasterrocket-parser --no-default-features --example flate_bench -- <path-to-pdf>
 
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pdf::{Dictionary, Document, Object, Stream};
+use rasterrocket_parser::{Dictionary, Document, Object, Stream};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
