@@ -623,6 +623,13 @@ pub fn resolve_image<#[cfg(feature = "gpu-jpeg-huffman")] B: gpu::backend::GpuBa
                             "image: colour-key /Mask malformed or mismatched — blitting image without mask"
                         );
                     }
+                } else {
+                    // Colour-key masking tests host-resident sample bytes; a
+                    // GPU-resident base can't be range-tested here.  Log rather
+                    // than drop the mask silently (the v1 silent-skip sin).
+                    log::warn!(
+                        "image: colour-key /Mask on GPU-resident base image not supported — blitting image without mask"
+                    );
                 }
             }
             _ => {

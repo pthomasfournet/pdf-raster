@@ -359,11 +359,18 @@ pub(super) fn decode_explicit_mask(
         }
     };
 
-    debug_assert_eq!(
-        desc.color_space,
-        ImageColorSpace::Mask,
-        "explicit /Mask decode must yield ImageColorSpace::Mask",
-    );
+    // A stencil decoded with is_mask=true must yield ImageColorSpace::Mask.
+    // If it does not, the bytes are *not* the §8.9.6.1 paint/transparent
+    // markers, so `!byte` would invert arbitrary samples into garbage alpha —
+    // exactly the silent-wrong mask-polarity class.  Reject loudly instead of
+    // a debug-only assert that vanishes in release builds.
+    if desc.color_space != ImageColorSpace::Mask {
+        log::warn!(
+            "image: /Mask object {id:?} decoded as {:?}, expected Mask stencil — skipping mask",
+            desc.color_space
+        );
+        return None;
+    }
 
     // §8.9.6.3: paint marker (0x00) → base image opaque (alpha 0xFF);
     // transparent marker (0xFF) → background shows (alpha 0x00).
@@ -394,6 +401,14 @@ pub(super) fn colour_key_mask(
     }
     let bounds: Vec<i64> = ranges.iter().filter_map(pdf::Object::as_i64).collect();
     if bounds.len() != components * 2 {
+        return None;
+    }
+    // §8.9.6.4: each component range is `min max` with min ≤ max.  An inverted
+    // pair would make `v >= min && v <= max` unsatisfiable for that component,
+    // silently producing a fully-opaque image (no masking) — the silent-wrong
+    // class.  Reject so the caller logs and blits unmasked instead.
+    if (0..components).any(|c| bounds[c * 2] > bounds[c * 2 + 1]) {
+        log::warn!("image: colour-key /Mask has an inverted min>max range — skipping mask");
         return None;
     }
     let npix = (img_w as usize).checked_mul(img_h as usize)?;
@@ -634,5 +649,33 @@ mod tests {
         // 3 ints for a 1-component image (needs exactly 2) ⇒ None.
         let ranges = [Object::Integer(0), Object::Integer(1), Object::Integer(2)];
         assert!(colour_key_mask(&ranges, &[0u8], 1, 1, 1).is_none());
+    }
+
+    /// §8.9.6.4 requires `min ≤ max`.  An inverted range must fail loudly-
+    /// graceful (`None` → caller blits unmasked) rather than silently leaving
+    /// the whole image opaque, which the v1 sin class would have done.
+    #[test]
+    fn colour_key_mask_inverted_range_returns_none() {
+        // min=20 > max=10 for a 1-component image ⇒ None, not all-opaque.
+        let ranges = [Object::Integer(20), Object::Integer(10)];
+        assert!(colour_key_mask(&ranges, &[15u8, 5], 1, 2, 1).is_none());
+    }
+
+    /// A `/Mask N 0 R` whose referenced stream is *not* a stencil (decodes as
+    /// Gray/Rgb, not [`ImageColorSpace::Mask`]) must be rejected.  Feeding
+    /// non-marker bytes through `!byte` would invert arbitrary samples into
+    /// garbage alpha — the silent-wrong mask-polarity class this guard exists
+    /// to stop.  The `/ImageMask true` dict claim is honoured by the decoder,
+    /// so this is exercised via the release-safe colour-space check rather
+    /// than a debug-only assert.
+    #[test]
+    fn explicit_mask_imagemask_false_is_rejected_before_invert() {
+        // No /ImageMask true ⇒ early ImageMask-flag guard rejects it.
+        let doc = crate::test_helpers::make_doc_with_stream(
+            &[0x12u8, 0x34],
+            " /Subtype /Image /Width 2 /Height 1 /BitsPerComponent 8 \
+              /ColorSpace /DeviceGray",
+        );
+        assert!(decode_explicit_mask(&doc, (2, 0), 2, 1).is_none());
     }
 }
