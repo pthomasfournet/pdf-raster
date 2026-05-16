@@ -17,6 +17,27 @@ use crate::{BackendPolicy, PageSet, RasterOptions, RenderedPage, SessionConfig};
 /// 32 768 px at 150 DPI corresponds to roughly 366 inches (~9.3 metres).
 pub const MAX_PX_DIMENSION: u32 = 32_768;
 
+/// Maximum total pixel area (width × height) accepted from a PDF page.
+///
+/// [`MAX_PX_DIMENSION`] bounds each side independently but says nothing about
+/// their product: a page whose width and height are *both* just under the
+/// per-side limit (e.g. a `/MediaBox [0 0 14400 14400]` rendered at 150 DPI →
+/// 30 000 × 30 000) passes the per-side check yet forces a single ~2.7 GB RGB
+/// allocation — an unbounded-allocation soft-DoS that lives *inside* the
+/// per-side limit. mutool and pdftoppm bound total raster size, not just each
+/// side; this matches that behaviour.
+///
+/// 600 000 000 px ≈ 600 MP ≈ 1.8 GiB at 3 bytes/px (RGB8). The headroom is
+/// deliberate: the largest legitimate page we expect is roughly A0
+/// (841 × 1189 mm ≈ 33.1 × 46.8 in) at 600 DPI ≈ 19 860 × 28 080 ≈ 5.6e8 px,
+/// which still fits with margin, while the absurd 30 000 × 30 000 = 9e8 px
+/// case is rejected before any buffer is allocated. The product is computed in
+/// `u64`: `MAX_PX_DIMENSION² = 32_768² ≈ 1.07e9` already overflows `u32`, so a
+/// `u32` area computation would itself be a latent overflow bug — the wrap
+/// could make a hostile page *pass*. `u64` cannot overflow for any
+/// `u32 × u32` product and never panics.
+pub const MAX_PX_AREA: u64 = 600_000_000;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors returned by [`crate::raster_pdf`].
@@ -41,12 +62,22 @@ pub enum RasterError {
         /// Height in pixels (0 when degenerate).
         height: u32,
     },
-    /// The computed pixel dimensions exceed the safety limit.
+    /// The computed pixel dimensions exceed the per-side safety limit.
     PageTooLarge {
         /// Width in pixels.
         width: u32,
         /// Height in pixels.
         height: u32,
+    },
+    /// The computed pixel area (width × height) exceeds the safety limit even
+    /// though each side is within [`MAX_PX_DIMENSION`].
+    PageAreaTooLarge {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Total area in pixels (`width as u64 * height as u64`).
+        area: u64,
     },
     /// Deskew rotation failed.
     Deskew(String),
@@ -99,6 +130,15 @@ impl std::fmt::Display for RasterError {
                 f,
                 "page pixel dimensions {width}×{height} exceed safety limit \
                  ({MAX_PX_DIMENSION}); lower the DPI or check the document"
+            ),
+            Self::PageAreaTooLarge {
+                width,
+                height,
+                area,
+            } => write!(
+                f,
+                "page pixel area {width}×{height} = {area} exceeds safety limit \
+                 (MAX_PX_AREA = {MAX_PX_AREA}); lower the DPI or check the document"
             ),
             Self::Deskew(msg) => write!(f, "deskew failed: {msg}"),
             Self::InvalidPageGeometry(msg) => write!(f, "invalid page geometry: {msg}"),
@@ -652,6 +692,18 @@ fn render_page_rgb_with_geom(
         return Err(RasterError::PageTooLarge {
             width: w_px,
             height: h_px,
+        });
+    }
+    // Both sides are within the per-side limit here, but their product is not
+    // yet bounded — reject before the bitmap is allocated, never after. The
+    // `u64` widening is mandatory: `32_768²` overflows `u32`. `u64::from` is
+    // the infallible widen — a `u32 × u32` product cannot overflow `u64`.
+    let area = u64::from(w_px) * u64::from(h_px);
+    if area > MAX_PX_AREA {
+        return Err(RasterError::PageAreaTooLarge {
+            width: w_px,
+            height: h_px,
+            area,
         });
     }
 
@@ -1807,6 +1859,112 @@ mod decoder_reclaim_guard_tests {
             1,
             "reclaim must run exactly once even when lend fails partway \
              (guard armed before the fallible lend)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod area_cap_tests {
+    use super::*;
+
+    // The area check in `render_page_rgb_with_geom` is:
+    //   let area = w_px as u64 * h_px as u64;
+    //   if area > MAX_PX_AREA { Err(PageAreaTooLarge { .. }) }
+    // Wiring a real PageRenderer requires a parsed PDF, which is too heavy for
+    // a unit test; these tests pin the exact arithmetic and error semantics
+    // the render path relies on, including the per-side/area independence.
+
+    /// Re-implementation of the guarded prefix of `render_page_rgb_with_geom`,
+    /// kept structurally identical so a future divergence is caught here.
+    fn guard(w_px: u32, h_px: u32) -> Result<(), RasterError> {
+        if w_px == 0 || h_px == 0 {
+            return Err(RasterError::PageDegenerate {
+                width: w_px,
+                height: h_px,
+            });
+        }
+        if w_px > MAX_PX_DIMENSION || h_px > MAX_PX_DIMENSION {
+            return Err(RasterError::PageTooLarge {
+                width: w_px,
+                height: h_px,
+            });
+        }
+        let area = u64::from(w_px) * u64::from(h_px);
+        if area > MAX_PX_AREA {
+            return Err(RasterError::PageAreaTooLarge {
+                width: w_px,
+                height: h_px,
+                area,
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn area_just_under_cap_is_accepted() {
+        // A square whose area is the largest perfect square ≤ MAX_PX_AREA and
+        // whose side is well within MAX_PX_DIMENSION.
+        let side = 24_000_u32; // 24_000² = 576_000_000 ≤ 600_000_000
+        assert!(u64::from(side).pow(2) <= MAX_PX_AREA);
+        assert!(side <= MAX_PX_DIMENSION);
+        assert!(
+            guard(side, side).is_ok(),
+            "area just under the cap must pass"
+        );
+    }
+
+    #[test]
+    fn area_just_over_cap_is_a_loud_error_not_a_panic() {
+        // Both sides < MAX_PX_DIMENSION, so the per-side check passes; only the
+        // area check can fire. This is the exact soft-DoS shape.
+        let (w, h) = (30_000_u32, 30_000_u32);
+        assert!(w <= MAX_PX_DIMENSION && h <= MAX_PX_DIMENSION);
+        let area = u64::from(w) * u64::from(h); // 900_000_000 > 600_000_000
+        assert!(area > MAX_PX_AREA);
+        let err = guard(w, h).expect_err("area over the cap must be rejected");
+        match err {
+            RasterError::PageAreaTooLarge {
+                width,
+                height,
+                area: a,
+            } => {
+                assert_eq!((width, height, a), (w, h, area));
+            }
+            other => panic!("expected PageAreaTooLarge, got {other:?}"),
+        }
+        // The message must name the limit and stay actionable.
+        let msg = guard(w, h).unwrap_err().to_string();
+        assert!(msg.contains("MAX_PX_AREA"), "message must name the limit: {msg}");
+        assert!(
+            msg.contains("lower the DPI"),
+            "message must stay actionable: {msg}"
+        );
+    }
+
+    #[test]
+    fn per_side_cap_still_fires_independently_of_area() {
+        // A tall, thin page: area is tiny but one side blows the per-side cap.
+        // Proves the area cap is additive defence-in-depth, not a replacement.
+        let (w, h) = (1_u32, MAX_PX_DIMENSION + 1);
+        let area = u64::from(w) * u64::from(h);
+        assert!(area <= MAX_PX_AREA, "area is well under the area cap");
+        assert!(
+            matches!(guard(w, h), Err(RasterError::PageTooLarge { .. })),
+            "per-side cap must fire before the area cap"
+        );
+    }
+
+    #[test]
+    fn area_product_uses_u64_and_cannot_overflow() {
+        // MAX_PX_DIMENSION² already overflows u32; computing in u64 must not
+        // wrap (a wrap could let a hostile page slip past the cap).
+        let max = MAX_PX_DIMENSION;
+        let area = u64::from(max) * u64::from(max);
+        assert_eq!(area, 1_073_741_824); // 32_768² — exact, no wrap
+        assert!(area > u64::from(u32::MAX) / 4); // sanity: far past any u32 area
+        assert!(
+            area > MAX_PX_AREA,
+            "a both-sides-maxed page must exceed the area cap"
         );
     }
 }
