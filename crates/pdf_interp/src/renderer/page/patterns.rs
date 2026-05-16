@@ -37,7 +37,7 @@ impl PageRenderer<'_> {
         clippy::cast_possible_wrap,
         reason = "tile dimensions are capped at 4096 and clamped to positive; phase coords are page-bounded; safe casts"
     )]
-    pub(super) fn resolve_fill_pattern(&self, name: &[u8]) -> Option<TiledPattern> {
+    pub(super) fn resolve_fill_pattern(&mut self, name: &[u8]) -> Option<TiledPattern> {
         // Break self-referential / cyclic pattern chains.  Each tile spawns a
         // fresh PageRenderer with its own pattern_depth seeded one above the
         // parent (see render_pattern_tile below), so reaching the cap means a
@@ -156,7 +156,7 @@ impl PageRenderer<'_> {
     /// graphics state.  Pass `None` for `PaintType` 1 (coloured) — the content
     /// stream supplies its own colours.
     pub(super) fn render_pattern_tile(
-        &self,
+        &mut self,
         desc: &crate::resources::tiling::TilingDescriptor,
         tile_w: u32,
         tile_h: u32,
@@ -177,6 +177,13 @@ impl PageRenderer<'_> {
         // of unbounded stack recursion.  saturating_add guards against the
         // (impossible) overflow.
         tile_renderer.pattern_depth = self.pattern_depth.saturating_add(1);
+        // Share the per-page work watchdog.  A fresh PageRenderer would
+        // otherwise get its own 50 M-op budget and a fresh 60 s deadline,
+        // letting a pathological pattern content stream (nested up to
+        // MAX_PATTERN_DEPTH) escape the page watchdog entirely — the parent's
+        // execute() loop is blocked synchronously here and never gets to tick
+        // its own budget or check its own deadline.
+        tile_renderer.adopt_parent_budget(self);
 
         // Override the CTM to map pattern space → tile device space.
         let gs = tile_renderer.gstate.current_mut();
@@ -192,6 +199,10 @@ impl PageRenderer<'_> {
 
         let ops = crate::content::parse(&desc.content);
         tile_renderer.execute(&ops);
+        // Account the tile's work against the shared page budget and propagate
+        // any breach so the parent's execute() loop bails loudly on its next
+        // iteration instead of rendering more pattern fills unbounded.
+        tile_renderer.fold_budget_into(self);
         tile_renderer.finish().0
     }
 }

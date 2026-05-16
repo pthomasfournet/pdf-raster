@@ -701,6 +701,48 @@ impl<'doc> PageRenderer<'doc> {
         self.budget_exceeded.as_deref()
     }
 
+    /// Seed this (child) renderer's work watchdog from a parent renderer.
+    ///
+    /// Tiling-pattern tiles and any other sub-render that spawns a fresh
+    /// [`PageRenderer`] would otherwise each get a brand-new 50 M-op budget and
+    /// a brand-new wall-clock deadline — a denial-of-service escape hatch: the per-page
+    /// watchdog is blind to all work done inside a child renderer, so a
+    /// pathological pattern content stream (nested up to `MAX_PATTERN_DEPTH`)
+    /// could burn arbitrarily many ops / seconds while the parent's
+    /// `execute()` loop is blocked synchronously inside the child render.
+    ///
+    /// The page budget MUST be *shared*, not reset, across every level of
+    /// sub-rendering.  This adopts the parent's *remaining* op allowance and
+    /// its exact wall-clock `Instant` deadline (the same monotonic instant, so
+    /// the deadline does not slide forward per child).  An already-tripped
+    /// parent budget is inherited so the child does no work at all.  Call
+    /// [`fold_budget_into`](Self::fold_budget_into) on the parent afterwards to
+    /// account for the work the child actually performed.
+    pub(super) fn adopt_parent_budget(&mut self, parent: &Self) {
+        // Remaining allowance = parent budget − parent ops already spent.
+        // saturating_sub: if the parent is already at/over budget the child
+        // gets zero allowance and trips on its first op.
+        self.op_budget = parent.op_budget.saturating_sub(parent.ops_executed);
+        self.ops_executed = 0;
+        self.deadline = parent.deadline;
+        self.budget_exceeded.clone_from(&parent.budget_exceeded);
+    }
+
+    /// Fold a finished child renderer's watchdog consumption back into this
+    /// (parent) renderer so the shared per-page budget keeps accounting for
+    /// work done inside sub-renders (tiling-pattern tiles).
+    ///
+    /// Without this the parent's `ops_executed` would not reflect the child's
+    /// work and a sequence of expensive pattern fills would never trip the
+    /// page budget.  A budget breach inside the child is propagated verbatim
+    /// so the outer `execute()` bails loudly on its next iteration.
+    pub(super) fn fold_budget_into(&self, parent: &mut Self) {
+        parent.ops_executed = parent.ops_executed.saturating_add(self.ops_executed);
+        if parent.budget_exceeded.is_none() && self.budget_exceeded.is_some() {
+            parent.budget_exceeded.clone_from(&self.budget_exceeded);
+        }
+    }
+
     /// Override the operator-count budget.  Test-only — used to trigger the
     /// watchdog with a small synthetic vector without running 50 M operators.
     #[cfg(test)]
@@ -842,7 +884,11 @@ impl<'doc> PageRenderer<'doc> {
                 return;
             }
             self.execute_one(op);
-            self.ops_executed += 1;
+            // saturating_add: the op cap fires at MAX_PAGE_OPS long before u64
+            // could wrap, but a test or future caller may set a huge budget
+            // with the deadline disabled — never silently wrap to a low count
+            // (which would mask, not catch, an unbounded stream).
+            self.ops_executed = self.ops_executed.saturating_add(1);
             if self.ops_executed > self.op_budget {
                 self.budget_exceeded = Some(format!(
                     "page render exceeded operator budget ({} ops); aborting",
@@ -1021,7 +1067,7 @@ impl<'doc> PageRenderer<'doc> {
         // Resolve the fill source — pattern or solid colour.
         let pat_name = gs.fill_pattern.clone();
         let solid_color = gs.fill_color.as_slice().to_vec();
-        let _ = gs; // end immutable borrow before the mutable resolve_fill_pattern call
+        let _ = gs; // end the immutable gstate borrow before the &mut self pattern resolve
 
         let tiled = pat_name
             .as_deref()
@@ -2407,6 +2453,84 @@ mod tests {
         assert!(
             renderer.budget_status().is_some(),
             "budget_status() must be Some after deadline is exceeded"
+        );
+    }
+
+    /// The page work-budget MUST be shared with — not reset for — a child
+    /// renderer (tiling-pattern tile).  A fresh `PageRenderer` would otherwise
+    /// get its own full budget and a fresh deadline, letting a pathological
+    /// pattern content stream escape the per-page watchdog entirely.  This
+    /// pins both halves of the contract: `adopt_parent_budget` carries the
+    /// parent's *remaining* allowance + exact deadline (and inherits an
+    /// already-tripped breach), and `fold_budget_into` rolls the child's
+    /// consumption and any breach back into the parent.
+    #[test]
+    fn watchdog_budget_shared_with_child_renderer() {
+        use crate::content::Operator;
+        use crate::test_helpers::empty_doc;
+
+        let doc = empty_doc();
+
+        // Parent with a 100-op budget that has already spent 90 ops.
+        let mut parent =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+        parent.set_op_budget_for_test(100);
+        parent.set_deadline_for_test(None);
+        let ops90: Vec<Operator> = std::iter::repeat_n(Operator::EndPath, 90).collect();
+        parent.execute(&ops90);
+        assert!(parent.budget_status().is_none(), "90 < 100 must not trip");
+        assert_eq!(parent.ops_executed_for_test(), 90);
+
+        // Child adopts the *remaining* 10-op allowance, not a fresh 100.
+        let mut child =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+        child.adopt_parent_budget(&parent);
+        assert_eq!(
+            child.op_budget, 10,
+            "child must inherit remaining allowance"
+        );
+        assert_eq!(child.ops_executed_for_test(), 0);
+        assert!(
+            child.deadline.is_none(),
+            "child must inherit exact deadline"
+        );
+
+        // Child runs 50 ops — well over its 10-op share — and trips.
+        let ops50: Vec<Operator> = std::iter::repeat_n(Operator::EndPath, 50).collect();
+        child.execute(&ops50);
+        assert!(
+            child.budget_status().is_some(),
+            "child must trip on the shared remaining budget"
+        );
+
+        // Folding back: parent's counter advances by the child's work and the
+        // breach propagates so the parent's execute() bails loudly next.
+        child.fold_budget_into(&mut parent);
+        assert!(
+            parent.ops_executed_for_test() >= 90 + 11,
+            "parent must account the child's work, got {}",
+            parent.ops_executed_for_test()
+        );
+        assert!(
+            parent.budget_status().is_some(),
+            "a child breach must propagate to the parent"
+        );
+
+        // An already-tripped parent must hand the child a zero allowance so it
+        // does no work at all.
+        let mut child2 =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+        child2.adopt_parent_budget(&parent);
+        assert!(
+            child2.budget_status().is_some(),
+            "child must inherit an already-tripped parent breach"
+        );
+        let one: Vec<Operator> = vec![Operator::EndPath];
+        child2.execute(&one);
+        assert_eq!(
+            child2.ops_executed_for_test(),
+            0,
+            "a child of a tripped parent must execute zero ops"
         );
     }
 
