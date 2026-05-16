@@ -1636,8 +1636,13 @@ impl<'doc> PageRenderer<'doc> {
             }
         }
 
+        // Use the bitmap's authoritative row stride rather than re-deriving
+        // `width * 3`.  `Bitmap` may pad rows to a `row_pad` multiple; a local
+        // recompute would silently address the wrong byte on any padded layout
+        // (a write-to-wrong-pixel corruption, not a panic).  Read it before the
+        // mutable `data_mut()` borrow.
+        let stride = self.bitmap.stride;
         let data = self.bitmap.data_mut();
-        let stride = self.width as usize * 3; // Rgb8: 3 bytes per pixel
 
         // Axis-aligned fast path: when b ≈ 0 and c ≈ 0, the CTM has no rotation
         // or shear.  The inverse mapping simplifies to:
@@ -1710,7 +1715,12 @@ impl<'doc> PageRenderer<'doc> {
                             // length precheck guarantees src+3 ≤ img_bytes.len().
                             let rgb = &img_bytes[src..src + 3];
                             let pixel_off = row_off + dx as usize * 3;
-                            // Destination bounds guard: the last pixel of a clipped row can round past the bitmap; skip rather than panic.
+                            // Defence-in-depth: the destination triple is
+                            // in-bounds whenever `stride == width * 3`, but a
+                            // future padded stride or an off-by-one in the
+                            // clip-row rounding would push the last pixel of a
+                            // clipped row past the buffer.  Skip that pixel
+                            // rather than panic on an untrusted-PDF geometry.
                             if pixel_off + 3 > data.len() {
                                 continue;
                             }
@@ -1737,7 +1747,7 @@ impl<'doc> PageRenderer<'doc> {
                             // Same bounds rationale as RGB arm.
                             let v = img_bytes[img_idx];
                             let pixel_off = row_off + dx as usize * 3;
-                            // Destination bounds guard: the last pixel of a clipped row can round past the bitmap; skip rather than panic.
+                            // Destination guard: same rationale as the Rgb arm.
                             if pixel_off + 3 > data.len() {
                                 continue;
                             }
@@ -1765,7 +1775,7 @@ impl<'doc> PageRenderer<'doc> {
                             // Same bounds rationale as RGB arm.
                             if img_bytes[img_idx] == 0x00 {
                                 let pixel_off = row_off + dx as usize * 3;
-                                // Destination bounds guard: the last pixel of a clipped row can round past the bitmap; skip rather than panic.
+                                // Destination guard: same rationale as the Rgb arm.
                                 if pixel_off + 3 > data.len() {
                                     continue;
                                 }
@@ -1802,6 +1812,13 @@ impl<'doc> PageRenderer<'doc> {
                     }
 
                     let pixel_off = dy as usize * stride + dx as usize * 3;
+                    // Destination guard: same rationale as the axis-aligned
+                    // Rgb arm.  The general path shares the identical
+                    // untrusted-geometry exposure, so it carries the same
+                    // defence rather than relying on the clamp alone.
+                    if pixel_off + 3 > data.len() {
+                        continue;
+                    }
 
                     match img.color_space {
                         ImageColorSpace::Rgb => {
