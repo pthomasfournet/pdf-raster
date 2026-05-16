@@ -31,6 +31,32 @@ use crate::{
 /// bound. This cap mirrors the per-stream `MAX_DECOMPRESSED` discipline.
 const MAX_PAGE_CONTENT: usize = 512 * 1024 * 1024; // 512 MiB
 
+/// Collect the indirect references from a `/Contents` array.
+///
+/// Shared by the indirect-ref-to-array and direct-array arms of
+/// [`Document::get_page_content`] so the extraction (and its diagnostics)
+/// exist in exactly one place.  ISO 32000-2 §7.7.3.3 says every element of a
+/// `/Contents` array is an indirect reference to a content stream, so any
+/// element that is *not* a reference (an inline object, a nested array, a
+/// number) cannot contribute renderable bytes.  Silently filtering such an
+/// element is the v1 partial-blank failure mode, so each one is logged before
+/// it is dropped; `page_id` is threaded purely so the message names the page.
+fn collect_content_refs(arr: &[Object], page_id: ObjectId) -> Vec<ObjectId> {
+    arr.iter()
+        .filter_map(|el| {
+            el.as_reference().or_else(|| {
+                log::warn!(
+                    "get_page_content: page {} /Contents array element is {}, \
+                     not an indirect reference — skipping (page may be missing content)",
+                    page_id.0,
+                    el.enum_variant()
+                );
+                None
+            })
+        })
+        .collect()
+}
+
 // ── Document ─────────────────────────────────────────────────────────────────
 
 /// A lazily-parsed PDF document backed by a memory-mapped file.
@@ -435,35 +461,70 @@ impl Document {
         // `get_object` returned the Array, the `Object::Stream` match failed,
         // and the page rendered blank.  Resolve one indirection level so a
         // ref-to-array expands into its element references.
+        //
+        // This expansion is intentionally a single, non-recursive pass: the
+        // spec permits exactly one array of *direct stream references*, never
+        // an array nested inside an array, so a flat collection both matches
+        // the spec and makes a cyclic/self-referential `/Contents` ring
+        // (an element ref pointing back at the array object) structurally
+        // impossible to loop on — each `get_object` is visited at most once
+        // and non-streams are diagnosed and skipped in the decode loop below.
         let refs: Vec<ObjectId> = match &contents {
             Object::Reference(id) => match self.get_object(*id)?.as_ref() {
-                Object::Array(arr) => arr.iter().filter_map(Object::as_reference).collect(),
+                Object::Array(arr) => collect_content_refs(arr, page_id),
                 // Stream (or anything else): keep the single ref; the decode
-                // loop below filters non-streams.
+                // loop below filters and diagnoses non-streams.
                 _ => vec![*id],
             },
-            Object::Array(arr) => arr.iter().filter_map(Object::as_reference).collect(),
+            Object::Array(arr) => collect_content_refs(arr, page_id),
             _ => return Ok(Vec::new()),
         };
 
         let mut out = Vec::new();
         for r in refs {
             let stream_obj = self.get_object(r)?;
-            if let Object::Stream(s) = stream_obj.as_ref() {
-                let decoded = decode_stream(&s.content, &s.dict).map_err(PdfError::DecodeFailed)?;
-                // +1 accounts for the possible '\n' separator pushed below.
-                if out.len().saturating_add(decoded.len()).saturating_add(1) > MAX_PAGE_CONTENT {
-                    return Err(PdfError::DecodeFailed(format!(
-                        "page content exceeds {} MiB aggregate decompressed cap \
-                         (possible decompression bomb)",
-                        MAX_PAGE_CONTENT / (1024 * 1024)
-                    )));
-                }
-                if !out.is_empty() && !out.ends_with(b"\n") {
-                    out.push(b'\n');
-                }
-                out.extend_from_slice(&decoded);
+            let Object::Stream(s) = stream_obj.as_ref() else {
+                // A `/Contents` array element that does not resolve to a
+                // stream (a dict, null, number, or — non-conformant — a
+                // nested array) is not renderable content.  Dropping it
+                // silently is the v1 blank/partial-page failure: the page
+                // would render with missing operators and EXIT 0.  Surface
+                // it loudly and continue with the streams that *are* valid
+                // so the page degrades gracefully instead of vanishing.
+                log::warn!(
+                    "get_page_content: page {} /Contents element obj {} is {}, \
+                     not a stream — skipping (page may be missing content)",
+                    page_id.0,
+                    r.0,
+                    stream_obj.enum_variant()
+                );
+                continue;
+            };
+            let decoded = decode_stream(&s.content, &s.dict).map_err(PdfError::DecodeFailed)?;
+            // +1 accounts for the '\n' separator pushed below.
+            if out.len().saturating_add(decoded.len()).saturating_add(1) > MAX_PAGE_CONTENT {
+                return Err(PdfError::DecodeFailed(format!(
+                    "page content exceeds {} MiB aggregate decompressed cap \
+                     (possible decompression bomb)",
+                    MAX_PAGE_CONTENT / (1024 * 1024)
+                )));
             }
+            // ISO 32000-2 §7.8.2: streams in a `/Contents` array are decoded
+            // and *concatenated as if a single stream*, but a content stream
+            // need not end at an operator/token boundary — the last token of
+            // one stream can abut the first of the next (e.g. one stream ends
+            // "...50 7", the next begins "00 cm").  A whitespace byte between
+            // them is required so the lexer keeps the tokens distinct; a
+            // single LF is the canonical, minimal separator.  Skip it only
+            // when the accumulated buffer already ends in PDF whitespace
+            // (LF/CR/space/tab/FF/NUL), which already provides the boundary.
+            if out
+                .last()
+                .is_some_and(|b| !matches!(b, b'\n' | b'\r' | b' ' | b'\t' | 0x0C | 0x00))
+            {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(&decoded);
         }
         Ok(out)
     }
@@ -991,6 +1052,119 @@ startxref\n180\n%%EOF"
         assert!(
             text.contains("BT ET"),
             "second content stream (obj 7) missing: {text:?}"
+        );
+    }
+
+    /// ISO 32000-2 §7.8.2: the streams of a `/Contents` array are decoded and
+    /// concatenated *as if a single stream*, and a stream need not break at a
+    /// token boundary.  This builds a page whose two content streams split a
+    /// number mid-digits — obj 6 ends `"10 0 0 10 50 7"`, obj 7 begins
+    /// `"00 cm ..."`.  Without the inter-stream separator the lexer reads
+    /// `"700 cm"` (a corrupt CTM) instead of `"50 700"` then `"cm"`, so the
+    /// page transforms wrongly and content lands off-page (silent-wrong, the
+    /// v1 sin).  Asserts the LF separator sits exactly at the join.
+    #[test]
+    fn get_page_content_array_inserts_separator_at_midtoken_split() {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n";
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R /Contents 9 0 R \
+                    /MediaBox [0 0 612 792]>>\nendobj\n";
+        let obj9 = "9 0 obj\n[10 0 R 11 0 R]\nendobj\n";
+        // Stream 10 ends in the middle of the literal "700": "...50 7".
+        let s10 = "q 1 0 0 1 0 0 cm 10 0 0 10 50 7";
+        let obj10 = format!(
+            "10 0 obj\n<</Length {}>>\nstream\n{s10}\nendstream\nendobj\n",
+            s10.len()
+        );
+        // Stream 11 resumes with "00 cm ...".  Joined raw this reads "700 cm".
+        let s11 = "00 cm BT ET Q";
+        let obj11 = format!(
+            "11 0 obj\n<</Length {}>>\nstream\n{s11}\nendstream\nendobj\n",
+            s11.len()
+        );
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        let off9 = off3 + obj3.len();
+        let off10 = off9 + obj9.len();
+        let off11 = off10 + obj10.len();
+        let xref_start = off11 + obj11.len();
+        // Objects 4..8 are free placeholders so xref indices stay literal.
+        let xref = format!(
+            "xref\n0 12\n0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n{off2:010} 00000 n\r\n{off3:010} 00000 n\r\n\
+             0000000000 65535 f\r\n0000000000 65535 f\r\n0000000000 65535 f\r\n\
+             0000000000 65535 f\r\n0000000000 65535 f\r\n\
+             {off9:010} 00000 n\r\n{off10:010} 00000 n\r\n{off11:010} 00000 n\r\n"
+        );
+        let trailer = format!("trailer\n<</Size 12 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes =
+            format!("{header}{obj1}{obj2}{obj3}{obj9}{obj10}{obj11}{xref}{trailer}").into_bytes();
+
+        let doc = Document::from_bytes_owned(bytes).expect("midtoken-split PDF");
+        let page_id = doc.get_pages().next().expect("one page").1;
+        let content = doc.get_page_content(page_id).expect("page content");
+        let text = String::from_utf8_lossy(&content);
+        // The separator must keep the "7" and "00" tokens apart: the corrupt
+        // glued form "700 cm" must NOT appear, and the correctly separated
+        // "50 7\n00 cm" boundary must.
+        assert!(
+            !text.contains("700 cm"),
+            "missing §7.8.2 separator glued mid-token numbers: {text:?}"
+        );
+        assert!(
+            text.contains("50 7\n00 cm"),
+            "expected LF separator exactly at the stream join: {text:?}"
+        );
+    }
+
+    /// A cyclic / self-referential `/Contents`: obj 9 is `[10 0 R 9 0 R]` —
+    /// the second element points back at the array object itself.  A naive
+    /// recursive expander would loop forever (the campaign's DoS class).  The
+    /// expander is a single non-recursive pass, so this must terminate
+    /// promptly: obj 10's stream renders, and the back-reference (which
+    /// resolves to an Array, not a Stream) is logged-and-skipped rather than
+    /// recursed into or silently lost.
+    #[test]
+    fn get_page_content_cyclic_contents_terminates() {
+        let header = "%PDF-1.4\n";
+        let obj1 = "1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n";
+        let obj2 = "2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n";
+        let obj3 = "3 0 obj\n<</Type /Page /Parent 2 0 R /Contents 9 0 R \
+                    /MediaBox [0 0 612 792]>>\nendobj\n";
+        // The array's 2nd element (9 0 R) is the array object itself.
+        let obj9 = "9 0 obj\n[10 0 R 9 0 R]\nendobj\n";
+        let s10 = "q BT ET Q";
+        let obj10 = format!(
+            "10 0 obj\n<</Length {}>>\nstream\n{s10}\nendstream\nendobj\n",
+            s10.len()
+        );
+        let off1 = header.len();
+        let off2 = off1 + obj1.len();
+        let off3 = off2 + obj2.len();
+        let off9 = off3 + obj3.len();
+        let off10 = off9 + obj9.len();
+        let xref_start = off10 + obj10.len();
+        let xref = format!(
+            "xref\n0 11\n0000000000 65535 f\r\n\
+             {off1:010} 00000 n\r\n{off2:010} 00000 n\r\n{off3:010} 00000 n\r\n\
+             0000000000 65535 f\r\n0000000000 65535 f\r\n0000000000 65535 f\r\n\
+             0000000000 65535 f\r\n0000000000 65535 f\r\n\
+             {off9:010} 00000 n\r\n{off10:010} 00000 n\r\n"
+        );
+        let trailer = format!("trailer\n<</Size 11 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF");
+        let bytes = format!("{header}{obj1}{obj2}{obj3}{obj9}{obj10}{xref}{trailer}").into_bytes();
+
+        let doc = Document::from_bytes_owned(bytes).expect("cyclic-/Contents PDF");
+        let page_id = doc.get_pages().next().expect("one page").1;
+        // Must return (not hang): the valid stream is kept, the self-ref is
+        // skipped because it resolves to an Array rather than a Stream.
+        let content = doc.get_page_content(page_id).expect("page content");
+        let text = String::from_utf8_lossy(&content);
+        assert!(
+            text.contains("q BT ET Q"),
+            "valid content stream must still render: {text:?}"
         );
     }
 
