@@ -211,7 +211,16 @@ fn find_last_trailer_dict(data: &[u8]) -> Option<Dictionary> {
 /// only a bare Catalog stub is genuinely unrecoverable and must fall
 /// through to the "truncated or corrupt" diagnosis rather than be reported
 /// as the misleading "document has no pages".
+///
+/// When several `/Type /Catalog` objects exist (an incremental update that
+/// replaced the catalogue, or a stale copy left by a partial overwrite) the
+/// one at the *highest file offset* wins: that is the last-written
+/// definition, the same incremental-update rule the object scan and the
+/// `trailer` recovery already follow.  Iterating the `entries` HashMap and
+/// returning the first match would be non-deterministic and could resurrect
+/// a stale catalogue — a silent-wrong recovery.
 fn find_catalog_object(data: &[u8], table: &XrefTable) -> Option<ObjectId> {
+    let mut best: Option<(ObjectId, usize)> = None;
     for (&num, entry) in &table.entries {
         let XrefEntry::Direct { offset, generation } = entry else {
             continue;
@@ -223,11 +232,12 @@ fn find_catalog_object(data: &[u8], table: &XrefTable) -> Option<ObjectId> {
         if let Some((_, Object::Dictionary(d))) = parse_indirect_object(data, off)
             && d.get(b"Type").and_then(Object::as_name) == Some(b"Catalog")
             && d.get(b"Pages").is_some()
+            && best.is_none_or(|(_, best_off)| off > best_off)
         {
-            return Some((num, *generation));
+            best = Some(((num, *generation), off));
         }
     }
-    None
+    best.map(|(id, _)| id)
 }
 
 fn read_xref_at(
@@ -667,5 +677,96 @@ startxref
         // Should succeed: /Prev=-1 is treated as no previous xref.
         let table = read_xref(data).expect("xref parse");
         assert_eq!(table.entries.len(), 0);
+    }
+
+    // ── Xref reconstruction (repair fallback) ────────────────────────────
+
+    /// Incremental-update semantics: when an object number is defined more
+    /// than once, the *last* (highest-offset) definition must win.  Picking
+    /// the earlier version is the classic silent-wrong-recovery bug.
+    #[test]
+    fn reconstruct_picks_last_object_definition() {
+        // No xref/startxref at all so the strict parse fails and repair runs.
+        // Object 4 is defined twice: an old stub, then the live version.
+        let body = b"%PDF-1.4\n\
+4 0 obj<</stale true>>endobj\n\
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 10 10]>>endobj\n\
+4 0 obj<</live true>>endobj\n";
+        let table = reconstruct_xref(body).expect("repair must succeed");
+        let XrefEntry::Direct { offset, .. } = table.get(4).expect("obj 4 present") else {
+            panic!("obj 4 must be a Direct entry");
+        };
+        let live = body
+            .windows(b"4 0 obj<</live".len())
+            .position(|w| w == b"4 0 obj<</live")
+            .expect("live def present") as u64;
+        assert_eq!(
+            offset, live,
+            "obj 4 must resolve to the LAST definition, not the stale one"
+        );
+    }
+
+    /// A hostile file that is millions of `1 0 obj` tokens must terminate
+    /// quickly: the scan is a single linear pass and duplicate object
+    /// numbers collapse to one HashMap entry (the cap is never the thing
+    /// that saves us here — the linear bound is).
+    #[test]
+    fn reconstruct_obj_flood_is_bounded() {
+        let mut body = b"%PDF-1.4\n".to_vec();
+        // ~2 million repetitions of the same header → ~16 MB of input.
+        for _ in 0..2_000_000 {
+            body.extend_from_slice(b"1 0 obj ");
+        }
+        let start = std::time::Instant::now();
+        // No /Root recoverable, so this returns Err — the point is that it
+        // *returns* (single pass, one collapsed entry) instead of hanging.
+        let _ = reconstruct_xref(&body);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "obj-flood scan must be linear, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// When two usable `/Type /Catalog` objects exist (incremental update
+    /// replaced the catalogue), the synthetic trailer must point at the
+    /// one written LAST in the file, never a stale earlier copy.
+    #[test]
+    fn reconstruct_synthetic_root_prefers_last_catalog() {
+        let body = b"%PDF-1.7\n\
+9 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 10 10]>>endobj\n\
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            .to_vec();
+        // Obj 1's catalog is written after obj 9's — it is the live one.
+        let root = find_catalog_object(&body, &reconstruct_objects_only(&body))
+            .expect("a usable catalog exists");
+        assert_eq!(root.0, 1, "must select the last-written /Catalog (obj 1)");
+    }
+
+    /// Helper: run only the object-header scan so a test can probe the
+    /// trailer-recovery selection in isolation.
+    fn reconstruct_objects_only(data: &[u8]) -> XrefTable {
+        let mut table = XrefTable::default();
+        let mut i = 0usize;
+        while i + 3 <= data.len() {
+            if data[i] == b'o'
+                && data[i..].starts_with(b"obj")
+                && let Some((id, header_start)) = scan_obj_header_backwards(data, i)
+            {
+                table.entries.insert(
+                    id.0,
+                    XrefEntry::Direct {
+                        offset: header_start as u64,
+                        generation: id.1,
+                    },
+                );
+            }
+            i += 1;
+        }
+        table
     }
 }
