@@ -23,7 +23,9 @@ fn parse_positive_dpi(s: &str) -> Result<f64, String> {
     reason = "each bool maps to a distinct CLI flag"
 )]
 pub struct Args {
-    /// Input PDF file ("-" for stdin).
+    /// Input PDF file ("-" for stdin). A path that begins with '-' must be
+    /// passed after a literal `--` (or as `./-name.pdf`) so it is not parsed
+    /// as an option.
     pub input: String,
 
     /// Output filename prefix (page number and extension are appended).

@@ -14,7 +14,7 @@ use crate::{
     dictionary::Dictionary,
     error::PdfError,
     lexer::{is_ws, parse_u64, skip_ws},
-    object::{Object, parse_object},
+    object::{Object, ObjectId, parse_indirect_object, parse_object},
 };
 
 /// Where to find an indirect object in the file.
@@ -23,9 +23,9 @@ pub(crate) enum XrefEntry {
     /// Object lives at `offset` bytes from the start of the file.
     Direct {
         offset: u64,
-        /// Generation number — stored but not used for rendering; reserved for
-        /// future encryption / repair support.
-        #[expect(dead_code, reason = "reserved for future encryption / repair support")]
+        /// Generation number — carried through xref repair so a synthetic
+        /// trailer can reference the recovered catalogue with its true
+        /// generation.
         generation: u16,
     },
     /// Object is inside an object stream; `container` is the object number of
@@ -52,6 +52,30 @@ impl XrefTable {
 /// Parse all xref sections starting from the `startxref` offset at the end of
 /// the file.  Follows `/Prev` chains.
 pub(crate) fn read_xref(data: &[u8]) -> Result<XrefTable, PdfError> {
+    match read_xref_strict(data) {
+        // A strict parse that resolved a `/Root` is authoritative — this is
+        // every well-formed file, byte-unchanged.
+        Ok(table) if table.trailer.contains_key(b"Root") => Ok(table),
+        // Strict parse succeeded structurally but the trailer carries no
+        // usable `/Root` (an xref section we located but could not resolve
+        // to a catalogue).  Try the repair scan as a *bonus*: only adopt it
+        // when it yields something better, otherwise keep the strict table
+        // so existing higher-level diagnostics are unchanged.
+        Ok(strict_table) => match reconstruct_xref(data) {
+            Ok(rebuilt) => Ok(rebuilt),
+            Err(_) => Ok(strict_table),
+        },
+        // Strict parse failed outright (no startxref, bad offset, …).  Many
+        // real-world "broken" PDFs — interrupted writes, hand-edited files,
+        // naive concatenations — still contain intact object bodies and a
+        // recoverable catalogue.  Mirror mutool/poppler: scan the body for
+        // object headers and rebuild.  If repair also fails, surface the
+        // original strict diagnostic (the more actionable of the two).
+        Err(strict_err) => reconstruct_xref(data).map_err(|_| strict_err),
+    }
+}
+
+fn read_xref_strict(data: &[u8]) -> Result<XrefTable, PdfError> {
     let start_offset = find_startxref(data)?;
 
     let mut table = XrefTable::default();
@@ -59,6 +83,151 @@ pub(crate) fn read_xref(data: &[u8]) -> Result<XrefTable, PdfError> {
     let mut visited = std::collections::HashSet::new();
     read_xref_at(data, start_offset, &mut table, &mut visited)?;
     Ok(table)
+}
+
+/// Rebuild a cross-reference table by scanning the file body for `N G obj`
+/// headers and a usable trailer/catalogue.
+///
+/// This is the repair path for truncated or corrupt files whose strict xref
+/// parse failed.  It is bounded: every object header costs a constant-time
+/// check at a byte boundary, the entry count is capped at the same 10 M
+/// sanity limit the strict parser uses, and a malformed file simply yields
+/// fewer (or zero) entries rather than looping.  On success the returned
+/// table is shaped exactly like a strict parse so the rest of the reader is
+/// unaware repair happened.
+fn reconstruct_xref(data: &[u8]) -> Result<XrefTable, PdfError> {
+    const SANITY_LIMIT: usize = 10_000_000;
+
+    let mut table = XrefTable::default();
+
+    // Pass 1: locate every "<n> <g> obj" header.  We accept the *last*
+    // definition of an object number (incremental-update semantics: later
+    // bytes in the file supersede earlier ones).
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        // Cheap anchor: only inspect positions starting with 'o' of "obj".
+        if data[i] == b'o' && data[i..].starts_with(b"obj") {
+            // Ensure "obj" is a token boundary (followed by ws/EOF/delim).
+            let after = data.get(i + 3).copied();
+            let token_end = after
+                .map(|b| is_ws(b) || b == b'<' || b == b'[' || b == b'(' || b == b'/')
+                .unwrap_or(true);
+            if token_end && let Some((id, header_start)) = scan_obj_header_backwards(data, i) {
+                table.entries.insert(
+                    id.0,
+                    XrefEntry::Direct {
+                        offset: header_start as u64,
+                        generation: id.1,
+                    },
+                );
+                if table.entries.len() > SANITY_LIMIT {
+                    return Err(PdfError::MissingXref(
+                        "reconstruction exceeded object sanity limit".into(),
+                    ));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if table.entries.is_empty() {
+        return Err(PdfError::MissingXref(
+            "no recoverable objects found while repairing".into(),
+        ));
+    }
+
+    // Pass 2: recover a trailer.  Prefer an explicit `trailer` dictionary
+    // (the common interrupted-write case keeps it); otherwise synthesise one
+    // pointing at the object whose dict is `/Type /Catalog`.
+    if let Some(dict) = find_last_trailer_dict(data)
+        && dict.get(b"Root").is_some()
+    {
+        table.trailer = dict;
+    } else if let Some(root) = find_catalog_object(data, &table) {
+        let mut t = Dictionary::new();
+        t.insert(b"Root".to_vec(), Object::Reference(root));
+        table.trailer = t;
+    } else {
+        return Err(PdfError::MissingXref(
+            "no trailer or /Catalog object recoverable while repairing".into(),
+        ));
+    }
+
+    Ok(table)
+}
+
+/// Given the byte offset of the `obj` keyword, walk backwards over the
+/// `<n> <g> ` prefix and return `((obj_num, gen), header_start_offset)`.
+fn scan_obj_header_backwards(data: &[u8], obj_kw: usize) -> Option<(ObjectId, usize)> {
+    let mut p = obj_kw;
+    // Skip the single space(s) before "obj".
+    while p > 0 && is_ws(data[p - 1]) {
+        p -= 1;
+    }
+    // Generation number.
+    let gen_end = p;
+    while p > 0 && data[p - 1].is_ascii_digit() {
+        p -= 1;
+    }
+    if p == gen_end {
+        return None;
+    }
+    let generation: u16 = std::str::from_utf8(&data[p..gen_end]).ok()?.parse().ok()?;
+    while p > 0 && is_ws(data[p - 1]) {
+        p -= 1;
+    }
+    // Object number.
+    let num_end = p;
+    while p > 0 && data[p - 1].is_ascii_digit() {
+        p -= 1;
+    }
+    if p == num_end {
+        return None;
+    }
+    let num: u32 = std::str::from_utf8(&data[p..num_end]).ok()?.parse().ok()?;
+    Some(((num, generation), p))
+}
+
+/// Find and parse the last `trailer` dictionary in the file, if any.
+fn find_last_trailer_dict(data: &[u8]) -> Option<Dictionary> {
+    let needle = b"trailer";
+    let kw = data.windows(needle.len()).rposition(|w| w == needle)?;
+    let mut pos = kw + needle.len();
+    skip_ws(data, &mut pos);
+    if !data.get(pos..)?.starts_with(b"<<") {
+        return None;
+    }
+    match parse_object(data, &mut pos)? {
+        Object::Dictionary(d) => Some(d),
+        _ => None,
+    }
+}
+
+/// Locate the indirect object whose dictionary is a *usable* `/Type
+/// /Catalog` (one that also carries `/Pages`) and return its id, so a
+/// synthetic trailer can point `/Root` at it.
+///
+/// Requiring `/Pages` keeps repair honest: a truncated file that contains
+/// only a bare Catalog stub is genuinely unrecoverable and must fall
+/// through to the "truncated or corrupt" diagnosis rather than be reported
+/// as the misleading "document has no pages".
+fn find_catalog_object(data: &[u8], table: &XrefTable) -> Option<ObjectId> {
+    for (&num, entry) in &table.entries {
+        let XrefEntry::Direct { offset, generation } = entry else {
+            continue;
+        };
+        let off = *offset as usize;
+        if off >= data.len() {
+            continue;
+        }
+        if let Some((_, Object::Dictionary(d))) = parse_indirect_object(data, off)
+            && d.get(b"Type").and_then(Object::as_name) == Some(b"Catalog")
+            && d.get(b"Pages").is_some()
+        {
+            return Some((num, *generation));
+        }
+    }
+    None
 }
 
 fn read_xref_at(

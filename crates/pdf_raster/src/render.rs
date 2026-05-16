@@ -80,7 +80,10 @@ impl std::fmt::Display for RasterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidOptions(msg) => write!(f, "invalid raster options: {msg}"),
-            Self::Pdf(e) => write!(f, "PDF error: {e}"),
+            // `e` is an `InterpError` that already formats its own labelled
+            // message (e.g. "PDF error: …"); delegate so the prefix is not
+            // applied twice.
+            Self::Pdf(e) => write!(f, "{e}"),
             Self::PageOutOfRange { page, total } => {
                 write!(
                     f,

@@ -132,7 +132,15 @@ impl Document {
     }
 
     fn from_bytes_with_guard(data: Arc<MmapOrVec>, guard: DecryptGuard) -> Result<Self, PdfError> {
-        let xref = read_xref(data.as_bytes())?;
+        validate_pdf_input(data.as_bytes())?;
+        let xref = read_xref(data.as_bytes()).map_err(|e| match e {
+            // A `%PDF-` header is present (validate_pdf_input passed) but the
+            // xref could neither be parsed nor reconstructed: the file is
+            // truncated or corrupt.  Replace the low-level "startxref not
+            // found" with an accurate, operator-actionable diagnosis.
+            PdfError::BadXref(detail) => PdfError::MissingXref(detail),
+            other => other,
+        })?;
         Ok(Self {
             data,
             xref,
@@ -675,6 +683,30 @@ impl Iterator for PageIter<'_> {
     }
 }
 
+/// How far into the file the `%PDF-` header may legally appear.
+///
+/// The spec puts the header at byte 0, but real-world files prepend a few
+/// junk bytes (mail transfer artefacts, UTF-8 BOM, shebang lines).  poppler
+/// and mutool scan roughly the first kilobyte; we match that leniency.
+const HEADER_SCAN_WINDOW: usize = 1024;
+
+/// Reject obviously-unusable input *before* the xref parser runs so the
+/// operator gets an accurate diagnosis ("file is empty" / "not a PDF")
+/// instead of the low-level, misleading "'startxref' not found".
+///
+/// This is the single entry choke point shared by [`Document::open`] and
+/// [`Document::from_bytes_owned`].
+fn validate_pdf_input(data: &[u8]) -> Result<(), PdfError> {
+    if data.is_empty() {
+        return Err(PdfError::EmptyInput);
+    }
+    let window = &data[..data.len().min(HEADER_SCAN_WINDOW)];
+    if !window.windows(5).any(|w| w == b"%PDF-") {
+        return Err(PdfError::NotPdf);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,6 +964,95 @@ startxref\n180\n%%EOF"
         assert!(
             text.contains("BT ET"),
             "second content stream (obj 7) missing: {text:?}"
+        );
+    }
+
+    // ── Input-boundary validation ────────────────────────────────────────
+
+    /// `Document` is intentionally not `Debug`, so `Result::unwrap_err` is
+    /// unavailable; pull the error out by hand.
+    fn open_err(bytes: Vec<u8>) -> PdfError {
+        match Document::from_bytes_owned(bytes) {
+            Ok(_) => panic!("expected an error, document opened successfully"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn empty_input_is_diagnosed_distinctly() {
+        let err = open_err(Vec::new());
+        assert!(
+            matches!(err, PdfError::EmptyInput),
+            "0-byte input must yield EmptyInput, got: {err}"
+        );
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn non_pdf_input_is_diagnosed_distinctly() {
+        let err = open_err(b"just some text, not a pdf\n".to_vec());
+        assert!(
+            matches!(err, PdfError::NotPdf),
+            "non-PDF input must yield NotPdf, got: {err}"
+        );
+        // Binary garbage with no %PDF- header takes the same path.
+        let err2 = open_err(vec![0u8; 2048]);
+        assert!(matches!(err2, PdfError::NotPdf), "2KB NUL: {err2}");
+    }
+
+    #[test]
+    fn header_only_without_xref_is_truncated_not_xref_jargon() {
+        // Has a valid %PDF- header but no startxref/trailer/objects: the
+        // operator must hear "truncated or corrupt", never the raw
+        // "'startxref' not found" jargon.
+        let err = open_err(b"%PDF-1.7\n".to_vec());
+        assert!(
+            matches!(err, PdfError::MissingXref(_)),
+            "header-only must yield MissingXref, got: {err}"
+        );
+        assert!(err.to_string().contains("truncated or corrupt"));
+    }
+
+    #[test]
+    fn header_late_within_scan_window_is_accepted_as_pdf() {
+        // The %PDF- signature need not be at byte 0; a few junk bytes are
+        // tolerated (matches poppler/mutool). It still has no xref, so the
+        // failure is the truncation diagnosis, *not* NotPdf.
+        let mut bytes = b"\xEF\xBB\xBFleading junk\n".to_vec();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let err = open_err(bytes);
+        assert!(
+            matches!(err, PdfError::MissingXref(_)),
+            "header-after-junk must pass the NotPdf gate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn broken_xref_is_reconstructed_from_object_scan() {
+        // A structurally complete body with NO xref table and NO startxref
+        // at all. The strict parser cannot find it; reconstruction must
+        // rebuild the table from the object headers and synthesise a
+        // trailer pointing at the /Catalog so the document opens.
+        let body = b"%PDF-1.4\n\
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
+            .to_vec();
+        let doc = Document::from_bytes_owned(body)
+            .expect("reconstruction must recover a usable catalogue");
+        assert_eq!(doc.page_count(), 1, "rebuilt page tree must yield 1 page");
+    }
+
+    #[test]
+    fn bare_catalog_stub_without_pages_is_not_falsely_recovered() {
+        // A truncated file whose only object is a Catalog with no /Pages is
+        // genuinely unrecoverable; repair must decline and report the
+        // truncation, not the misleading "document has no pages".
+        let body = b"%PDF-1.7\n1 0 obj<</Type/Catalog>>endobj\n".to_vec();
+        let err = open_err(body);
+        assert!(
+            matches!(err, PdfError::MissingXref(_)),
+            "bare-Catalog stub must yield MissingXref, got: {err}"
         );
     }
 }

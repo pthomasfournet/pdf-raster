@@ -10,10 +10,20 @@ use crate::args::Args;
 use crate::render::RenderError;
 
 /// Print the `source()` chain of `e` to stderr, one line per level.
+///
+/// A level whose `Display` is identical to the text already printed is a
+/// transparent wrapper (e.g. `RasterError::Pdf` delegating to its
+/// `InterpError` source) and is skipped — repeating the same sentence under
+/// "caused by:" is noise, not a diagnosis.
 pub fn print_error_chain(e: &dyn std::error::Error) {
+    let mut prev = e.to_string();
     let mut src = e.source();
     while let Some(cause) = src {
-        eprintln!("  caused by: {cause}");
+        let text = cause.to_string();
+        if text != prev {
+            eprintln!("  caused by: {text}");
+            prev = text;
+        }
         src = cause.source();
     }
 }
