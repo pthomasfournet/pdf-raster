@@ -1934,7 +1934,10 @@ mod area_cap_tests {
         }
         // The message must name the limit and stay actionable.
         let msg = guard(w, h).unwrap_err().to_string();
-        assert!(msg.contains("MAX_PX_AREA"), "message must name the limit: {msg}");
+        assert!(
+            msg.contains("MAX_PX_AREA"),
+            "message must name the limit: {msg}"
+        );
         assert!(
             msg.contains("lower the DPI"),
             "message must stay actionable: {msg}"
