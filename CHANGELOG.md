@@ -2,6 +2,98 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] - 2026-05-16
+
+### Bug Fixes
+
+- Guard destination bounds in axis-aligned image blit
+- Surface image-decode failures instead of silent blank pages
+- Consume JBIG2/CCITT SMask samples as direct alpha (no stencil invert)
+- Dedupe unsupported-operator warnings per page
+- Cap aggregate decompressed page-content size; fix tokenizer infinite loop
+- Isolate per-page panics; correct render_channel contract docs
+- Wire GPU features to the internal rasterrocket-gpu crate
+- Correct CTM concatenation order for cm and form-XObject matrix
+- Apply page-box origin to the initial CTM
+- Reclaim GPU decoders via RAII guard so unwind doesn't leak them
+- Inherit MediaBox/CropBox/Rotate; clamp CropBox to MediaBox
+- Correct 1-bpc raw stencil mask polarity so dense JBIG2 DeviceGray pages aren't inverted
+- Scan for endstream when /Length is indirect so text/vector PDFs aren't silently blank
+- Index CIDFont glyphs by resolved GID so PDF 1.5 CFF text isn't blank
+- Expand /Contents indirect-ref-to-array so pages aren't blank
+- Select Mac/Symbol cmap for symbolic TrueType subsets so scanned-book deep pages aren't blank
+- Resolve explicit /Mask (§8.9.6.3/§8.9.6.4) so JPXDecode pages with /Mask aren't dark/inverted
+- Decode chained image filters so ASCII85+CCITTFax scanned pages aren't blank
+- Evaluate Type-4 PostScript calculator functions so Separation-tint pages aren't blank
+- Resolve simple Type1/CFF glyphs by name via font charset, not code-identity/Unicode-cmap
+- Resolve indirect /W and /DW in CIDFont width extraction
+- Accurate diagnostics + xref repair for empty/non-PDF/truncated input
+- Render JavaScript-bearing PDFs with a warning instead of refusing to open
+- Parse inline-image DecodeParms dictionary so CCITTFax G3-1D ImageMask pages render
+- Decode CMYK JPEG2000 via raw components so JPX-CMYK pages render
+
+### Chores
+
+- Gitignore /qa/ alongside /audit/ for private QA artifacts
+- Fix stale flate_bench example crate path
+
+### Documentation
+
+- Document hardening posture + native-FFI trust boundary
+- Refresh README/ROADMAP/api-reference for the v1.0.2 remediation
+
+### Features
+
+- Per-page work watchdog (op budget + deadline + form-depth cap)
+- Qpdf-assisted decryption of owned encrypted PDFs, with liability gate
+
+### Other
+
+- Exclude qa/ from cargo workspace (private QA driver)
+- Image blit — authoritative stride, dedup guard, general-path parity
+- Blit_image — surface decoded-but-unrenderable images as decode errors
+- Smask bitonal arms — fail loudly on short CCITT/JBIG2 SMask
+- Unknown-op dedup — bound the warned-set against adversarial input
+- Tokenizer skip paths loop, not recurse — kill residual stack-overflow DoS
+- Close render_channel setup-panic silent-loss; fix stale AssertUnwindSafe doc
+- Replace irrefutable if-let with expect_err in panic-isolation test
+- Ctm form-XObject — restore §8.10.1 premultiply order
+- Page-box-origin initial-CTM — testable helper + loud malformed-box recovery
+- Decoder-reclaim lend window — close FIX-07c partial-move leak
+- Page-box-inherit DoS+overflow — loud cyclic/Parent, finite box, Rotate warn
+- Watchdog tiling-pattern escape — share the per-page budget across child renderers
+- Stencil-mask polarity — honest WHY + dedup + loud bpc/Decode
+- Endstream-scan false-match + DoS bound — anchor on EOL+endobj, fail loud
+- Cid-gid by-gid path — hostile OOB-CID guard + dispatch test
+- Page-contents array — loud-skip non-stream elements + §7.8.2 separator robustness
+- Symbolic-cmap test region — clippy --tests clean by fixing, not suppressing
+- Explicit-mask edge cases — loud-graceful min>max, release-safe Mask guard, no silent GPU skip
+- Decrypt qpdf-spawn — abs-path arg-injection fix, single-open hot path, empty-output guard, 0600 temp test
+- Chained-filter DoS — bound chain length, aggregate size, LZW bomb
+- Type4-fn evaluator — cap parse/exec recursion, operand stack, and reject non-finite output
+- Name-gid base-encoding tables — restore 17 PDF App. D.2 slots dropped to .notdef
+- Cid-widths inner-W indirect refs — resolve every /W element + cap range expansion
+- Xref-recovery synthetic-root — last-written /Catalog wins, not HashMap-order
+- Js-detect AA accuracy — flag /AA only on a genuine /S /JavaScript sub-action
+- Clippy-clean test code (interp + pdf_raster --tests)
+- Cap total raster area to close within-per-side-limit alloc DoS
+- Cargo fmt (post-H4.5 raster-cap + fuzz-harness)
+- Detect page-level and annotation JavaScript entry points
+- Align gpu-validation JPEG-oracle dispatch gate with its consumers
+- Pin resolve_image backend type in the prefetch leaf call
+
+### Refactor
+
+- Simplify rasterrocket-parser (pdf) crate
+- Simplify rasterrocket-interp crate
+- Simplify rasterrocket-font crate
+- Simplify rasterrocket (pdf_raster) crate
+
+### Testing
+
+- Bounded decoder property/fuzz harness for malformed-input invariant
+- Skip lazy_session tests cleanly when private corpus absent
+
 ## [1.0.2] - 2026-05-13
 
 ### Bug Fixes
@@ -12,6 +104,14 @@ All notable changes to this project will be documented in this file.
 - Fix gray SMask blend reads wrong dst channels; extract blend_u8 helper
 - Harden decode_smask_dct and correct test reference values
 - Harden parse_decode and apply_decode; avoid 8-bpc copy on identity
+
+### Chores
+
+- Release v1.0.2
+
+### Documentation
+
+- Prep v1.0.2 release notes
 
 ## [1.0.1] - 2026-05-13
 
