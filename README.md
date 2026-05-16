@@ -153,6 +153,37 @@ cargo test -p rasterrocket-gpu --lib -- icc
 tests/compare/compare.sh -r 150 tests/fixtures/input.pdf
 ```
 
+## Security
+
+rasterrocket parses untrusted PDF input. Its hardening posture:
+
+- **Memory-safe core.** The PDF parser, content interpreter, font/glyph
+  resolution, and the JBIG2 / CCITT / JPEG / Flate / LZW decoders are pure
+  Rust. Malformed, truncated, adversarial, or hostile input is converted to a
+  clear per-page `Err` or a bounded skip — never a silent wrong render, an
+  unbounded allocation, an infinite loop, or a process abort. The render
+  pipeline enforces a per-page operator/wall-clock/form-depth watchdog, an
+  aggregate content-size cap, a filter-chain length and decompression-bomb
+  cap, and a total-raster-area cap; per-page panics are isolated so one bad
+  page cannot abort a batch.
+- **No script execution.** rasterrocket has no JavaScript engine. A PDF
+  containing JavaScript (`/OpenAction`, `/AA`, `/Names/JavaScript`) is
+  rendered for its static appearance and a warning is logged; no `/JS` is
+  ever decoded or evaluated.
+- **Native FFI trust boundary.** Two transitive dependencies wrap C
+  libraries: glyph rasterization links the system **FreeType**
+  (`libfreetype6`) and JPEG 2000 decoding links the system **OpenJPEG**
+  (`libopenjp2`). These are the historically highest-CVE components of any
+  PDF stack. rasterrocket links the *system* libraries (not vendored
+  copies), so their CVE exposure is exactly your host's package patch level.
+  **Deployments that process untrusted PDFs MUST keep `libfreetype6` and
+  `libopenjp2` patched** (or sandbox the process). `cargo audit` is clean
+  for the Rust dependency tree, but RustSec does not track upstream C-library
+  CVEs — the host's patch cadence is the control there.
+- **Encrypted input.** Owner-password-only encrypted PDFs are decrypted via
+  an opt-in, default-deny liability gate (see Getting Started). Unencrypted
+  input never spawns a subprocess and never writes a temp file.
+
 ## Performance
 
 Benchmarks vs Poppler's `pdftoppm` on a 10-document corpus at 150 DPI. Full methodology, hardware details, and AVX2 vs AVX-512 comparison in **[the Benchmarks wiki page](../../wiki/Benchmarks)**.
