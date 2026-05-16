@@ -161,10 +161,12 @@ impl FontCache {
         // must be preserved.  A simple embedded Type1/Type1C/CFF font instead
         // needs its codes resolved by glyph *name* against the font program's
         // own charset after the face is loaded (see resolve_simple_to_gid).
-        let resolve_by_name = desc.bytes.is_some()
-            && desc.cid_encoding.is_none()
-            && desc.type3.is_none()
-            && matches!(desc.kind, PdfFontKind::Type1 | PdfFontKind::Other);
+        let resolve_by_name = wants_name_resolution(
+            desc.bytes.is_some(),
+            desc.cid_encoding.is_none(),
+            desc.type3.is_none(),
+            desc.kind,
+        );
 
         let params = FaceParams {
             kind: to_font_kind(desc.kind),
@@ -217,6 +219,30 @@ pub(crate) fn trm_pixel_size_valid(trm: [f64; 4]) -> bool {
 }
 
 // ── Simple-font name → GID resolution ────────────────────────────────────────
+
+/// Decide whether the glyph-name → charset resolution path applies, given
+/// the descriptor's shape.  This is the load-bearing dispatch gate for the
+/// NF-6 fix and must fire *only* for a simple embedded Type1/Type1C/CFF
+/// font:
+///
+/// - `has_bytes` false  → non-embedded standard-14: the fallback face's own
+///   active charmap resolves codes; name resolution on a substitute face
+///   would mis-map.
+/// - `not_cid` false    → CID/Type0: the descriptor's `code_to_gid` (built
+///   from `CIDToGIDMap` / the `CMap`) already owns resolution.
+/// - `not_type3` false  → Type 3: glyphs are content-stream procedures, not
+///   a font program with a charset.
+/// - `kind` `TrueType`  → symbolic/non-symbolic TrueType keeps the cmap
+///   `select_truetype_cmap` chose; only `Type1` (incl. `MMType1`) and
+///   `Other` (OpenType-CFF wrappers) are name-resolved.
+const fn wants_name_resolution(
+    has_bytes: bool,
+    not_cid: bool,
+    not_type3: bool,
+    kind: PdfFontKind,
+) -> bool {
+    has_bytes && not_cid && not_type3 && matches!(kind, PdfFontKind::Type1 | PdfFontKind::Other)
+}
 
 /// Build a 256-entry `code_to_gid` table for a simple embedded
 /// Type1/Type1C/CFF font by resolving each char code's glyph *name* against
@@ -1086,7 +1112,9 @@ static WIN_ANSI_ENCODING: [Option<&str>; 256] = [
     None,
     Some("zcaron"),
     Some("Ydieresis"),
-    None,
+    // 0xA0: WinAnsiEncoding maps the no-break space to `space` (PDF App. D.2);
+    // a bare NBSP in body text must be a blank glyph, not `.notdef`.
+    Some("space"),
     Some("exclamdown"),
     Some("cent"),
     Some("sterling"),
@@ -1099,7 +1127,9 @@ static WIN_ANSI_ENCODING: [Option<&str>; 256] = [
     Some("ordfeminine"),
     Some("guillemotleft"),
     Some("logicalnot"),
-    None,
+    // 0xAD: WinAnsiEncoding maps the soft hyphen to `hyphen` (PDF App. D.2);
+    // omitting it drops discretionary hyphens to `.notdef` mid-word.
+    Some("hyphen"),
     Some("registered"),
     Some("macron"),
     Some("degree"),
@@ -1185,6 +1215,14 @@ static WIN_ANSI_ENCODING: [Option<&str>; 256] = [
 ];
 
 /// `MacRomanEncoding` (Mac OS Roman): char code → glyph name.
+///
+/// The C2–D7 mathematical-symbol slots (notequal, infinity, lessequal,
+/// greaterequal, partialdiff, summation, product, pi, integral, Omega,
+/// radical, approxequal, Delta, lozenge) and the 0xCA no-break space are
+/// part of PDF Appendix D.2; leaving them unmapped silently routed those
+/// glyphs to `.notdef` in MacRoman-encoded text.  0xF0 (the Apple-logo
+/// glyph) is intentionally absent: it is a non-spec vendor extension with
+/// no Adobe-Glyph-List name, so it can never resolve regardless.
 static MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
     None,
     None,
@@ -1359,36 +1397,36 @@ static MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
     Some("trademark"),
     Some("acute"),
     Some("dieresis"),
-    None,
+    Some("notequal"),
     Some("AE"),
     Some("Oslash"),
-    None,
+    Some("infinity"),
     Some("plusminus"),
-    None,
-    None,
+    Some("lessequal"),
+    Some("greaterequal"),
     Some("yen"),
     Some("mu"),
-    None,
-    None,
-    None,
-    None,
-    None,
+    Some("partialdiff"),
+    Some("summation"),
+    Some("product"),
+    Some("pi"),
+    Some("integral"),
     Some("ordfeminine"),
     Some("ordmasculine"),
-    None,
+    Some("Omega"),
     Some("ae"),
     Some("oslash"),
     Some("questiondown"),
     Some("exclamdown"),
     Some("logicalnot"),
-    None,
+    Some("radical"),
     Some("florin"),
-    None,
-    None,
+    Some("approxequal"),
+    Some("Delta"),
     Some("guillemotleft"),
     Some("guillemotright"),
     Some("ellipsis"),
-    None,
+    Some("space"),
     Some("Agrave"),
     Some("Atilde"),
     Some("Otilde"),
@@ -1401,7 +1439,7 @@ static MAC_ROMAN_ENCODING: [Option<&str>; 256] = [
     Some("quoteleft"),
     Some("quoteright"),
     Some("divide"),
-    None,
+    Some("lozenge"),
     Some("ydieresis"),
     Some("Ydieresis"),
     Some("fraction"),
@@ -1472,6 +1510,130 @@ mod tests {
         // MacRoman: ASCII identity; 0xC7 = guillemotleft (Mac OS Roman).
         assert_eq!(MAC_ROMAN_ENCODING[0x41], Some("A"));
         assert_eq!(MAC_ROMAN_ENCODING[0xC7], Some("guillemotleft"));
+    }
+
+    /// PDF Appendix D.2 conformance for the slots that *differ* between the
+    /// three base encodings and the slots a single wrong byte would turn into
+    /// a systematic silent-wrong-glyph defect.  A wrong entry here mis-maps
+    /// that code in every PDF using that base encoding, so pin them hard.
+    #[test]
+    fn base_encoding_appendix_d2_differing_slots() {
+        // All three tables are exactly 256 entries (index == char code).
+        assert_eq!(STANDARD_ENCODING.len(), 256);
+        assert_eq!(WIN_ANSI_ENCODING.len(), 256);
+        assert_eq!(MAC_ROMAN_ENCODING.len(), 256);
+
+        // 0x27 / 0x60: the classic quote distinction.  Standard uses the
+        // typographic quoteright/quoteleft; WinAnsi & MacRoman use the
+        // straight quotesingle/grave.
+        assert_eq!(STANDARD_ENCODING[0x27], Some("quoteright"));
+        assert_eq!(WIN_ANSI_ENCODING[0x27], Some("quotesingle"));
+        assert_eq!(MAC_ROMAN_ENCODING[0x27], Some("quotesingle"));
+        assert_eq!(STANDARD_ENCODING[0x60], Some("quoteleft"));
+        assert_eq!(WIN_ANSI_ENCODING[0x60], Some("grave"));
+        assert_eq!(MAC_ROMAN_ENCODING[0x60], Some("grave"));
+
+        // WinAnsi CP-1252 high specials (0x80–0x9F) the other two leave unset.
+        assert_eq!(WIN_ANSI_ENCODING[0x80], Some("Euro"));
+        assert_eq!(WIN_ANSI_ENCODING[0x85], Some("ellipsis"));
+        assert_eq!(WIN_ANSI_ENCODING[0x91], Some("quoteleft"));
+        assert_eq!(WIN_ANSI_ENCODING[0x92], Some("quoteright"));
+        assert_eq!(WIN_ANSI_ENCODING[0x96], Some("endash"));
+        assert_eq!(WIN_ANSI_ENCODING[0x97], Some("emdash"));
+        assert_eq!(STANDARD_ENCODING[0x80], None);
+        assert_eq!(MAC_ROMAN_ENCODING[0x80], Some("Adieresis"));
+
+        // Spec-mandated slots that were previously unmapped (the bug this
+        // hardening pass fixed): WinAnsi NBSP/soft-hyphen and the MacRoman
+        // C2–D7 math symbols + 0xCA no-break space.
+        assert_eq!(WIN_ANSI_ENCODING[0xA0], Some("space"));
+        assert_eq!(WIN_ANSI_ENCODING[0xAD], Some("hyphen"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xAD], Some("notequal"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xB0], Some("infinity"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xB2], Some("lessequal"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xB3], Some("greaterequal"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xBD], Some("Omega"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xC3], Some("radical"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xCA], Some("space"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xD7], Some("lozenge"));
+
+        // MacRoman accented-letter high range (Mac OS Roman layout, not
+        // CP-1252) — proves the table is the Mac vector, not a WinAnsi copy.
+        assert_eq!(MAC_ROMAN_ENCODING[0x81], Some("Aring"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xAE], Some("AE"));
+        assert_eq!(MAC_ROMAN_ENCODING[0xD0], Some("endash"));
+        assert_eq!(WIN_ANSI_ENCODING[0xD0], Some("Eth"));
+
+        // 0xF0: the Apple-logo glyph is a non-spec vendor extension absent
+        // from PDF Appendix D.2 and the AGL — it stays unmapped by design.
+        assert_eq!(MAC_ROMAN_ENCODING[0xF0], None);
+
+        // StandardEncoding high-range distinctives (PDF App. D.2).
+        assert_eq!(STANDARD_ENCODING[0xA1], Some("exclamdown"));
+        assert_eq!(STANDARD_ENCODING[0xAB], Some("guillemotleft"));
+        assert_eq!(STANDARD_ENCODING[0xD0], Some("emdash"));
+        assert_eq!(STANDARD_ENCODING[0xE1], Some("AE"));
+    }
+
+    /// The name-resolution path must fire ONLY for a simple embedded
+    /// Type1/Type1C/CFF font.  A misfire would steal resolution from CID,
+    /// symbolic TrueType, Type 3, or the non-embedded standard-14 path.
+    #[test]
+    fn name_resolution_dispatch_is_isolated() {
+        // Simple embedded Type1 / OpenType-CFF (`Other`): the only YES cases.
+        assert!(wants_name_resolution(true, true, true, PdfFontKind::Type1));
+        assert!(wants_name_resolution(true, true, true, PdfFontKind::Other));
+
+        // Non-embedded standard-14 (no font bytes): fallback face owns it.
+        assert!(!wants_name_resolution(
+            false,
+            true,
+            true,
+            PdfFontKind::Type1
+        ));
+        // CID/Type0 (cid_encoding present → not_cid == false).
+        assert!(!wants_name_resolution(
+            true,
+            false,
+            true,
+            PdfFontKind::Other
+        ));
+        // Type 3 (type3 present → not_type3 == false).
+        assert!(!wants_name_resolution(
+            true,
+            true,
+            false,
+            PdfFontKind::Type1
+        ));
+        // Embedded TrueType: keeps select_truetype_cmap's charmap.
+        assert!(!wants_name_resolution(
+            true,
+            true,
+            true,
+            PdfFontKind::TrueType
+        ));
+    }
+
+    /// The simple-font name path must yield `.notdef` (0) for an unresolvable
+    /// code — never code-identity.  Code-identity for a subsetted program is
+    /// the original NF-6 garble; this pins the regression.
+    #[test]
+    fn unresolvable_code_is_notdef_never_identity() {
+        let diffs = empty_diffs();
+        // StandardEncoding leaves 0x80 unmapped: no name → no GID lookup.
+        assert_eq!(
+            glyph_name_for_code(&diffs, BaseEncoding::Standard, 0x80),
+            None
+        );
+        // The control range is unmapped in every base encoding.
+        for base in [
+            BaseEncoding::Standard,
+            BaseEncoding::WinAnsi,
+            BaseEncoding::MacRoman,
+        ] {
+            assert_eq!(glyph_name_for_code(&diffs, base, 0), None);
+            assert_eq!(glyph_name_for_code(&diffs, base, 31), None);
+        }
     }
 
     #[test]
