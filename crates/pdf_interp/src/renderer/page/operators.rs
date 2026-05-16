@@ -2,7 +2,7 @@
 
 use super::super::color::RasterColor;
 use super::super::gstate::ctm_multiply;
-use super::{PageRenderer, int_to_cap, int_to_join};
+use super::{MAX_WARNED_UNKNOWN_OPS, PageRenderer, int_to_cap, int_to_join};
 use crate::content::{Operator, TextArrayElement};
 
 impl PageRenderer<'_> {
@@ -402,14 +402,7 @@ impl PageRenderer<'_> {
             // Handled in the OCG pre-pass above; unreachable here.
             Operator::BeginOptionalContent(_) | Operator::EndOptionalContent => {}
 
-            Operator::Unknown(kw) if self.warned_unknown_ops.insert(kw.clone()) => {
-                log::warn!(
-                    "rasterrocket-interp: unsupported content operator {:?} (further occurrences suppressed for this page)",
-                    String::from_utf8_lossy(kw)
-                );
-            }
-
-            Operator::Unknown(_) => {}
+            Operator::Unknown(kw) => self.warn_unknown_operator(kw),
 
             // Compile-time exhaustiveness guard.
             #[expect(
@@ -417,6 +410,46 @@ impl PageRenderer<'_> {
                 reason = "future Operator variants are caught here"
             )]
             _ => {}
+        }
+    }
+
+    /// Warn (once per distinct keyword per page) that `kw` is an unsupported
+    /// content operator, so a repeating junk operator doesn't flood the log
+    /// and bury real image-decode error lines.
+    ///
+    /// The first occurrence of every distinct keyword still warns — the page
+    /// may be rendering incompletely and that signal must surface; only exact
+    /// repeats are suppressed.
+    ///
+    /// The distinct-keyword set is hard-capped at [`MAX_WARNED_UNKNOWN_OPS`].
+    /// An adversarial content stream can emit up to `MAX_PAGE_OPS` operators,
+    /// each a distinct (and arbitrarily long) junk keyword; without the cap the
+    /// set would grow to multiple gigabytes of attacker-controlled bytes before
+    /// the operator-budget watchdog aborts the page, defeating the page memory
+    /// budget. On reaching the cap we emit one final summary warning and stop
+    /// tracking new keywords: the "page has unsupported content" signal is
+    /// preserved while memory stays bounded.
+    fn warn_unknown_operator(&mut self, kw: &[u8]) {
+        if self.warned_unknown_ops.len() >= MAX_WARNED_UNKNOWN_OPS {
+            // `contains` (no allocation) for already-tracked keywords; only the
+            // first keyword that overflows the cap takes the summary branch.
+            if !self.warned_unknown_ops.contains(kw) && !self.warned_unknown_ops_capped {
+                self.warned_unknown_ops_capped = true;
+                log::warn!(
+                    "rasterrocket-interp: more than {MAX_WARNED_UNKNOWN_OPS} distinct \
+                     unsupported content operators on this page; further distinct \
+                     operators are no longer individually reported (page content \
+                     may be incomplete)"
+                );
+            }
+            return;
+        }
+        if self.warned_unknown_ops.insert(kw.to_vec()) {
+            log::warn!(
+                "rasterrocket-interp: unsupported content operator {:?} \
+                 (further occurrences suppressed for this page)",
+                String::from_utf8_lossy(kw)
+            );
         }
     }
 }

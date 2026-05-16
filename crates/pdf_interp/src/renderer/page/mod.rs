@@ -223,6 +223,16 @@ const PAGE_RENDER_DEADLINE_SECS: u64 = 60;
 /// overhead.  The overrun after a deadline is bounded to ≤ 4 096 extra ops.
 const DEADLINE_CHECK_INTERVAL: u64 = 4_096;
 
+/// Upper bound on distinct unsupported-operator keywords tracked per page for
+/// warn-once deduplication.
+///
+/// Blunt safety net: a real PDF has at most a handful of distinct unsupported
+/// operators; this is far beyond that.  Caps the attacker-controlled auxiliary
+/// allocation an adversarial content stream (up to `MAX_PAGE_OPS` distinct,
+/// arbitrarily long junk keywords) can force, which would otherwise grow to
+/// gigabytes before the operator budget aborts the page.  Not a tuning knob.
+pub(super) const MAX_WARNED_UNKNOWN_OPS: usize = 256;
+
 /// Renders a decoded operator sequence onto a `Bitmap<Rgb8>`.
 pub struct PageRenderer<'doc> {
     /// Target pixel buffer.
@@ -268,8 +278,12 @@ pub struct PageRenderer<'doc> {
     /// per-page result.
     budget_exceeded: Option<String>,
     /// Distinct unknown operator keywords already warned about this page,
-    /// so a content stream that repeats an unsupported op doesn't flood the log.
+    /// so a content stream that repeats an unsupported op doesn't flood the
+    /// log.  Bounded at [`MAX_WARNED_UNKNOWN_OPS`] entries.
     warned_unknown_ops: std::collections::HashSet<Vec<u8>>,
+    /// Set once the distinct-keyword cap is reached, so the "no longer
+    /// individually reporting" summary warning is emitted exactly once.
+    warned_unknown_ops_capped: bool,
     /// Per-filter blit counts used to compute `diag.dominant_filter`.
     filter_counts: [u32; IMAGE_FILTER_COUNT],
     /// Optional Content Group (OCG) visibility stack.
@@ -473,6 +487,7 @@ impl<'doc> PageRenderer<'doc> {
             ops_executed: 0,
             budget_exceeded: None,
             warned_unknown_ops: std::collections::HashSet::new(),
+            warned_unknown_ops_capped: false,
             filter_counts: [0u32; IMAGE_FILTER_COUNT],
             ocg_stack: Vec::new(),
             #[cfg(feature = "gpu-jpeg-huffman")]
@@ -683,6 +698,17 @@ impl<'doc> PageRenderer<'doc> {
     #[cfg(test)]
     pub(crate) fn ops_executed_for_test(&self) -> u64 {
         self.ops_executed
+    }
+
+    /// `(tracked distinct unknown-op keywords, cap-reached flag)`.  Test-only
+    /// accessor so the dedup unit test can assert the set stays bounded under
+    /// adversarial input without touching private fields cross-module.
+    #[cfg(test)]
+    pub(crate) fn warned_unknown_ops_state_for_test(&self) -> (usize, bool) {
+        (
+            self.warned_unknown_ops.len(),
+            self.warned_unknown_ops_capped,
+        )
     }
 
     /// Consume the renderer and return the finished bitmap and page diagnostics.
@@ -1597,9 +1623,7 @@ impl<'doc> PageRenderer<'doc> {
             // `ImageResolution` contract eradicates upstream, so record it
             // on `decode_errors` to surface as a per-page `Err` rather than
             // dropping the image with only a log line.
-            log::debug!(
-                "blit_image: GPU image-blit failed with no host fallback bytes"
-            );
+            log::debug!("blit_image: GPU image-blit failed with no host fallback bytes");
             self.decode_errors
                 .push("page image: GPU blit failed, no host fallback".to_owned());
             return;
@@ -1613,9 +1637,7 @@ impl<'doc> PageRenderer<'doc> {
             // Decoded pixels exist but are device-resident with no GPU
             // dispatch available to blit them — unrenderable, not absent.
             // Surface as a decode failure (silent-blank parity).
-            log::debug!(
-                "blit_image: image data not host-resident and GPU dispatch unavailable"
-            );
+            log::debug!("blit_image: image data not host-resident and GPU dispatch unavailable");
             self.decode_errors
                 .push("page image: pixels device-resident but GPU dispatch unavailable".to_owned());
             return;
@@ -2253,6 +2275,89 @@ mod tests {
         assert!(
             renderer.budget_status().is_some(),
             "budget_status() must be Some after deadline is exceeded"
+        );
+    }
+
+    // ── unsupported-operator warn-once dedup ──────────────────────────────────
+
+    /// A hostile content stream with far more distinct junk operators than the
+    /// cap must not grow `warned_unknown_ops` without bound: the set is capped
+    /// at `MAX_WARNED_UNKNOWN_OPS` and the cap-reached flag is set (so the
+    /// summary warning fires exactly once).  Exact repeats of a tracked keyword
+    /// must not inflate the set.
+    #[test]
+    fn unknown_op_dedup_set_is_bounded_under_adversarial_input() {
+        use crate::content::Operator;
+        use crate::test_helpers::empty_doc;
+
+        let doc = empty_doc();
+        let mut renderer =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+        renderer.set_op_budget_for_test(u64::MAX);
+        renderer.set_deadline_for_test(None);
+
+        // Ten times the cap of *distinct* junk keywords, each repeated twice to
+        // also exercise the dedup-hit (no-allocation) path.
+        let distinct = MAX_WARNED_UNKNOWN_OPS * 10;
+        let mut ops: Vec<Operator> = Vec::with_capacity(distinct * 2);
+        for i in 0..distinct {
+            let kw = format!("junk{i}").into_bytes();
+            ops.push(Operator::Unknown(kw.clone()));
+            ops.push(Operator::Unknown(kw));
+        }
+        renderer.execute(&ops);
+
+        let (tracked, capped) = renderer.warned_unknown_ops_state_for_test();
+        assert_eq!(
+            tracked, MAX_WARNED_UNKNOWN_OPS,
+            "warned set must be hard-capped, got {tracked}"
+        );
+        assert!(
+            capped,
+            "cap-reached flag must be set so the summary warning fires"
+        );
+    }
+
+    /// The first occurrence of every distinct unsupported operator (below the
+    /// cap) is tracked — proving the first-occurrence WARN still surfaces and
+    /// the dedup never swallows the signal that content may be incomplete.
+    #[test]
+    fn unknown_op_first_occurrence_is_tracked_per_keyword() {
+        use crate::content::Operator;
+        use crate::test_helpers::empty_doc;
+
+        let doc = empty_doc();
+        let mut renderer =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+
+        // Three distinct keywords, the first repeated three times.
+        renderer.execute(&[
+            Operator::Unknown(b"foo".to_vec()),
+            Operator::Unknown(b"foo".to_vec()),
+            Operator::Unknown(b"foo".to_vec()),
+            Operator::Unknown(b"bar".to_vec()),
+            Operator::Unknown(b"baz".to_vec()),
+        ]);
+
+        let (tracked, capped) = renderer.warned_unknown_ops_state_for_test();
+        assert_eq!(tracked, 3, "one tracked entry per distinct keyword");
+        assert!(!capped, "cap must not trip below MAX_WARNED_UNKNOWN_OPS");
+    }
+
+    /// Each page gets a fresh `PageRenderer`, so the dedup set is inherently
+    /// per-page.  Verify a freshly constructed renderer starts with an empty
+    /// set (no cross-page leakage of suppression state).
+    #[test]
+    fn unknown_op_dedup_state_is_per_renderer() {
+        use crate::test_helpers::empty_doc;
+
+        let doc = empty_doc();
+        let renderer =
+            PageRenderer::new(1, 1, &doc, (1, 0)).expect("renderer construction must not fail");
+        assert_eq!(
+            renderer.warned_unknown_ops_state_for_test(),
+            (0, false),
+            "a new per-page renderer must start with an empty, uncapped dedup set"
         );
     }
 }
