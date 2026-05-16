@@ -6,12 +6,12 @@
 
 use pdf::{Document, Object, ObjectId};
 
-use super::ImageColorSpace;
 use super::bitpack::{downsample_16bpp, expand_1bpp, expand_nbpp};
 use super::codecs::{decode_ccitt, decode_jbig2};
 use super::filter_name;
 use super::raw::decode_raw;
 use super::validated_dims;
+use super::{ImageColorSpace, ImageDescriptor};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -66,18 +66,16 @@ pub(super) fn decode_smask(
         Some("CCITTFaxDecode") => {
             let parms = stream.dict.get(b"DecodeParms");
             let sm_desc = decode_ccitt(stream.content.as_slice(), sm_w, sm_h, false, parms)?;
-            let actual_w = sm_desc.width;
-            let actual_h = sm_desc.height;
-            let alpha: Vec<u8> = sm_desc.data.as_cpu()?.to_vec();
-            return Some(scale_smask(alpha, actual_w, actual_h, img_w, img_h));
+            let (aw, ah) = (sm_desc.width, sm_desc.height);
+            let alpha = alpha_from_decoded("CCITTFaxDecode", &sm_desc)?;
+            return Some(scale_smask(alpha, aw, ah, img_w, img_h));
         }
         Some("JBIG2Decode") => {
             let parms = stream.dict.get(b"DecodeParms");
             let sm_desc = decode_jbig2(doc, stream.content.as_slice(), sm_w, sm_h, false, parms)?;
-            let actual_w = sm_desc.width;
-            let actual_h = sm_desc.height;
-            let alpha: Vec<u8> = sm_desc.data.as_cpu()?.to_vec();
-            return Some(scale_smask(alpha, actual_w, actual_h, img_w, img_h));
+            let (aw, ah) = (sm_desc.width, sm_desc.height);
+            let alpha = alpha_from_decoded("JBIG2Decode", &sm_desc)?;
+            return Some(scale_smask(alpha, aw, ah, img_w, img_h));
         }
         Some("DCTDecode") => {
             // decode_smask_dct returns (pixels, jpeg_w, jpeg_h) so we can use the
@@ -104,6 +102,33 @@ pub(super) fn decode_smask(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Extract a host-resident alpha buffer from a bitonal-codec `SMask` descriptor,
+/// validating it covers the descriptor's own reported dimensions.
+///
+/// The CCITT/JBIG2 decoders normalise their output to `width × height` on every
+/// path the `SMask` pipeline exercises today, but a future codec change — or an
+/// adversarial stream that drives a decoder down a not-yet-hardened branch (the
+/// CCITT G4 clean-EOFB-before-`height`-rows path is one such gap) — could yield
+/// a short buffer.  `scale_smask` indexes `src[sy*sw + sx]` over the *declared*
+/// `width × height`, so a short `src` is a panic, not a wrong pixel.  Fail
+/// loudly and gracefully here instead, matching the explicit length guards in
+/// the `DCTDecode` and raw/`FlateDecode` arms (a short `SMask` is a decode
+/// failure, never silently-wrong alpha — the v1 alpha-polarity sin).
+fn alpha_from_decoded(filter: &str, desc: &ImageDescriptor) -> Option<Vec<u8>> {
+    let bytes = desc.data.as_cpu()?;
+    let expected = (desc.width as usize).checked_mul(desc.height as usize)?;
+    if bytes.len() < expected {
+        log::warn!(
+            "image: {filter} SMask decoded {} bytes, expected {expected} for {}×{} — skipping image",
+            bytes.len(),
+            desc.width,
+            desc.height
+        );
+        return None;
+    }
+    Some(bytes[..expected].to_vec())
+}
 
 /// Decode a `DCTDecode`-compressed (`JPEG`) `SMask` stream into an 8-bpp alpha buffer.
 ///
@@ -421,6 +446,40 @@ mod tests {
         // an empty buffer — must return empty instead.
         let result = scale_smask(vec![], 0, 1, 4, 4);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn alpha_from_decoded_short_buffer_returns_none() {
+        // A bitonal codec that reports 4×4 but produced only 3 bytes must be
+        // skipped loudly, not fed to scale_smask (which would panic on the
+        // out-of-bounds index when the SMask grid differs from the parent).
+        let desc = ImageDescriptor {
+            width: 4,
+            height: 4,
+            color_space: ImageColorSpace::Gray,
+            data: crate::resources::image::ImageData::Cpu(vec![0u8, 0xFF, 0x00]),
+            smask: None,
+            filter: crate::resources::image::ImageFilter::Raw,
+        };
+        assert!(alpha_from_decoded("JBIG2Decode", &desc).is_none());
+    }
+
+    #[test]
+    fn alpha_from_decoded_exact_buffer_passes_through() {
+        // Exact-length buffer is consumed as alpha directly (§11.6.5.2: the
+        // decoded sample value IS the alpha — no inversion).
+        let desc = ImageDescriptor {
+            width: 2,
+            height: 2,
+            color_space: ImageColorSpace::Gray,
+            data: crate::resources::image::ImageData::Cpu(vec![0x00, 0xFF, 0x10, 0xF0]),
+            smask: None,
+            filter: crate::resources::image::ImageFilter::Raw,
+        };
+        assert_eq!(
+            alpha_from_decoded("CCITTFaxDecode", &desc).unwrap(),
+            vec![0x00, 0xFF, 0x10, 0xF0]
+        );
     }
 
     #[test]

@@ -191,7 +191,18 @@ fn decode_ccitt_g4(data: &[u8], p: &CcittParams) -> Option<ImageDescriptor> {
         if rows_decoded == 0 {
             return None;
         }
-        // When black_is_1=true, 0xFF encodes black; pad with 0x00 (white) instead.
+    }
+
+    // Normalise to exactly p.capacity on every path (success and incomplete
+    // alike): a clean EOFB before `height` rows leaves data_out short even when
+    // `completed.is_some()`, and a malformed stream can over-emit.  G3-1D/G3-2D
+    // normalise unconditionally; keep G4 consistent so a short or long buffer
+    // never reaches ccitt_descriptor (which would later panic in scale_smask or
+    // silently drop image content).  black_is_1=true means 0xFF encodes black,
+    // so pad missing rows with 0x00 (white) instead.
+    if data_out.len() > p.capacity {
+        data_out.truncate(p.capacity);
+    } else if data_out.len() < p.capacity {
         let pad = if p.black_is_1 { 0x00 } else { 0xFF };
         data_out.resize(p.capacity, pad);
     }
